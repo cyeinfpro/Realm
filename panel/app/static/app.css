@@ -124,6 +124,9 @@ label{display:block; font-size:12px; color:var(--muted); margin-bottom:6px}
 .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size:12px}
 .small{font-size:12px; color:var(--muted)}
 
+/* utility */
+.hidden{display:none !important}
+
 .modal{position:fixed; inset:0; display:none; align-items:center; justify-content:center; padding:18px; background:rgba(0,0,0,0.55)}
 .modal.open{display:flex}
 .modal-card{

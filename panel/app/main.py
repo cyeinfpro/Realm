@@ -3,6 +3,10 @@ from __future__ import annotations
 import os
 import time
 import uuid
+import hashlib
+import hmac
+import secrets
+import urllib.parse
 from typing import Any, Dict, Optional
 
 import httpx
@@ -10,6 +14,8 @@ from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .db import (
     consume_wss_pair,
@@ -23,9 +29,82 @@ from .db import (
 )
 
 APP_TITLE = "Realm Pro Panel"
-APP_VERSION = "15.0"
+APP_VERSION = "15.1"
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
+
+
+def _auth_enabled() -> bool:
+    # Enable auth when admin hash exists, or explicitly enabled.
+    if os.getenv("PANEL_AUTH_ENABLED") is not None:
+        return os.getenv("PANEL_AUTH_ENABLED", "0").strip() in ("1", "true", "True")
+    return bool(os.getenv("PANEL_ADMIN_PASS_HASH"))
+
+
+def _admin_user() -> str:
+    return (os.getenv("PANEL_ADMIN_USER") or "admin").strip() or "admin"
+
+
+def _pbkdf2_hash(password: str, *, iterations: int = 200_000, salt_hex: Optional[str] = None) -> str:
+    salt = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${dk.hex()}"
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    try:
+        algo, it_s, salt_hex, hash_hex = stored.split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        it = int(it_s)
+        computed = _pbkdf2_hash(password, iterations=it, salt_hex=salt_hex)
+        return hmac.compare_digest(computed, stored)
+    except Exception:
+        return False
+
+
+class PanelAuthMiddleware(BaseHTTPMiddleware):
+    """Protects the panel with a session login.
+
+    NOTE: SessionMiddleware must wrap this middleware (be outermost),
+    therefore we add PanelAuthMiddleware first and SessionMiddleware after.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        if not _auth_enabled():
+            return await call_next(request)
+
+        path = request.url.path
+
+        # Public endpoints
+        if path.startswith("/static") or path in ("/login", "/health"):
+            return await call_next(request)
+
+        is_authed = bool(request.session.get("authed"))
+        if is_authed:
+            return await call_next(request)
+
+        if path.startswith("/api/"):
+            return JSONResponse(status_code=401, content={"detail": "not authenticated"})
+
+        nxt = path
+        if request.url.query:
+            nxt = f"{path}?{request.url.query}"
+        nxt_q = urllib.parse.quote(nxt, safe="")
+        return RedirectResponse(url=f"/login?next={nxt_q}", status_code=302)
+
+
+# Add auth middleware first, then SessionMiddleware (so session is available)
+app.add_middleware(PanelAuthMiddleware)
+
+_session_secret = os.getenv("PANEL_SECRET_KEY") or secrets.token_urlsafe(32)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=_session_secret,
+    same_site="lax",
+    max_age=60 * 60 * 24 * 30,
+)
+
 
 BASE_DIR = os.path.dirname(__file__)
 TEMPLATES = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
@@ -89,19 +168,84 @@ def _human_ts(ts: int) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request, next: str = "/"):
+    if _auth_enabled() and request.session.get("authed"):
+        return RedirectResponse(url=next or "/", status_code=302)
+    return TEMPLATES.TemplateResponse(
+        "login.html",
+        {
+            "request": request,
+            "version": APP_VERSION,
+            "next": next or "/",
+            "auth_enabled": _auth_enabled(),
+            "user": "",
+            "error": "",
+        },
+    )
+
+
+@app.post("/login")
+async def login_submit(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    next: str = Form("/"),
+):
+    if not _auth_enabled():
+        return RedirectResponse(url="/", status_code=302)
+
+    username = (username or "").strip()
+    password = password or ""
+    admin_user = _admin_user()
+    stored = os.getenv("PANEL_ADMIN_PASS_HASH") or ""
+    if username != admin_user or not stored or not _verify_password(password, stored):
+        return TEMPLATES.TemplateResponse(
+            "login.html",
+            {
+                "request": request,
+                "version": APP_VERSION,
+                "next": next or "/",
+                "auth_enabled": _auth_enabled(),
+                "user": "",
+                "error": "用户名或密码错误",
+            },
+            status_code=401,
+        )
+
+    request.session["authed"] = True
+    request.session["user"] = admin_user
+    return RedirectResponse(url=next or "/", status_code=302)
+
+
+@app.get("/logout")
+async def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse(url="/login", status_code=302)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    err_key = request.query_params.get("err")
+    err_map = {
+        "bad_api_url": "API 地址格式不正确（示例：http://10.0.0.2:6080）",
+        "missing_token": "Token 不能为空（请粘贴 Agent 安装输出的 Token）",
+    }
+    err_msg = err_map.get(err_key, "") if err_key else ""
     agents = list_agents()
     # Show recent activity only; status fetched on the client side.
     for a in agents:
-        a["added_at_h"] = _human_ts(int(a.get("added_at", 0)))
-        a["last_seen_h"] = _human_ts(int(a.get("last_seen", 0)))
+        a["added_at"] = _human_ts(int(a.get("added_at", 0)))
+        a["last_seen"] = _human_ts(int(a.get("last_seen", 0)))
     return TEMPLATES.TemplateResponse(
         "index.html",
         {
             "request": request,
             "agents": agents,
             "version": APP_VERSION,
+            "auth_enabled": _auth_enabled(),
+            "user": request.session.get("user"),
+            "error": err_msg or "",
         },
     )
 
@@ -153,8 +297,11 @@ async def agent_detail(request: Request, agent_id: str):
             "agent": agent,
             "rules": rules,
             "status": status,
-            "err": err,
+            "error": err,
             "version": APP_VERSION,
+            "repo_base": os.getenv("REALM_REPO_RAW_BASE", "").rstrip("/"),
+            "auth_enabled": _auth_enabled(),
+            "user": request.session.get("user"),
         },
     )
 

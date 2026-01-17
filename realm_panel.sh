@@ -54,6 +54,34 @@ main(){
   read -r -p "面板监听端口 (默认 18750): " PANEL_PORT
   PANEL_PORT="${PANEL_PORT:-18750}"
 
+  echo
+  read -r -p "设置面板登录用户名 (默认 admin): " ADMIN_USER
+  ADMIN_USER="${ADMIN_USER:-admin}"
+  while true; do
+    read -r -s -p "设置面板登录密码 (必填): " ADMIN_PASS
+    echo
+    if [[ -n "$ADMIN_PASS" ]]; then
+      break
+    fi
+    echo "密码不能为空，请重新输入。"
+  done
+
+  # Generate password hash using PBKDF2-SHA256
+  ADMIN_PASS_HASH=$(P="$ADMIN_PASS" python3 - <<'PY'
+import os, hashlib
+pwd = os.environ.get('P','')
+salt = os.urandom(16)
+iters = 200000
+dk = hashlib.pbkdf2_hmac('sha256', pwd.encode(), salt, iters)
+print(f"pbkdf2_sha256${iters}${salt.hex()}${dk.hex()}")
+PY
+)
+  PANEL_SECRET_KEY=$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(32))
+PY
+)
+
   local repo_root
   repo_root="$(fetch_repo)"
 
@@ -70,11 +98,33 @@ main(){
 
   info "创建环境文件 /etc/realm-panel/panel.env"
   mkdir -p /etc/realm-panel
+
+  # 生成面板密码哈希 (pbkdf2_sha256$iterations$salt_hex$hash_hex)
+  ADMIN_PASS_HASH="$(PANEL_PWD="$ADMIN_PASS" python3 - <<'PY'
+import os, hashlib
+pwd = os.environ.get("PANEL_PWD", "")
+salt = os.urandom(16)
+it = 200000
+dk = hashlib.pbkdf2_hmac("sha256", pwd.encode("utf-8"), salt, it)
+print(f"pbkdf2_sha256${it}${salt.hex()}${dk.hex()}")
+PY
+)"
+
+  # Session cookie signing key
+  PANEL_SECRET_KEY="$(python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(32))
+PY
+)"
   cat > /etc/realm-panel/panel.env <<ENV
 REALM_PANEL_HOST=0.0.0.0
 REALM_PANEL_PORT=$PANEL_PORT
 REALM_PANEL_DB=/etc/realm-panel/panel.db
 REALM_REPO_RAW_BASE=$REPO_RAW_BASE
+PANEL_AUTH_ENABLED=1
+PANEL_ADMIN_USER=$ADMIN_USER
+PANEL_ADMIN_PASS_HASH=$ADMIN_PASS_HASH
+PANEL_SECRET_KEY=$PANEL_SECRET_KEY
 ENV
 
   info "创建 Python venv"
@@ -95,7 +145,9 @@ ENV
   echo -e "面板地址: http://${ip}:${PANEL_PORT}"
   echo -e "面板服务: systemctl status realm-panel --no-pager"
   echo
-  echo -e "说明: 本版本面板不再需要账号密码；Agent 对接使用 Token。"
+  echo -e "登录账号: ${ADMIN_USER}"
+  echo -e "登录密码: (安装时输入的密码)"
+  echo -e "说明: 面板访问需要登录；Agent 对接仍使用 Token。"
 }
 
 main "$@"
