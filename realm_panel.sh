@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Realm Pro Panel Installer (v18)
+# Realm Pro Panel Installer (v18.1)
 # Repo: https://github.com/cyeinfpro/Realm
 
 REPO_OWNER="cyeinfpro"
@@ -13,9 +13,12 @@ ARCHIVE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${
 PANEL_HOME="/opt/realm-panel"
 ETC_DIR="/etc/realm-panel"
 
-_red(){ echo -e "\033[31m$*\033[0m"; }
-_green(){ echo -e "\033[32m$*\033[0m"; }
-_yellow(){ echo -e "\033[33m$*\033[0m"; }
+# Log helpers
+# IMPORTANT: installer functions may be used in command substitution.
+# Therefore, ALL logs must go to STDERR to avoid contaminating stdout.
+_red(){ echo -e "\033[31m$*\033[0m" >&2; }
+_green(){ echo -e "\033[32m$*\033[0m" >&2; }
+_yellow(){ echo -e "\033[33m$*\033[0m" >&2; }
 
 need_root(){
   if [[ $EUID -ne 0 ]]; then
@@ -27,7 +30,9 @@ need_root(){
 pick_source(){
   local tmp
   tmp="$(mktemp -d)"
-  trap 'rm -rf "${tmp}"' EXIT
+  # With "set -u", local vars may be unset by the time the EXIT trap runs.
+  # Capture the value NOW.
+  trap "rm -rf '$tmp'" EXIT
 
   _yellow "[1/5] 下载面板文件..."
   curl -fsSL "$ARCHIVE_URL" -o "${tmp}/src.tgz"

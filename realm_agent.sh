@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Realm Pro Agent Installer (v18)
+# Realm Pro Agent Installer (v18.1)
 # Repo: https://github.com/cyeinfpro/Realm
 
 REPO_OWNER="cyeinfpro"
@@ -13,9 +13,10 @@ ARCHIVE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${
 AGENT_HOME="/opt/realm-agent"
 ETC_DIR="/etc/realm-agent"
 
-_red(){ echo -e "\033[31m$*\033[0m"; }
-_green(){ echo -e "\033[32m$*\033[0m"; }
-_yellow(){ echo -e "\033[33m$*\033[0m"; }
+# Log helpers - send to STDERR to keep stdout clean (command substitution safe)
+_red(){ echo -e "\033[31m$*\033[0m" >&2; }
+_green(){ echo -e "\033[32m$*\033[0m" >&2; }
+_yellow(){ echo -e "\033[33m$*\033[0m" >&2; }
 
 need_root(){
   if [[ $EUID -ne 0 ]]; then
@@ -27,7 +28,8 @@ need_root(){
 pick_source(){
   local tmp
   tmp="$(mktemp -d)"
-  trap 'rm -rf "${tmp}"' EXIT
+  # Capture value now; otherwise EXIT trap may run when local var is unset under `set -u`
+  trap "rm -rf '$tmp'" EXIT
 
   _yellow "[1/6] 下载 Agent 文件..."
   curl -fsSL "$ARCHIVE_URL" -o "${tmp}/src.tgz"
