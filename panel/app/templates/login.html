@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Realm Pro 登录</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ version }}" />
+</head>
+<body>
+  <div class="bg"></div>
+  <div class="auth">
+    <div class="auth-card">
+      <div class="brand-row">
+        <div class="logo">R</div>
+        <div>
+          <div class="brand-title">Realm Pro</div>
+          <div class="muted">安全 · 清爽 · 高级</div>
+        </div>
+      </div>
+      <h1>登录面板</h1>
+      {% if error %}
+      <div class="alert">{{ error }}</div>
+      {% endif %}
+      <form method="post" action="/login" class="form">
+        <label>
+          <span>用户名</span>
+          <input name="username" autocomplete="username" required />
+        </label>
+        <label>
+          <span>密码</span>
+          <input name="password" type="password" autocomplete="current-password" required />
+        </label>
+        <button class="btn primary" type="submit">进入控制台</button>
+      </form>
+      <div class="muted small">v{{ version }}</div>
+    </div>
+  </div>
+</body>
+</html>

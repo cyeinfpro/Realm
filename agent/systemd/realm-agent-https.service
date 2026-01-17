@@ -1,0 +1,15 @@
+[Unit]
+Description=Realm Agent API Service (HTTPS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/realm-agent/agent.env
+WorkingDirectory=/opt/realm-agent
+ExecStart=/opt/realm-agent/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port ${REALM_AGENT_PORT:-18700} --ssl-keyfile /etc/realm-agent/certs/server.key --ssl-certfile /etc/realm-agent/certs/server.crt
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

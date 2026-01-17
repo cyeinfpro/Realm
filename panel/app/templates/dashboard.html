@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% set header_title = '仪表盘' %}
+
+{% block top_actions %}
+  <button class="btn" id="btnNewPair">生成配对码</button>
+{% endblock %}
+
+{% block content %}
+<div class="grid">
+  <div class="card">
+    <div class="card-title">Agent 总数</div>
+    <div class="card-num">{{ stats.agents_total }}</div>
+  </div>
+  <div class="card">
+    <div class="card-title">在线 Agent</div>
+    <div class="card-num">{{ stats.agents_online }}</div>
+  </div>
+  <div class="card">
+    <div class="card-title">最近配对码</div>
+    <div class="card-desc">可用于 Agent 绑定面板</div>
+    <div class="pair-list">
+      {% for p in stats.pair_codes %}
+        <div class="pair-item">
+          <div class="pair-code">{{ p.code }}</div>
+          <div class="pair-meta">
+            {% if p.used == 1 %}<span class="tag tag-muted">已使用</span>{% else %}<span class="tag tag-ok">可用</span>{% endif %}
+            <span class="muted">过期：{{ p.expires_at }}</span>
+          </div>
+          <button class="btn btn-ghost" onclick="copyText('{{ p.code }}')">复制</button>
+        </div>
+      {% else %}
+        <div class="muted">暂无配对码</div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+<div class="card mt">
+  <div class="card-row">
+    <div>
+      <div class="card-title">Agent 列表</div>
+      <div class="card-desc">点击进入可视化管理规则 / 编辑 / 暂停 / 删除 / 查看日志</div>
+    </div>
+    <button class="btn btn-ghost" onclick="location.reload()">刷新</button>
+  </div>
+
+  <div class="agent-list">
+    {% for a in agents %}
+      {% set online = (stats.agents_online and ( (a.last_seen|int) > 0 ) ) %}
+      <a class="agent-card" href="/agents/{{ a.id }}">
+        <div class="agent-top">
+          <div class="agent-name">{{ a.name }}</div>
+          <div class="dot {{ 'dot-ok' if (a.last_seen|int) > 0 and ( (stats and true) ) else 'dot-muted' }}"></div>
+        </div>
+        <div class="agent-meta">
+          <div class="muted">{{ a.api_url }}</div>
+          <div class="muted">LastSeen: {{ a.last_seen }}</div>
+        </div>
+      </a>
+    {% else %}
+      <div class="empty">
+        <div class="empty-title">还没有绑定任何 Agent</div>
+        <div class="empty-desc">点击右上角 <b>生成配对码</b>，然后在被控机安装 Agent 时输入该配对码即可。</div>
+      </div>
+    {% endfor %}
+  </div>
+</div>
+
+<!-- Pair code modal -->
+<div class="modal" id="modalPair" hidden>
+  <div class="modal-card">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">生成配对码</div>
+        <div class="muted">默认有效期 10 分钟，可改成更长</div>
+      </div>
+      <button class="icon" onclick="UI.close('modalPair')">✕</button>
+    </div>
+    <div class="modal-body">
+      <label class="field">
+        <span>有效期（秒）</span>
+        <input id="pairTtl" type="number" value="600" min="60" />
+      </label>
+      <div class="pair-result" id="pairResult" hidden>
+        <div class="pair-big" id="pairCode">000000</div>
+        <button class="btn" id="btnCopyPair">一键复制</button>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" id="btnGenPair">生成</button>
+      <button class="btn ghost" onclick="UI.close('modalPair')">关闭</button>
+    </div>
+  </div>
+</div>
+{% endblock %}

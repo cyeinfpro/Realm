@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ title or 'Realm Pro Web 管理' }}</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ version }}" />
+</head>
+<body>
+  <div class="bg"></div>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">R</div>
+        <div>
+          <div class="brand-title">Realm Pro</div>
+          <div class="brand-sub">Web 管理 v{{ version }}</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <a class="nav-item" href="/">仪表盘</a>
+        <a class="nav-item" href="/logout">退出登录</a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="muted">提示：配对码有效期可设置</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="topbar-title">{{ header_title or '控制台' }}</div>
+        <div class="topbar-actions">
+          {% block top_actions %}{% endblock %}
+        </div>
+      </header>
+
+      <section class="content">
+        {% block content %}{% endblock %}
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="/static/app.js?v={{ version }}"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>
