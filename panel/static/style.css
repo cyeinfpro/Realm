@@ -1,51 +1,49 @@
 :root{
-  --bg:#0b0f19;
-  --panel:#121826;
-  --panel2:#0f172a;
-  --text:#e5e7eb;
-  --muted:#94a3b8;
-  --line:rgba(148,163,184,0.18);
-  --ok:#22c55e;
-  --bad:#ef4444;
-  --warn:#f59e0b;
-  --accent:#60a5fa;
+  --bg:#f5f7fb;
+  --panel:#ffffff;
+  --panel2:#f1f5f9;
+  --text:#0f172a;
+  --muted:#64748b;
+  --line:#e2e8f0;
+  --ok:#16a34a;
+  --bad:#dc2626;
+  --warn:#d97706;
+  --accent:#2563eb;
 }
 *{box-sizing:border-box}
 body{
   margin:0;
   font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;
-  background:radial-gradient(1200px 800px at 10% 10%, rgba(96,165,250,0.10), transparent 60%),
-             radial-gradient(1200px 800px at 90% 0%, rgba(34,197,94,0.08), transparent 55%),
-             var(--bg);
+  background:var(--bg);
   color:var(--text);
 }
 .topbar{
   display:flex;align-items:center;justify-content:space-between;
   padding:16px 20px;border-bottom:1px solid var(--line);
-  background:rgba(18,24,38,0.65);
-  backdrop-filter: blur(10px);
+  background:var(--panel);
   position:sticky;top:0;z-index:20;
 }
 .brand{display:flex;gap:12px;align-items:center}
 .logo{
-  width:36px;height:36px;border-radius:12px;
-  background:linear-gradient(135deg, rgba(96,165,250,0.9), rgba(34,197,94,0.6));
+  width:36px;height:36px;border-radius:10px;
+  background:var(--accent);
+  color:#fff;
   display:flex;align-items:center;justify-content:center;
   font-weight:800;
 }
 .brand-name{font-weight:800;letter-spacing:0.4px}
 .brand-sub{font-size:12px;color:var(--muted)}
 .nav{display:flex;gap:12px}
-.nav-link{color:var(--text);text-decoration:none;padding:8px 10px;border-radius:12px;border:1px solid transparent}
-.nav-link:hover{border-color:var(--line);background:rgba(148,163,184,0.08)}
+.nav-link{color:var(--text);text-decoration:none;padding:8px 10px;border-radius:10px;border:1px solid transparent}
+.nav-link:hover{border-color:var(--line);background:var(--panel2)}
 .container{max-width:1100px;margin:0 auto;padding:18px}
 .footer{max-width:1100px;margin:0 auto;padding:16px 18px;color:var(--muted);font-size:12px}
 .card{
-  background:rgba(18,24,38,0.72);
+  background:var(--panel);
   border:1px solid var(--line);
-  border-radius:18px;
+  border-radius:14px;
   padding:18px;
-  box-shadow:0 10px 30px rgba(0,0,0,0.25);
+  box-shadow:none;
 }
 .grid{display:grid;grid-template-columns:repeat(auto-fit, minmax(260px,1fr));gap:14px;margin-top:14px}
 .row{display:flex;gap:14px;align-items:center}
@@ -55,23 +53,24 @@ body{
 .h2{margin:0;font-size:18px}
 .muted{color:var(--muted)}
 .btn{
-  background:rgba(96,165,250,0.18);
-  border:1px solid rgba(96,165,250,0.35);
-  color:var(--text);
+  background:var(--accent);
+  border:1px solid var(--accent);
+  color:#fff;
   padding:10px 14px;
-  border-radius:14px;
+  border-radius:10px;
   cursor:pointer;
   transition:transform .05s ease, background .2s ease;
 }
-.btn:hover{background:rgba(96,165,250,0.25)}
+.btn:hover{background:#1d4ed8}
 .btn:active{transform:translateY(1px)}
 .btn.ghost{
-  background:rgba(148,163,184,0.08);
+  background:var(--panel2);
   border:1px solid var(--line);
+  color:var(--text);
 }
-.btn.danger{background:rgba(239,68,68,0.15);border-color:rgba(239,68,68,0.35)}
-.btn.danger:hover{background:rgba(239,68,68,0.22)}
-.pill{display:inline-block;padding:6px 10px;border-radius:999px;font-size:12px;border:1px solid var(--line);color:var(--muted)}
+.btn.danger{background:#fee2e2;border-color:#fecaca;color:#b91c1c}
+.btn.danger:hover{background:#fecaca}
+.pill{display:inline-block;padding:6px 10px;border-radius:999px;font-size:12px;border:1px solid var(--line);color:var(--muted);background:var(--panel2)}
 .pill.ok{color:var(--ok);border-color:rgba(34,197,94,0.35);background:rgba(34,197,94,0.08)}
 .pill.bad{color:var(--bad);border-color:rgba(239,68,68,0.35);background:rgba(239,68,68,0.08)}
 .pill.warn{color:var(--warn);border-color:rgba(245,158,11,0.35);background:rgba(245,158,11,0.10)}
@@ -83,24 +82,24 @@ body{
 .help{font-size:12px;color:var(--muted);margin-top:6px}
 .input,.select,textarea{
   width:100%;
-  background:rgba(15,23,42,0.85);
+  background:#fff;
   border:1px solid var(--line);
-  border-radius:14px;
+  border-radius:10px;
   padding:10px 12px;
   color:var(--text);
   outline:none;
 }
 textarea{min-height:90px;resize:vertical}
-.flash{margin:12px 0;padding:12px 14px;border-radius:14px;border:1px solid var(--line);background:rgba(245,158,11,0.10);color:var(--text)}
+.flash{margin:12px 0;padding:12px 14px;border-radius:12px;border:1px solid #fde68a;background:#fffbeb;color:#92400e}
 .tabs{display:flex;gap:8px;margin:14px 0}
-.tab{padding:10px 12px;border-radius:14px;border:1px solid var(--line);background:rgba(15,23,42,0.65);color:var(--text);cursor:pointer}
-.tab.active{border-color:rgba(96,165,250,0.55);background:rgba(96,165,250,0.15)}
+.tab{padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--panel2);color:var(--text);cursor:pointer}
+.tab.active{border-color:var(--accent);background:#e0e7ff;color:#1e3a8a}
 .tabpane{display:none}
 .tabpane.show{display:block}
 .modal{
   position:fixed;
   inset:0;
-  background:rgba(10,12,20,0.82);
+  background:rgba(15,23,42,0.55);
   display:flex;
   align-items:center;
   justify-content:center;
@@ -113,11 +112,11 @@ textarea{min-height:90px;resize:vertical}
   max-width:100%;
   max-height:100%;
   overflow:auto;
-  background:#0f172a;
+  background:var(--panel);
   border:1px solid var(--line);
-  border-radius:18px;
+  border-radius:14px;
   padding:20px;
-  box-shadow:0 18px 40px rgba(0,0,0,0.45);
+  box-shadow:0 18px 40px rgba(15,23,42,0.12);
 }
 .form-error{
   color:var(--warn);
@@ -126,14 +125,14 @@ textarea{min-height:90px;resize:vertical}
 .hide{display:none}
 .divider{height:1px;background:var(--line);margin:12px 0}
 .kv{display:flex;gap:10px;flex-wrap:wrap}
-.kv .item{padding:10px 12px;border-radius:14px;border:1px solid var(--line);background:rgba(15,23,42,0.65)}
+.kv .item{padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--panel2)}
 code{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}
 .code-block{
   margin:12px 0 0 0;
   padding:12px 14px;
-  border-radius:12px;
+  border-radius:10px;
   border:1px solid var(--line);
-  background:rgba(15,23,42,0.8);
+  background:var(--panel2);
   color:var(--text);
   font-family:ui-monospace,Menlo,Monaco,Consolas,monospace;
   font-size:12px;

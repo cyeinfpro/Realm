@@ -3,10 +3,10 @@
 <div class="row">
   <div class="col">
     <h1 class="h1">控制台</h1>
-    <p class="muted">管理你的机器（Agent）与 Realm 转发规则</p>
+    <p class="muted">集中管理节点接入与转发策略</p>
   </div>
   <div class="col right">
-    <a class="btn" href="/nodes/new">添加机器</a>
+    <a class="btn" href="/nodes/new">接入节点</a>
   </div>
 </div>
 
@@ -28,8 +28,8 @@
   </div>
   {% else %}
   <div class="card">
-    <div class="h2">还没有机器</div>
-    <p class="muted">先在目标机器安装 Realm Agent，然后在这里添加。</p>
+    <div class="h2">暂无已接入节点</div>
+    <p class="muted">请先在目标机器安装 Realm Agent，再回到此处完成接入。</p>
   </div>
   {% endfor %}
 </div>

@@ -1,23 +1,23 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="card" style="max-width:720px;margin:20px auto;">
-  <h1 class="h1">添加机器</h1>
-  <p class="muted">填写机器名称与 IP，端口默认 18700，API Key 将自动生成</p>
+  <h1 class="h1">接入节点</h1>
+  <p class="muted">填写节点名称与 IP，端口默认 18700，系统自动生成密钥</p>
   <form method="post" action="/nodes/new" class="form">
-    <label class="label">显示名称</label>
-    <input class="input" name="name" placeholder="...">
+    <label class="label">节点名称</label>
+    <input class="input" name="name" placeholder="例如：北京-主机01">
 
-    <label class="label">机器 IP 地址</label>
+    <label class="label">节点 IP 地址</label>
     <input class="input" name="ip_address" placeholder="10.0.0.2" required>
-    <div class="help">端口默认 {{ default_port }}</div>
+    <div class="help">默认端口 {{ default_port }}，可在 Agent 侧修改</div>
     <input type="hidden" name="api_key" value="{{ api_key }}">
 
     <div class="row" style="margin-top:14px;">
       <div class="col">
-        <a href="/" class="btn ghost">返回</a>
+        <a href="/" class="btn ghost">返回控制台</a>
       </div>
       <div class="col right">
-        <button class="btn" type="submit">保存</button>
+        <button class="btn" type="submit">生成接入配置</button>
       </div>
     </div>
   </form>

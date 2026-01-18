@@ -6,10 +6,10 @@
     <div class="muted">{{ node.base_url }}</div>
   </div>
   <div class="col right">
-    <a class="btn ghost" href="/">返回</a>
-    <button class="btn" onclick="applyNow()">应用配置</button>
+    <a class="btn ghost" href="/">返回控制台</a>
+    <button class="btn" onclick="applyNow()">发布配置</button>
     <form method="post" action="/nodes/{{ node.id }}/delete" style="margin:0;">
-      <button class="btn danger" type="submit" onclick="return confirm('确认删除该机器？')">删除机器</button>
+      <button class="btn danger" type="submit" onclick="return confirm('确认移除该节点？')">移除节点</button>
     </form>
   </div>
 </div>
@@ -17,8 +17,8 @@
 <div class="card" style="margin-top:16px;">
   <div class="row">
     <div class="col">
-      <h2 class="h2">一键安装命令</h2>
-      <p class="muted">在目标机器执行，下发 API Key 并安装 Agent（端口默认 18700）</p>
+      <h2 class="h2">一键接入命令</h2>
+      <p class="muted">在目标节点执行，自动下发密钥并安装 Agent（默认端口 18700）</p>
     </div>
     <div class="col right">
       <button class="btn ghost" data-copy-target="installCmd">复制命令</button>
@@ -64,8 +64,8 @@
 
 <section id="tab-graph" class="tabpane">
   <div class="card">
-    <h2 class="h2">规则连接图</h2>
-    <p class="muted">从 listen 到每个 remote 的连线；WSS 会显示为特殊边</p>
+    <h2 class="h2">连接拓扑</h2>
+    <p class="muted">展示 listen 与 remote 的关系，WSS 通道将以标记呈现</p>
     <div id="graphBox" style="width:100%;height:560px;border-radius:16px;overflow:hidden;background:rgba(255,255,255,0.04);"></div>
     <div class="muted" style="margin-top:10px;">提示：图形渲染依赖浏览器加载 Cytoscape CDN，如你网络受限，可忽略此视图。</div>
   </div>
@@ -73,8 +73,8 @@
 
 <section id="tab-lb" class="tabpane">
   <div class="card">
-    <h2 class="h2">负载均衡策略可视化</h2>
-    <p class="muted">对多目标规则展示权重与顺序</p>
+    <h2 class="h2">负载均衡视图</h2>
+    <p class="muted">展示多目标规则的调度策略与权重</p>
     <div class="row" style="gap:12px;align-items:center;">
       <select id="lbSelect" class="select"></select>
       <button class="btn ghost" onclick="renderLB(parseInt(document.getElementById('lbSelect').value || 0, 10))">刷新</button>
@@ -175,10 +175,10 @@
 <div id="installModal" class="modal">
   <div class="modal-inner">
     <div class="row">
-      <div class="col"><div class="h2">已添加机器</div></div>
+      <div class="col"><div class="h2">节点已接入</div></div>
       <div class="col right"><button class="btn ghost" onclick="document.getElementById('installModal').style.display='none'">关闭</button></div>
     </div>
-    <p class="muted">复制下面命令到目标机器执行即可完成 Agent 安装与绑定。</p>
+    <p class="muted">复制以下命令到目标节点执行即可完成 Agent 安装与绑定。</p>
     <pre class="code-block" id="installCmdModal">{{ install_cmd }}</pre>
     <div class="row" style="justify-content:flex-end;">
       <button class="btn" data-copy-target="installCmdModal">复制命令</button>
