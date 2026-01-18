@@ -2,17 +2,15 @@
 {% block content %}
 <div class="card" style="max-width:720px;margin:20px auto;">
   <h1 class="h1">添加机器</h1>
-  <p class="muted">填写 Agent 访问地址和 API Key（在 Agent 安装时生成）</p>
+  <p class="muted">填写机器名称与 IP，端口默认 18700，API Key 将自动生成</p>
   <form method="post" action="/nodes/new" class="form">
     <label class="label">显示名称</label>
     <input class="input" name="name" placeholder="...">
 
-    <label class="label">Agent Base URL</label>
-    <input class="input" name="base_url" placeholder="http://10.0.0.2:18700" required>
-    <div class="help">结尾不要加斜杠。例如：http://10.0.0.2:18700</div>
-
-    <label class="label">API Key</label>
-    <input class="input" name="api_key" placeholder="e.g. 1f2e3d..." required>
+    <label class="label">机器 IP 地址</label>
+    <input class="input" name="ip_address" placeholder="10.0.0.2" required>
+    <div class="help">端口默认 {{ default_port }}</div>
+    <input type="hidden" name="api_key" value="{{ api_key }}">
 
     <div class="row" style="margin-top:14px;">
       <div class="col">

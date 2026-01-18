@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -43,6 +44,10 @@ def _set_flash(request: Request, msg: str) -> None:
 
 def _has_credentials() -> bool:
     return load_credentials() is not None
+
+
+def _generate_api_key() -> str:
+    return secrets.token_hex(16)
 
 
 def require_login(request: Request) -> str:
@@ -134,9 +139,17 @@ async def index(request: Request, user: str = Depends(require_login_page)):
 
 @app.get("/nodes/new", response_class=HTMLResponse)
 async def node_new_page(request: Request, user: str = Depends(require_login_page)):
+    api_key = _generate_api_key()
     return templates.TemplateResponse(
         "nodes_new.html",
-        {"request": request, "user": user, "flash": _flash(request), "title": "添加机器"},
+        {
+            "request": request,
+            "user": user,
+            "flash": _flash(request),
+            "title": "添加机器",
+            "api_key": api_key,
+            "default_port": 18700,
+        },
     )
 
 
@@ -144,23 +157,22 @@ async def node_new_page(request: Request, user: str = Depends(require_login_page
 async def node_new_action(
     request: Request,
     name: str = Form(""),
-    base_url: str = Form(...),
-    api_key: str = Form(...),
+    ip_address: str = Form(...),
+    api_key: str = Form(""),
 ):
     user = request.session.get("user")
     if not user:
         return RedirectResponse(url="/login", status_code=303)
 
-    base_url = base_url.strip()
-    api_key = api_key.strip()
-    if not base_url.startswith("http"):
-        _set_flash(request, "Agent 地址必须以 http:// 或 https:// 开头")
+    ip_address = ip_address.strip()
+    api_key = api_key.strip() or _generate_api_key()
+    if not ip_address:
+        _set_flash(request, "IP 地址不能为空")
         return RedirectResponse(url="/nodes/new", status_code=303)
-    if not api_key:
-        _set_flash(request, "API Key 不能为空")
-        return RedirectResponse(url="/nodes/new", status_code=303)
+    base_url = f"http://{ip_address}:18700"
 
     node_id = add_node(name or base_url, base_url, api_key)
+    request.session["show_install_cmd"] = True
     _set_flash(request, "已添加机器")
     return RedirectResponse(url=f"/nodes/{node_id}", status_code=303)
 
@@ -180,9 +192,24 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
     if not node:
         _set_flash(request, "机器不存在")
         return RedirectResponse(url="/", status_code=303)
+    show_install_cmd = bool(request.session.pop("show_install_cmd", False))
+    install_cmd = (
+        "sudo -i && "
+        "mkdir -p /etc/realm-agent && "
+        f"echo '{node['api_key']}' > /etc/realm-agent/api.key && "
+        "curl -fsSL https://raw.githubusercontent.com/cyeinfpro/Realm/main/realm_agent.sh | bash"
+    )
     return templates.TemplateResponse(
         "node.html",
-        {"request": request, "user": user, "node": node, "flash": _flash(request), "title": node["name"]},
+        {
+            "request": request,
+            "user": user,
+            "node": node,
+            "flash": _flash(request),
+            "title": node["name"],
+            "install_cmd": install_cmd,
+            "show_install_cmd": show_install_cmd,
+        },
     )
 
 

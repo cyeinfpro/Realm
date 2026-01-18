@@ -80,6 +80,7 @@ body{
 .table th{color:var(--muted);font-weight:600}
 .form{display:flex;flex-direction:column;gap:10px;margin-top:10px}
 .label{font-size:12px;color:var(--muted)}
+.help{font-size:12px;color:var(--muted);margin-top:6px}
 .input,.select,textarea{
   width:100%;
   background:rgba(15,23,42,0.85);
@@ -103,3 +104,15 @@ textarea{min-height:90px;resize:vertical}
 .kv{display:flex;gap:10px;flex-wrap:wrap}
 .kv .item{padding:10px 12px;border-radius:14px;border:1px solid var(--line);background:rgba(15,23,42,0.65)}
 code{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}
+.code-block{
+  margin:12px 0 0 0;
+  padding:12px 14px;
+  border-radius:12px;
+  border:1px solid var(--line);
+  background:rgba(15,23,42,0.8);
+  color:var(--text);
+  font-family:ui-monospace,Menlo,Monaco,Consolas,monospace;
+  font-size:12px;
+  white-space:pre-wrap;
+  word-break:break-all;
+}

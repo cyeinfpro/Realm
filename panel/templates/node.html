@@ -8,7 +8,23 @@
   <div class="col right">
     <a class="btn ghost" href="/">返回</a>
     <button class="btn" onclick="applyNow()">应用配置</button>
+    <form method="post" action="/nodes/{{ node.id }}/delete" style="margin:0;">
+      <button class="btn danger" type="submit" onclick="return confirm('确认删除该机器？')">删除机器</button>
+    </form>
   </div>
+</div>
+
+<div class="card" style="margin-top:16px;">
+  <div class="row">
+    <div class="col">
+      <h2 class="h2">一键安装命令</h2>
+      <p class="muted">在目标机器执行，下发 API Key 并安装 Agent（端口默认 18700）</p>
+    </div>
+    <div class="col right">
+      <button class="btn ghost" data-copy-target="installCmd">复制命令</button>
+    </div>
+  </div>
+  <pre class="code-block" id="installCmd">{{ install_cmd }}</pre>
 </div>
 
 <div class="tabs">
@@ -155,7 +171,21 @@
     </div>
   </div>
 </div>
-
+{% if show_install_cmd %}
+<div id="installModal" class="modal">
+  <div class="modal-inner">
+    <div class="row">
+      <div class="col"><div class="h2">已添加机器</div></div>
+      <div class="col right"><button class="btn ghost" onclick="document.getElementById('installModal').style.display='none'">关闭</button></div>
+    </div>
+    <p class="muted">复制下面命令到目标机器执行即可完成 Agent 安装与绑定。</p>
+    <pre class="code-block" id="installCmdModal">{{ install_cmd }}</pre>
+    <div class="row" style="justify-content:flex-end;">
+      <button class="btn" data-copy-target="installCmdModal">复制命令</button>
+    </div>
+  </div>
+</div>
+{% endif %}
 {% endblock %}
 
 {% block scripts %}
@@ -163,5 +193,22 @@
 <script>
 window.__NODE_ID__ = {{ node.id }};
 initNodePage();
+document.querySelectorAll('[data-copy-target]').forEach((btn)=>{
+  btn.addEventListener('click', async ()=>{
+    const id = btn.getAttribute('data-copy-target');
+    const text = document.getElementById(id).textContent.trim();
+    try{
+      await navigator.clipboard.writeText(text);
+      btn.textContent = '已复制';
+      setTimeout(()=>{ btn.textContent = '复制命令'; }, 1200);
+    }catch(e){
+      alert('复制失败，请手动复制');
+    }
+  });
+});
+{% if show_install_cmd %}
+const modal = document.getElementById('installModal');
+modal.style.display = 'flex';
+{% endif %}
 </script>
 {% endblock %}
