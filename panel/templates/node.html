@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row">
+  <div class="col">
+    <h1 class="h1">{{ node.name }}</h1>
+    <div class="muted">{{ node.base_url }}</div>
+  </div>
+  <div class="col right">
+    <a class="btn ghost" href="/">返回</a>
+    <button class="btn" onclick="applyNow()">应用配置</button>
+  </div>
+</div>
+
+<div class="tabs">
+  <button class="tab active" data-tab="rules">规则列表</button>
+  <button class="tab" data-tab="graph">连接图</button>
+  <button class="tab" data-tab="lb">负载均衡</button>
+</div>
+
+<section id="tab-rules" class="tabpane show">
+  <div class="card">
+    <div class="row">
+      <div class="col">
+        <h2 class="h2">规则</h2>
+        <p class="muted">编辑 listen / remote / wss 参数，支持启用/暂停</p>
+      </div>
+      <div class="col right">
+        <button class="btn" onclick="newRule()">新增规则</button>
+      </div>
+    </div>
+    <div id="rulesLoading" class="muted">正在加载规则…</div>
+    <table id="rulesTable" class="table" style="display:none;">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>状态</th>
+          <th>Listen</th>
+          <th>Remote(目标)</th>
+          <th>类型</th>
+          <th>策略</th>
+          <th class="right">操作</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+<section id="tab-graph" class="tabpane">
+  <div class="card">
+    <h2 class="h2">规则连接图</h2>
+    <p class="muted">从 listen 到每个 remote 的连线；WSS 会显示为特殊边</p>
+    <div id="cy" style="width:100%;height:560px;border-radius:16px;overflow:hidden;background:rgba(255,255,255,0.04);"></div>
+    <div id="graphHint" class="muted" style="margin-top:10px;">提示：图形渲染依赖浏览器加载 Cytoscape CDN，如你网络受限，可忽略此视图。</div>
+  </div>
+</section>
+
+<section id="tab-lb" class="tabpane">
+  <div class="card">
+    <h2 class="h2">负载均衡策略可视化</h2>
+    <p class="muted">对多目标规则展示权重与顺序</p>
+    <div class="row" style="gap:12px;align-items:center;">
+      <select id="lbRuleSel" class="select" onchange="renderLB()"></select>
+      <button class="btn ghost" onclick="renderLB()">刷新</button>
+    </div>
+    <div id="lbBox" style="margin-top:14px;"></div>
+  </div>
+</section>
+
+<!-- Edit Modal -->
+<div id="modal" class="modal" style="display:none;">
+  <div class="modal-card">
+    <div class="row">
+      <div class="col"><div class="h2" id="modalTitle">编辑规则</div></div>
+      <div class="col right"><button class="btn ghost" onclick="closeModal()">关闭</button></div>
+    </div>
+    <div class="form">
+      <div class="row" style="gap:12px;">
+        <div class="col">
+          <label class="label">Listen (例如 0.0.0.0:443)</label>
+          <input class="input" id="f_listen" placeholder="0.0.0.0:443">
+        </div>
+        <div class="col">
+          <label class="label">启用</label>
+          <select class="select" id="f_enabled">
+            <option value="1">启用</option>
+            <option value="0">暂停</option>
+          </select>
+        </div>
+      </div>
+
+      <label class="label">Remote 目标（每行一个 host:port）</label>
+      <textarea class="textarea" id="f_remotes" rows="5" placeholder="198.176.54.226:443\n10.8.5.2:443"></textarea>
+
+      <div class="row" style="gap:12px;">
+        <div class="col">
+          <label class="label">策略</label>
+          <select class="select" id="f_balance">
+            <option value="round_robin">轮询</option>
+            <option value="iphash">IP Hash</option>
+          </select>
+        </div>
+        <div class="col">
+          <label class="label">权重（与 Remote 行数一致，逗号分隔，可空）</label>
+          <input class="input" id="f_weights" placeholder="1,1,2">
+        </div>
+      </div>
+
+      <label class="label">隧道模式</label>
+      <select class="select" id="f_tunnel" onchange="toggleWSS()">
+        <option value="plain">TCP/UDP</option>
+        <option value="wss_send">WSS 发送（remote_transport=ws）</option>
+        <option value="wss_recv">WSS 接收（listen_transport=ws）</option>
+      </select>
+
+      <div id="wssBox" style="display:none;">
+        <div class="row" style="gap:12px;">
+          <div class="col">
+            <label class="label">WSS Host</label>
+            <input class="input" id="f_wss_host" placeholder="www.bing.com">
+          </div>
+          <div class="col">
+            <label class="label">WSS Path</label>
+            <input class="input" id="f_wss_path" placeholder="/ws">
+          </div>
+        </div>
+        <div class="row" style="gap:12px;">
+          <div class="col">
+            <label class="label">SNI</label>
+            <input class="input" id="f_wss_sni" placeholder="www.bing.com">
+          </div>
+          <div class="col">
+            <label class="label">TLS</label>
+            <select class="select" id="f_wss_tls">
+              <option value="1">启用</option>
+              <option value="0">关闭</option>
+            </select>
+          </div>
+          <div class="col">
+            <label class="label">insecure</label>
+            <select class="select" id="f_wss_insecure">
+              <option value="0">否</option>
+              <option value="1">是</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="row" style="gap:12px; justify-content:flex-end;">
+        <button class="btn ghost" onclick="closeModal()">取消</button>
+        <button class="btn" onclick="saveRule()">保存</button>
+      </div>
+
+      <div id="modalMsg" class="muted" style="margin-top:10px;"></div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
+<script src="/static/app.js"></script>
+<script>
+window.__NODE_ID__ = {{ node.id }};
+initNodePage();
+</script>
+{% endblock %}

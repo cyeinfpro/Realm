@@ -1,1 +1,1 @@
-"""Realm Panel package."""
+__all__ = []

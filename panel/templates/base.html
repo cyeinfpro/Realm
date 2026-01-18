@@ -1,36 +1,40 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title or "Realm Pro Panel" }}</title>
-  <link rel="stylesheet" href="/static/app.css" />
+  <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <div class="bg"></div>
   <header class="topbar">
     <div class="brand">
-      <div class="logo">R</div>
+      <div class="logo">RP</div>
       <div>
-        <div class="brand-title">Realm Pro Panel</div>
-        <div class="brand-sub">Machine & Rule Manager</div>
+        <div class="brand-name">Realm Pro Panel</div>
+        <div class="brand-sub">机器与规则管理面板</div>
       </div>
     </div>
     <nav class="nav">
-      <a href="/" class="nav-link {{ 'active' if active=='dashboard' else '' }}">概览</a>
-      <a href="/nodes" class="nav-link {{ 'active' if active=='nodes' else '' }}">机器</a>
-      <a href="/topology" class="nav-link {{ 'active' if active=='topology' else '' }}">连接图</a>
-      <div class="spacer"></div>
-      <a href="/logout" class="nav-link subtle">退出</a>
+      {% if user %}
+        <a href="/" class="nav-link">控制台</a>
+        <a href="/logout" class="nav-link">退出</a>
+      {% endif %}
     </nav>
   </header>
 
   <main class="container">
+    {% if flash %}
+      <div class="flash">{{ flash }}</div>
+    {% endif %}
     {% block content %}{% endblock %}
   </main>
 
-  <div id="toast" class="toast" hidden></div>
-  <script src="/static/app.js"></script>
+  <footer class="footer">
+    <span>Realm Pro Suite v31</span>
+    <span class="muted">| 本面板只管理你授权的机器与规则</span>
+  </footer>
+
   {% block scripts %}{% endblock %}
 </body>
 </html>

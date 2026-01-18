@@ -1,55 +1,55 @@
-# Realm Pro Suite v21
+# Realm Pro Suite v31
 
-Web Panel + Agent for managing `realm` forwarding rules.
+这个包包含两部分：
 
-## ✅ Key behaviors
+- **Realm Pro Panel（面板）**：集中管理多台机器（Agent），提供规则列表 / 编辑 / 连接图可视化 / 负载均衡可视化。
+- **Realm Agent（被控机）**：部署在每台需要被管理的机器上，提供 API 来读写规则并应用到 `/etc/realm/config.json`。
 
-- Panel install asks for **login username & password**.
-- **Pairing Code** is used **ONLY** for syncing WSS sender parameters (Host / Path / SNI / Insecure).
-- Linking a machine to Panel is done with **Agent Token** (NOT pairing code).
+> 说明：v31 彻底移除了 `bcrypt/passlib` 依赖，面板密码使用 PBKDF2-SHA256 存储，不会再出现 bcrypt 版本/72字节限制报错。
 
-## ✅ Repo layout (MUST be in repo root)
+---
 
-```
-.
-├── agent/
-├── panel/
-├── realm_agent.sh
-├── realm_panel.sh
-└── README.md
-```
-
-## Install
-
-### Panel (controller)
+## 1) 安装 Agent（每台被控机都装一次）
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/refs/heads/<BRANCH>/realm_panel.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/cyeinfpro/Realm/main/realm_agent.sh)
 ```
 
-### Agent (node)
+安装完成后会输出：
+
+- Agent API 地址（默认端口 `18700`）
+- **API Key**（复制到面板里添加机器）
+
+---
+
+## 2) 安装 Panel（控制台机器装一次）
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/refs/heads/<BRANCH>/realm_agent.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/cyeinfpro/Realm/main/realm_panel.sh)
 ```
 
-## Change your GitHub repo address
+然后用浏览器打开：
 
-Edit the top of these two files:
+- `http://<你的IP>:6080`
 
-- `realm_panel.sh`
-- `realm_agent.sh`
+---
 
-Change:
+## 3) 面板功能
 
-```bash
-REPO_OWNER="cyeinfpro"
-REPO_NAME="Realm"
-REPO_BRANCH="main"
+- 机器列表（添加/删除）
+- 规则列表（启用/禁用）
+- 规则编辑（listen/remote/wss/balance/权重）
+- 连接图（Graph）
+- 负载均衡可视化（Load Balancer）
+
+---
+
+## 目录结构
+
 ```
-
-## Ports
-
-- Panel default: `6080`
-- Agent default: `18700`
-
+Realm/
+  realm_panel.sh
+  realm_agent.sh
+  panel/
+  agent/
+```

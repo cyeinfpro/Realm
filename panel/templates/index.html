@@ -1,40 +1,64 @@
 {% extends "base.html" %}
 {% block content %}
-  <div class="grid3">
-    <div class="card">
-      <div class="card-title">节点</div>
-      <div class="big-num" id="stat_nodes">-</div>
-      <div class="muted">已绑定的 Agent 数量</div>
-    </div>
-    <div class="card">
-      <div class="card-title">规则</div>
-      <div class="big-num" id="stat_rules">-</div>
-      <div class="muted">所有节点的转发规则总数</div>
-    </div>
-    <div class="card">
-      <div class="card-title">活跃连接</div>
-      <div class="big-num" id="stat_conns">-</div>
-      <div class="muted">所有规则累计连接数（估算）</div>
-    </div>
+<div class="row">
+  <div class="col">
+    <h1 class="h1">控制台</h1>
+    <p class="muted">管理你的机器（Agent）与 Realm 转发规则</p>
   </div>
+  <div class="col right">
+    <a class="btn" href="/nodes/new">添加机器</a>
+  </div>
+</div>
 
-  <div class="card mt">
-    <div class="row between">
-      <div>
-        <div class="card-title">最近节点状态</div>
-        <div class="muted">实时拉取 Agent /api/status（如超时会显示离线）</div>
+<div class="grid">
+  {% for n in nodes %}
+  <div class="card">
+    <div class="row">
+      <div class="col">
+        <div class="h2">{{ n.name }}</div>
+        <div class="muted">{{ n.base_url }}</div>
       </div>
-      <a class="btn" href="/nodes">管理节点</a>
+      <div class="col right">
+        <a class="btn-secondary" href="/nodes/{{ n.id }}">打开</a>
+      </div>
     </div>
-    <div class="table-wrap">
-      <table class="table" id="node_table">
-        <thead><tr><th>节点</th><th>地址</th><th>Realm</th><th>规则</th><th>连接</th><th>状态</th><th></th></tr></thead>
-        <tbody></tbody>
-      </table>
+    <div class="meta" data-node-id="{{ n.id }}">
+      <span class="pill" id="node-{{ n.id }}-state">检测中...</span>
     </div>
   </div>
+  {% else %}
+  <div class="card">
+    <div class="h2">还没有机器</div>
+    <p class="muted">先在目标机器安装 Realm Agent，然后在这里添加。</p>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}
 
-  <script>
-    window.PAGE = { name: "index" };
-  </script>
+{% block scripts %}
+<script>
+async function pingNode(id){
+  try{
+    const res = await fetch(`/api/nodes/${id}/ping`);
+    const data = await res.json();
+    const el = document.getElementById(`node-${id}-state`);
+    if(data.ok){
+      el.textContent = `在线 · ${data.hostname||''}`.trim();
+      el.className = 'pill ok';
+    }else{
+      el.textContent = '离线';
+      el.className = 'pill bad';
+    }
+  }catch(e){
+    const el = document.getElementById(`node-${id}-state`);
+    el.textContent = '离线';
+    el.className = 'pill bad';
+  }
+}
+
+for(const el of document.querySelectorAll('[data-node-id]')){
+  const id = el.getAttribute('data-node-id');
+  pingNode(id);
+}
+</script>
 {% endblock %}

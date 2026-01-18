@@ -1,284 +1,196 @@
-import base64
-import json
+from __future__ import annotations
+
 import os
-import secrets
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
-from .agent_client import AgentError, call_agent
-from .auth import authenticate
-from .db import (
-    add_node,
-    delete_node,
-    get_node,
-    init_db,
-    list_nodes,
-    update_node,
-)
+from .auth import ensure_secret_key, verify_login
+from .db import add_node, delete_node, ensure_db, get_node, list_nodes
+from .agents import agent_get, agent_post, agent_ping
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-TEMPLATE_DIR = os.path.join(APP_DIR, "..", "templates")
-STATIC_DIR = os.path.join(APP_DIR, "..", "static")
+BASE_DIR = Path(__file__).resolve().parent.parent
+TEMPLATES_DIR = BASE_DIR / "templates"
+STATIC_DIR = BASE_DIR / "static"
 
-app = FastAPI(title="Realm Pro Panel")
+app = FastAPI(title="Realm Pro Panel", version="31")
 
-secret_key = os.environ.get("PANEL_SECRET_KEY") or secrets.token_hex(32)
-app.add_middleware(SessionMiddleware, secret_key=secret_key, same_site="lax")
+# Session
+secret = ensure_secret_key()
+app.add_middleware(SessionMiddleware, secret_key=secret, session_cookie="realm_panel_sess")
 
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-templates = Jinja2Templates(directory=TEMPLATE_DIR)
+# Static + templates
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+
+# DB init
+ensure_db()
 
 
-@app.on_event("startup")
-def _startup() -> None:
-    init_db()
+def _flash(request: Request) -> Optional[str]:
+    msg = request.session.pop("flash", None)
+    return msg
 
 
-# -------------------------
-# Auth helpers
-# -------------------------
-
-def require_login(request: Request) -> None:
-    if not request.session.get("user"):
-        raise HTTPException(status_code=401, detail="login required")
+def _set_flash(request: Request, msg: str) -> None:
+    request.session["flash"] = msg
 
 
-def ui_guard(request: Request):
-    if not request.session.get("user"):
-        return RedirectResponse("/login", status_code=302)
-    return None
+def require_login(request: Request) -> str:
+    user = request.session.get("user")
+    if not user:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    return user
 
 
-# -------------------------
-# UI pages
-# -------------------------
+def require_login_page(request: Request) -> str:
+    user = request.session.get("user")
+    if not user:
+        raise HTTPException(status_code=302, headers={"Location": "/login"})
+    return user
+
 
 @app.get("/login", response_class=HTMLResponse)
-def login_page(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request})
-
-
-@app.post("/login")
-def login_action(request: Request, username: str = Form(...), password: str = Form(...)):
-    if authenticate(username, password):
-        request.session["user"] = username
-        return RedirectResponse("/", status_code=302)
+async def login_page(request: Request):
     return templates.TemplateResponse(
-        "login.html", {"request": request, "error": "用户名或密码错误"}, status_code=401
+        "login.html",
+        {"request": request, "user": None, "flash": _flash(request), "title": "登录"},
     )
 
 
+@app.post("/login")
+async def login_action(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+):
+    if verify_login(username, password):
+        request.session["user"] = username
+        _set_flash(request, "登录成功")
+        return RedirectResponse(url="/", status_code=303)
+    _set_flash(request, "账号或密码错误")
+    return RedirectResponse(url="/login", status_code=303)
+
+
 @app.get("/logout")
-def logout(request: Request):
+async def logout(request: Request):
     request.session.clear()
-    return RedirectResponse("/login", status_code=302)
+    return RedirectResponse(url="/login", status_code=303)
 
 
 @app.get("/", response_class=HTMLResponse)
-def home(request: Request):
-    if not request.session.get("user"):
-        return RedirectResponse("/login", status_code=302)
+async def index(request: Request, user: str = Depends(require_login_page)):
     nodes = list_nodes()
-    return templates.TemplateResponse("index.html", {"request": request, "nodes": nodes})
+    return templates.TemplateResponse(
+        "index.html",
+        {"request": request, "user": user, "nodes": nodes, "flash": _flash(request), "title": "控制台"},
+    )
+
+
+@app.get("/nodes/new", response_class=HTMLResponse)
+async def node_new_page(request: Request, user: str = Depends(require_login_page)):
+    return templates.TemplateResponse(
+        "nodes_new.html",
+        {"request": request, "user": user, "flash": _flash(request), "title": "添加机器"},
+    )
+
+
+@app.post("/nodes/new")
+async def node_new_action(
+    request: Request,
+    name: str = Form(""),
+    base_url: str = Form(...),
+    api_key: str = Form(...),
+):
+    user = request.session.get("user")
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+
+    base_url = base_url.strip()
+    api_key = api_key.strip()
+    if not base_url.startswith("http"):
+        _set_flash(request, "Agent 地址必须以 http:// 或 https:// 开头")
+        return RedirectResponse(url="/nodes/new", status_code=303)
+    if not api_key:
+        _set_flash(request, "API Key 不能为空")
+        return RedirectResponse(url="/nodes/new", status_code=303)
+
+    node_id = add_node(name or base_url, base_url, api_key)
+    _set_flash(request, "已添加机器")
+    return RedirectResponse(url=f"/nodes/{node_id}", status_code=303)
+
+
+@app.post("/nodes/{node_id}/delete")
+async def node_delete(request: Request, node_id: int):
+    if not request.session.get("user"):
+        return RedirectResponse(url="/login", status_code=303)
+    delete_node(node_id)
+    _set_flash(request, "已删除机器")
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.get("/nodes/{node_id}", response_class=HTMLResponse)
-def node_page(request: Request, node_id: int):
-    if not request.session.get("user"):
-        return RedirectResponse("/login", status_code=302)
+async def node_detail(request: Request, node_id: int, user: str = Depends(require_login_page)):
     node = get_node(node_id)
     if not node:
-        return RedirectResponse("/", status_code=302)
-    return templates.TemplateResponse("node.html", {"request": request, "node": node})
+        _set_flash(request, "机器不存在")
+        return RedirectResponse(url="/", status_code=303)
+    return templates.TemplateResponse(
+        "node.html",
+        {"request": request, "user": user, "node": node, "flash": _flash(request), "title": node["name"]},
+    )
 
 
-@app.get("/topology", response_class=HTMLResponse)
-def topology_page(request: Request):
-    if not request.session.get("user"):
-        return RedirectResponse("/login", status_code=302)
-    return templates.TemplateResponse("topology.html", {"request": request, "nodes": list_nodes()})
+# ------------------------ API (needs login) ------------------------
 
-
-# -------------------------
-# Panel API - nodes
-# -------------------------
-
-@app.get("/api/nodes")
-def api_nodes(request: Request):
-    require_login(request)
-    return list_nodes()
-
-
-@app.post("/api/nodes")
-def api_add_node(request: Request, payload: Dict[str, Any]):
-    require_login(request)
-    name = (payload.get("name") or "").strip() or "Node"
-    base_url = (payload.get("base_url") or "").strip()
-    api_key = (payload.get("api_key") or "").strip()
-    if not base_url or not api_key:
-        raise HTTPException(status_code=400, detail="base_url/api_key required")
-    node_id = add_node(name, base_url, api_key)
-    return {"id": node_id}
-
-
-@app.put("/api/nodes/{node_id}")
-def api_update_node(request: Request, node_id: int, payload: Dict[str, Any]):
-    require_login(request)
-    if not update_node(node_id, payload.get("name"), payload.get("base_url"), payload.get("api_key")):
-        raise HTTPException(status_code=404, detail="not found")
-    return {"ok": True}
-
-
-@app.delete("/api/nodes/{node_id}")
-def api_delete_node(request: Request, node_id: int):
-    require_login(request)
-    if not delete_node(node_id):
-        raise HTTPException(status_code=404, detail="not found")
-    return {"ok": True}
-
-
-# -------------------------
-# Panel API - proxy to agents
-# -------------------------
-
-def _node_or_404(node_id: int) -> Dict[str, Any]:
+@app.get("/api/nodes/{node_id}/ping")
+async def api_ping(request: Request, node_id: int, user: str = Depends(require_login)):
     node = get_node(node_id)
     if not node:
-        raise HTTPException(status_code=404, detail="node not found")
-    return node
+        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+    info = await agent_ping(node["base_url"], node["api_key"])
+    if info.get("error"):
+        return {"ok": False, "error": info["error"]}
+    info["ok"] = True
+    return info
 
 
-def proxy(node_id: int, path: str, method: str = "GET", body: Dict[str, Any] | None = None) -> Any:
-    node = _node_or_404(node_id)
-    try:
-        return call_agent(node["base_url"], node["api_key"], path, method=method, body=body)
-    except AgentError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+@app.get("/api/nodes/{node_id}/pool")
+async def api_pool_get(request: Request, node_id: int, user: str = Depends(require_login)):
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+    data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool")
+    return data
 
 
-@app.get("/api/nodes/{node_id}/status")
-def api_node_status(request: Request, node_id: int):
-    require_login(request)
-    return proxy(node_id, "/api/status")
-
-
-@app.get("/api/nodes/{node_id}/rules")
-def api_node_rules(request: Request, node_id: int):
-    require_login(request)
-    return proxy(node_id, "/api/rules")
-
-
-@app.post("/api/nodes/{node_id}/rules")
-def api_add_rule(request: Request, node_id: int, payload: Dict[str, Any]):
-    require_login(request)
-    return proxy(node_id, "/api/rules", method="POST", body=payload)
-
-
-@app.put("/api/nodes/{node_id}/rules/{rule_id}")
-def api_update_rule(request: Request, node_id: int, rule_id: str, payload: Dict[str, Any]):
-    require_login(request)
-    return proxy(node_id, f"/api/rules/{rule_id}", method="PUT", body=payload)
-
-
-@app.delete("/api/nodes/{node_id}/rules/{rule_id}")
-def api_del_rule(request: Request, node_id: int, rule_id: str):
-    require_login(request)
-    return proxy(node_id, f"/api/rules/{rule_id}", method="DELETE")
-
-
-@app.post("/api/nodes/{node_id}/rules/{rule_id}/toggle")
-def api_toggle_rule(request: Request, node_id: int, rule_id: str, payload: Dict[str, Any]):
-    require_login(request)
-    return proxy(node_id, f"/api/rules/{rule_id}/toggle", method="POST", body=payload)
+@app.post("/api/nodes/{node_id}/pool")
+async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], user: str = Depends(require_login)):
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+    data = await agent_post(node["base_url"], node["api_key"], "/api/v1/pool", payload)
+    return data
 
 
 @app.post("/api/nodes/{node_id}/apply")
-def api_apply(request: Request, node_id: int):
-    require_login(request)
-    return proxy(node_id, "/api/apply", method="POST", body={})
+async def api_apply(request: Request, node_id: int, user: str = Depends(require_login)):
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+    data = await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {})
+    return data
 
 
-@app.get("/api/nodes/{node_id}/metrics")
-def api_metrics(request: Request, node_id: int):
-    require_login(request)
-    return proxy(node_id, "/api/metrics")
-
-
-# -------------------------
-# Pair-code helpers (Panel-side)
-# -------------------------
-
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
-
-
-def _b64url_dec(s: str) -> bytes:
-    return base64.urlsafe_b64decode(s + "==")
-
-
-@app.post("/api/pair/encode")
-def api_pair_encode(request: Request, payload: Dict[str, Any]):
-    require_login(request)
-    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    return {"code": "RP1." + _b64url(raw)}
-
-
-@app.post("/api/pair/decode")
-def api_pair_decode(request: Request, payload: Dict[str, Any]):
-    require_login(request)
-    code = (payload.get("code") or "").strip()
-    if not code.startswith("RP1."):
-        raise HTTPException(status_code=400, detail="invalid pair code")
-    try:
-        raw = _b64url_dec(code[4:])
-        return json.loads(raw.decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="invalid pair code")
-
-
-# -------------------------
-# Topology graph data
-# -------------------------
-
-@app.get("/api/topology")
-def api_topology(request: Request):
-    require_login(request)
-    nodes = list_nodes()
-    graph_nodes: List[Dict[str, Any]] = []
-    graph_edges: List[Dict[str, Any]] = []
-
-    for n in nodes:
-        nid = f"node:{n['id']}"
-        graph_nodes.append({"id": nid, "label": n["name"], "group": "node"})
-        try:
-            rules = call_agent(n["base_url"], n["api_key"], "/api/rules")
-        except Exception:
-            continue
-        for r in rules.get("endpoints", []):
-            rid = f"rule:{n['id']}:{r.get('id','')}"
-            lp = r.get("listen", "")
-            graph_nodes.append({"id": rid, "label": lp, "group": "rule"})
-            graph_edges.append({"from": nid, "to": rid})
-            remotes = []
-            if r.get("remote"):
-                remotes = [r["remote"]]
-            elif r.get("remotes"):
-                remotes = list(r["remotes"])
-            elif r.get("extra_remotes"):
-                remotes = list(r["extra_remotes"])
-            for rm in remotes:
-                tid = f"target:{rm}"
-                graph_nodes.append({"id": tid, "label": rm, "group": "target"})
-                graph_edges.append({"from": rid, "to": tid})
-
-    # Deduplicate nodes by id
-    uniq = {}
-    for gn in graph_nodes:
-        uniq[gn["id"]] = gn
-
-    return {"nodes": list(uniq.values()), "edges": graph_edges}
+@app.get("/api/nodes/{node_id}/stats")
+async def api_stats(request: Request, node_id: int, user: str = Depends(require_login)):
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+    data = await agent_get(node["base_url"], node["api_key"], "/api/v1/stats")
+    return data

@@ -1,113 +1,218 @@
-import os
-import time
-from typing import Any, Dict
+from __future__ import annotations
 
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+import json
+import socket
+import subprocess
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List
 
-from .auth import require_key
-from .metrics import gather_metrics
-from .realmctl import apply_realm_config, ensure_pool_jq
-from .rules import (
-    add_rule,
-    delete_rule,
-    get_rule,
-    list_rules,
-    toggle_rule,
-    update_rule,
-)
-from .storage import Paths
-from .utils import sh
+from fastapi import Depends, FastAPI, HTTPException, Request
 
-app = FastAPI(title="Realm Agent API", version="1.0.0")
-
-START_TS = int(time.time())
+API_KEY_FILE = Path('/etc/realm-agent/api.key')
+POOL_FULL = Path('/etc/realm/pool_full.json')
+POOL_ACTIVE = Path('/etc/realm/pool.json')
+POOL_RUN_FILTER = Path('/etc/realm/pool_to_run.jq')
+REALM_CONFIG = Path('/etc/realm/config.json')
 
 
-def _paths() -> Paths:
-    return Paths(conf_dir=os.environ.get("REALM_CONF_DIR", "/etc/realm"))
+def _read_text(p: Path) -> str:
+    return p.read_text(encoding='utf-8')
 
 
-@app.get("/api/status")
-def status(_: None = Depends(require_key)):
-    code, out, _ = sh("systemctl is-active realm.service 2>/dev/null || true", timeout=5)
-    active = (out.strip() == "active")
-    code2, out2, _ = sh("realm -v 2>/dev/null || true", timeout=5)
+def _write_text(p: Path, content: str) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding='utf-8')
+
+
+def _read_json(p: Path, default: Any) -> Any:
+    try:
+        return json.loads(_read_text(p))
+    except FileNotFoundError:
+        return default
+    except Exception:
+        return default
+
+
+def _write_json(p: Path, data: Any) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    _write_text(p, json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _api_key_required(req: Request) -> None:
+    api_key = req.headers.get('x-api-key', '')
+    try:
+        expected = _read_text(API_KEY_FILE).strip()
+    except FileNotFoundError:
+        raise HTTPException(status_code=401, detail='Agent未初始化API Key')
+    if not expected or api_key != expected:
+        raise HTTPException(status_code=401, detail='API Key 无效')
+
+
+def _service_is_active(name: str) -> bool:
+    r = subprocess.run(['systemctl', 'is-active', name], capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == 'active'
+
+
+def _restart_realm() -> None:
+    for svc in ['realm.service', 'realm']:
+        r = subprocess.run(['systemctl', 'restart', svc], capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+    # 如果 systemd 没有服务名，至少不让 API 崩溃
+    raise RuntimeError('无法重启 realm 服务（realm.service/realm 都失败）')
+
+
+def _apply_pool_to_config() -> None:
+    if not POOL_RUN_FILTER.exists():
+        raise RuntimeError(f'缺少JQ过滤器: {POOL_RUN_FILTER}')
+    if not POOL_FULL.exists():
+        raise RuntimeError(f'缺少pool_full.json: {POOL_FULL}')
+
+    # jq -c -f filter pool_full.json > /etc/realm/config.json
+    cmd = ['jq', '-c', '-f', str(POOL_RUN_FILTER), str(POOL_FULL)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f'JQ生成config失败: {r.stderr.strip()}')
+    _write_text(REALM_CONFIG, r.stdout.strip() + '\n')
+
+
+def _sync_active_pool() -> None:
+    full = _read_json(POOL_FULL, {'endpoints': []})
+    eps = full.get('endpoints') or []
+    active_eps = [e for e in eps if not bool(e.get('disabled'))]
+    _write_json(POOL_ACTIVE, {'endpoints': active_eps})
+
+
+def _parse_listen_port(listen: str) -> int:
+    # listen = "0.0.0.0:443" or "[::]:443"
+    if not listen:
+        return 0
+    if listen.count(':') == 1:
+        return int(listen.split(':')[-1])
+    # ipv6 like [::]:443
+    if listen.endswith(']'):
+        return 0
+    if ']' in listen:
+        return int(listen.split(']:')[-1])
+    return int(listen.rsplit(':', 1)[-1])
+
+
+def _conn_count(port: int) -> int:
+    if port <= 0:
+        return 0
+    # 只统计 TCP established（足够用了）
+    cmd = ['bash', '-lc', f"ss -Htan state established sport = :{port} 2>/dev/null | wc -l"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return 0
+    try:
+        return int(r.stdout.strip())
+    except Exception:
+        return 0
+
+
+def _tcp_probe(host: str, port: int, timeout: float = 0.8) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _split_hostport(addr: str) -> tuple[str, int]:
+    # addr like 1.2.3.4:443
+    host, p = addr.rsplit(':', 1)
+    return host.strip(), int(p)
+
+
+app = FastAPI(title='Realm Agent', version='31')
+
+
+@app.get('/api/v1/info')
+def api_info(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
     return {
-        "ok": True,
-        "realm_active": active,
-        "realm_version": out2.strip(),
-        "uptime_sec": int(time.time()) - START_TS,
+        'ok': True,
+        'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'hostname': socket.gethostname(),
+        'realm_active': _service_is_active('realm.service') or _service_is_active('realm'),
     }
 
 
-@app.get("/api/rules")
-def api_list_rules(_: None = Depends(require_key)):
-    rules = list_rules(_paths())
-    return {"endpoints": rules}
+@app.get('/api/v1/pool')
+def api_pool(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    full = _read_json(POOL_FULL, None)
+    if full is None:
+        # 兼容只存在 pool.json 的机器
+        active = _read_json(POOL_ACTIVE, {'endpoints': []})
+        eps = active.get('endpoints') or []
+        for e in eps:
+            e.setdefault('disabled', False)
+        full = {'endpoints': eps}
+        _write_json(POOL_FULL, full)
+    # 强制包含 disabled
+    eps = full.get('endpoints') or []
+    for e in eps:
+        e.setdefault('disabled', False)
+    return {'ok': True, 'pool': full}
 
 
-@app.get("/api/rules/{rule_id}")
-def api_get_rule(rule_id: str, _: None = Depends(require_key)):
-    r = get_rule(_paths(), rule_id)
-    if not r:
-        raise HTTPException(status_code=404, detail="rule not found")
-    return r
+@app.post('/api/v1/pool')
+def api_pool_save(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    pool = payload.get('pool') if isinstance(payload, dict) else None
+    if not isinstance(pool, dict):
+        raise HTTPException(status_code=400, detail='缺少 pool 字段')
+    eps = pool.get('endpoints')
+    if not isinstance(eps, list):
+        raise HTTPException(status_code=400, detail='pool.endpoints 必须是数组')
+    for e in eps:
+        if isinstance(e, dict):
+            e.setdefault('disabled', False)
+    _write_json(POOL_FULL, pool)
+    _sync_active_pool()
+    return {'ok': True}
 
 
-@app.post("/api/rules")
-def api_add_rule(payload: Dict[str, Any], _: None = Depends(require_key)):
-    try:
-        r = add_rule(_paths(), payload)
-        return r
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+@app.post('/api/v1/apply')
+def api_apply(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    _sync_active_pool()
+    _apply_pool_to_config()
+    _restart_realm()
+    return {'ok': True}
 
 
-@app.put("/api/rules/{rule_id}")
-def api_update_rule(rule_id: str, payload: Dict[str, Any], _: None = Depends(require_key)):
-    try:
-        r = update_rule(_paths(), rule_id, payload)
-        return r
-    except KeyError:
-        raise HTTPException(status_code=404, detail="rule not found")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.delete("/api/rules/{rule_id}")
-def api_delete_rule(rule_id: str, _: None = Depends(require_key)):
-    try:
-        delete_rule(_paths(), rule_id)
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.post("/api/rules/{rule_id}/toggle")
-def api_toggle_rule(rule_id: str, payload: Dict[str, Any], _: None = Depends(require_key)):
-    disabled = bool(payload.get("disabled", False))
-    try:
-        r = toggle_rule(_paths(), rule_id, disabled)
-        return r
-    except KeyError:
-        raise HTTPException(status_code=404, detail="rule not found")
-
-
-@app.post("/api/apply")
-def api_apply(_: None = Depends(require_key)):
-    paths = _paths()
-    ensure_pool_jq(paths)
-    ok, msg = apply_realm_config(paths)
-    return {"ok": ok, "message": msg}
-
-
-@app.get("/api/metrics")
-def api_metrics(_: None = Depends(require_key)):
-    rules = list_rules(_paths())
-    return gather_metrics(rules)
-
-
-@app.get("/api/health")
-def api_health():
-    return JSONResponse({"ok": True})
+@app.get('/api/v1/stats')
+def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    full = _read_json(POOL_FULL, {'endpoints': []})
+    eps = full.get('endpoints') or []
+    rules = []
+    for idx, e in enumerate(eps):
+        listen = (e.get('listen') or '').strip()
+        port = 0
+        try:
+            port = _parse_listen_port(listen)
+        except Exception:
+            port = 0
+        remotes: List[str] = []
+        if isinstance(e.get('remote'), str) and e.get('remote'):
+            remotes = [e['remote']]
+        elif isinstance(e.get('remotes'), list):
+            remotes = [str(x) for x in e.get('remotes') if x]
+        else:
+            remotes = []
+        health = []
+        for r in remotes[:8]:  # 限制探测数量
+            try:
+                h, p = _split_hostport(r)
+                ok = _tcp_probe(h, p)
+            except Exception:
+                ok = False
+            health.append({'target': r, 'ok': ok})
+        rules.append({
+            'idx': idx,
+            'listen': listen,
+            'disabled': bool(e.get('disabled')),
+            'connections': _conn_count(port),
+            'health': health,
+        })
+    return {'ok': True, 'rules': rules}

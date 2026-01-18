@@ -1,138 +1,134 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Realm Agent Installer (v30)
+VERSION="v31"
+REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
 
-INSTALL_ROOT="/opt/realm-agent"
-ENV_FILE="$INSTALL_ROOT/.env"
-SERVICE_FILE="/etc/systemd/system/realm-agent.service"
-
-DEFAULT_REPO_ZIP_URL="https://github.com/Liangcye/Realm/archive/refs/heads/main.zip"
-REPO_ZIP_URL="${REPO_ZIP_URL:-$DEFAULT_REPO_ZIP_URL}"
-
-say(){ echo -e "[RealmAgent] $*"; }
-err(){ echo -e "[RealmAgent][ERR] $*" >&2; }
+info(){ printf "[提示] %s\n" "$*"; }
+ok(){ printf "[OK] %s\n" "$*"; }
+err(){ printf "[ERR ] %s\n" "$*" >&2; }
 
 need_root(){
   if [[ "$(id -u)" -ne 0 ]]; then
-    err "请使用 root 运行。"; exit 1
+    err "请使用 root 运行：sudo -i"
+    exit 1
   fi
 }
 
-choose_mode(){
-  echo "Realm Pro Agent Installer v30"
-  echo "------------------------------------------------------------"
-  echo "1) 在线安装（推荐）"
-  echo "2) 离线安装（手动下载）"
-  read -r -p "请选择安装模式 [1-2] (默认 1): " mode
-  mode="${mode:-1}"
-  if [[ "$mode" != "1" && "$mode" != "2" ]]; then
-    err "无效选择"; exit 1
-  fi
-  echo "$mode"
+apt_install(){
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y curl ca-certificates unzip jq python3 python3-venv python3-pip
+}
+
+ask(){
+  local prompt="$1" default="$2" var
+  read -r -p "$prompt" var || true
+  if [[ -z "${var}" ]]; then echo "${default}"; else echo "$var"; fi
 }
 
 fetch_repo(){
   local mode="$1"
-  local tmp
-  tmp="$(mktemp -d)"
+  local tmpdir="$2"
+  local zip_path=""
 
-  if [[ "$mode" == "1" ]]; then
-    say "正在下载仓库..."
-    if ! command -v curl >/dev/null 2>&1; then
-      apt-get update -y && apt-get install -y curl
+  if [[ "${mode}" == "2" ]]; then
+    zip_path=$(ask "请输入 ZIP 文件路径（例如 /root/Realm-main.zip）: " "")
+    if [[ -z "${zip_path}" || ! -f "${zip_path}" ]]; then
+      err "ZIP 文件不存在：${zip_path}"
+      exit 1
     fi
-    local zip="$tmp/repo.zip"
-    curl -fsSL "$REPO_ZIP_URL" -o "$zip"
-    say "解压中..."
-    apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y unzip >/dev/null 2>&1 || true
-    unzip -q "$zip" -d "$tmp"
+    info "使用离线 ZIP：${zip_path}"
+    unzip -q "${zip_path}" -d "${tmpdir}"
   else
-    echo "\n离线安装说明："
-    echo "1) 请在可联网的机器下载仓库 zip："
-    echo "   $REPO_ZIP_URL"
-    echo "2) 上传到本机 /root/realm_repo.zip"
-    echo "3) 然后回到这里继续"
-    read -r -p "已放好 /root/realm_repo.zip？(回车继续) " _
-    if [[ ! -f /root/realm_repo.zip ]]; then
-      err "未找到 /root/realm_repo.zip"; exit 1
-    fi
-    apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y unzip >/dev/null 2>&1 || true
-    unzip -q /root/realm_repo.zip -d "$tmp"
+    local url
+    url=$(ask "仓库 ZIP 下载地址（回车=默认）: " "${REPO_ZIP_URL_DEFAULT}")
+    info "正在下载仓库..."
+    curl -fsSL "${url}" -o "${tmpdir}/repo.zip"
+    info "解压中..."
+    unzip -q "${tmpdir}/repo.zip" -d "${tmpdir}"
   fi
-
-  echo "$tmp"
 }
 
 find_agent_dir(){
-  local tmp="$1"
-  local agent_dir=""
-  if [[ -d "$tmp/agent" ]]; then
-    agent_dir="$tmp/agent"
-  else
-    agent_dir="$(find "$tmp" -maxdepth 3 -type d -name agent | head -n 1 || true)"
-  fi
-  if [[ -z "$agent_dir" || ! -f "$agent_dir/requirements.txt" ]]; then
-    err "找不到 agent 目录。请确认仓库里包含 agent/ 目录。"
-    err "建议结构：仓库根目录/agent  或  仓库根目录/realm-pro-suite-vXX/agent"
+  local base="$1"
+  local p
+  p=$(find "${base}" -maxdepth 5 -type d -name agent -print | head -n 1 || true)
+  if [[ -z "${p}" ]]; then
+    err "找不到 agent 目录。请确认仓库里包含 agent/ 或 realm-pro-suite-vXX/agent/"
+    err "建议仓库结构：仓库根目录/agent  或  仓库根目录/realm-pro-suite-v31/agent"
     exit 1
   fi
-  echo "$agent_dir"
+  echo "${p}"
 }
 
-install_deps(){
-  say "安装系统依赖..."
-  apt-get update -y >/dev/null 2>&1 || true
-  apt-get install -y python3 python3-venv python3-pip jq iproute2 >/dev/null 2>&1 || true
+restart_service(){
+  local svc="$1"
+  systemctl daemon-reload
+  systemctl enable --now "${svc}" >/dev/null 2>&1 || systemctl restart "${svc}" >/dev/null 2>&1
 }
 
-setup_agent(){
-  local agent_src="$1"
-  say "部署到 $INSTALL_ROOT ..."
-  mkdir -p "$INSTALL_ROOT"
-  rm -rf "$INSTALL_ROOT/agent"
-  cp -a "$agent_src" "$INSTALL_ROOT/agent"
+main(){
+  need_root
 
-  say "创建虚拟环境..."
-  python3 -m venv "$INSTALL_ROOT/venv"
-  "$INSTALL_ROOT/venv/bin/pip" -q install --upgrade pip
-  "$INSTALL_ROOT/venv/bin/pip" -q install -r "$INSTALL_ROOT/agent/requirements.txt"
+  echo "Realm Pro Agent Installer ${VERSION}"
+  echo "------------------------------------------------------------"
+  echo "1) 在线安装（推荐）"
+  echo "2) 离线安装（手动下载）"
+  local mode
+  mode=$(ask "请选择安装模式 [1-2] (默认 1): " "1")
 
+  local port
+  port=$(ask "Agent 端口 (默认 18700): " "18700")
+
+  info "安装依赖..."
+  apt_install
+
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  cleanup(){ rm -rf "${tmpdir}"; }
+  trap cleanup EXIT
+
+  fetch_repo "${mode}" "${tmpdir}"
+
+  local agent_dir
+  agent_dir=$(find_agent_dir "${tmpdir}")
+  ok "agent 目录：${agent_dir}"
+
+  info "部署到 /opt/realm-agent ..."
+  mkdir -p /opt/realm-agent
+  rm -rf /opt/realm-agent/agent
+  cp -a "${agent_dir}" /opt/realm-agent/agent
+
+  info "创建虚拟环境..."
+  python3 -m venv /opt/realm-agent/venv
+  /opt/realm-agent/venv/bin/pip install -U pip wheel setuptools >/dev/null
+  /opt/realm-agent/venv/bin/pip install -r /opt/realm-agent/agent/requirements.txt >/dev/null
+
+  info "生成 API Key..."
+  mkdir -p /etc/realm-agent
+  if [[ ! -f /etc/realm-agent/api.key ]]; then
+    head -c 32 /dev/urandom | xxd -p -c 32 > /etc/realm-agent/api.key
+  fi
   local api_key
-  api_key="${AGENT_API_KEY:-}"
-  if [[ -z "$api_key" ]]; then
-    read -r -p "设置 Agent API Key（回车=随机生成）: " api_key
-    api_key="${api_key:-}"
-  fi
-  if [[ -z "$api_key" ]]; then
-    api_key="$($INSTALL_ROOT/venv/bin/python - <<'PY'
-import secrets
-print(secrets.token_urlsafe(24))
-PY
-)"
+  api_key=$(cat /etc/realm-agent/api.key)
+
+  # jq filter
+  mkdir -p /etc/realm
+  if [[ -f /opt/realm-agent/agent/pool_to_run.jq ]]; then
+    cp -a /opt/realm-agent/agent/pool_to_run.jq /etc/realm/pool_to_run.jq
   fi
 
-  read -r -p "Agent 端口 (默认 18700): " port
-  port="${port:-18700}"
-
-  cat > "$ENV_FILE" <<EOF
-AGENT_PORT=$port
-AGENT_API_KEY=$api_key
-EOF
-
-  cat > "$SERVICE_FILE" <<'EOF'
+  info "创建 systemd 服务..."
+  cat > /etc/systemd/system/realm-agent.service <<EOF
 [Unit]
-Description=Realm Agent API Service
-After=network-online.target
-Wants=network-online.target
+Description=Realm Pro Agent API Service
+After=network.target
 
 [Service]
 Type=simple
-EnvironmentFile=/opt/realm-agent/.env
 WorkingDirectory=/opt/realm-agent/agent
-ExecStart=/opt/realm-agent/venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port $AGENT_PORT
+ExecStart=/opt/realm-agent/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port ${port} --workers 1
 Restart=always
 RestartSec=2
 
@@ -140,26 +136,12 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable --now realm-agent
+  restart_service realm-agent.service
 
-  say "安装完成！"
-  echo "------------------------------------------------------------"
-  echo "Agent 已启动：systemctl status realm-agent --no-pager"
-  echo "API 地址: http://<本机IP>:$port"
-  echo "API Key : $api_key"
-  echo "------------------------------------------------------------"
-}
-
-main(){
-  need_root
-  local mode tmp agent_dir
-  mode="$(choose_mode)"
-  tmp="$(fetch_repo "$mode")"
-  agent_dir="$(find_agent_dir "$tmp")"
-
-  install_deps
-  setup_agent "$agent_dir"
+  ok "Agent 已安装并启动"
+  echo "- Agent URL:   http://$(hostname -I 2>/dev/null | awk '{print $1}'):${port}"
+  echo "- API Key:     ${api_key}"
+  echo "- Service:     systemctl status realm-agent --no-pager"
 }
 
 main "$@"
