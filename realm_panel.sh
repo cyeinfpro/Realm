@@ -33,6 +33,8 @@ prompt(){
 }
 
 TMPDIR=""
+EXTRACT_ROOT=""
+PANEL_DIR=""
 cleanup(){
   if [[ -n "${TMPDIR}" && -d "${TMPDIR}" ]]; then
     rm -rf "${TMPDIR}" || true
@@ -52,15 +54,14 @@ extract_repo(){
     [[ -f "$zip_path" ]] || { err "ZIP 文件不存在：$zip_path"; exit 1; }
   fi
   info "解压中..."
-  unzip -q "$zip_path" -d "$TMPDIR/extract"
-  local panel_dir
-  panel_dir="$(find "$TMPDIR/extract" -maxdepth 6 -type d -name panel -print -quit)"
-  if [[ -z "$panel_dir" ]]; then
+  EXTRACT_ROOT="$TMPDIR/extract"
+  unzip -q "$zip_path" -d "$EXTRACT_ROOT"
+  PANEL_DIR="$(find "$EXTRACT_ROOT" -maxdepth 6 -type d -name panel -print -quit)"
+  if [[ -z "$PANEL_DIR" ]]; then
     err "找不到 panel 目录。请确认仓库里包含 panel/ 或 realm-pro-suite-vXX/panel/"
     err "建议仓库结构：仓库根目录/panel  或  仓库根目录/realm-pro-suite-v33/panel"
     exit 1
   fi
-  echo "$panel_dir"
 }
 
 find_agent_dir(){
@@ -132,9 +133,8 @@ install_panel(){
 
   apt_install
 
-  local panel_dir
-  panel_dir="$(extract_repo "$mode" "$zip_path")"
-  ok "panel 目录：$panel_dir"
+  extract_repo "$mode" "$zip_path"
+  ok "panel 目录：$PANEL_DIR"
 
   local user pass port
   user="$(prompt "设置面板登录用户名" "admin")"
@@ -148,8 +148,8 @@ install_panel(){
   info "部署到 /opt/realm-panel ..."
   rm -rf /opt/realm-panel
   mkdir -p /opt/realm-panel
-  cp -a "$panel_dir" /opt/realm-panel/panel
-  prepare_agent_bundle "$TMPDIR/extract"
+  cp -a "$PANEL_DIR" /opt/realm-panel/panel
+  prepare_agent_bundle "$EXTRACT_ROOT"
 
   info "创建虚拟环境..."
   python3 -m venv /opt/realm-panel/venv
@@ -193,14 +193,13 @@ update_panel(){
     zip_path="$(prompt "请输入 ZIP 文件路径（例如 /root/Realm-main.zip）" "")"
   fi
   apt_install
-  local panel_dir
-  panel_dir="$(extract_repo "$mode" "$zip_path")"
-  ok "panel 目录：$panel_dir"
+  extract_repo "$mode" "$zip_path"
+  ok "panel 目录：$PANEL_DIR"
   info "更新面板文件..."
   rm -rf /opt/realm-panel/panel
   mkdir -p /opt/realm-panel
-  cp -a "$panel_dir" /opt/realm-panel/panel
-  prepare_agent_bundle "$TMPDIR/extract"
+  cp -a "$PANEL_DIR" /opt/realm-panel/panel
+  prepare_agent_bundle "$EXTRACT_ROOT"
   info "更新依赖..."
   /opt/realm-panel/venv/bin/pip install -r /opt/realm-panel/panel/requirements.txt >/dev/null
   systemctl daemon-reload
