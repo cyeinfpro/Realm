@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Realm Pro Panel Installer (v22)
-# Fixes vs v21:
+# Realm Pro Panel Installer (v23)
+# Fixes vs v22:
+# - remove bcrypt dependency entirely (PBKDF2-SHA256, no 72-byte limit)
 # - ask_password newline no longer pollutes captured value
 # - password hashing uses env var (no broken bash @Q / $'..' python)
 # - EnvironmentFile is now pure KEY=VALUE (no command substitution)
@@ -89,11 +90,18 @@ hash_password(){
   local venv_python="$1"
   local plain="$2"
   ADMIN_PASS="$plain" "$venv_python" - <<'PY'
-import os
-from passlib.context import CryptContext
-pw = os.environ.get('ADMIN_PASS','')
-ctx = CryptContext(schemes=['bcrypt'], deprecated='auto')
-print(ctx.hash(pw))
+"""Generate a PBKDF2-SHA256 password hash without external deps."""
+import os, base64, hashlib, secrets
+
+pw = (os.environ.get("ADMIN_PASS") or "").encode("utf-8")
+iters = 260000
+salt = secrets.token_bytes(16)
+dk = hashlib.pbkdf2_hmac("sha256", pw, salt, iters, dklen=32)
+
+def b64u_nopad(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+
+print(f"pbkdf2_sha256${iters}${b64u_nopad(salt)}${b64u_nopad(dk)}")
 PY
 }
 
@@ -111,7 +119,7 @@ main(){
   need_cmd python3
 
   clear || true
-  blue "Realm Pro Panel Installer v22"
+  blue "Realm Pro Panel Installer v23"
   echo "------------------------------------------------------------"
 
   local mode
