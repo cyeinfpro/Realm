@@ -1,71 +1,50 @@
-from __future__ import annotations
-
 import base64
 import hashlib
 import hmac
-import secrets
-from dataclasses import dataclass
+import os
+from typing import Optional
 
 
-# A tiny, dependency-free password hashing implementation.
-#
-# Format:
-#   pbkdf2_sha256$<iterations>$<salt_b64url_nopad>$<hash_b64url_nopad>
-#
-# Notes:
-# - PBKDF2-HMAC-SHA256 is available in Python stdlib.
-# - No 72-byte password limit (unlike bcrypt).
+def _get_admin_user() -> str:
+    return os.environ.get("PANEL_ADMIN_USER", "admin")
 
 
-@dataclass(frozen=True)
-class Pbkdf2Config:
-    iterations: int = 260_000
-    salt_bytes: int = 16
-    dklen: int = 32
+def _get_admin_hash() -> str:
+    return os.environ.get("PANEL_ADMIN_HASH", "")
 
 
-CFG = Pbkdf2Config()
+def pbkdf2_hash(password: str, salt: bytes, iterations: int = 200_000) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
 
 
-def _b64u_nopad(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+def encode_hash(password: str, iterations: int = 200_000) -> str:
+    salt = os.urandom(16)
+    dk = pbkdf2_hash(password, salt, iterations)
+    return "pbkdf2_sha256${}${}${}".format(
+        iterations,
+        base64.urlsafe_b64encode(salt).decode("ascii").rstrip("="),
+        base64.urlsafe_b64encode(dk).decode("ascii").rstrip("="),
+    )
 
 
-def _b64u_nopad_decode(s: str) -> bytes:
-    s = s.strip()
-    # restore padding
-    pad = "=" * ((4 - (len(s) % 4)) % 4)
-    return base64.urlsafe_b64decode((s + pad).encode("ascii"))
-
-
-def hash_password(password: str) -> str:
-    if password is None:
-        raise ValueError("password is None")
-    pw = password.encode("utf-8")
-    salt = secrets.token_bytes(CFG.salt_bytes)
-    dk = hashlib.pbkdf2_hmac("sha256", pw, salt, CFG.iterations, dklen=CFG.dklen)
-    return f"pbkdf2_sha256${CFG.iterations}${_b64u_nopad(salt)}${_b64u_nopad(dk)}"
-
-
-def verify_password(password: str, password_hash: str) -> bool:
+def verify(password: str, stored: str) -> bool:
     try:
-        if not password_hash or "$" not in password_hash:
+        algo, it_s, salt_b64, dk_b64 = stored.split("$", 3)
+        if algo != "pbkdf2_sha256":
             return False
-
-        parts = password_hash.split("$")
-        if len(parts) != 4:
-            return False
-
-        scheme, iters_s, salt_s, hash_s = parts
-        if scheme != "pbkdf2_sha256":
-            return False
-
-        iters = int(iters_s)
-        salt = _b64u_nopad_decode(salt_s)
-        expected = _b64u_nopad_decode(hash_s)
-
-        pw = (password or "").encode("utf-8")
-        actual = hashlib.pbkdf2_hmac("sha256", pw, salt, iters, dklen=len(expected))
-        return hmac.compare_digest(actual, expected)
+        iterations = int(it_s)
+        salt = base64.urlsafe_b64decode(salt_b64 + "==")
+        dk = base64.urlsafe_b64decode(dk_b64 + "==")
+        got = pbkdf2_hash(password, salt, iterations)
+        return hmac.compare_digest(got, dk)
     except Exception:
         return False
+
+
+def authenticate(username: str, password: str) -> bool:
+    if username != _get_admin_user():
+        return False
+    stored = _get_admin_hash()
+    if not stored:
+        return False
+    return verify(password, stored)

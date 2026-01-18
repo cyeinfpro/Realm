@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ title or "Realm Pro Panel" }}</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <div class="bg"></div>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">R</div>
+      <div>
+        <div class="brand-title">Realm Pro Panel</div>
+        <div class="brand-sub">Machine & Rule Manager</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <a href="/" class="nav-link {{ 'active' if active=='dashboard' else '' }}">概览</a>
+      <a href="/nodes" class="nav-link {{ 'active' if active=='nodes' else '' }}">机器</a>
+      <a href="/topology" class="nav-link {{ 'active' if active=='topology' else '' }}">连接图</a>
+      <div class="spacer"></div>
+      <a href="/logout" class="nav-link subtle">退出</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="/static/app.js"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

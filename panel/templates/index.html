@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="grid3">
+    <div class="card">
+      <div class="card-title">节点</div>
+      <div class="big-num" id="stat_nodes">-</div>
+      <div class="muted">已绑定的 Agent 数量</div>
+    </div>
+    <div class="card">
+      <div class="card-title">规则</div>
+      <div class="big-num" id="stat_rules">-</div>
+      <div class="muted">所有节点的转发规则总数</div>
+    </div>
+    <div class="card">
+      <div class="card-title">活跃连接</div>
+      <div class="big-num" id="stat_conns">-</div>
+      <div class="muted">所有规则累计连接数（估算）</div>
+    </div>
+  </div>
+
+  <div class="card mt">
+    <div class="row between">
+      <div>
+        <div class="card-title">最近节点状态</div>
+        <div class="muted">实时拉取 Agent /api/status（如超时会显示离线）</div>
+      </div>
+      <a class="btn" href="/nodes">管理节点</a>
+    </div>
+    <div class="table-wrap">
+      <table class="table" id="node_table">
+        <thead><tr><th>节点</th><th>地址</th><th>Realm</th><th>规则</th><th>连接</th><th>状态</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    window.PAGE = { name: "index" };
+  </script>
+{% endblock %}

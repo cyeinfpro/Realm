@@ -1,243 +1,242 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -euo pipefail
 
-# Realm Pro Panel Installer (v23)
-# Fixes vs v22:
-# - remove bcrypt dependency entirely (PBKDF2-SHA256, no 72-byte limit)
-# - ask_password newline no longer pollutes captured value
-# - password hashing uses env var (no broken bash @Q / $'..' python)
-# - EnvironmentFile is now pure KEY=VALUE (no command substitution)
-# - cleanup trap no longer breaks with `set -u`
+# Realm Pro Panel Installer (v30)
+# Supports online (download repo zip) and offline (use local directory / provided zip).
 
-red(){ echo -e "\033[31m$*\033[0m"; }
-green(){ echo -e "\033[32m$*\033[0m"; }
-yellow(){ echo -e "\033[33m$*\033[0m"; }
-blue(){ echo -e "\033[36m$*\033[0m"; }
-
-REPO_OWNER="cyeinfpro"
-REPO_NAME="Realm"
-REPO_BRANCH="main"
-ARCHIVE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${REPO_BRANCH}.tar.gz"
-
-PANEL_DIR="/opt/realm-panel"
-ENV_FILE="/etc/realm-panel/env"
+PANEL_DIR_NAME="panel"
+INSTALL_ROOT="/opt/realm-panel"
+ENV_FILE="$INSTALL_ROOT/.env"
 SERVICE_FILE="/etc/systemd/system/realm-panel.service"
-PANEL_PORT_DEFAULT=6080
 
-TMP_WORKDIR=""
-cleanup(){
-  if [[ -n "${TMP_WORKDIR:-}" && -d "${TMP_WORKDIR:-}" ]]; then
-    rm -rf "${TMP_WORKDIR}" || true
-  fi
-}
-trap cleanup EXIT
+# Default repository zip (override with env REPO_ZIP_URL)
+DEFAULT_REPO_ZIP_URL="https://github.com/Liangcye/Realm/archive/refs/heads/main.zip"
+REPO_ZIP_URL="${REPO_ZIP_URL:-$DEFAULT_REPO_ZIP_URL}"
 
-need_cmd(){ command -v "$1" >/dev/null 2>&1 || { red "[ERR] 缺少依赖命令: $1"; exit 1; }; }
-ensure_root(){ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then red "[ERR] 请使用 root 运行"; exit 1; fi; }
+_red(){ echo -e "\033[31m$*\033[0m"; }
+_grn(){ echo -e "\033[32m$*\033[0m"; }
+_yel(){ echo -e "\033[33m$*\033[0m"; }
+_cyan(){ echo -e "\033[36m$*\033[0m"; }
 
-ask(){
-  local prompt="$1" def="${2:-}" var
-  if [[ -n "$def" ]]; then
-    read -r -p "$prompt (默认 $def): " var || true
-    echo "${var:-$def}"
-  else
-    read -r -p "$prompt: " var || true
-    echo "$var"
+need_root(){
+  if [[ "${EUID:-$(id -u)}" != "0" ]]; then
+    _red "[ERR ] 请使用 root 运行此脚本"
+    exit 1
   fi
 }
 
-ask_password(){
-  local prompt="$1" var
+pause(){ read -r -p "按回车继续..." _ || true; }
+
+read_secret(){
+  local prompt="$1";
+  local v="";
   while true; do
-    # prompt is printed by bash `read -p` to stderr, so it won't pollute capture
-    read -r -s -p "$prompt (必填): " var || true
-    # print newline to stderr to avoid being captured by command substitution
-    printf '\n' >&2
-
-    # strip CR/LF just in case terminal injected them
-    var=${var//$'\r'/}
-    var=${var//$'\n'/}
-
-    if [[ -n "$var" ]]; then
-      echo "$var"
-      return 0
-    fi
-    yellow "[提示] 密码不能为空，请重试" >&2
+    read -r -s -p "$prompt" v || true
+    echo
+    [[ -n "$v" ]] && break
+    _yel "密码不能为空，请重新输入。"
   done
+  echo "$v"
 }
 
-extract_from_archive(){
-  local src="$1" tmp="$2"
-  tar -xzf "$src" -C "$tmp"
-}
-
-find_panel_dir(){
-  local root="$1" req pdir
-  req=$(find "$root" -maxdepth 6 -type f -path "*/panel/requirements.txt" -print -quit 2>/dev/null || true)
-  if [[ -n "$req" ]]; then
-    dirname "$req"
-    return 0
-  fi
-  pdir=$(find "$root" -maxdepth 6 -type d -name panel -print -quit 2>/dev/null || true)
-  if [[ -n "$pdir" ]]; then
-    echo "$pdir"
-    return 0
-  fi
-  return 1
-}
-
-hash_password(){
-  local venv_python="$1"
-  local plain="$2"
-  ADMIN_PASS="$plain" "$venv_python" - <<'PY'
-"""Generate a PBKDF2-SHA256 password hash without external deps."""
-import os, base64, hashlib, secrets
-
-pw = (os.environ.get("ADMIN_PASS") or "").encode("utf-8")
-iters = 260000
-salt = secrets.token_bytes(16)
-dk = hashlib.pbkdf2_hmac("sha256", pw, salt, iters, dklen=32)
-
-def b64u_nopad(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
-
-print(f"pbkdf2_sha256${iters}${b64u_nopad(salt)}${b64u_nopad(dk)}")
-PY
-}
-
-gen_secret(){
-  python3 - <<'PY'
-import secrets
-print(secrets.token_urlsafe(32))
-PY
-}
-
-main(){
-  ensure_root
-  need_cmd curl
-  need_cmd tar
-  need_cmd python3
-
-  clear || true
-  blue "Realm Pro Panel Installer v23"
+choose_mode(){
+  echo "Realm Pro Panel Installer v30"
   echo "------------------------------------------------------------"
-
-  local mode
   echo "1) 在线安装（推荐）"
   echo "2) 离线安装（手动下载）"
   read -r -p "请选择安装模式 [1-2] (默认 1): " mode || true
-  mode=${mode:-1}
+  mode="${mode:-1}"
+  if [[ "$mode" != "1" && "$mode" != "2" ]]; then
+    mode="1"
+  fi
+  echo "$mode"
+}
 
-  TMP_WORKDIR=$(mktemp -d)
-  local tmp="$TMP_WORKDIR"
-
-  local archive="$tmp/repo.tar.gz"
-
-  if [[ "$mode" == "2" ]]; then
-    yellow "[离线模式] 你需要先手动下载仓库压缩包：" >&2
-    echo "  - ${ARCHIVE_URL}" >&2
-    echo >&2
-    echo "然后把它保存为：/root/${REPO_NAME}.tar.gz" >&2
-    echo "保存完成后再继续。" >&2
-    read -r -p "按回车键继续..." _ || true
-
-    if [[ ! -f "/root/${REPO_NAME}.tar.gz" ]]; then
-      red "[ERR] 未找到 /root/${REPO_NAME}.tar.gz"
-      exit 1
-    fi
-    cp -f "/root/${REPO_NAME}.tar.gz" "$archive"
-  else
-    yellow "[提示] 正在下载仓库..." >&2
-    if ! curl -fsSL -L "$ARCHIVE_URL" -o "$archive"; then
-      red "[ERR] 下载失败：$ARCHIVE_URL"
-      red "[ERR] 若你的机器无法访问 github.com，请使用离线模式"
-      exit 1
-    fi
+prepare_source_online(){
+  local tmp
+  tmp="$(mktemp -d)"
+  _cyan "[提示] 正在下载仓库..."
+  if ! command -v curl >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y curl >/dev/null 2>&1
+  fi
+  if ! command -v unzip >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y unzip >/dev/null 2>&1
   fi
 
-  yellow "[提示] 解压中..." >&2
-  extract_from_archive "$archive" "$tmp"
+  local zip="$tmp/repo.zip"
+  curl -fsSL -o "$zip" "$REPO_ZIP_URL" || {
+    _red "[ERR ] 下载失败：$REPO_ZIP_URL"
+    _yel "       你可以通过：export REPO_ZIP_URL=... 重新指定仓库 zip 链接"
+    exit 1
+  }
 
-  local pdir
-  if ! pdir=$(find_panel_dir "$tmp"); then
-    red "[ERR] 找不到 panel 目录。请确认仓库里包含 panel/"
-    yellow "[调试] 解压后的目录结构：" >&2
-    find "$tmp" -maxdepth 3 -type d -print | sed 's#^#  - #' >&2 || true
+  _cyan "[提示] 解压中..."
+  unzip -q "$zip" -d "$tmp"
+
+  # Find panel dir
+  local panel_path
+  panel_path="$(find "$tmp" -maxdepth 3 -type d -name "$PANEL_DIR_NAME" | head -n 1 || true)"
+  if [[ -z "$panel_path" ]]; then
+    _red "[ERR ] 找不到 panel 目录。请确认仓库里包含 panel/ 或 <repo>/panel/"
+    _yel "[ERR ] 建议仓库结构：仓库根目录/panel"
     exit 1
   fi
 
-  green "[OK] panel 目录：$pdir"
+  echo "$panel_path"
+}
 
-  # Ask credentials
-  local admin_user admin_pass panel_port
-  admin_user=$(ask "设置面板登录用户名" "admin")
-  admin_pass=$(ask_password "设置面板登录密码")
-  panel_port=$(ask "面板端口" "$PANEL_PORT_DEFAULT")
+prepare_source_offline(){
+  echo "Realm Pro Panel Installer v30"
+  echo "------------------------------------------------------------"
+  _yel "离线安装说明："
+  echo "1) 请手动下载你的仓库 ZIP（或把本套件上传到服务器本地）"
+  echo "2) 需要包含 panel/ 目录"
+  echo
+  read -r -p "请输入 ZIP 文件路径（例如 /root/Realm-main.zip）: " zip_path
+  if [[ ! -f "$zip_path" ]]; then
+    _red "[ERR ] 文件不存在：$zip_path"
+    exit 1
+  fi
+  if ! command -v unzip >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y unzip >/dev/null 2>&1
+  fi
+  local tmp
+  tmp="$(mktemp -d)"
+  unzip -q "$zip_path" -d "$tmp"
 
-  # sanitize user/pass minimal
-  admin_user=${admin_user//$'\r'/}
-  admin_user=${admin_user//$'\n'/}
+  local panel_path
+  panel_path="$(find "$tmp" -maxdepth 3 -type d -name "$PANEL_DIR_NAME" | head -n 1 || true)"
+  if [[ -z "$panel_path" ]]; then
+    _red "[ERR ] 找不到 panel 目录。请确认 ZIP 里包含 panel/"
+    exit 1
+  fi
+  echo "$panel_path"
+}
 
-  yellow "[提示] 安装依赖..." >&2
-  export DEBIAN_FRONTEND=noninteractive
+ensure_deps(){
+  _cyan "[提示] 安装依赖..."
   apt-get update -y >/dev/null 2>&1 || true
-  apt-get install -y python3-venv python3-pip ca-certificates >/dev/null 2>&1 || true
+  apt-get install -y python3 python3-venv python3-pip >/dev/null 2>&1
+}
 
-  yellow "[提示] 部署到 $PANEL_DIR ..." >&2
-  rm -rf "$PANEL_DIR"
-  mkdir -p "$PANEL_DIR"
-  cp -a "$pdir"/* "$PANEL_DIR"/
-  mkdir -p "$PANEL_DIR/data"
+make_admin_hash(){
+  local user="$1"
+  local pass="$2"
+  python3 - <<'PY'
+import base64, hashlib, os, secrets
+import sys
+user = os.environ.get('U','admin')
+password = os.environ.get('P','')
+if not password:
+    print('')
+    sys.exit(0)
+iterations = 200_000
+salt = secrets.token_bytes(16)
+dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, iterations)
+enc_salt = base64.urlsafe_b64encode(salt).decode('ascii').rstrip('=')
+enc_dk = base64.urlsafe_b64encode(dk).decode('ascii').rstrip('=')
+print(f"pbkdf2_sha256${iterations}${enc_salt}${enc_dk}")
+PY
+}
 
-  yellow "[提示] 创建虚拟环境..." >&2
-  python3 -m venv "$PANEL_DIR/venv"
-  "$PANEL_DIR/venv/bin/pip" install -U pip >/dev/null
-  "$PANEL_DIR/venv/bin/pip" install -r "$PANEL_DIR/requirements.txt" >/dev/null
+install_panel(){
+  local panel_src="$1"
 
-  yellow "[提示] 生成密码哈希..." >&2
-  local pass_hash
-  pass_hash=$(hash_password "$PANEL_DIR/venv/bin/python" "$admin_pass")
+  local admin_user
+  read -r -p "设置面板登录用户名 (默认 admin): " admin_user || true
+  admin_user="${admin_user:-admin}"
 
-  local session_secret
-  session_secret=$(gen_secret)
+  local admin_pass
+  admin_pass="$(read_secret "设置面板登录密码 (必填): ")"
 
-  mkdir -p "$(dirname "$ENV_FILE")"
-  umask 077
-  cat > "$ENV_FILE" <<EENV
-PANEL_PORT=$panel_port
-ADMIN_USER=$admin_user
-ADMIN_PASS_HASH=$pass_hash
-SESSION_SECRET=$session_secret
-DB_PATH=$PANEL_DIR/data/panel.db
-EENV
+  local port
+  read -r -p "面板端口 (默认 6080): " port || true
+  port="${port:-6080}"
 
-  cat > "$SERVICE_FILE" <<EOFUNIT
+  ensure_deps
+
+  _cyan "[提示] 部署到 $INSTALL_ROOT ..."
+  mkdir -p "$INSTALL_ROOT"
+  rm -rf "$INSTALL_ROOT/panel"
+  cp -a "$panel_src" "$INSTALL_ROOT/panel"
+
+  _cyan "[提示] 创建虚拟环境..."
+  python3 -m venv "$INSTALL_ROOT/venv"
+
+  _cyan "[提示] 安装 Python 依赖..."
+  "$INSTALL_ROOT/venv/bin/pip" install -U pip >/dev/null 2>&1
+  "$INSTALL_ROOT/venv/bin/pip" install -r "$INSTALL_ROOT/panel/requirements.txt" >/dev/null 2>&1
+
+  _cyan "[提示] 生成密码哈希..."
+  export U="$admin_user"
+  export P="$admin_pass"
+  local admin_hash
+  admin_hash="$(make_admin_hash "$admin_user" "$admin_pass")"
+  if [[ -z "$admin_hash" ]]; then
+    _red "[ERR ] 密码哈希生成失败"
+    exit 1
+  fi
+
+  local secret
+  secret="$(python3 - <<'PY'
+import secrets; print(secrets.token_urlsafe(32))
+PY
+)"
+
+  mkdir -p "$INSTALL_ROOT/data"
+
+  cat > "$ENV_FILE" <<EOF
+PANEL_PORT=$port
+PANEL_ADMIN_USER=$admin_user
+PANEL_ADMIN_HASH=$admin_hash
+PANEL_SECRET_KEY=$secret
+PANEL_DB=$INSTALL_ROOT/data/panel.db
+EOF
+
+  _cyan "[提示] 写入 systemd 服务..."
+  cat > "$SERVICE_FILE" <<'EOF'
 [Unit]
-Description=Realm Panel Web UI
-After=network.target
+Description=Realm Pro Panel
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=$PANEL_DIR
-EnvironmentFile=$ENV_FILE
-ExecStart=$PANEL_DIR/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port $panel_port
+WorkingDirectory=/opt/realm-panel/panel
+EnvironmentFile=/opt/realm-panel/.env
+ExecStart=/opt/realm-panel/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port $PANEL_PORT
 Restart=always
 RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
-EOFUNIT
+EOF
 
   systemctl daemon-reload
   systemctl enable --now realm-panel.service
 
-  green "[OK] 面板已启动"
-  echo "------------------------------------------------------------"
-  echo "访问地址： http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'SERVER_IP'):$panel_port"
-  echo "用户名：$admin_user"
-  echo "------------------------------------------------------------"
-  echo
-  systemctl status realm-panel --no-pager || true
+  _grn "[OK] 面板已启动"
+  echo "     URL:  http://<你的服务器IP>:$port"
+  echo "     User: $admin_user"
+}
+
+main(){
+  need_root
+  local mode
+  mode="$(choose_mode)"
+
+  local panel_src
+  if [[ "$mode" == "1" ]]; then
+    panel_src="$(prepare_source_online)"
+  else
+    panel_src="$(prepare_source_offline)"
+  fi
+
+  _grn "[OK] panel 目录：$panel_src"
+  install_panel "$panel_src"
 }
 
 main "$@"

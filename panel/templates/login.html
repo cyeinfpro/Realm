@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>登录 - Realm Pro Panel</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <div class="bg"></div>
+  <div class="login-wrap">
+    <div class="card login-card">
+      <div class="login-head">
+        <div class="logo big">R</div>
+        <div>
+          <div class="brand-title">Realm Pro Panel</div>
+          <div class="muted">请登录后继续</div>
+        </div>
+      </div>
+      {% if error %}
+      <div class="alert">{{ error }}</div>
+      {% endif %}
+      <form method="post" action="/login" class="form">
+        <label>
+          <span>用户名</span>
+          <input name="username" autocomplete="username" placeholder="admin" required />
+        </label>
+        <label>
+          <span>密码</span>
+          <input name="password" type="password" autocomplete="current-password" placeholder="••••••••" required />
+        </label>
+        <button class="btn primary" type="submit">登录</button>
+      </form>
+      <div class="muted tiny">提示：管理员账号在安装脚本中设置</div>
+    </div>
+  </div>
+</body>
+</html>
