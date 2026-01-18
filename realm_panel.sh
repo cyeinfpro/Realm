@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v32"
+VERSION="v33"
 REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
 
 info(){ echo -e "\033[33m[提示]\033[0m $*" >&2; }
@@ -57,7 +57,7 @@ extract_repo(){
   panel_dir="$(find "$TMPDIR/extract" -maxdepth 6 -type d -name panel -print -quit)"
   if [[ -z "$panel_dir" ]]; then
     err "找不到 panel 目录。请确认仓库里包含 panel/ 或 realm-pro-suite-vXX/panel/"
-    err "建议仓库结构：仓库根目录/panel  或  仓库根目录/realm-pro-suite-v31/panel"
+    err "建议仓库结构：仓库根目录/panel  或  仓库根目录/realm-pro-suite-v33/panel"
     exit 1
   fi
   echo "$panel_dir"
@@ -128,13 +128,14 @@ main(){
   mkdir -p /etc/realm-panel
   export PANEL_USER="$user"
   export PANEL_PASS="$pass"
-  /opt/realm-panel/venv/bin/python - <<'PY'
+  ( cd /opt/realm-panel/panel && /opt/realm-panel/venv/bin/python - <<'PY'
 import os
-from app.auth import ensure_secret_key, make_credentials_file
+from app.auth import ensure_secret_key, save_credentials
 ensure_secret_key()
-make_credentials_file(os.environ['PANEL_USER'], os.environ['PANEL_PASS'])
+save_credentials(os.environ['PANEL_USER'], os.environ['PANEL_PASS'])
 print('OK')
 PY
+) 
 
   write_systemd "$port"
   systemctl daemon-reload

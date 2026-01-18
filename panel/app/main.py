@@ -18,7 +18,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
 
-app = FastAPI(title="Realm Pro Panel", version="31")
+app = FastAPI(title="Realm Pro Panel", version="33")
 
 # Session
 secret = ensure_secret_key()
