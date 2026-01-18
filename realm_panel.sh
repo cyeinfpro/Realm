@@ -18,7 +18,7 @@ apt_install(){
   export DEBIAN_FRONTEND=noninteractive
   info "安装依赖..."
   apt-get update -y >/dev/null
-  apt-get install -y curl unzip jq python3 python3-venv python3-pip ca-certificates >/dev/null
+  apt-get install -y curl unzip zip jq python3 python3-venv python3-pip ca-certificates >/dev/null
 }
 
 prompt(){
@@ -63,6 +63,37 @@ extract_repo(){
   echo "$panel_dir"
 }
 
+find_agent_dir(){
+  local base="$1"
+  local agent_dir
+  agent_dir="$(find "$base" -maxdepth 6 -type d -name agent -print -quit)"
+  if [[ -z "$agent_dir" ]]; then
+    err "找不到 agent 目录。请确认仓库里包含 agent/ 或 realm-pro-suite-vXX/agent/"
+    err "建议仓库结构：仓库根目录/agent  或  仓库根目录/realm-pro-suite-v33/agent"
+    exit 1
+  fi
+  echo "$agent_dir"
+}
+
+prepare_agent_bundle(){
+  local extract_root="$1"
+  local agent_dir
+  agent_dir="$(find_agent_dir "$extract_root")"
+  info "生成 Agent 离线包..."
+  mkdir -p /opt/realm-panel/panel/static
+  ( cd "$agent_dir/.." && zip -qr /opt/realm-panel/panel/static/realm-agent.zip "$(basename "$agent_dir")" )
+  if [[ -f "/opt/realm-panel/panel/../realm_agent.sh" ]]; then
+    cp -a "/opt/realm-panel/panel/../realm_agent.sh" /opt/realm-panel/panel/static/realm_agent.sh
+  else
+    local script_path
+    script_path="$(find "$extract_root" -maxdepth 2 -type f -name realm_agent.sh -print -quit)"
+    if [[ -n "$script_path" ]]; then
+      cp -a "$script_path" /opt/realm-panel/panel/static/realm_agent.sh
+    fi
+  fi
+  ok "Agent 离线包已就绪：/opt/realm-panel/panel/static/realm-agent.zip"
+}
+
 write_systemd(){
   local port="$1"
   cat > /etc/systemd/system/realm-panel.service <<EOF
@@ -84,7 +115,7 @@ WantedBy=multi-user.target
 EOF
 }
 
-main(){
+install_panel(){
   need_root
   echo "Realm Pro Panel Installer ${VERSION}"
   echo "------------------------------------------------------------"
@@ -118,6 +149,7 @@ main(){
   rm -rf /opt/realm-panel
   mkdir -p /opt/realm-panel
   cp -a "$panel_dir" /opt/realm-panel/panel
+  prepare_agent_bundle "$TMPDIR/extract"
 
   info "创建虚拟环境..."
   python3 -m venv /opt/realm-panel/venv
@@ -146,6 +178,67 @@ PY
   echo "访问: http://<你的IP>:${port}"
   echo "用户名: ${user}"
   echo "密码: (你刚刚输入的)"
+}
+
+update_panel(){
+  need_root
+  local mode="online"
+  local zip_path=""
+  echo "1) 在线更新（推荐）"
+  echo "2) 离线更新（手动下载）"
+  local choice
+  choice="$(prompt "请选择更新模式 [1-2]" "1")"
+  if [[ "$choice" == "2" ]]; then
+    mode="offline"
+    zip_path="$(prompt "请输入 ZIP 文件路径（例如 /root/Realm-main.zip）" "")"
+  fi
+  apt_install
+  local panel_dir
+  panel_dir="$(extract_repo "$mode" "$zip_path")"
+  ok "panel 目录：$panel_dir"
+  info "更新面板文件..."
+  rm -rf /opt/realm-panel/panel
+  mkdir -p /opt/realm-panel
+  cp -a "$panel_dir" /opt/realm-panel/panel
+  prepare_agent_bundle "$TMPDIR/extract"
+  info "更新依赖..."
+  /opt/realm-panel/venv/bin/pip install -r /opt/realm-panel/panel/requirements.txt >/dev/null
+  systemctl daemon-reload
+  systemctl restart realm-panel.service
+  ok "面板已更新并重启"
+}
+
+restart_panel(){
+  need_root
+  systemctl restart realm-panel.service
+  ok "面板已重启"
+}
+
+uninstall_panel(){
+  need_root
+  systemctl disable --now realm-panel.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/realm-panel.service
+  systemctl daemon-reload
+  rm -rf /opt/realm-panel /etc/realm-panel
+  ok "面板已卸载"
+}
+
+main(){
+  echo "Realm Pro Panel 管理 ${VERSION}"
+  echo "------------------------------------------------------------"
+  echo "1) 安装面板"
+  echo "2) 更新面板"
+  echo "3) 重启面板"
+  echo "4) 卸载面板"
+  local action
+  action="$(prompt "请选择操作 [1-4]" "1")"
+  case "$action" in
+    1) install_panel ;;
+    2) update_panel ;;
+    3) restart_panel ;;
+    4) uninstall_panel ;;
+    *) err "无效选择"; exit 1 ;;
+  esac
 }
 
 main "$@"

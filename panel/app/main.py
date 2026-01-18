@@ -193,11 +193,14 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
         _set_flash(request, "机器不存在")
         return RedirectResponse(url="/", status_code=303)
     show_install_cmd = bool(request.session.pop("show_install_cmd", False))
+    base_url = str(request.base_url).rstrip("/")
+    repo_zip_url = f"{base_url}/static/realm-agent.zip"
     install_cmd = (
         "sudo -E bash -c \""
         "mkdir -p /etc/realm-agent && "
         f"echo '{node['api_key']}' > /etc/realm-agent/api.key && "
-        "curl -fsSL https://raw.githubusercontent.com/cyeinfpro/Realm/main/realm_agent.sh | "
+        f"curl -fsSL {base_url}/static/realm_agent.sh | "
+        f"REALM_AGENT_REPO_ZIP_URL={repo_zip_url} "
         "REALM_AGENT_MODE=1 REALM_AGENT_PORT=18700 REALM_AGENT_ASSUME_YES=1 bash"
         "\""
     )
