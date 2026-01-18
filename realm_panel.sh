@@ -83,15 +83,13 @@ prepare_agent_bundle(){
   info "生成 Agent 离线包..."
   mkdir -p /opt/realm-panel/panel/static
   ( cd "$agent_dir/.." && zip -qr /opt/realm-panel/panel/static/realm-agent.zip "$(basename "$agent_dir")" )
-  if [[ -f "/opt/realm-panel/panel/../realm_agent.sh" ]]; then
-    cp -a "/opt/realm-panel/panel/../realm_agent.sh" /opt/realm-panel/panel/static/realm_agent.sh
-  else
-    local script_path
-    script_path="$(find "$extract_root" -maxdepth 2 -type f -name realm_agent.sh -print -quit)"
-    if [[ -n "$script_path" ]]; then
-      cp -a "$script_path" /opt/realm-panel/panel/static/realm_agent.sh
-    fi
+  local script_path
+  script_path="$(find "$extract_root" -maxdepth 6 -type f -name realm_agent.sh -print -quit)"
+  if [[ -z "$script_path" ]]; then
+    err "找不到 realm_agent.sh，无法生成 Agent 安装脚本"
+    exit 1
   fi
+  cp -a "$script_path" /opt/realm-panel/panel/static/realm_agent.sh
   ok "Agent 离线包已就绪：/opt/realm-panel/panel/static/realm-agent.zip"
 }
 
