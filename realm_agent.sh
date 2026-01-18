@@ -3,6 +3,8 @@ set -euo pipefail
 
 VERSION="v31"
 REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
+DEFAULT_MODE="1"
+DEFAULT_PORT="18700"
 
 info(){ printf "[提示] %s\n" "$*"; }
 ok(){ printf "[OK] %s\n" "$*"; }
@@ -23,6 +25,14 @@ apt_install(){
 
 ask(){
   local prompt="$1" default="$2" var
+  if [[ "${REALM_AGENT_ASSUME_YES:-}" == "1" ]]; then
+    echo "${default}"
+    return
+  fi
+  if [[ ! -t 0 ]]; then
+    echo "${default}"
+    return
+  fi
   read -r -p "$prompt" var || true
   if [[ -z "${var}" ]]; then echo "${default}"; else echo "$var"; fi
 }
@@ -33,7 +43,10 @@ fetch_repo(){
   local zip_path=""
 
   if [[ "${mode}" == "2" ]]; then
-    zip_path=$(ask "请输入 ZIP 文件路径（例如 /root/Realm-main.zip）: " "")
+    zip_path="${REALM_AGENT_ZIP_PATH:-}"
+    if [[ -z "${zip_path}" ]]; then
+      zip_path=$(ask "请输入 ZIP 文件路径（例如 /root/Realm-main.zip）: " "")
+    fi
     if [[ -z "${zip_path}" || ! -f "${zip_path}" ]]; then
       err "ZIP 文件不存在：${zip_path}"
       exit 1
@@ -42,7 +55,10 @@ fetch_repo(){
     unzip -q "${zip_path}" -d "${tmpdir}"
   else
     local url
-    url=$(ask "仓库 ZIP 下载地址（回车=默认）: " "${REPO_ZIP_URL_DEFAULT}")
+    url="${REALM_AGENT_REPO_ZIP_URL:-}"
+    if [[ -z "${url}" ]]; then
+      url=$(ask "仓库 ZIP 下载地址（回车=默认）: " "${REPO_ZIP_URL_DEFAULT}")
+    fi
     info "正在下载仓库..."
     curl -fsSL "${url}" -o "${tmpdir}/repo.zip"
     info "解压中..."
@@ -76,10 +92,16 @@ main(){
   echo "1) 在线安装（推荐）"
   echo "2) 离线安装（手动下载）"
   local mode
-  mode=$(ask "请选择安装模式 [1-2] (默认 1): " "1")
+  mode="${REALM_AGENT_MODE:-}"
+  if [[ -z "${mode}" ]]; then
+    mode=$(ask "请选择安装模式 [1-2] (默认 1): " "${DEFAULT_MODE}")
+  fi
 
   local port
-  port=$(ask "Agent 端口 (默认 18700): " "18700")
+  port="${REALM_AGENT_PORT:-}"
+  if [[ -z "${port}" ]]; then
+    port=$(ask "Agent 端口 (默认 18700): " "${DEFAULT_PORT}")
+  fi
 
   info "安装依赖..."
   apt_install
