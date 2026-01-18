@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card" style="max-width:520px;margin:40px auto;">
+  <h1 class="h1">初始化账号</h1>
+  <p class="muted">首次启动需要设置面板账号与密码</p>
+  <form method="post" action="/setup" class="form">
+    <label class="label">用户名</label>
+    <input class="input" name="username" placeholder="admin" required>
+
+    <label class="label">密码</label>
+    <input class="input" type="password" name="password" placeholder="至少 6 位" required>
+
+    <label class="label">确认密码</label>
+    <input class="input" type="password" name="confirm" placeholder="再次输入密码" required>
+
+    <button class="btn" type="submit">保存并继续</button>
+  </form>
+</div>
+{% endblock %}

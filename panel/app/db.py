@@ -29,6 +29,10 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         conn.commit()
 
 
+def ensure_db(db_path: str = DEFAULT_DB_PATH) -> None:
+    init_db(db_path)
+
+
 @contextmanager
 def connect(db_path: str = DEFAULT_DB_PATH):
     ensure_parent_dir(db_path)

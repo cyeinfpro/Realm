@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
-from .auth import ensure_secret_key, verify_login
+from .auth import ensure_secret_key, load_credentials, save_credentials, verify_login
 from .db import add_node, delete_node, ensure_db, get_node, list_nodes
 from .agents import agent_get, agent_post, agent_ping
 
@@ -41,6 +41,10 @@ def _set_flash(request: Request, msg: str) -> None:
     request.session["flash"] = msg
 
 
+def _has_credentials() -> bool:
+    return load_credentials() is not None
+
+
 def require_login(request: Request) -> str:
     user = request.session.get("user")
     if not user:
@@ -57,6 +61,8 @@ def require_login_page(request: Request) -> str:
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
+    if not _has_credentials():
+        return RedirectResponse(url="/setup", status_code=303)
     return templates.TemplateResponse(
         "login.html",
         {"request": request, "user": None, "flash": _flash(request), "title": "登录"},
@@ -69,6 +75,9 @@ async def login_action(
     username: str = Form(...),
     password: str = Form(...),
 ):
+    if not _has_credentials():
+        _set_flash(request, "请先初始化面板账号")
+        return RedirectResponse(url="/setup", status_code=303)
     if verify_login(username, password):
         request.session["user"] = username
         _set_flash(request, "登录成功")
@@ -80,6 +89,37 @@ async def login_action(
 @app.get("/logout")
 async def logout(request: Request):
     request.session.clear()
+    return RedirectResponse(url="/login", status_code=303)
+
+
+@app.get("/setup", response_class=HTMLResponse)
+async def setup_page(request: Request):
+    if _has_credentials():
+        return RedirectResponse(url="/login", status_code=303)
+    return templates.TemplateResponse(
+        "setup.html",
+        {"request": request, "user": None, "flash": _flash(request), "title": "初始化账号"},
+    )
+
+
+@app.post("/setup")
+async def setup_action(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    confirm: str = Form(...),
+):
+    if _has_credentials():
+        return RedirectResponse(url="/login", status_code=303)
+    if password != confirm:
+        _set_flash(request, "两次输入的密码不一致")
+        return RedirectResponse(url="/setup", status_code=303)
+    try:
+        save_credentials(username, password)
+    except ValueError as exc:
+        _set_flash(request, str(exc))
+        return RedirectResponse(url="/setup", status_code=303)
+    _set_flash(request, "账号已初始化，请登录")
     return RedirectResponse(url="/login", status_code=303)
 
 
@@ -165,8 +205,11 @@ async def api_pool_get(request: Request, node_id: int, user: str = Depends(requi
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
-    data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool")
-    return data
+    try:
+        data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool")
+        return data
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
 
 @app.post("/api/nodes/{node_id}/pool")
@@ -174,8 +217,11 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
-    data = await agent_post(node["base_url"], node["api_key"], "/api/v1/pool", payload)
-    return data
+    try:
+        data = await agent_post(node["base_url"], node["api_key"], "/api/v1/pool", payload)
+        return data
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
 
 @app.post("/api/nodes/{node_id}/apply")
@@ -183,8 +229,11 @@ async def api_apply(request: Request, node_id: int, user: str = Depends(require_
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
-    data = await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {})
-    return data
+    try:
+        data = await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {})
+        return data
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
 
 @app.get("/api/nodes/{node_id}/stats")
@@ -192,5 +241,48 @@ async def api_stats(request: Request, node_id: int, user: str = Depends(require_
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
-    data = await agent_get(node["base_url"], node["api_key"], "/api/v1/stats")
-    return data
+    try:
+        data = await agent_get(node["base_url"], node["api_key"], "/api/v1/stats")
+        return data
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+
+
+@app.get("/api/nodes/{node_id}/graph")
+async def api_graph(request: Request, node_id: int, user: str = Depends(require_login)):
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+    try:
+        data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool")
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+
+    pool = data.get("pool") if isinstance(data, dict) else None
+    endpoints = pool.get("endpoints", []) if isinstance(pool, dict) else []
+    elements: list[dict[str, Any]] = []
+    for idx, endpoint in enumerate(endpoints):
+        listen = endpoint.get("listen", f"listen-{idx}")
+        listen_id = f"listen-{idx}"
+        classes = ["listen"]
+        if endpoint.get("disabled"):
+            classes.append("disabled")
+        elements.append({"data": {"id": listen_id, "label": listen}, "classes": " ".join(classes)})
+        remotes = endpoint.get("remotes") or ([endpoint.get("remote")] if endpoint.get("remote") else [])
+        for r_idx, remote in enumerate(remotes):
+            remote_id = f"remote-{idx}-{r_idx}"
+            elements.append(
+                {
+                    "data": {"id": remote_id, "label": remote},
+                    "classes": "remote" + (" disabled" if endpoint.get("disabled") else ""),
+                }
+            )
+            ex = endpoint.get("extra_config") or {}
+            edge_label = "WSS" if ex.get("listen_transport") == "ws" or ex.get("remote_transport") == "ws" else ""
+            elements.append(
+                {
+                    "data": {"source": listen_id, "target": remote_id, "label": edge_label},
+                    "classes": "disabled" if endpoint.get("disabled") else "",
+                }
+            )
+    return {"ok": True, "elements": elements}

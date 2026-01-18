@@ -119,6 +119,16 @@ function showWssBox(){
   q('wssBox').style.display = (mode === 'tcp') ? 'none' : 'block';
 }
 
+function parseWeights(text){
+  if(!text) return [];
+  return text.split(/[,，]/).map(x=>x.trim()).filter(Boolean).map(x=>Number(x));
+}
+
+function formatWeights(weights){
+  if(!weights || !weights.length) return '';
+  return weights.join(',');
+}
+
 function newRule(){
   CURRENT_EDIT_INDEX = null;
   q('modalTitle').textContent = '新增规则';
@@ -126,6 +136,7 @@ function newRule(){
   setField('f_remotes','');
   q('f_disabled').value = '0';
   q('f_balance').value = 'roundrobin';
+  setField('f_weights','');
   q('f_type').value = 'tcp';
   fillWssFields({});
   showWssBox();
@@ -139,7 +150,10 @@ function editRule(idx){
   setField('f_listen', e.listen || '');
   setField('f_remotes', formatRemote(e));
   q('f_disabled').value = e.disabled ? '1':'0';
-  q('f_balance').value = (e.balance || 'roundrobin').startsWith('iphash') ? 'iphash' : 'roundrobin';
+  const balance = e.balance || 'roundrobin';
+  q('f_balance').value = balance.startsWith('iphash') ? 'iphash' : 'roundrobin';
+  const weights = balance.startsWith('roundrobin:') ? balance.split(':').slice(1).join(':').trim().split(',').map(x=>x.trim()).filter(Boolean) : [];
+  setField('f_weights', weights.join(','));
   fillWssFields(e);
   showWssBox();
   openModal();
@@ -166,7 +180,22 @@ async function saveRule(){
 
   const disabled = q('f_disabled').value === '1';
   const balanceSel = q('f_balance').value;
-  const balance = balanceSel === 'iphash' ? 'iphash' : 'roundrobin: 1, 1';
+  let balance = 'roundrobin';
+  if(balanceSel === 'iphash'){
+    balance = 'iphash';
+  }else{
+    const weights = parseWeights(q('f_weights').value.trim());
+    if(weights.length && weights.length !== remotes.length){
+      q('modalMsg').textContent='权重数量必须与 Remote 数量一致';
+      return;
+    }
+    const finalWeights = weights.length ? weights : remotes.map(()=>1);
+    if(finalWeights.some((w)=>Number.isNaN(w) || w <= 0)){
+      q('modalMsg').textContent='权重必须为正数';
+      return;
+    }
+    balance = `roundrobin: ${finalWeights.join(', ')}`;
+  }
 
   const typeSel = q('f_type').value;
   const ex = readWssFields();
@@ -271,28 +300,34 @@ async function loadGraph(){
   try{
     const data = await fetchJSON(`/api/nodes/${id}/graph`);
     box.innerHTML = '<div id="cy" style="height:520px;"></div>';
-    const script = document.createElement('script');
-    script.src = 'https://cdn.jsdelivr.net/npm/cytoscape@3.28.1/dist/cytoscape.min.js';
-    script.onload = ()=>{
-      const cy = cytoscape({
-        container: document.getElementById('cy'),
-        elements: data.elements,
-        style: [
-          { selector: 'node', style: { 'label': 'data(label)', 'color': '#e5e7eb', 'text-wrap':'wrap', 'text-max-width': 120, 'font-size': 10, 'background-color': '#60a5fa' } },
-          { selector: 'edge', style: { 'label':'data(label)', 'width':2, 'curve-style':'bezier', 'line-color':'#94a3b8', 'target-arrow-shape':'triangle', 'target-arrow-color':'#94a3b8', 'font-size': 10, 'color':'#94a3b8' } },
-          { selector: '.listen', style: { 'background-color':'#22c55e' } },
-          { selector: '.remote', style: { 'background-color':'#f59e0b' } },
-          { selector: '.disabled', style: { 'opacity': 0.35 } }
-        ],
-        layout: { name: 'breadthfirst', directed: true, padding: 20 }
-      });
-      cy.fit();
-    };
-    script.onerror = ()=>{ box.innerHTML = '<div class="muted">加载 Cytoscape 失败（CDN 不可用）</div>'; };
-    document.body.appendChild(script);
+    if(typeof cytoscape !== 'function'){
+      const script = document.createElement('script');
+      script.src = 'https://cdn.jsdelivr.net/npm/cytoscape@3.28.1/dist/cytoscape.min.js';
+      script.onload = ()=>renderGraph(data.elements);
+      script.onerror = ()=>{ box.innerHTML = '<div class="muted">加载 Cytoscape 失败（CDN 不可用）</div>'; };
+      document.body.appendChild(script);
+    }else{
+      renderGraph(data.elements);
+    }
   }catch(e){
     box.innerHTML = `<div class="muted">生成失败：${e.message}</div>`;
   }
+}
+
+function renderGraph(elements){
+  const cy = cytoscape({
+    container: document.getElementById('cy'),
+    elements: elements || [],
+    style: [
+      { selector: 'node', style: { 'label': 'data(label)', 'color': '#e5e7eb', 'text-wrap':'wrap', 'text-max-width': 120, 'font-size': 10, 'background-color': '#60a5fa' } },
+      { selector: 'edge', style: { 'label':'data(label)', 'width':2, 'curve-style':'bezier', 'line-color':'#94a3b8', 'target-arrow-shape':'triangle', 'target-arrow-color':'#94a3b8', 'font-size': 10, 'color':'#94a3b8' } },
+      { selector: '.listen', style: { 'background-color':'#22c55e' } },
+      { selector: '.remote', style: { 'background-color':'#f59e0b' } },
+      { selector: '.disabled', style: { 'opacity': 0.35 } }
+    ],
+    layout: { name: 'breadthfirst', directed: true, padding: 20 }
+  });
+  cy.fit();
 }
 
 async function loadPool(){

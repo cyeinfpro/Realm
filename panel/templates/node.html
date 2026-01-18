@@ -41,7 +41,7 @@
           <th class="right">操作</th>
         </tr>
       </thead>
-      <tbody></tbody>
+      <tbody id="rulesBody"></tbody>
     </table>
   </div>
 </section>
@@ -50,8 +50,8 @@
   <div class="card">
     <h2 class="h2">规则连接图</h2>
     <p class="muted">从 listen 到每个 remote 的连线；WSS 会显示为特殊边</p>
-    <div id="cy" style="width:100%;height:560px;border-radius:16px;overflow:hidden;background:rgba(255,255,255,0.04);"></div>
-    <div id="graphHint" class="muted" style="margin-top:10px;">提示：图形渲染依赖浏览器加载 Cytoscape CDN，如你网络受限，可忽略此视图。</div>
+    <div id="graphBox" style="width:100%;height:560px;border-radius:16px;overflow:hidden;background:rgba(255,255,255,0.04);"></div>
+    <div class="muted" style="margin-top:10px;">提示：图形渲染依赖浏览器加载 Cytoscape CDN，如你网络受限，可忽略此视图。</div>
   </div>
 </section>
 
@@ -60,8 +60,8 @@
     <h2 class="h2">负载均衡策略可视化</h2>
     <p class="muted">对多目标规则展示权重与顺序</p>
     <div class="row" style="gap:12px;align-items:center;">
-      <select id="lbRuleSel" class="select" onchange="renderLB()"></select>
-      <button class="btn ghost" onclick="renderLB()">刷新</button>
+      <select id="lbSelect" class="select"></select>
+      <button class="btn ghost" onclick="renderLB(parseInt(document.getElementById('lbSelect').value || 0, 10))">刷新</button>
     </div>
     <div id="lbBox" style="margin-top:14px;"></div>
   </div>
@@ -69,7 +69,7 @@
 
 <!-- Edit Modal -->
 <div id="modal" class="modal" style="display:none;">
-  <div class="modal-card">
+  <div class="modal-inner">
     <div class="row">
       <div class="col"><div class="h2" id="modalTitle">编辑规则</div></div>
       <div class="col right"><button class="btn ghost" onclick="closeModal()">关闭</button></div>
@@ -81,10 +81,10 @@
           <input class="input" id="f_listen" placeholder="0.0.0.0:443">
         </div>
         <div class="col">
-          <label class="label">启用</label>
-          <select class="select" id="f_enabled">
-            <option value="1">启用</option>
-            <option value="0">暂停</option>
+          <label class="label">状态</label>
+          <select class="select" id="f_disabled">
+            <option value="0">启用</option>
+            <option value="1">暂停</option>
           </select>
         </div>
       </div>
@@ -96,7 +96,7 @@
         <div class="col">
           <label class="label">策略</label>
           <select class="select" id="f_balance">
-            <option value="round_robin">轮询</option>
+            <option value="roundrobin">轮询</option>
             <option value="iphash">IP Hash</option>
           </select>
         </div>
@@ -107,8 +107,8 @@
       </div>
 
       <label class="label">隧道模式</label>
-      <select class="select" id="f_tunnel" onchange="toggleWSS()">
-        <option value="plain">TCP/UDP</option>
+      <select class="select" id="f_type">
+        <option value="tcp">TCP/UDP</option>
         <option value="wss_send">WSS 发送（remote_transport=ws）</option>
         <option value="wss_recv">WSS 接收（listen_transport=ws）</option>
       </select>
@@ -159,7 +159,6 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
 <script src="/static/app.js"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
