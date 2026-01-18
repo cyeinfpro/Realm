@@ -227,7 +227,7 @@ async function savePool(msg){
   const id = window.__NODE_ID__;
   const res = await fetchJSON(`/api/nodes/${id}/pool`, {
     method:'POST',
-    body: JSON.stringify(CURRENT_POOL)
+    body: JSON.stringify({ pool: CURRENT_POOL })
   });
   if(res.ok){
     CURRENT_POOL = res.pool;
