@@ -288,6 +288,7 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
         f"echo '{node['api_key']}' > /etc/realm-agent/api.key && "
         f"curl -fsSL {base_url}/static/realm_agent.sh | "
         f"REALM_AGENT_REPO_ZIP_URL={repo_zip_url} "
+        "REALM_AGENT_FORCE_UPDATE=1 "
         f"REALM_AGENT_MODE=1 REALM_AGENT_PORT={agent_port} REALM_AGENT_ASSUME_YES=1 bash"
         "\""
     )

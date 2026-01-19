@@ -158,9 +158,14 @@ fetch_repo(){
     unzip -q "${zip_path}" -d "${tmpdir}"
   else
     local url
-    url="${REALM_AGENT_REPO_ZIP_URL:-}"
-    if [[ -z "${url}" ]]; then
-      url=$(ask "仓库 ZIP 下载地址（回车=默认）: " "${REPO_ZIP_URL_DEFAULT}")
+    if [[ "${REALM_AGENT_FORCE_UPDATE:-}" == "1" ]]; then
+      url="${REPO_ZIP_URL_DEFAULT}"
+      info "已启用强制更新，使用最新仓库包：${url}"
+    else
+      url="${REALM_AGENT_REPO_ZIP_URL:-}"
+      if [[ -z "${url}" ]]; then
+        url=$(ask "仓库 ZIP 下载地址（回车=默认）: " "${REPO_ZIP_URL_DEFAULT}")
+      fi
     fi
     info "正在下载仓库..."
     curl -fsSL "${url}" -o "${tmpdir}/repo.zip"

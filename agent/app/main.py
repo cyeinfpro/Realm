@@ -19,6 +19,7 @@ POOL_ACTIVE = Path('/etc/realm/pool.json')
 POOL_RUN_FILTER = Path('/etc/realm/pool_to_run.jq')
 FALLBACK_RUN_FILTER = Path(__file__).resolve().parents[1] / 'pool_to_run.jq'
 REALM_CONFIG = Path('/etc/realm/config.json')
+TRAFFIC_TOTALS: Dict[int, Dict[str, Any]] = {}
 
 
 def _read_text(p: Path) -> str:
@@ -160,24 +161,43 @@ def _traffic_bytes(port: int) -> tuple[int, int]:
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         return 0, 0
-    rx_total = 0
-    tx_total = 0
+    totals = TRAFFIC_TOTALS.setdefault(port, {'sum_rx': 0, 'sum_tx': 0, 'conns': {}})
+    conns: Dict[str, Dict[str, int]] = totals['conns']
+    seen = set()
     for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        local = parts[3]
+        peer = parts[4]
+        key = f"{local}->{peer}"
+        seen.add(key)
         rx_matches = re.findall(r"bytes_received:(\d+)", line)
         tx_matches = re.findall(r"bytes_acked:(\d+)", line)
         if not tx_matches:
             tx_matches = re.findall(r"bytes_sent:(\d+)", line)
-        for value in rx_matches:
-            try:
-                rx_total += int(value)
-            except ValueError:
-                continue
-        for value in tx_matches:
-            try:
-                tx_total += int(value)
-            except ValueError:
-                continue
-    return rx_total, tx_total
+        rx_value = int(rx_matches[-1]) if rx_matches else 0
+        tx_value = int(tx_matches[-1]) if tx_matches else 0
+        last = conns.get(key)
+        if last is None:
+            totals['sum_rx'] += rx_value
+            totals['sum_tx'] += tx_value
+            conns[key] = {'last_rx': rx_value, 'last_tx': tx_value}
+        else:
+            if rx_value >= last['last_rx']:
+                totals['sum_rx'] += rx_value - last['last_rx']
+            else:
+                totals['sum_rx'] += rx_value
+            if tx_value >= last['last_tx']:
+                totals['sum_tx'] += tx_value - last['last_tx']
+            else:
+                totals['sum_tx'] += tx_value
+            last['last_rx'] = rx_value
+            last['last_tx'] = tx_value
+    for key in list(conns.keys()):
+        if key not in seen:
+            del conns[key]
+    return totals['sum_rx'], totals['sum_tx']
 
 
 def _tcp_probe(host: str, port: int, timeout: float = 0.8) -> bool:
