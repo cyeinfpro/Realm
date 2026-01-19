@@ -67,21 +67,33 @@ body{
 .h2{margin:0;font-size:18px}
 .muted{color:var(--muted)}
 .btn{
-  background:linear-gradient(135deg, rgba(99,102,241,0.95), rgba(124,58,237,0.9));
-  border:1px solid rgba(148,163,184,0.25);
-  color:#fff;
-  padding:10px 16px;
+  appearance:none;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:6px;
+  min-height:40px;
+  padding:9px 16px;
   border-radius:12px;
+  font-size:13px;
+  font-weight:600;
+  letter-spacing:0.2px;
   cursor:pointer;
+  color:#fff;
+  border:1px solid rgba(148,163,184,0.25);
+  background:linear-gradient(135deg, rgba(99,102,241,0.98), rgba(124,58,237,0.95));
   box-shadow:0 12px 24px rgba(15,23,42,0.35);
-  transition:transform .12s ease, box-shadow .2s ease, background .2s ease;
+  transition:transform .12s ease, box-shadow .2s ease, background .2s ease, border-color .2s ease;
 }
 .btn:hover{transform:translateY(-1px);box-shadow:0 18px 30px rgba(15,23,42,0.45)}
 .btn:active{transform:translateY(0)}
-.btn.primary{background:linear-gradient(135deg, rgba(56,189,248,0.95), rgba(99,102,241,0.9))}
+.btn.primary{
+  background:linear-gradient(135deg, rgba(56,189,248,0.98), rgba(99,102,241,0.95));
+  border-color:rgba(56,189,248,0.45);
+}
 .btn.ghost{
   background:rgba(148,163,184,0.12);
-  border:1px solid var(--line);
+  border:1px solid rgba(148,163,184,0.35);
   color:var(--text);
   box-shadow:none;
 }
@@ -89,13 +101,18 @@ body{
   display:inline-flex;
   align-items:center;
   justify-content:center;
-  padding:9px 14px;
+  gap:6px;
+  min-height:40px;
+  padding:9px 16px;
   border-radius:12px;
+  font-size:13px;
+  font-weight:600;
+  letter-spacing:0.2px;
   border:1px solid rgba(148,163,184,0.35);
   background:rgba(15,23,42,0.55);
   color:var(--text);
   text-decoration:none;
-  transition:transform .12s ease, box-shadow .2s ease, background .2s ease;
+  transition:transform .12s ease, box-shadow .2s ease, background .2s ease, border-color .2s ease;
 }
 .btn-secondary:hover{transform:translateY(-1px);background:rgba(148,163,184,0.16);box-shadow:0 12px 24px rgba(15,23,42,0.35)}
 .btn.secondary{
