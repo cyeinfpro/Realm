@@ -42,8 +42,7 @@
 
 <div class="tabs">
   <button class="tab active" data-tab="rules">规则列表</button>
-  <button class="tab" data-tab="graph">连接图</button>
-  <button class="tab" data-tab="lb">负载均衡</button>
+  <button class="tab" data-tab="traffic">流量统计</button>
 </div>
 
 <section id="tab-rules" class="tabpane show">
@@ -76,24 +75,32 @@
   </div>
 </section>
 
-<section id="tab-graph" class="tabpane">
+<section id="tab-traffic" class="tabpane">
   <div class="card">
-    <h2 class="h2">连接拓扑</h2>
-    <p class="muted">展示 listen 与 remote 的关系，WSS 通道将以标记呈现</p>
-    <div id="graphBox" style="width:100%;height:560px;border-radius:16px;overflow:hidden;background:rgba(255,255,255,0.04);"></div>
-    <div class="muted" style="margin-top:10px;">提示：图形渲染依赖浏览器加载 Cytoscape CDN，如你网络受限，可忽略此视图。</div>
-  </div>
-</section>
-
-<section id="tab-lb" class="tabpane">
-  <div class="card">
-    <h2 class="h2">负载均衡视图</h2>
-    <p class="muted">展示多目标规则的调度策略与权重</p>
-    <div class="row" style="gap:12px;align-items:center;">
-      <select id="lbSelect" class="select"></select>
-      <button class="btn ghost" onclick="renderLB(parseInt(document.getElementById('lbSelect').value || 0, 10))">刷新</button>
+    <div class="row">
+      <div class="col">
+        <h2 class="h2">规则流量统计</h2>
+        <p class="muted">展示每条规则的连接数与累计流量</p>
+      </div>
+      <div class="col right">
+        <button class="btn ghost" onclick="refreshStats()">刷新统计</button>
+      </div>
     </div>
-    <div id="lbBox" style="margin-top:14px;"></div>
+    <div id="trafficLoading" class="muted">正在加载流量统计…</div>
+    <table id="trafficTable" class="table" style="display:none;">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>状态</th>
+          <th>Listen</th>
+          <th>连接数</th>
+          <th>下行</th>
+          <th>上行</th>
+          <th>总计</th>
+        </tr>
+      </thead>
+      <tbody id="trafficBody"></tbody>
+    </table>
   </div>
 </section>
 
