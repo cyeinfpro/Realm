@@ -445,6 +445,11 @@ async function restoreRules(file){
   }
 }
 
+function triggerRestore(){
+  const input = q('restoreFile');
+  if(input) input.click();
+}
+
 function renderTraffic(){
   const body = q('trafficBody');
   const table = q('trafficTable');
@@ -558,6 +563,16 @@ function initNodePage(){
     restoreBtn.addEventListener('click', triggerRestore);
   }
   q('f_type').addEventListener('change', showWssBox);
+  const restoreInput = q('restoreFile');
+  if(restoreInput){
+    restoreInput.addEventListener('change', async (ev)=>{
+      const file = ev.target.files && ev.target.files[0];
+      if(file){
+        await restoreRules(file);
+        ev.target.value = '';
+      }
+    });
+  }
   loadPool();
 }
 
@@ -568,8 +583,10 @@ window.saveRule = saveRule;
 window.closeModal = closeModal;
 window.toggleRule = toggleRule;
 window.deleteRule = deleteRule;
-window.applyNow = applyNow;
+window.triggerRestore = triggerRestore;
 window.refreshStats = refreshStats;
+window.openCommandModal = openCommandModal;
+window.closeCommandModal = closeCommandModal;
 window.applyPairingCode = applyPairingCode;
 window.closePairingModal = closePairingModal;
 window.randomizeWss = randomizeWss;
