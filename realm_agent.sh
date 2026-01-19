@@ -5,7 +5,7 @@ VERSION="v31"
 REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
 DEFAULT_MODE="1"
 DEFAULT_PORT="18700"
-DEFAULT_HOST="::"
+DEFAULT_HOST="0.0.0.0"
 
 info(){ printf "[提示] %s\n" "$*"; }
 ok(){ printf "[OK] %s\n" "$*"; }
