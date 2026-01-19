@@ -9,6 +9,8 @@ from typing import Any, Dict, List
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 
+from .config import CFG
+
 API_KEY_FILE = Path('/etc/realm-agent/api.key')
 POOL_FULL = Path('/etc/realm/pool_full.json')
 POOL_ACTIVE = Path('/etc/realm/pool.json')
@@ -52,16 +54,40 @@ def _api_key_required(req: Request) -> None:
 
 def _service_is_active(name: str) -> bool:
     r = subprocess.run(['systemctl', 'is-active', name], capture_output=True, text=True)
-    return r.returncode == 0 and r.stdout.strip() == 'active'
+    if r.returncode == 0 and r.stdout.strip() == 'active':
+        return True
+    r = subprocess.run(['service', name, 'status'], capture_output=True, text=True)
+    if r.returncode == 0:
+        return True
+    r = subprocess.run(['rc-service', name, 'status'], capture_output=True, text=True)
+    return r.returncode == 0
 
 
 def _restart_realm() -> None:
-    for svc in ['realm.service', 'realm']:
+    candidates = []
+    if CFG.realm_service:
+        candidates.append(CFG.realm_service)
+    candidates.extend(['realm.service', 'realm'])
+    seen = set()
+    services = [s for s in candidates if s and not (s in seen or seen.add(s))]
+    errors = []
+    for svc in services:
         r = subprocess.run(['systemctl', 'restart', svc], capture_output=True, text=True)
         if r.returncode == 0:
             return
-    # 如果 systemd 没有服务名，至少不让 API 崩溃
-    raise RuntimeError('无法重启 realm 服务（realm.service/realm 都失败）')
+        errors.append(f"systemctl {svc}: {r.stderr.strip() or r.stdout.strip()}")
+    for svc in services:
+        r = subprocess.run(['service', svc, 'restart'], capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+        errors.append(f"service {svc}: {r.stderr.strip() or r.stdout.strip()}")
+    for svc in services:
+        r = subprocess.run(['rc-service', svc, 'restart'], capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+        errors.append(f"rc-service {svc}: {r.stderr.strip() or r.stdout.strip()}")
+    detail = "; ".join([e for e in errors if e]) or "unknown error"
+    raise RuntimeError(f'无法重启 realm 服务（尝试 {", ".join(services)} 失败）：{detail}')
 
 
 def _apply_pool_to_config() -> None:
@@ -140,6 +166,7 @@ def _split_hostport(addr: str) -> tuple[str, int]:
 
 
 app = FastAPI(title='Realm Agent', version='31')
+REALM_SERVICE_NAMES = [s for s in [CFG.realm_service, 'realm.service', 'realm'] if s]
 
 
 @app.get('/api/v1/info')
@@ -148,7 +175,7 @@ def api_info(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
         'ok': True,
         'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'hostname': socket.gethostname(),
-        'realm_active': _service_is_active('realm.service') or _service_is_active('realm'),
+        'realm_active': any(_service_is_active(name) for name in REALM_SERVICE_NAMES),
     }
 
 

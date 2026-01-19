@@ -21,6 +21,25 @@ apt_install(){
   apt-get install -y curl unzip zip jq python3 python3-venv python3-pip ca-certificates >/dev/null
 }
 
+prepare_realm_assets(){
+  local dest="/opt/realm-panel/panel/static/realm"
+  mkdir -p "${dest}"
+  info "拉取 realm 安装文件到面板..."
+  local archs=("x86_64" "aarch64")
+  local flavors=("unknown-linux-gnu.tar.gz" "unknown-linux-musl.tar.gz")
+  for arch in "${archs[@]}"; do
+    for flavor in "${flavors[@]}"; do
+      local filename="realm-${arch}-${flavor}"
+      local url="https://github.com/zhboner/realm/releases/latest/download/${filename}"
+      if curl -fsSL "${url}" -o "${dest}/${filename}"; then
+        ok "已下载 ${filename}"
+      else
+        err "下载失败：${filename}"
+      fi
+    done
+  done
+}
+
 prompt(){
   local msg="$1"; local def="${2:-}"; local out
   if [[ -n "$def" ]]; then
@@ -160,6 +179,7 @@ install_panel(){
   mkdir -p /opt/realm-panel
   cp -a "$PANEL_DIR" /opt/realm-panel/panel
   prepare_agent_bundle "$EXTRACT_ROOT"
+  prepare_realm_assets
 
   info "创建虚拟环境..."
   python3 -m venv /opt/realm-panel/venv
@@ -214,6 +234,7 @@ update_panel(){
   mkdir -p /opt/realm-panel
   cp -a "$PANEL_DIR" /opt/realm-panel/panel
   prepare_agent_bundle "$EXTRACT_ROOT"
+  prepare_realm_assets
   info "更新依赖..."
   /opt/realm-panel/venv/bin/pip install -r /opt/realm-panel/panel/requirements.txt >/dev/null
   systemctl daemon-reload

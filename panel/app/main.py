@@ -358,7 +358,7 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
         )
         if not data.get("ok", True):
             return JSONResponse({"ok": False, "error": data.get("error", "agent pool apply failed")}, status_code=502)
-        await agent_post(
+        apply_data = await agent_post(
             node["base_url"],
             node["api_key"],
             "/api/v1/apply",
@@ -370,7 +370,13 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
                 {"ok": False, "error": apply_data.get("error", "agent apply failed")},
                 status_code=502,
             )
-        return data
+        pool_data = await agent_get(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/pool",
+            _node_verify_tls(node),
+        )
+        return pool_data
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
