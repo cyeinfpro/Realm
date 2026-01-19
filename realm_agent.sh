@@ -84,6 +84,24 @@ restart_service(){
   systemctl enable --now "${svc}" >/dev/null 2>&1 || systemctl restart "${svc}" >/dev/null 2>&1
 }
 
+get_ipv4(){
+  local ip
+  ip=$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1 || true)
+  if [[ -z "${ip}" ]]; then
+    ip=$(hostname -I 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i ~ /^[0-9.]+$/) {print $i; exit}}' || true)
+  fi
+  echo "${ip}"
+}
+
+get_ipv6(){
+  local ip
+  ip=$(ip -o -6 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1 || true)
+  if [[ -z "${ip}" ]]; then
+    ip=$(hostname -I 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i ~ /:/) {print $i; exit}}' || true)
+  fi
+  echo "${ip}"
+}
+
 main(){
   need_root
 
@@ -108,7 +126,11 @@ main(){
 
   local tmpdir
   tmpdir=$(mktemp -d)
-  cleanup(){ rm -rf "${tmpdir}"; }
+  cleanup(){
+    if [[ -n "${tmpdir:-}" ]]; then
+      rm -rf "${tmpdir}"
+    fi
+  }
   trap cleanup EXIT
 
   fetch_repo "${mode}" "${tmpdir}"
@@ -150,7 +172,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/realm-agent/agent
-ExecStart=/opt/realm-agent/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port ${port} --workers 1
+ExecStart=/opt/realm-agent/venv/bin/uvicorn app.main:app --host :: --port ${port} --workers 1
 Restart=always
 RestartSec=2
 
@@ -161,7 +183,15 @@ EOF
   restart_service realm-agent.service
 
   ok "Agent 已安装并启动"
-  echo "- Agent URL:   http://$(hostname -I 2>/dev/null | awk '{print $1}'):${port}"
+  local ipv4 ipv6
+  ipv4=$(get_ipv4)
+  ipv6=$(get_ipv6)
+  if [[ -n "${ipv4}" ]]; then
+    echo "- Agent URL:   http://${ipv4}:${port}"
+  fi
+  if [[ -n "${ipv6}" ]]; then
+    echo "- Agent URL:   http://[${ipv6}]:${port}"
+  fi
   echo "- API Key:     ${api_key}"
   echo "- Service:     systemctl status realm-agent --no-pager"
 }
