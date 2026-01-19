@@ -422,7 +422,7 @@ async function restoreRules(file){
   const formData = new FormData();
   formData.append('file', file);
   try{
-    toast('正在还原…');
+    toast('正在恢复…');
     const res = await fetch(`/api/nodes/${id}/restore`, {
       method: 'POST',
       body: formData,
@@ -436,12 +436,12 @@ async function restoreRules(file){
     }
     const data = text ? JSON.parse(text) : {};
     if(!data.ok){
-      throw new Error(data.error || '还原失败');
+      throw new Error(data.error || '恢复失败');
     }
     await loadPool();
-    toast('还原成功');
+    toast('规则恢复完成');
   }catch(e){
-    alert('还原失败：' + e.message);
+    alert('恢复失败：' + e.message);
   }
 }
 
