@@ -43,7 +43,8 @@ async function pingNode(id){
     const data = await res.json();
     const el = document.getElementById(`node-${id}-state`);
     if(data.ok){
-      el.textContent = `在线 · ${data.hostname||''}`.trim();
+      const latency = (data.latency_ms != null) ? `在线 · ${data.latency_ms} ms` : '在线';
+      el.textContent = latency;
       el.className = 'pill ok';
     }else{
       el.textContent = '离线';
