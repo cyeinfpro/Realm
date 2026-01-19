@@ -292,10 +292,12 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
     )
     uninstall_cmd = (
         "sudo -E bash -c \""
-        "systemctl disable --now realm-agent.service >/dev/null 2>&1 || true; "
-        "rm -f /etc/systemd/system/realm-agent.service; "
+        "systemctl disable --now realm-agent.service realm-agent-https.service realm.service realm "
+        ">/dev/null 2>&1 || true; "
+        "rm -f /etc/systemd/system/realm-agent.service /etc/systemd/system/realm-agent-https.service "
+        "/etc/systemd/system/realm.service; "
         "systemctl daemon-reload; "
-        "rm -rf /opt/realm-agent /etc/realm-agent"
+        "rm -rf /opt/realm-agent /etc/realm-agent /etc/realm /opt/realm /usr/local/bin/realm /usr/bin/realm"
         "\""
     )
     return templates.TemplateResponse(
@@ -353,13 +355,20 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
             payload,
             _node_verify_tls(node),
         )
-        await agent_post(
+        if not data.get("ok", True):
+            return JSONResponse({"ok": False, "error": data.get("error", "agent pool apply failed")}, status_code=502)
+        apply_data = await agent_post(
             node["base_url"],
             node["api_key"],
             "/api/v1/apply",
             {},
             _node_verify_tls(node),
         )
+        if not apply_data.get("ok", True):
+            return JSONResponse(
+                {"ok": False, "error": apply_data.get("error", "agent apply failed")},
+                status_code=502,
+            )
         return data
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
@@ -378,6 +387,8 @@ async def api_apply(request: Request, node_id: int, user: str = Depends(require_
             {},
             _node_verify_tls(node),
         )
+        if not data.get("ok", True):
+            return JSONResponse({"ok": False, "error": data.get("error", "agent apply failed")}, status_code=502)
         return data
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
