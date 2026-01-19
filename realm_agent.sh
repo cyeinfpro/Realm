@@ -24,6 +24,87 @@ apt_install(){
   apt-get install -y curl ca-certificates unzip jq python3 python3-venv python3-pip
 }
 
+command_exists(){
+  command -v "$1" >/dev/null 2>&1
+}
+
+install_realm(){
+  if command_exists realm; then
+    ok "检测到 realm 已安装：$(command -v realm)"
+    return
+  fi
+
+  info "未检测到 realm，开始安装..."
+  local arch
+  arch=$(uname -m)
+  case "${arch}" in
+    x86_64|amd64) arch="x86_64" ;;
+    aarch64|arm64) arch="aarch64" ;;
+    *) err "不支持的架构：${arch}，请手动安装 realm"; exit 1 ;;
+  esac
+
+  local urls=(
+    "https://github.com/zhboner/realm/releases/latest/download/realm-${arch}-unknown-linux-gnu.tar.gz"
+    "https://github.com/zhboner/realm/releases/latest/download/realm-${arch}-unknown-linux-musl.tar.gz"
+    "https://github.com/zhboner/realm/releases/latest/download/realm-${arch}-unknown-linux-gnu"
+    "https://github.com/zhboner/realm/releases/latest/download/realm-${arch}-unknown-linux-musl"
+  )
+
+  local tmpdir bin_path downloaded="0"
+  tmpdir=$(mktemp -d)
+  for url in "${urls[@]}"; do
+    if curl -fsSL "${url}" -o "${tmpdir}/realm.pkg"; then
+      downloaded="1"
+      if tar -tzf "${tmpdir}/realm.pkg" >/dev/null 2>&1; then
+        tar -xzf "${tmpdir}/realm.pkg" -C "${tmpdir}"
+        bin_path=$(find "${tmpdir}" -maxdepth 2 -type f -name realm -print -quit)
+      else
+        bin_path="${tmpdir}/realm.pkg"
+      fi
+      if [[ -n "${bin_path}" ]]; then
+        install -m 0755 "${bin_path}" /usr/local/bin/realm
+        ok "realm 已安装至 /usr/local/bin/realm"
+        rm -rf "${tmpdir}"
+        return
+      fi
+    fi
+  done
+  rm -rf "${tmpdir}"
+  if [[ "${downloaded}" != "1" ]]; then
+    err "realm 下载失败，请检查网络或手动安装"
+  else
+    err "realm 安装失败，请手动安装"
+  fi
+  exit 1
+}
+
+install_realm_service(){
+  if [[ -f /etc/systemd/system/realm.service ]]; then
+    ok "检测到 realm.service 已存在"
+    return
+  fi
+  if ! command_exists systemctl; then
+    info "未检测到 systemd，跳过 realm.service 生成"
+    return
+  fi
+  info "创建 realm.service..."
+  cat > /etc/systemd/system/realm.service <<'EOF'
+[Unit]
+Description=Realm Proxy Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/realm -c /etc/realm/config.json
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
 ask(){
   local prompt="$1" default="$2" var
   if [[ "${REALM_AGENT_ASSUME_YES:-}" == "1" ]]; then
@@ -145,6 +226,8 @@ main(){
 
   info "安装依赖..."
   apt_install
+  install_realm
+  install_realm_service
 
   local tmpdir
   tmpdir=$(mktemp -d)
