@@ -326,9 +326,8 @@ async def api_ping(request: Request, node_id: int, user: str = Depends(require_l
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
     info = await agent_ping(node["base_url"], node["api_key"], _node_verify_tls(node))
-    if info.get("error"):
-        return {"ok": False, "error": info["error"]}
-    info["ok"] = True
+    if not info.get("ok"):
+        return {"ok": False, "error": info.get("error", "offline")}
     return info
 
 

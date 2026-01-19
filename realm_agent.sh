@@ -28,6 +28,20 @@ command_exists(){
   command -v "$1" >/dev/null 2>&1
 }
 
+install_tcping(){
+  if command_exists tcping; then
+    ok "检测到 tcping 已安装：$(command -v tcping)"
+    return
+  fi
+  info "未检测到 tcping，开始安装..."
+  bash <(curl -Ls https://pub-f97d920473f14f6cb25df639ef970ecf.r2.dev/Tcping.sh)
+  if command_exists tcping; then
+    ok "tcping 安装完成"
+  else
+    err "tcping 安装失败，请检查网络或脚本"
+  fi
+}
+
 normalize_panel_url(){
   local url="$1"
   if [[ -z "${url}" ]]; then
@@ -252,6 +266,7 @@ main(){
 
   info "安装依赖..."
   apt_install
+  install_tcping
   install_realm
   install_realm_service
 
