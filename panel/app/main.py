@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import json
 import os
 import secrets
 from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
@@ -338,6 +339,68 @@ async def api_pool_get(request: Request, node_id: int, user: str = Depends(requi
     try:
         data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool", _node_verify_tls(node))
         return data
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+
+
+@app.get("/api/nodes/{node_id}/backup")
+async def api_backup(request: Request, node_id: int, user: str = Depends(require_login)):
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+    try:
+        data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool", _node_verify_tls(node))
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    filename = f"realm-rules-node-{node_id}.json"
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(content=payload, media_type="application/json", headers=headers)
+
+
+@app.post("/api/nodes/{node_id}/restore")
+async def api_restore(
+    request: Request,
+    node_id: int,
+    file: UploadFile = File(...),
+    user: str = Depends(require_login),
+):
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+    try:
+        raw = await file.read()
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"invalid backup file: {exc}"}, status_code=400)
+    pool = payload.get("pool") if isinstance(payload, dict) else None
+    if pool is None:
+        pool = payload
+    if not isinstance(pool, dict):
+        return JSONResponse({"ok": False, "error": "backup missing pool data"}, status_code=400)
+    try:
+        data = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/pool",
+            {"pool": pool},
+            _node_verify_tls(node),
+        )
+        if not data.get("ok", True):
+            return JSONResponse({"ok": False, "error": data.get("error", "agent pool apply failed")}, status_code=502)
+        apply_data = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/apply",
+            {},
+            _node_verify_tls(node),
+        )
+        if not apply_data.get("ok", True):
+            return JSONResponse(
+                {"ok": False, "error": apply_data.get("error", "agent apply failed")},
+                status_code=502,
+            )
+        return {"ok": True}
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 

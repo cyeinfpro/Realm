@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import socket
 import subprocess
@@ -152,6 +153,33 @@ def _conn_count(port: int) -> int:
         return 0
 
 
+def _traffic_bytes(port: int) -> tuple[int, int]:
+    if port <= 0:
+        return 0, 0
+    cmd = ['bash', '-lc', f"ss -Htin state established sport = :{port} 2>/dev/null"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return 0, 0
+    rx_total = 0
+    tx_total = 0
+    for line in r.stdout.splitlines():
+        rx_matches = re.findall(r"bytes_received:(\\d+)", line)
+        tx_matches = re.findall(r"bytes_acked:(\\d+)", line)
+        if not tx_matches:
+            tx_matches = re.findall(r"bytes_sent:(\\d+)", line)
+        for value in rx_matches:
+            try:
+                rx_total += int(value)
+            except ValueError:
+                continue
+        for value in tx_matches:
+            try:
+                tx_total += int(value)
+            except ValueError:
+                continue
+    return rx_total, tx_total
+
+
 def _tcp_probe(host: str, port: int, timeout: float = 0.8) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -259,11 +287,14 @@ def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
             except Exception:
                 ok = False
             health.append({'target': r, 'ok': ok})
+        rx_bytes, tx_bytes = _traffic_bytes(port)
         rules.append({
             'idx': idx,
             'listen': listen,
             'disabled': bool(e.get('disabled')),
             'connections': _conn_count(port),
+            'rx_bytes': rx_bytes,
+            'tx_bytes': tx_bytes,
             'health': health,
         })
     return {'ok': True, 'rules': rules}

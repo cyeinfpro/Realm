@@ -18,6 +18,7 @@ function q(id){ return document.getElementById(id); }
 let CURRENT_POOL = null;
 let CURRENT_EDIT_INDEX = null;
 let CURRENT_STATS = null;
+let PENDING_COMMAND_TEXT = '';
 
 function showTab(name){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -56,6 +57,19 @@ function statusPill(e){
 
 function escapeHtml(text){
   return String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function formatBytes(value){
+  const num = Number(value) || 0;
+  if(num <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let idx = 0;
+  let val = num;
+  while(val >= 1024 && idx < units.length - 1){
+    val /= 1024;
+    idx += 1;
+  }
+  return `${val.toFixed(val >= 10 || idx === 0 ? 0 : 1)} ${units[idx]}`;
 }
 
 function buildStatsLookup(){
@@ -116,11 +130,26 @@ function renderRules(){
     tbody.appendChild(tr);
   });
   table.style.display = '';
-  updateLBSelect();
 }
 
 function openModal(){ q('modal').style.display = 'block'; }
 function closeModal(){ q('modal').style.display = 'none'; q('modalMsg').textContent=''; }
+
+function openCommandModal(title, text){
+  const modal = q('commandModal');
+  if(!modal) return;
+  q('commandTitle').textContent = title || '命令';
+  const commandText = q('commandText');
+  PENDING_COMMAND_TEXT = String(text || '');
+  commandText.textContent = PENDING_COMMAND_TEXT;
+  modal.style.display = 'flex';
+}
+
+function closeCommandModal(){
+  const modal = q('commandModal');
+  if(!modal) return;
+  modal.style.display = 'none';
+}
 
 function setField(id, v){ q(id).value = v==null?'':String(v); }
 
@@ -387,96 +416,107 @@ function toast(text){
   setTimeout(()=>{t.style.display='none';}, 1800);
 }
 
-async function applyNow(){
+async function restoreRules(file){
+  if(!file) return;
   const id = window.__NODE_ID__;
-  const btns = document.querySelectorAll('button');
+  const formData = new FormData();
+  formData.append('file', file);
   try{
-    toast('正在应用…');
-    await fetchJSON(`/api/nodes/${id}/apply`, {method:'POST'});
-    toast('已应用并重启');
+    toast('正在还原…');
+    const res = await fetch(`/api/nodes/${id}/restore`, {
+      method: 'POST',
+      body: formData,
+      credentials: 'same-origin',
+    });
+    const text = await res.text();
+    if(!res.ok){
+      let detail = text;
+      try{ detail = JSON.parse(text).error || text; }catch(e){}
+      throw new Error(detail || `HTTP ${res.status}`);
+    }
+    const data = text ? JSON.parse(text) : {};
+    if(!data.ok){
+      throw new Error(data.error || '还原失败');
+    }
+    await loadPool();
+    toast('还原成功');
   }catch(e){
-    alert('应用失败：'+e.message);
+    alert('还原失败：' + e.message);
   }
 }
 
-function updateLBSelect(){
-  const sel = q('lbSelect');
-  if(!sel) return;
-  sel.innerHTML = '';
+function triggerRestore(){
+  const input = q('restoreFile');
+  if(input) input.click();
+}
+
+function renderTraffic(){
+  const body = q('trafficBody');
+  const table = q('trafficTable');
+  const loading = q('trafficLoading');
+  if(!body || !table || !loading) return;
+  body.innerHTML = '';
   const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
-  eps.forEach((e, idx)=>{
-    const opt = document.createElement('option');
-    opt.value = String(idx);
-    opt.textContent = `#${idx+1} ${e.listen}`;
-    sel.appendChild(opt);
-  });
-  if(eps.length){
-    sel.value = '0';
-    renderLB(0);
-  }
-}
-
-function renderLB(idx){
-  const box = q('lbBox');
-  if(!CURRENT_POOL || !CURRENT_POOL.endpoints || !CURRENT_POOL.endpoints[idx]){
-    box.innerHTML = '<div class="muted">暂无规则</div>';
+  const statsLookup = buildStatsLookup();
+  if(statsLookup.error){
+    loading.style.display = '';
+    loading.textContent = `统计获取失败：${statsLookup.error}`;
+    table.style.display = 'none';
     return;
   }
-  const e = CURRENT_POOL.endpoints[idx];
-  const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
-  const algo = (e.balance||'roundrobin').split(':')[0];
-  let html = `<div class="kv"><div class="k">Listen</div><div class="v mono">${e.listen}</div></div>`;
-  html += `<div class="kv"><div class="k">策略</div><div class="v">${algo}</div></div>`;
-  html += `<div class="kv"><div class="k">目标数量</div><div class="v">${rs.length}</div></div>`;
-  html += `<div style="margin-top:12px;">`;
-  rs.forEach((r)=>{
-    html += `<div class="lb-item"><div class="mono">${r}</div><div class="bar"></div></div>`;
-  });
-  html += `</div>`;
-  box.innerHTML = html;
-}
-
-async function loadGraph(){
-  const id = window.__NODE_ID__;
-  const box = q('graphBox');
-  box.innerHTML = '<div class="muted">正在生成连接图…</div>';
-  try{
-    const data = await fetchJSON(`/api/nodes/${id}/graph`);
-    box.innerHTML = '<div id="cy" style="height:520px;"></div>';
-    if(typeof cytoscape !== 'function'){
-      const script = document.createElement('script');
-      script.src = 'https://cdn.jsdelivr.net/npm/cytoscape@3.28.1/dist/cytoscape.min.js';
-      script.onload = ()=>renderGraph(data.elements);
-      script.onerror = ()=>{ box.innerHTML = '<div class="muted">加载 Cytoscape 失败（CDN 不可用）</div>'; };
-      document.body.appendChild(script);
-    }else{
-      renderGraph(data.elements);
-    }
-  }catch(e){
-    box.innerHTML = `<div class="muted">生成失败：${e.message}</div>`;
+  if(!eps.length){
+    loading.style.display = '';
+    loading.textContent = '暂无规则';
+    table.style.display = 'none';
+    return;
   }
+  loading.style.display = 'none';
+  table.style.display = '';
+  eps.forEach((e, idx)=>{
+    const stats = statsLookup.byIdx[idx] || statsLookup.byListen[e.listen] || {};
+    const rx = stats.rx_bytes || 0;
+    const tx = stats.tx_bytes || 0;
+    const total = rx + tx;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${idx + 1}</td>
+      <td>${statusPill(e)}</td>
+      <td><div class="mono">${escapeHtml(e.listen)}</div></td>
+      <td>${stats.connections ?? 0}</td>
+      <td>${formatBytes(rx)}</td>
+      <td>${formatBytes(tx)}</td>
+      <td>${formatBytes(total)}</td>
+    `;
+    body.appendChild(tr);
+  });
 }
 
-function renderGraph(elements){
-  const cy = cytoscape({
-    container: document.getElementById('cy'),
-    elements: elements || [],
-    style: [
-      { selector: 'node', style: { 'label': 'data(label)', 'color': '#e5e7eb', 'text-wrap':'wrap', 'text-max-width': 120, 'font-size': 10, 'background-color': '#60a5fa' } },
-      { selector: 'edge', style: { 'label':'data(label)', 'width':2, 'curve-style':'bezier', 'line-color':'#94a3b8', 'target-arrow-shape':'triangle', 'target-arrow-color':'#94a3b8', 'font-size': 10, 'color':'#94a3b8' } },
-      { selector: '.listen', style: { 'background-color':'#22c55e' } },
-      { selector: '.remote', style: { 'background-color':'#f59e0b' } },
-      { selector: '.disabled', style: { 'opacity': 0.35 } }
-    ],
-    layout: { name: 'breadthfirst', directed: true, padding: 20 }
-  });
-  cy.fit();
+async function refreshStats(){
+  const id = window.__NODE_ID__;
+  const loading = q('trafficLoading');
+  if(loading){
+    loading.style.display = '';
+    loading.textContent = '正在加载流量统计…';
+  }
+  try{
+    const statsData = await fetchJSON(`/api/nodes/${id}/stats`);
+    CURRENT_STATS = statsData;
+  }catch(e){
+    CURRENT_STATS = { ok: false, error: e.message, rules: [] };
+  }
+  renderRules();
+  renderTraffic();
 }
 
 async function loadPool(){
   const id = window.__NODE_ID__;
   q('rulesLoading').style.display = '';
   q('rulesLoading').textContent = '正在加载规则…';
+  const trafficLoading = q('trafficLoading');
+  if(trafficLoading){
+    trafficLoading.style.display = '';
+    trafficLoading.textContent = '正在加载流量统计…';
+  }
   try{
     const data = await fetchJSON(`/api/nodes/${id}/pool`);
     let statsData = null;
@@ -489,8 +529,12 @@ async function loadPool(){
     if(!CURRENT_POOL.endpoints) CURRENT_POOL.endpoints = [];
     CURRENT_STATS = statsData;
     renderRules();
+    renderTraffic();
   }catch(e){
     q('rulesLoading').textContent = '加载失败：' + e.message;
+    if(trafficLoading){
+      trafficLoading.textContent = '加载失败：' + e.message;
+    }
   }
 }
 
@@ -499,13 +543,36 @@ function initNodePage(){
     t.addEventListener('click', ()=>{
       const name = t.getAttribute('data-tab');
       showTab(name);
-      if(name==='graph') loadGraph();
+      if(name === 'traffic') renderTraffic();
     });
   });
+  const installBtn = q('installCmdBtn');
+  if(installBtn){
+    installBtn.addEventListener('click', ()=>{
+      openCommandModal('一键接入命令', window.__INSTALL_CMD__);
+    });
+  }
+  const uninstallBtn = q('uninstallCmdBtn');
+  if(uninstallBtn){
+    uninstallBtn.addEventListener('click', ()=>{
+      openCommandModal('一键卸载 Agent', window.__UNINSTALL_CMD__);
+    });
+  }
+  const restoreBtn = q('restoreRulesBtn');
+  if(restoreBtn){
+    restoreBtn.addEventListener('click', triggerRestore);
+  }
   q('f_type').addEventListener('change', showWssBox);
-  q('lbSelect').addEventListener('change', (ev)=>{
-    renderLB(parseInt(ev.target.value,10));
-  });
+  const restoreInput = q('restoreFile');
+  if(restoreInput){
+    restoreInput.addEventListener('change', async (ev)=>{
+      const file = ev.target.files && ev.target.files[0];
+      if(file){
+        await restoreRules(file);
+        ev.target.value = '';
+      }
+    });
+  }
   loadPool();
 }
 
@@ -516,8 +583,10 @@ window.saveRule = saveRule;
 window.closeModal = closeModal;
 window.toggleRule = toggleRule;
 window.deleteRule = deleteRule;
-window.applyNow = applyNow;
-window.renderLB = renderLB;
+window.triggerRestore = triggerRestore;
+window.refreshStats = refreshStats;
+window.openCommandModal = openCommandModal;
+window.closeCommandModal = closeCommandModal;
 window.applyPairingCode = applyPairingCode;
 window.closePairingModal = closePairingModal;
 window.randomizeWss = randomizeWss;
