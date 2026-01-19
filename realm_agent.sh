@@ -5,6 +5,7 @@ VERSION="v31"
 REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
 DEFAULT_MODE="1"
 DEFAULT_PORT="18700"
+DEFAULT_HOST="::"
 
 info(){ printf "[提示] %s\n" "$*"; }
 ok(){ printf "[OK] %s\n" "$*"; }
@@ -84,6 +85,14 @@ restart_service(){
   systemctl enable --now "${svc}" >/dev/null 2>&1 || systemctl restart "${svc}" >/dev/null 2>&1
 }
 
+get_bindv6only(){
+  if [[ -f /proc/sys/net/ipv6/bindv6only ]]; then
+    cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo "0"
+  else
+    echo "0"
+  fi
+}
+
 get_ipv4(){
   local ip
   ip=$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1 || true)
@@ -119,6 +128,19 @@ main(){
   port="${REALM_AGENT_PORT:-}"
   if [[ -z "${port}" ]]; then
     port=$(ask "Agent 端口 (默认 18700): " "${DEFAULT_PORT}")
+  fi
+  local host
+  host="${REALM_AGENT_HOST:-}"
+  if [[ -z "${host}" ]]; then
+    host="${DEFAULT_HOST}"
+  fi
+  if [[ "${host}" == "::" ]]; then
+    local bindv6only
+    bindv6only=$(get_bindv6only)
+    if [[ "${bindv6only}" == "1" ]]; then
+      info "检测到 bindv6only=1，IPv6 仅监听将导致 IPv4 无法连接，已切换为 0.0.0.0"
+      host="0.0.0.0"
+    fi
   fi
 
   info "安装依赖..."
@@ -172,7 +194,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/realm-agent/agent
-ExecStart=/opt/realm-agent/venv/bin/uvicorn app.main:app --host :: --port ${port} --workers 1
+ExecStart=/opt/realm-agent/venv/bin/uvicorn app.main:app --host ${host} --port ${port} --workers 1
 Restart=always
 RestartSec=2
 
@@ -189,7 +211,7 @@ EOF
   if [[ -n "${ipv4}" ]]; then
     echo "- Agent URL:   http://${ipv4}:${port}"
   fi
-  if [[ -n "${ipv6}" ]]; then
+  if [[ "${host}" == "::" && -n "${ipv6}" ]]; then
     echo "- Agent URL:   http://[${ipv6}]:${port}"
   fi
   echo "- API Key:     ${api_key}"
