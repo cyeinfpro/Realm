@@ -216,7 +216,6 @@ function decodePairingCode(code){
 
 function buildPairingPayload(){
   return {
-    mode: q('f_type').value,
     host: q('f_wss_host').value.trim(),
     path: q('f_wss_path').value.trim(),
     sni: q('f_wss_sni').value.trim(),
@@ -227,9 +226,6 @@ function buildPairingPayload(){
 
 function applyPairingPayload(payload){
   if(!payload) return;
-  if(payload.mode === 'wss_send' || payload.mode === 'wss_recv'){
-    q('f_type').value = payload.mode;
-  }
   setField('f_wss_host', payload.host || '');
   setField('f_wss_path', payload.path || '');
   setField('f_wss_sni', payload.sni || '');
@@ -264,12 +260,38 @@ function closePairingModal(){
   q('pairingModal').style.display = 'none';
 }
 
+function randomToken(len){
+  return Math.random().toString(36).slice(2, 2 + len);
+}
+
 function randomizeWss(){
-  const hosts = ['cdn.example.com', 'edge.example.com', 'gw.example.net'];
+  const hosts = [
+    'cdn.jsdelivr.net',
+    'assets.cloudflare.com',
+    'edge.microsoft.com',
+    'static.cloudflareinsights.com',
+    'ajax.googleapis.com',
+    'fonts.gstatic.com',
+    'images.unsplash.com',
+    'cdn.discordapp.com',
+  ];
+  const pathTemplates = [
+    '/ws',
+    '/ws/{token}',
+    '/socket',
+    '/socket/{token}',
+    '/connect',
+    '/gateway',
+    '/api/ws',
+    '/v1/ws/{token}',
+    '/edge/{token}',
+  ];
   const pick = hosts[Math.floor(Math.random() * hosts.length)];
-  const token = Math.random().toString(36).slice(2, 8);
+  const token = randomToken(10);
+  const tpl = pathTemplates[Math.floor(Math.random() * pathTemplates.length)];
+  const path = tpl.replace('{token}', token);
   setField('f_wss_host', pick);
-  setField('f_wss_path', `/ws/${token}`);
+  setField('f_wss_path', path);
   setField('f_wss_sni', pick);
   q('f_wss_tls').value = '1';
   q('f_wss_insecure').value = '0';

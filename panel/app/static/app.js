@@ -123,9 +123,9 @@ async function fillWssFromCode(inputEl) {
   }
 }
 
-function renderNodeStatus(cell, ok, detail) {
+function renderNodeStatus(cell, ok, detail, latencyMs) {
   if (!cell) return;
-  const statusLabel = ok ? '在线' : '离线';
+  const statusLabel = ok ? `在线${latencyMs != null ? ` · ${latencyMs} ms` : ''}` : '离线';
   const dotClass = ok ? 'dot ok' : 'dot danger';
   cell.innerHTML = `<span class="badge"><span class="${dotClass}"></span>${statusLabel}</span>`;
   if (detail) cell.title = detail;
@@ -138,8 +138,8 @@ async function refreshNodeStatus(nodeId) {
   try {
     const data = await api(`/api/nodes/${nodeId}/ping`);
     if (data && data.ok) {
-      renderNodeStatus(cell, true, '');
-      if (last) last.textContent = data.time || '刚刚';
+      renderNodeStatus(cell, true, '', data.latency_ms);
+      if (last) last.textContent = data.latency_ms != null ? `${data.latency_ms} ms` : '刚刚';
     } else {
       renderNodeStatus(cell, false, data && data.error ? data.error : '离线');
       if (last) last.textContent = '-';
