@@ -48,7 +48,7 @@
         </div>
       </div>
     </div>
-    <input id="restoreFile" type="file" accept="application/json" style="display:none;">
+    <input id="restoreFile" type="file" accept="application/json" style="display:none;" onchange="handleRestoreChange(this)">
     <div id="rulesLoading" class="muted">正在加载规则…</div>
     <table id="rulesTable" class="table" style="display:none;">
       <thead>
