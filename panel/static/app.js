@@ -440,23 +440,57 @@ async function restoreRules(file){
     }
     await loadPool();
     toast('规则恢复完成');
+    return true;
   }catch(e){
     alert('恢复失败：' + e.message);
+    return false;
   }
 }
 
 function triggerRestore(){
-  const input = q('restoreFile');
-  if(input) input.click();
+  openRestoreModal();
 }
 
-async function handleRestoreChange(input){
-  if(!input) return;
-  const file = input.files && input.files[0];
-  if(file){
-    await restoreRules(file);
+function openRestoreModal(){
+  const modal = q('restoreModal');
+  if(modal){
+    modal.style.display = '';
   }
-  input.value = '';
+  const textarea = q('restoreText');
+  if(textarea){
+    textarea.focus();
+  }
+}
+
+function closeRestoreModal(){
+  const modal = q('restoreModal');
+  if(modal){
+    modal.style.display = 'none';
+  }
+}
+
+async function restoreFromText(){
+  const textarea = q('restoreText');
+  if(!textarea) return;
+  const raw = textarea.value.trim();
+  if(!raw){
+    alert('请先粘贴备份内容');
+    return;
+  }
+  let payload;
+  try{
+    payload = JSON.parse(raw);
+  }catch(e){
+    alert('内容不是有效的 JSON：' + e.message);
+    return;
+  }
+  const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+  const file = new File([blob], 'realm-rules.json', { type: 'application/json' });
+  const ok = await restoreRules(file);
+  if(ok){
+    textarea.value = '';
+    closeRestoreModal();
+  }
 }
 
 function renderTraffic(){
@@ -583,7 +617,9 @@ window.closeModal = closeModal;
 window.toggleRule = toggleRule;
 window.deleteRule = deleteRule;
 window.triggerRestore = triggerRestore;
-window.handleRestoreChange = handleRestoreChange;
+window.openRestoreModal = openRestoreModal;
+window.closeRestoreModal = closeRestoreModal;
+window.restoreFromText = restoreFromText;
 window.refreshStats = refreshStats;
 window.openCommandModal = openCommandModal;
 window.closeCommandModal = closeCommandModal;
