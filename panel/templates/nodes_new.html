@@ -2,14 +2,18 @@
 {% block content %}
 <div class="card" style="max-width:720px;margin:20px auto;">
   <h1 class="h1">接入节点</h1>
-  <p class="muted">填写节点名称与 IP，端口默认 18700，系统自动生成密钥</p>
+  <p class="muted">填写节点名称与 IP，可自定义端口（默认 {{ default_port }}），系统自动生成密钥</p>
   <form method="post" action="/nodes/new" class="form">
     <label class="label">节点名称</label>
     <input class="input" name="name" placeholder="例如：北京-主机01">
 
     <label class="label">节点 IP 地址</label>
     <input class="input" name="ip_address" placeholder="10.0.0.2" required>
-    <div class="help">默认端口 {{ default_port }}，可在 Agent 侧修改</div>
+    <div class="help">请输入主机或 IP。若填写了端口，需与下方端口保持一致。</div>
+
+    <label class="label">端口</label>
+    <input class="input" name="port" type="number" min="1" max="65535" value="{{ default_port }}" required>
+    <div class="help">默认 {{ default_port }}，需与 Agent 实际监听端口一致。</div>
     <input type="hidden" name="api_key" value="{{ api_key }}">
 
     <div class="row" style="margin-top:14px;">

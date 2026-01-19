@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import secrets
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -18,6 +19,8 @@ from .agents import agent_get, agent_post, agent_ping
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
+
+DEFAULT_AGENT_PORT = 18700
 
 app = FastAPI(title="Realm Pro Panel", version="33")
 
@@ -48,6 +51,42 @@ def _has_credentials() -> bool:
 
 def _generate_api_key() -> str:
     return secrets.token_hex(16)
+
+
+def _split_host_and_port(value: str, fallback_port: int) -> tuple[str, int, bool]:
+    raw = value.strip()
+    if not raw:
+        return "", fallback_port, False
+    if "://" in raw:
+        parsed = urlparse(raw)
+        host = parsed.hostname or ""
+        port = parsed.port or fallback_port
+        return host, port, parsed.port is not None
+    if raw.startswith("[") and "]" in raw:
+        host_part, rest = raw.split("]", 1)
+        host = host_part[1:].strip()
+        rest = rest.strip()
+        if rest.startswith(":") and rest[1:].isdigit():
+            return host, int(rest[1:]), True
+        return host, fallback_port, False
+    if raw.count(":") == 1 and raw.rsplit(":", 1)[1].isdigit():
+        host, port_s = raw.rsplit(":", 1)
+        return host.strip(), int(port_s), True
+    return raw, fallback_port, False
+
+
+def _format_host_for_url(host: str) -> str:
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
+def _extract_port_from_url(base_url: str, fallback_port: int) -> int:
+    target = base_url.strip()
+    if "://" not in target:
+        target = f"http://{target}"
+    parsed = urlparse(target)
+    return parsed.port or fallback_port
 
 
 def _node_verify_tls(node: Dict[str, Any]) -> bool:
@@ -152,7 +191,7 @@ async def node_new_page(request: Request, user: str = Depends(require_login_page
             "flash": _flash(request),
             "title": "添加机器",
             "api_key": api_key,
-            "default_port": 18700,
+            "default_port": DEFAULT_AGENT_PORT,
         },
     )
 
@@ -162,6 +201,7 @@ async def node_new_action(
     request: Request,
     name: str = Form(""),
     ip_address: str = Form(...),
+    port: str = Form(""),
     api_key: str = Form(""),
     verify_tls: Optional[str] = Form(None),
 ):
@@ -170,11 +210,29 @@ async def node_new_action(
         return RedirectResponse(url="/login", status_code=303)
 
     ip_address = ip_address.strip()
+    port = port.strip()
     api_key = api_key.strip() or _generate_api_key()
     if not ip_address:
         _set_flash(request, "IP 地址不能为空")
         return RedirectResponse(url="/nodes/new", status_code=303)
-    base_url = f"http://{ip_address}:18700"
+    port_value = DEFAULT_AGENT_PORT
+    if port:
+        if not port.isdigit():
+            _set_flash(request, "端口必须是数字")
+            return RedirectResponse(url="/nodes/new", status_code=303)
+        port_value = int(port)
+    if not (1 <= port_value <= 65535):
+        _set_flash(request, "端口范围应为 1-65535")
+        return RedirectResponse(url="/nodes/new", status_code=303)
+    host, parsed_port, has_port = _split_host_and_port(ip_address, port_value)
+    if not host:
+        _set_flash(request, "IP 地址不能为空")
+        return RedirectResponse(url="/nodes/new", status_code=303)
+    if has_port and port and parsed_port != port_value:
+        _set_flash(request, "IP 地址已包含端口，请与端口输入保持一致")
+        return RedirectResponse(url="/nodes/new", status_code=303)
+    port_value = parsed_port if has_port and not port else port_value
+    base_url = f"http://{_format_host_for_url(host)}:{port_value}"
 
     node_id = add_node(name or base_url, base_url, api_key, verify_tls=bool(verify_tls))
     request.session["show_install_cmd"] = True
@@ -222,13 +280,14 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
     show_install_cmd = bool(request.session.pop("show_install_cmd", False))
     base_url = str(request.base_url).rstrip("/")
     repo_zip_url = f"{base_url}/static/realm-agent.zip"
+    agent_port = _extract_port_from_url(node["base_url"], DEFAULT_AGENT_PORT)
     install_cmd = (
         "sudo -E bash -c \""
         "mkdir -p /etc/realm-agent && "
         f"echo '{node['api_key']}' > /etc/realm-agent/api.key && "
         f"curl -fsSL {base_url}/static/realm_agent.sh | "
         f"REALM_AGENT_REPO_ZIP_URL={repo_zip_url} "
-        "REALM_AGENT_MODE=1 REALM_AGENT_PORT=18700 REALM_AGENT_ASSUME_YES=1 bash"
+        f"REALM_AGENT_MODE=1 REALM_AGENT_PORT={agent_port} REALM_AGENT_ASSUME_YES=1 bash"
         "\""
     )
     uninstall_cmd = (
@@ -247,6 +306,7 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
             "node": node,
             "flash": _flash(request),
             "title": node["name"],
+            "node_port": agent_port,
             "install_cmd": install_cmd,
             "uninstall_cmd": uninstall_cmd,
             "show_install_cmd": show_install_cmd,
