@@ -18,7 +18,7 @@ POOL_FULL = Path('/etc/realm/pool_full.json')
 POOL_ACTIVE = Path('/etc/realm/pool.json')
 POOL_RUN_FILTER = Path('/etc/realm/pool_to_run.jq')
 FALLBACK_RUN_FILTER = Path(__file__).resolve().parents[1] / 'pool_to_run.jq'
-REALM_CONFIG = Path('/etc/realm/config.json')
+REALM_CONFIG = Path(CFG.realm_config_file)
 TRAFFIC_TOTALS: Dict[int, Dict[str, Any]] = {}
 
 
@@ -99,6 +99,8 @@ def _restart_realm() -> None:
 
 
 def _apply_pool_to_config() -> None:
+    if not shutil.which('jq'):
+        raise RuntimeError('缺少 jq 命令，无法生成 realm 配置')
     if not POOL_RUN_FILTER.exists():
         if FALLBACK_RUN_FILTER.exists():
             _write_text(POOL_RUN_FILTER, FALLBACK_RUN_FILTER.read_text(encoding='utf-8').strip() + '\n')
@@ -143,6 +145,8 @@ def _parse_listen_port(listen: str) -> int:
 def _conn_count(port: int) -> int:
     if port <= 0:
         return 0
+    if not shutil.which('ss'):
+        return 0
     # 只统计 TCP established（足够用了）
     cmd = ['bash', '-lc', f"ss -Htan state established sport = :{port} 2>/dev/null | wc -l"]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -156,6 +160,8 @@ def _conn_count(port: int) -> int:
 
 def _traffic_bytes(port: int) -> tuple[int, int]:
     if port <= 0:
+        return 0, 0
+    if not shutil.which('ss'):
         return 0, 0
     cmd = ['bash', '-lc', f"ss -Htin state established sport = :{port} 2>/dev/null"]
     r = subprocess.run(cmd, capture_output=True, text=True)

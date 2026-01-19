@@ -1,4 +1,5 @@
 import re
+import shutil
 import socket
 from typing import Any, Dict, List, Optional
 
@@ -7,6 +8,8 @@ from .utils import sh
 
 def count_established_tcp(port: int) -> int:
     # local port established
+    if not shutil.which("ss"):
+        return 0
     code, out, _ = sh(f"ss -Hnt state established '( sport = :{port} )' 2>/dev/null | wc -l", timeout=5)
     try:
         return int(out.strip() or "0")

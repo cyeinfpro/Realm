@@ -54,26 +54,27 @@ def _generate_api_key() -> str:
     return secrets.token_hex(16)
 
 
-def _split_host_and_port(value: str, fallback_port: int) -> tuple[str, int, bool]:
+def _split_host_and_port(value: str, fallback_port: int) -> tuple[str, int, bool, str]:
     raw = value.strip()
     if not raw:
-        return "", fallback_port, False
+        return "", fallback_port, False, "http"
     if "://" in raw:
         parsed = urlparse(raw)
         host = parsed.hostname or ""
         port = parsed.port or fallback_port
-        return host, port, parsed.port is not None
+        scheme = parsed.scheme or "http"
+        return host, port, parsed.port is not None, scheme
     if raw.startswith("[") and "]" in raw:
         host_part, rest = raw.split("]", 1)
         host = host_part[1:].strip()
         rest = rest.strip()
         if rest.startswith(":") and rest[1:].isdigit():
-            return host, int(rest[1:]), True
-        return host, fallback_port, False
+            return host, int(rest[1:]), True, "http"
+        return host, fallback_port, False, "http"
     if raw.count(":") == 1 and raw.rsplit(":", 1)[1].isdigit():
         host, port_s = raw.rsplit(":", 1)
-        return host.strip(), int(port_s), True
-    return raw, fallback_port, False
+        return host.strip(), int(port_s), True, "http"
+    return raw, fallback_port, False, "http"
 
 
 def _format_host_for_url(host: str) -> str:
@@ -203,6 +204,7 @@ async def node_new_action(
     name: str = Form(""),
     ip_address: str = Form(...),
     port: str = Form(""),
+    scheme: str = Form("http"),
     api_key: str = Form(""),
     verify_tls: Optional[str] = Form(None),
 ):
@@ -213,9 +215,15 @@ async def node_new_action(
     ip_address = ip_address.strip()
     port = port.strip()
     api_key = api_key.strip() or _generate_api_key()
+    scheme = scheme.strip().lower() or "http"
+    if scheme not in ("http", "https"):
+        _set_flash(request, "协议仅支持 http 或 https")
+        return RedirectResponse(url="/nodes/new", status_code=303)
     if not ip_address:
         _set_flash(request, "IP 地址不能为空")
         return RedirectResponse(url="/nodes/new", status_code=303)
+    if "://" not in ip_address:
+        ip_address = f"{scheme}://{ip_address}"
     port_value = DEFAULT_AGENT_PORT
     if port:
         if not port.isdigit():
@@ -225,7 +233,7 @@ async def node_new_action(
     if not (1 <= port_value <= 65535):
         _set_flash(request, "端口范围应为 1-65535")
         return RedirectResponse(url="/nodes/new", status_code=303)
-    host, parsed_port, has_port = _split_host_and_port(ip_address, port_value)
+    host, parsed_port, has_port, scheme = _split_host_and_port(ip_address, port_value)
     if not host:
         _set_flash(request, "IP 地址不能为空")
         return RedirectResponse(url="/nodes/new", status_code=303)
@@ -233,7 +241,7 @@ async def node_new_action(
         _set_flash(request, "IP 地址已包含端口，请与端口输入保持一致")
         return RedirectResponse(url="/nodes/new", status_code=303)
     port_value = parsed_port if has_port and not port else port_value
-    base_url = f"http://{_format_host_for_url(host)}:{port_value}"
+    base_url = f"{scheme}://{_format_host_for_url(host)}:{port_value}"
 
     node_id = add_node(name or base_url, base_url, api_key, verify_tls=bool(verify_tls))
     request.session["show_install_cmd"] = True

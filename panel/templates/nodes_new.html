@@ -11,6 +11,13 @@
     <input class="input" name="ip_address" placeholder="10.0.0.2" required>
     <div class="help">请输入主机或 IP。若填写了端口，需与下方端口保持一致。</div>
 
+    <label class="label">协议</label>
+    <select class="select" name="scheme">
+      <option value="http">http</option>
+      <option value="https">https</option>
+    </select>
+    <div class="help">用于生成 API 地址，HTTPS 场景请选 https。</div>
+
     <label class="label">端口</label>
     <input class="input" name="port" type="number" min="1" max="65535" value="{{ default_port }}" required>
     <div class="help">默认 {{ default_port }}，需与 Agent 实际监听端口一致。</div>

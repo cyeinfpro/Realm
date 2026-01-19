@@ -10,7 +10,7 @@ class AgentConfig:
     data_dir: str = os.getenv("REALM_AGENT_DATA_DIR", "/etc/realm-agent")
     rules_file: str = os.getenv("REALM_AGENT_RULES_FILE", "/etc/realm-agent/rules.json")
     agent_env_file: str = os.getenv("REALM_AGENT_ENV_FILE", "/etc/realm-agent/agent.env")
-    realm_config_file: str = os.getenv("REALM_CONFIG_FILE", "/etc/realm/realm.toml")
+    realm_config_file: str = os.getenv("REALM_CONFIG_FILE", "/etc/realm/config.json")
 
     # Realm service
     realm_service: str = os.getenv("REALM_SERVICE", "realm.service")
