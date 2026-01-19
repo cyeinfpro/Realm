@@ -19,6 +19,7 @@ POOL_ACTIVE = Path('/etc/realm/pool.json')
 POOL_RUN_FILTER = Path('/etc/realm/pool_to_run.jq')
 FALLBACK_RUN_FILTER = Path(__file__).resolve().parents[1] / 'pool_to_run.jq'
 REALM_CONFIG = Path('/etc/realm/config.json')
+TRAFFIC_TOTALS: Dict[int, Dict[str, int]] = {}
 
 
 def _read_text(p: Path) -> str:
@@ -177,7 +178,20 @@ def _traffic_bytes(port: int) -> tuple[int, int]:
                 tx_total += int(value)
             except ValueError:
                 continue
-    return rx_total, tx_total
+    totals = TRAFFIC_TOTALS.setdefault(port, {'last_rx': 0, 'last_tx': 0, 'sum_rx': 0, 'sum_tx': 0})
+    last_rx = totals['last_rx']
+    last_tx = totals['last_tx']
+    if rx_total >= last_rx:
+        totals['sum_rx'] += rx_total - last_rx
+    else:
+        totals['sum_rx'] += rx_total
+    if tx_total >= last_tx:
+        totals['sum_tx'] += tx_total - last_tx
+    else:
+        totals['sum_tx'] += tx_total
+    totals['last_rx'] = rx_total
+    totals['last_tx'] = tx_total
+    return totals['sum_rx'], totals['sum_tx']
 
 
 def _tcp_probe(host: str, port: int, timeout: float = 0.8) -> bool:
