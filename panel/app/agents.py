@@ -58,4 +58,4 @@ def _format_agent_error(response: httpx.Response) -> str:
         error = response.text.strip()
     if not error:
         error = f"HTTP {response.status_code}"
-    return f"Agent请求失败({response.status_code}) {response.url}: {error}"
+    return f"Agent请求失败({response.status_code}): {error}"
