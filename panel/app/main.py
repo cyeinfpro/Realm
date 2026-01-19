@@ -231,6 +231,14 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
         "REALM_AGENT_MODE=1 REALM_AGENT_PORT=18700 REALM_AGENT_ASSUME_YES=1 bash"
         "\""
     )
+    uninstall_cmd = (
+        "sudo -E bash -c \""
+        "systemctl disable --now realm-agent.service >/dev/null 2>&1 || true; "
+        "rm -f /etc/systemd/system/realm-agent.service; "
+        "systemctl daemon-reload; "
+        "rm -rf /opt/realm-agent /etc/realm-agent"
+        "\""
+    )
     return templates.TemplateResponse(
         "node.html",
         {
@@ -240,6 +248,7 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
             "flash": _flash(request),
             "title": node["name"],
             "install_cmd": install_cmd,
+            "uninstall_cmd": uninstall_cmd,
             "show_install_cmd": show_install_cmd,
         },
     )
