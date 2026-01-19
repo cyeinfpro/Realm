@@ -121,7 +121,12 @@ def _tcp_probe(host: str, port: int, timeout: float = 0.8) -> bool:
 
 
 def _split_hostport(addr: str) -> tuple[str, int]:
-    # addr like 1.2.3.4:443
+    # addr like 1.2.3.4:443 or [::1]:443
+    if addr.startswith('['):
+        host, rest = addr.split(']', 1)
+        host = host[1:]
+        port = int(rest.lstrip(':'))
+        return host.strip(), port
     host, p = addr.rsplit(':', 1)
     return host.strip(), int(p)
 
@@ -195,11 +200,13 @@ def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
             port = 0
         remotes: List[str] = []
         if isinstance(e.get('remote'), str) and e.get('remote'):
-            remotes = [e['remote']]
-        elif isinstance(e.get('remotes'), list):
-            remotes = [str(x) for x in e.get('remotes') if x]
-        else:
-            remotes = []
+            remotes.append(e['remote'])
+        if isinstance(e.get('remotes'), list):
+            remotes += [str(x) for x in e.get('remotes') if x]
+        if isinstance(e.get('extra_remotes'), list):
+            remotes += [str(x) for x in e.get('extra_remotes') if x]
+        seen = set()
+        remotes = [r for r in remotes if not (r in seen or seen.add(r))]
         health = []
         for r in remotes[:8]:  # 限制探测数量
             try:
