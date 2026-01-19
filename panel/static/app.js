@@ -26,12 +26,21 @@ function showTab(name){
   q(`tab-${name}`).classList.add('show');
 }
 
-function endpointType(e){
+function wssMode(e){
   const ex = e.extra_config || {};
-  const hasLisWs = (e.listen_transport || '').includes('ws') || (ex.listen_transport === 'ws');
-  const hasRemWs = (e.remote_transport || '').includes('ws') || (ex.remote_transport === 'ws');
-  if(hasLisWs) return 'WSS接收';
-  if(hasRemWs) return 'WSS发送';
+  const listenTransport = e.listen_transport || ex.listen_transport || '';
+  const remoteTransport = e.remote_transport || ex.remote_transport || '';
+  const hasLisWs = String(listenTransport).includes('ws') || ex.listen_ws_host || ex.listen_ws_path || ex.listen_tls_servername;
+  const hasRemWs = String(remoteTransport).includes('ws') || ex.remote_ws_host || ex.remote_ws_path || ex.remote_tls_sni;
+  if(hasLisWs) return 'wss_recv';
+  if(hasRemWs) return 'wss_send';
+  return 'tcp';
+}
+
+function endpointType(e){
+  const mode = wssMode(e);
+  if(mode === 'wss_recv') return 'WSS接收';
+  if(mode === 'wss_send') return 'WSS发送';
   return 'TCP/UDP';
 }
 
@@ -145,12 +154,10 @@ function readWssFields(){
 
 function fillWssFields(e){
   const ex = e.extra_config || {};
-  const mode = endpointType(e);
-  if(mode === 'WSS发送') q('f_type').value = 'wss_send';
-  else if(mode === 'WSS接收') q('f_type').value = 'wss_recv';
-  else q('f_type').value = 'tcp';
+  const mode = wssMode(e);
+  q('f_type').value = mode;
 
-  const isSend = mode === 'WSS发送';
+  const isSend = mode === 'wss_send';
   const host = isSend ? ex.remote_ws_host : ex.listen_ws_host;
   const path = isSend ? ex.remote_ws_path : ex.listen_ws_path;
   const sni = isSend ? ex.remote_tls_sni : ex.listen_tls_servername;
