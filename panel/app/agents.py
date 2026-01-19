@@ -86,14 +86,14 @@ def _extract_host_port(base_url: str, fallback_port: int) -> Tuple[str, int]:
 async def _tcp_ping(host: str, port: int) -> float:
     tcping = shutil.which("tcping")
     if tcping:
-        output = await _run_tcping(tcping, host, port)
+        output, _code = await _run_tcping(tcping, host, port)
         latency = _parse_tcping_latency(output)
         if latency is not None:
             return round(latency, 2)
     return await _tcp_ping_socket(host, port, TCPING_TIMEOUT)
 
 
-async def _run_tcping(tcping: str, host: str, port: int) -> str:
+async def _run_tcping(tcping: str, host: str, port: int) -> Tuple[str, int]:
     proc = await asyncio.create_subprocess_exec(
         tcping,
         "-c",
@@ -109,11 +109,9 @@ async def _run_tcping(tcping: str, host: str, port: int) -> str:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=TCPING_TIMEOUT + 1)
     except asyncio.TimeoutError:
         proc.kill()
-        raise RuntimeError("tcping timeout") from None
+        return "tcping timeout", 1
     output = (stdout or b"") + (stderr or b"")
-    if proc.returncode != 0:
-        raise RuntimeError(output.decode(errors="ignore").strip() or "tcping failed")
-    return output.decode(errors="ignore")
+    return output.decode(errors="ignore"), proc.returncode or 0
 
 
 def _parse_tcping_latency(output: str) -> Optional[float]:
