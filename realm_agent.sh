@@ -108,7 +108,11 @@ main(){
 
   local tmpdir
   tmpdir=$(mktemp -d)
-  cleanup(){ rm -rf "${tmpdir}"; }
+  cleanup(){
+    if [[ -n "${tmpdir:-}" ]]; then
+      rm -rf "${tmpdir}"
+    fi
+  }
   trap cleanup EXIT
 
   fetch_repo "${mode}" "${tmpdir}"
