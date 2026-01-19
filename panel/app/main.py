@@ -353,20 +353,13 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
             payload,
             _node_verify_tls(node),
         )
-        try:
-            await agent_post(
-                node["base_url"],
-                node["api_key"],
-                "/api/v1/apply",
-                {},
-                _node_verify_tls(node),
-            )
-        except Exception as exc:
-            if isinstance(data, dict):
-                data.setdefault("ok", True)
-                data["apply_error"] = str(exc)
-                data["apply_ok"] = False
-            return data
+        await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/apply",
+            {},
+            _node_verify_tls(node),
+        )
         return data
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
