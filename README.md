@@ -15,6 +15,12 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/cyeinfpro/Realm/main/realm_agent.sh)
 ```
 
+如果希望 Agent 在安装 realm 时优先从面板机拉取文件（面板会在更新时刷新这些文件），请设置面板地址：
+
+```bash
+REALM_PANEL_URL="http://<面板IP>:6080" bash <(curl -fsSL https://raw.githubusercontent.com/cyeinfpro/Realm/main/realm_agent.sh)
+```
+
 安装完成后会输出：
 
 - Agent API 地址（默认端口 `18700`）

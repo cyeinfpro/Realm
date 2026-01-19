@@ -28,6 +28,18 @@ command_exists(){
   command -v "$1" >/dev/null 2>&1
 }
 
+normalize_panel_url(){
+  local url="$1"
+  if [[ -z "${url}" ]]; then
+    echo ""
+    return
+  fi
+  if [[ "${url}" != http://* && "${url}" != https://* ]]; then
+    url="http://${url}"
+  fi
+  echo "${url%/}"
+}
+
 install_realm(){
   if command_exists realm; then
     ok "检测到 realm 已安装：$(command -v realm)"
@@ -43,7 +55,16 @@ install_realm(){
     *) err "不支持的架构：${arch}，请手动安装 realm"; exit 1 ;;
   esac
 
-  local urls=(
+  local urls=()
+  local panel_base
+  panel_base="$(normalize_panel_url "${REALM_PANEL_URL:-}")"
+  if [[ -n "${panel_base}" ]]; then
+    urls+=(
+      "${panel_base}/static/realm/realm-${arch}-unknown-linux-gnu.tar.gz"
+      "${panel_base}/static/realm/realm-${arch}-unknown-linux-musl.tar.gz"
+    )
+  fi
+  urls+=(
     "https://github.com/zhboner/realm/releases/latest/download/realm-${arch}-unknown-linux-gnu.tar.gz"
     "https://github.com/zhboner/realm/releases/latest/download/realm-${arch}-unknown-linux-musl.tar.gz"
     "https://github.com/zhboner/realm/releases/latest/download/realm-${arch}-unknown-linux-gnu"
