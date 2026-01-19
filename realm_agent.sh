@@ -161,6 +161,10 @@ main(){
   agent_dir=$(find_agent_dir "${tmpdir}")
   ok "agent 目录：${agent_dir}"
 
+  if [[ -d /opt/realm-agent/agent ]]; then
+    info "检测到已安装的 Agent，将覆盖更新文件"
+  fi
+
   info "部署到 /opt/realm-agent ..."
   mkdir -p /opt/realm-agent
   rm -rf /opt/realm-agent/agent
