@@ -163,10 +163,10 @@ def _traffic_bytes(port: int) -> tuple[int, int]:
     rx_total = 0
     tx_total = 0
     for line in r.stdout.splitlines():
-        rx_matches = re.findall(r"bytes_received:(\\d+)", line)
-        tx_matches = re.findall(r"bytes_acked:(\\d+)", line)
+        rx_matches = re.findall(r"bytes_received:(\d+)", line)
+        tx_matches = re.findall(r"bytes_acked:(\d+)", line)
         if not tx_matches:
-            tx_matches = re.findall(r"bytes_sent:(\\d+)", line)
+            tx_matches = re.findall(r"bytes_sent:(\d+)", line)
         for value in rx_matches:
             try:
                 rx_total += int(value)
