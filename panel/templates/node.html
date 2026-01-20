@@ -32,14 +32,15 @@
   <div class="card">
     <div class="row">
       <div class="col">
-        <h2 class="h2">规则</h2>
-        <p class="muted">编辑 listen / remote / wss 参数，支持启用/暂停</p>
+        <h2 class="h2">规则与流量统计</h2>
+        <p class="muted">编辑 listen / remote / wss 参数，支持启用/暂停，并展示连接数与累计流量</p>
       </div>
       <div class="col right">
-        <div class="row" style="gap:10px;justify-content:flex-end;">
+        <div class="row" style="gap:10px;justify-content:flex-end;flex-wrap:wrap;">
           <a class="btn ghost" href="/api/nodes/{{ node.id }}/backup">备份规则</a>
           <button class="btn ghost" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则</button>
           <button class="btn" onclick="newRule()">新增规则</button>
+          <button class="btn ghost" onclick="refreshStats()">刷新统计</button>
         </div>
       </div>
     </div>
@@ -59,16 +60,7 @@
       </thead>
       <tbody id="rulesBody"></tbody>
     </table>
-
-    <div class="row" style="margin-top:24px; border-top:1px solid var(--line); padding-top:20px;">
-      <div class="col">
-        <h2 class="h2">规则流量统计</h2>
-        <p class="muted">展示每条规则的连接数与累计流量</p>
-      </div>
-      <div class="col right">
-        <button class="btn ghost" onclick="refreshStats()">刷新统计</button>
-      </div>
-    </div>
+    <div class="muted" style="margin-top:20px;">规则流量统计（连接数与累计流量）</div>
     <div id="trafficLoading" class="muted">正在加载流量统计…</div>
     <table id="trafficTable" class="table" style="display:none;">
       <thead>
