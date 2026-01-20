@@ -28,12 +28,7 @@
   </div>
 </div>
 
-<div class="tabs">
-  <button class="tab active" data-tab="rules">规则列表</button>
-  <button class="tab" data-tab="traffic">流量统计</button>
-</div>
-
-<section id="tab-rules" class="tabpane show">
+<section>
   <div class="card">
     <div class="row">
       <div class="col">
@@ -49,6 +44,7 @@
       </div>
     </div>
     <div id="rulesLoading" class="muted">正在加载规则…</div>
+    <div id="statsError" class="muted" style="display:none;"></div>
     <table id="rulesTable" class="table" style="display:none;">
       <thead>
         <tr>
@@ -59,40 +55,18 @@
           <th>连通检测</th>
           <th>类型</th>
           <th>策略</th>
+          <th>连接数</th>
+          <th>下行</th>
+          <th>上行</th>
+          <th>总计</th>
           <th class="right">操作</th>
         </tr>
       </thead>
       <tbody id="rulesBody"></tbody>
     </table>
-  </div>
-</section>
-
-<section id="tab-traffic" class="tabpane">
-  <div class="card">
-    <div class="row">
-      <div class="col">
-        <h2 class="h2">规则流量统计</h2>
-        <p class="muted">展示每条规则的连接数与累计流量</p>
-      </div>
-      <div class="col right">
-        <button class="btn ghost" onclick="refreshStats()">刷新统计</button>
-      </div>
+    <div class="row" style="margin-top:16px; justify-content:flex-end;">
+      <button class="btn ghost" onclick="refreshStats()">刷新统计</button>
     </div>
-    <div id="trafficLoading" class="muted">正在加载流量统计…</div>
-    <table id="trafficTable" class="table" style="display:none;">
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>状态</th>
-          <th>Listen</th>
-          <th>连接数</th>
-          <th>下行</th>
-          <th>上行</th>
-          <th>总计</th>
-        </tr>
-      </thead>
-      <tbody id="trafficBody"></tbody>
-    </table>
   </div>
 </section>
 

@@ -20,13 +20,6 @@ let CURRENT_EDIT_INDEX = null;
 let CURRENT_STATS = null;
 let PENDING_COMMAND_TEXT = '';
 
-function showTab(name){
-  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  document.querySelectorAll('.tabpane').forEach(p=>p.classList.remove('show'));
-  document.querySelector(`.tab[data-tab="${name}"]`).classList.add('active');
-  q(`tab-${name}`).classList.add('show');
-}
-
 function wssMode(e){
   const ex = e.extra_config || {};
   const listenTransport = e.listen_transport || ex.listen_transport || '';
@@ -103,14 +96,27 @@ function renderHealth(healthList, statsError){
 
 function renderRules(){
   q('rulesLoading').style.display = 'none';
+  const statsError = q('statsError');
   const table = q('rulesTable');
   const tbody = q('rulesBody');
   tbody.innerHTML = '';
   const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
   const statsLookup = buildStatsLookup();
+  if(statsError){
+    if(statsLookup.error){
+      statsError.style.display = '';
+      statsError.textContent = `流量统计获取失败：${statsLookup.error}`;
+    }else{
+      statsError.style.display = 'none';
+      statsError.textContent = '';
+    }
+  }
   eps.forEach((e, idx)=>{
     const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
     const stats = statsLookup.byIdx[idx] || statsLookup.byListen[e.listen] || {};
+    const rx = statsLookup.error ? null : (stats.rx_bytes || 0);
+    const tx = statsLookup.error ? null : (stats.tx_bytes || 0);
+    const total = statsLookup.error ? null : (rx + tx);
     const healthHtml = renderHealth(stats.health, statsLookup.error);
     const tr = document.createElement('tr');
     tr.innerHTML = `
@@ -121,6 +127,10 @@ function renderRules(){
       <td>${healthHtml}</td>
       <td>${endpointType(e)}</td>
       <td>${e.balance || 'roundrobin'}</td>
+      <td>${statsLookup.error ? '-' : (stats.connections ?? 0)}</td>
+      <td>${statsLookup.error ? '-' : formatBytes(rx)}</td>
+      <td>${statsLookup.error ? '-' : formatBytes(tx)}</td>
+      <td>${statsLookup.error ? '-' : formatBytes(total)}</td>
       <td>
         <button class="btn sm ghost" onclick="editRule(${idx})">编辑</button>
         <button class="btn sm" onclick="toggleRule(${idx})">${e.disabled?'启用':'暂停'}</button>
@@ -515,54 +525,8 @@ async function restoreFromText(){
   }
 }
 
-function renderTraffic(){
-  const body = q('trafficBody');
-  const table = q('trafficTable');
-  const loading = q('trafficLoading');
-  if(!body || !table || !loading) return;
-  body.innerHTML = '';
-  const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
-  const statsLookup = buildStatsLookup();
-  if(statsLookup.error){
-    loading.style.display = '';
-    loading.textContent = `统计获取失败：${statsLookup.error}`;
-    table.style.display = 'none';
-    return;
-  }
-  if(!eps.length){
-    loading.style.display = '';
-    loading.textContent = '暂无规则';
-    table.style.display = 'none';
-    return;
-  }
-  loading.style.display = 'none';
-  table.style.display = '';
-  eps.forEach((e, idx)=>{
-    const stats = statsLookup.byIdx[idx] || statsLookup.byListen[e.listen] || {};
-    const rx = stats.rx_bytes || 0;
-    const tx = stats.tx_bytes || 0;
-    const total = rx + tx;
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${idx + 1}</td>
-      <td>${statusPill(e)}</td>
-      <td><div class="mono">${escapeHtml(e.listen)}</div></td>
-      <td>${stats.connections ?? 0}</td>
-      <td>${formatBytes(rx)}</td>
-      <td>${formatBytes(tx)}</td>
-      <td>${formatBytes(total)}</td>
-    `;
-    body.appendChild(tr);
-  });
-}
-
 async function refreshStats(){
   const id = window.__NODE_ID__;
-  const loading = q('trafficLoading');
-  if(loading){
-    loading.style.display = '';
-    loading.textContent = '正在加载流量统计…';
-  }
   try{
     const statsData = await fetchJSON(`/api/nodes/${id}/stats`);
     CURRENT_STATS = statsData;
@@ -570,18 +534,12 @@ async function refreshStats(){
     CURRENT_STATS = { ok: false, error: e.message, rules: [] };
   }
   renderRules();
-  renderTraffic();
 }
 
 async function loadPool(){
   const id = window.__NODE_ID__;
   q('rulesLoading').style.display = '';
   q('rulesLoading').textContent = '正在加载规则…';
-  const trafficLoading = q('trafficLoading');
-  if(trafficLoading){
-    trafficLoading.style.display = '';
-    trafficLoading.textContent = '正在加载流量统计…';
-  }
   try{
     const data = await fetchJSON(`/api/nodes/${id}/pool`);
     let statsData = null;
@@ -594,23 +552,12 @@ async function loadPool(){
     if(!CURRENT_POOL.endpoints) CURRENT_POOL.endpoints = [];
     CURRENT_STATS = statsData;
     renderRules();
-    renderTraffic();
   }catch(e){
     q('rulesLoading').textContent = '加载失败：' + e.message;
-    if(trafficLoading){
-      trafficLoading.textContent = '加载失败：' + e.message;
-    }
   }
 }
 
 function initNodePage(){
-  document.querySelectorAll('.tab').forEach(t=>{
-    t.addEventListener('click', ()=>{
-      const name = t.getAttribute('data-tab');
-      showTab(name);
-      if(name === 'traffic') renderTraffic();
-    });
-  });
   const installBtn = q('installCmdBtn');
   if(installBtn){
     installBtn.addEventListener('click', ()=>{
