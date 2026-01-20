@@ -127,7 +127,6 @@ function renderRules(){
     }
   }
   eps.forEach((e, idx)=>{
-    const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
     const stats = statsLookup.byIdx[idx] || statsLookup.byListen[e.listen] || {};
     const healthHtml = renderHealth(stats.health, statsLookup.error);
     const statsError = statsLookup.error;
@@ -138,11 +137,9 @@ function renderRules(){
     tr.innerHTML = `
       <td>${idx+1}</td>
       <td>${statusPill(e)}</td>
-      <td><div class="mono">${escapeHtml(e.listen)}</div></td>
-      <td><div class="mono">${rs.map(escapeHtml).join('<br>')}</div></td>
-      <td>${healthHtml}</td>
+      <td class="listen"><div class="mono">${escapeHtml(e.listen)}</div></td>
+      <td class="health">${healthHtml}</td>
       <td>${endpointType(e)}</td>
-      <td>${e.balance || 'roundrobin'}</td>
       <td class="stat">${statsError ? '—' : (stats.connections ?? 0)}</td>
       <td class="stat">${rx == null ? '—' : formatBytes(rx)}</td>
       <td class="stat">${tx == null ? '—' : formatBytes(tx)}</td>
