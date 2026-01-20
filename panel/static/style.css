@@ -139,6 +139,8 @@ body{
 .rules-table{min-width:1180px}
 .rules-table th,.rules-table td{white-space:nowrap;vertical-align:top}
 .rules-table th.stat,.rules-table td.stat{text-align:right}
+.rules-table th.stat,.rules-table td.stat{min-width:90px}
+.rules-table th.actions,.rules-table td.actions{text-align:right;min-width:190px}
 .rules-table td:nth-child(4),
 .rules-table td:nth-child(5){white-space:normal}
 .rules-actions{display:flex;gap:8px;flex-wrap:nowrap;justify-content:flex-end}

@@ -147,7 +147,7 @@ function renderRules(){
       <td class="stat">${rx == null ? '—' : formatBytes(rx)}</td>
       <td class="stat">${tx == null ? '—' : formatBytes(tx)}</td>
       <td class="stat">${total == null ? '—' : formatBytes(total)}</td>
-      <td class="right">
+      <td class="actions">
         <div class="rules-actions">
           <button class="btn sm ghost" onclick="editRule(${idx})">编辑</button>
           <button class="btn sm" onclick="toggleRule(${idx})">${e.disabled?'启用':'暂停'}</button>
