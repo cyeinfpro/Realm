@@ -277,6 +277,31 @@ def _split_hostport(addr: str) -> tuple[str, int]:
     return host.strip(), int(p)
 
 
+def _build_health_entries(rule: Dict[str, Any], remotes: List[str]) -> List[Dict[str, Any]]:
+    if rule.get('disabled'):
+        return [{'target': '—', 'ok': None, 'message': '规则已暂停'}]
+    if not remotes:
+        return [{'target': '—', 'ok': None, 'message': '未配置目标'}]
+    protocol = str(rule.get('protocol') or 'tcp+udp').lower()
+    tcp_probe_enabled = 'tcp' in protocol
+    if not tcp_probe_enabled:
+        return [{'target': r, 'ok': None, 'message': '协议不支持探测'} for r in remotes]
+
+    health: List[Dict[str, Any]] = []
+    for r in remotes:
+        try:
+            h, p = _split_hostport(r)
+        except Exception:
+            health.append({'target': r, 'ok': None, 'message': '目标格式无效'})
+            continue
+        ok, latency_ms = _tcp_probe(h, p)
+        payload = {'target': r, 'ok': ok}
+        if latency_ms is not None:
+            payload['latency_ms'] = latency_ms
+        health.append(payload)
+    return health
+
+
 app = FastAPI(title='Realm Agent', version='31')
 REALM_SERVICE_NAMES = [s for s in [CFG.realm_service, 'realm.service', 'realm'] if s]
 
@@ -357,23 +382,7 @@ def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
             remotes += [str(x) for x in e.get('extra_remotes') if x]
         seen = set()
         remotes = [r for r in remotes if not (r in seen or seen.add(r))]
-        protocol = str(e.get('protocol') or 'tcp+udp').lower()
-        tcp_probe_enabled = 'tcp' in protocol
-        health = []
-        for r in remotes[:8]:  # 限制探测数量
-            if not tcp_probe_enabled:
-                health.append({'target': r, 'ok': None, 'message': '协议不支持探测'})
-                continue
-            try:
-                h, p = _split_hostport(r)
-                ok, latency_ms = _tcp_probe(h, p)
-            except Exception:
-                ok = False
-                latency_ms = None
-            payload = {'target': r, 'ok': ok}
-            if latency_ms is not None:
-                payload['latency_ms'] = latency_ms
-            health.append(payload)
+        health = _build_health_entries(e, remotes[:8])
         rx_bytes, tx_bytes = _traffic_bytes(port)
         rules.append({
             'idx': idx,
