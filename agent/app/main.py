@@ -5,6 +5,7 @@ import re
 import shutil
 import socket
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -206,12 +207,14 @@ def _traffic_bytes(port: int) -> tuple[int, int]:
     return totals['sum_rx'], totals['sum_tx']
 
 
-def _tcp_probe(host: str, port: int, timeout: float = 0.8) -> bool:
+def _tcp_probe(host: str, port: int, timeout: float = 0.8) -> tuple[bool, float | None]:
+    start = time.monotonic()
     try:
         with socket.create_connection((host, port), timeout=timeout):
-            return True
+            latency_ms = (time.monotonic() - start) * 1000
+            return True, round(latency_ms, 2)
     except Exception:
-        return False
+        return False, None
 
 
 def _split_hostport(addr: str) -> tuple[str, int]:
@@ -309,10 +312,14 @@ def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
         for r in remotes[:8]:  # 限制探测数量
             try:
                 h, p = _split_hostport(r)
-                ok = _tcp_probe(h, p)
+                ok, latency_ms = _tcp_probe(h, p)
             except Exception:
                 ok = False
-            health.append({'target': r, 'ok': ok})
+                latency_ms = None
+            payload = {'target': r, 'ok': ok}
+            if latency_ms is not None:
+                payload['latency_ms'] = latency_ms
+            health.append(payload)
         rx_bytes, tx_bytes = _traffic_bytes(port)
         rules.append({
             'idx': idx,
