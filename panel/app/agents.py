@@ -115,10 +115,15 @@ async def _run_tcping(tcping: str, host: str, port: int) -> Tuple[str, int]:
 
 
 def _parse_tcping_latency(output: str) -> Optional[float]:
-    match = re.search(r"time[=<]?\s*([0-9.]+)\s*ms", output, re.IGNORECASE)
-    if not match:
-        return None
-    return float(match.group(1))
+    patterns = [
+        r"time[=<]?\s*([0-9.]+)\s*ms",
+        r"\bopen\b[^\n\r]*?([0-9.]+)\s*ms",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, output, re.IGNORECASE)
+        if match:
+            return float(match.group(1))
+    return None
 
 
 async def _tcp_ping_socket(host: str, port: int, timeout: float) -> float:
