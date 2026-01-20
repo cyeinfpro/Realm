@@ -218,6 +218,19 @@ def _parse_tcping_latency(output: str) -> float | None:
     return None
 
 
+def _parse_tcping_result(output: str, returncode: int) -> tuple[bool, float | None]:
+    latency = _parse_tcping_latency(output)
+    if latency is not None:
+        return True, latency
+    if returncode == 0:
+        return True, None
+    if re.search(r"\bopen\b", output, re.IGNORECASE):
+        return True, None
+    if re.search(r"\bconnected\b", output, re.IGNORECASE):
+        return True, None
+    return False, None
+
+
 def _tcp_probe(host: str, port: int, timeout: float = 0.8) -> tuple[bool, float | None]:
     tcping = shutil.which("tcping")
     if tcping:
@@ -240,12 +253,10 @@ def _tcp_probe(host: str, port: int, timeout: float = 0.8) -> tuple[bool, float 
         except Exception:
             return False, None
         output = (result.stdout or "") + (result.stderr or "")
-        latency = _parse_tcping_latency(output)
-        if latency is not None:
-            return True, round(latency, 2)
-        if result.returncode == 0 or re.search(r"\bopen\b", output, re.IGNORECASE):
-            return True, None
-        return False, None
+        ok, latency = _parse_tcping_result(output, result.returncode)
+        if ok:
+            return True, round(latency, 2) if latency is not None else None
+        # tcping output is unreliable on some distros, fall back to socket probe
     start = time.monotonic()
     try:
         with socket.create_connection((host, port), timeout=timeout):
