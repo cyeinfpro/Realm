@@ -277,6 +277,25 @@ def _split_hostport(addr: str) -> tuple[str, int]:
     return host.strip(), int(p)
 
 
+def _load_full_pool() -> Dict[str, Any]:
+    full = _read_json(POOL_FULL, None)
+    if full is None:
+        active = _read_json(POOL_ACTIVE, {'endpoints': []})
+        eps = active.get('endpoints') or []
+        for e in eps:
+            if isinstance(e, dict):
+                e.setdefault('disabled', False)
+        full = {'endpoints': eps}
+        _write_json(POOL_FULL, full)
+        return full
+    eps = full.get('endpoints') or []
+    for e in eps:
+        if isinstance(e, dict):
+            e.setdefault('disabled', False)
+    full['endpoints'] = eps
+    return full
+
+
 def _build_health_entries(rule: Dict[str, Any], remotes: List[str]) -> List[Dict[str, Any]]:
     if rule.get('disabled'):
         return [{'target': '—', 'ok': None, 'message': '规则已暂停'}]
@@ -363,7 +382,7 @@ def api_apply(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
 
 @app.get('/api/v1/stats')
 def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
-    full = _read_json(POOL_FULL, {'endpoints': []})
+    full = _load_full_pool()
     eps = full.get('endpoints') or []
     rules = []
     for idx, e in enumerate(eps):
