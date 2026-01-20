@@ -135,6 +135,13 @@ body{
 .table{width:100%;border-collapse:collapse;margin-top:12px}
 .table th,.table td{padding:10px 8px;border-bottom:1px solid var(--line);text-align:left;font-size:13px}
 .table th{color:var(--muted);font-weight:600}
+.table-wrap{overflow-x:auto}
+.rules-table{min-width:1180px}
+.rules-table th,.rules-table td{white-space:nowrap;vertical-align:top}
+.rules-table th.stat,.rules-table td.stat{text-align:right}
+.rules-table td:nth-child(4),
+.rules-table td:nth-child(5){white-space:normal}
+.rules-actions{display:flex;gap:8px;flex-wrap:nowrap;justify-content:flex-end}
 .form{display:flex;flex-direction:column;gap:10px;margin-top:10px}
 .label{font-size:12px;color:var(--muted)}
 .help{font-size:12px;color:var(--muted);margin-top:6px}

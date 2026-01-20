@@ -143,14 +143,16 @@ function renderRules(){
       <td>${healthHtml}</td>
       <td>${endpointType(e)}</td>
       <td>${e.balance || 'roundrobin'}</td>
-      <td>${statsError ? '—' : (stats.connections ?? 0)}</td>
-      <td>${rx == null ? '—' : formatBytes(rx)}</td>
-      <td>${tx == null ? '—' : formatBytes(tx)}</td>
-      <td>${total == null ? '—' : formatBytes(total)}</td>
-      <td>
-        <button class="btn sm ghost" onclick="editRule(${idx})">编辑</button>
-        <button class="btn sm" onclick="toggleRule(${idx})">${e.disabled?'启用':'暂停'}</button>
-        <button class="btn sm ghost" onclick="deleteRule(${idx})">删除</button>
+      <td class="stat">${statsError ? '—' : (stats.connections ?? 0)}</td>
+      <td class="stat">${rx == null ? '—' : formatBytes(rx)}</td>
+      <td class="stat">${tx == null ? '—' : formatBytes(tx)}</td>
+      <td class="stat">${total == null ? '—' : formatBytes(total)}</td>
+      <td class="right">
+        <div class="rules-actions">
+          <button class="btn sm ghost" onclick="editRule(${idx})">编辑</button>
+          <button class="btn sm" onclick="toggleRule(${idx})">${e.disabled?'启用':'暂停'}</button>
+          <button class="btn sm ghost" onclick="deleteRule(${idx})">删除</button>
+        </div>
       </td>
     `;
     tbody.appendChild(tr);

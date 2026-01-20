@@ -45,25 +45,27 @@
       </div>
     </div>
     <div id="rulesLoading" class="muted">正在加载规则…</div>
-    <table id="rulesTable" class="table" style="display:none;">
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>状态</th>
-          <th>Listen</th>
-          <th>Remote(目标)</th>
-          <th>连通检测</th>
-          <th>类型</th>
-          <th>策略</th>
-          <th>连接数</th>
-          <th>下行</th>
-          <th>上行</th>
-          <th>总计</th>
-          <th class="right">操作</th>
-        </tr>
-      </thead>
-      <tbody id="rulesBody"></tbody>
-    </table>
+    <div class="table-wrap">
+      <table id="rulesTable" class="table rules-table" style="display:none;">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>状态</th>
+            <th>Listen</th>
+            <th>Remote(目标)</th>
+            <th>连通检测</th>
+            <th>类型</th>
+            <th>策略</th>
+            <th class="stat">连接数</th>
+            <th class="stat">下行</th>
+            <th class="stat">上行</th>
+            <th class="stat">总计</th>
+            <th class="right">操作</th>
+          </tr>
+        </thead>
+        <tbody id="rulesBody"></tbody>
+      </table>
+    </div>
     <div id="statsLoading" class="muted">正在加载流量统计…</div>
   </div>
 </section>
