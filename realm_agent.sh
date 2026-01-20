@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v32"
+VERSION="v33"
 REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
 DEFAULT_MODE="1"
 DEFAULT_PORT="18700"
@@ -158,12 +158,35 @@ ask(){
 fetch_repo(){
   local mode="$1"
   local tmpdir="$2"
-  local zip_path=""
 
-  if [[ "${mode}" == "2" ]]; then
-    zip_path="${REALM_AGENT_ZIP_PATH:-}"
+  # 内部下载函数：支持 https 自签证书（自动 -k 重试）
+  download_url(){
+    local url="$1" out="$2"
+    # 更激进的连接超时，避免卡很久
+    if curl -fsSL --connect-timeout 5 -m 20 "$url" -o "$out"; then
+      return 0
+    fi
+    # TLS 证书问题时兜底
+    if curl -fsSL -k --connect-timeout 5 -m 20 "$url" -o "$out"; then
+      return 0
+    fi
+    return 1
+  }
+
+  append_bust(){
+    local url="$1"
+    local bust="ts=$(date +%s)"
+    if [[ "$url" == *\?* ]]; then
+      echo "${url}&${bust}"
+    else
+      echo "${url}?${bust}"
+    fi
+  }
+
+  fetch_from_local_zip(){
+    local zip_path="${REALM_AGENT_ZIP_PATH:-}"
     if [[ -z "${zip_path}" ]]; then
-      zip_path=$(ask "请输入 ZIP 文件路径（例如 /root/Realm-main.zip）: " "")
+      zip_path=$(ask "请输入 ZIP 文件路径（例如 /root/realm-agent.zip）: " "")
     fi
     if [[ -z "${zip_path}" || ! -f "${zip_path}" ]]; then
       err "ZIP 文件不存在：${zip_path}"
@@ -171,15 +194,14 @@ fetch_repo(){
     fi
     info "使用离线 ZIP：${zip_path}"
     unzip -q "${zip_path}" -d "${tmpdir}"
-  else
+  }
+
+  fetch_from_github(){
     local url
-    # 如果机器上已存在 Agent，则默认进入“自动更新”逻辑：
-    # - 不再询问用户 URL
-    # - 强制拉取默认 main.zip
-    # - 增加 cache bust，避免 CDN/代理缓存导致下载到旧包
+    # 如果机器上已存在 Agent，则默认进入“自动更新”逻辑：强制拉取默认 main.zip
     if [[ -d /opt/realm-agent/agent || "${REALM_AGENT_FORCE_UPDATE:-}" == "1" ]]; then
       url="${REPO_ZIP_URL_DEFAULT}"
-      info "检测到已安装 Agent，将自动更新到最新版本：${url}"
+      info "检测到已安装 Agent，将自动更新到最新版本（GitHub）：${url}"
     else
       url="${REALM_AGENT_REPO_ZIP_URL:-}"
       if [[ -z "${url}" ]]; then
@@ -187,19 +209,86 @@ fetch_repo(){
       fi
     fi
 
-    local bust
-    bust="ts=$(date +%s)"
-    info "正在下载仓库（强制不走缓存）..."
-    if ! curl -fsSL \
-      -H 'Cache-Control: no-cache' \
-      -H 'Pragma: no-cache' \
-      "${url}?${bust}" -o "${tmpdir}/repo.zip"; then
-      # 兜底：不带 query 重新拉一次
-      curl -fsSL "${url}" -o "${tmpdir}/repo.zip"
+    local final_url
+    final_url=$(append_bust "$url")
+    info "正在从 GitHub 下载仓库（强制不走缓存）..."
+    if ! download_url "$final_url" "${tmpdir}/repo.zip"; then
+      err "GitHub 下载失败：${url}"
+      return 1
     fi
     info "解压中..."
     unzip -q "${tmpdir}/repo.zip" -d "${tmpdir}"
-  fi
+    return 0
+  }
+
+  fetch_from_panel(){
+    local panel_base
+    panel_base=$(normalize_panel_url "${REALM_PANEL_URL:-}")
+    if [[ -z "${panel_base}" ]]; then
+      panel_base=$(ask "请输入面板地址（例如 http://198.176.54.226:6080 ）: " "")
+      panel_base=$(normalize_panel_url "$panel_base")
+    fi
+    if [[ -z "${panel_base}" ]]; then
+      err "未提供面板地址（REALM_PANEL_URL）"
+      return 1
+    fi
+
+    # 面板更新时会生成 /static/realm-agent.zip
+    local candidates=(
+      "${panel_base}/static/realm-agent.zip"
+      "${panel_base}/static/realm-agent.zip?download=1"
+      "${panel_base}/static/realm-agent/realm-agent.zip"
+    )
+
+    info "正在从面板拉取 Agent 离线包（避免 GitHub 依赖）..."
+    local ok_dl=0
+    for u in "${candidates[@]}"; do
+      local final_url
+      final_url=$(append_bust "$u")
+      if download_url "$final_url" "${tmpdir}/repo.zip"; then
+        ok_dl=1
+        ok "已从面板下载：$u"
+        break
+      fi
+    done
+
+    if [[ "$ok_dl" != "1" ]]; then
+      err "从面板下载 Agent 失败：${panel_base}"
+      err "请确认面板可访问，并且存在 /static/realm-agent.zip"
+      return 1
+    fi
+
+    info "解压中..."
+    unzip -q "${tmpdir}/repo.zip" -d "${tmpdir}"
+    return 0
+  }
+
+  case "$mode" in
+    1)
+      # 优先从面板获取
+      if ! fetch_from_panel; then
+        err "从面板获取失败。你也可以改用 GitHub 在线更新（模式 2）或本地 ZIP（模式 3）。"
+        exit 1
+      fi
+      ;;
+    2)
+      # GitHub 在线更新（失败会提示你切换到面板）
+      if ! fetch_from_github; then
+        warn "GitHub 不可达，尝试改用面板下载（模式 1）..."
+        if ! fetch_from_panel; then
+          err "GitHub 和面板都无法下载。请改用离线 ZIP（模式 3）"
+          exit 1
+        fi
+      fi
+      ;;
+    3)
+      fetch_from_local_zip
+      ;;
+    *)
+      err "无效模式：$mode"
+      exit 1
+      ;;
+  esac
 }
 
 stop_service_if_running(){
@@ -309,11 +398,22 @@ EOF
 
 find_agent_dir(){
   local base="$1"
+
+  # ✅ 更稳：优先找 app/main.py 或 app/agent.py（适配面板离线包结构）
+  local f
+  f=$(find "${base}" -maxdepth 8 -type f \( -path '*/app/main.py' -o -path '*/app/agent.py' \) -print -quit 2>/dev/null || true)
+  if [[ -n "${f}" ]]; then
+    # .../X/app/main.py -> 根目录为 .../X
+    echo "$(dirname "$(dirname "${f}")")"
+    return 0
+  fi
+
+  # 兼容旧结构：目录名为 agent/
   local p
-  p=$(find "${base}" -maxdepth 5 -type d -name agent -print | head -n 1 || true)
+  p=$(find "${base}" -maxdepth 6 -type d -name agent -print | head -n 1 || true)
   if [[ -z "${p}" ]]; then
-    err "找不到 agent 目录。请确认仓库里包含 agent/ 或 realm-pro-suite-vXX/agent/"
-    err "建议仓库结构：仓库根目录/agent  或  仓库根目录/realm-pro-suite-v31/agent"
+    err "找不到 Agent 目录或 app/main.py。"
+    err "请确认离线包里包含 app/main.py 或 agent/ 目录。"
     exit 1
   fi
   echo "${p}"
@@ -356,12 +456,13 @@ main(){
 
   echo "Realm Pro Agent Installer ${VERSION}"
   echo "------------------------------------------------------------"
-  echo "1) 在线安装（推荐）"
-  echo "2) 离线安装（手动下载）"
+  echo "1) 从面板更新（推荐，适用于无法连接 GitHub 的机器）"
+  echo "2) GitHub 在线更新"
+  echo "3) 离线更新（本地 ZIP 文件）"
   local mode
   mode="${REALM_AGENT_MODE:-}"
   if [[ -z "${mode}" ]]; then
-    mode=$(ask "请选择安装模式 [1-2] (默认 1): " "${DEFAULT_MODE}")
+    mode=$(ask "请选择更新模式 [1-3] (默认 1): " "${DEFAULT_MODE}")
   fi
 
   local port
