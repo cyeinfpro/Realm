@@ -255,14 +255,17 @@ def _scan_ss_once(target_ports: set[int]) -> tuple[Dict[int, Dict[str, int]], st
 
     pending: tuple[int, str] | None = None
 
+    addr_re = re.compile(r"^(?:\\[[^\\]]+\\]|\\*|[0-9A-Fa-f:.]+):\\d+$")
+
     for raw_line in (r.stdout or '').splitlines():
         line = raw_line.strip()
         if not line:
             continue
         parts = line.split()
-        if len(parts) >= 5:
-            local = parts[3]
-            peer = parts[4]
+        addrs = [p for p in parts if addr_re.match(p)]
+        if len(addrs) >= 2:
+            local = addrs[-2]
+            peer = addrs[-1]
             port = _addr_to_port(local)
             if port not in target_ports:
                 pending = None
