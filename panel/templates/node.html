@@ -55,27 +55,16 @@
           <th>连通检测</th>
           <th>类型</th>
           <th>策略</th>
+          <th>连接数</th>
+          <th>下行</th>
+          <th>上行</th>
+          <th>总计</th>
           <th class="right">操作</th>
         </tr>
       </thead>
       <tbody id="rulesBody"></tbody>
     </table>
-    <div class="muted" style="margin-top:20px;">规则流量统计（连接数与累计流量）</div>
-    <div id="trafficLoading" class="muted">正在加载流量统计…</div>
-    <table id="trafficTable" class="table" style="display:none;">
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>状态</th>
-          <th>Listen</th>
-          <th>连接数</th>
-          <th>下行</th>
-          <th>上行</th>
-          <th>总计</th>
-        </tr>
-      </thead>
-      <tbody id="trafficBody"></tbody>
-    </table>
+    <div id="statsLoading" class="muted">正在加载流量统计…</div>
   </div>
 </section>
 
