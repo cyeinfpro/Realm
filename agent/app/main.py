@@ -31,9 +31,10 @@ TCPING_TIMEOUT = 2.0
 # 1) 永远返回可渲染的数据（不因为探测阻塞导致 /stats 超时）
 # 2) 返回稳定的延迟（ms），优先使用 socket 直连测量
 # 3) 支持并发探测 + 短缓存，避免规则多时整页卡死
+# 默认更快：并发探测 + 短缓存下，0.45s 基本够用；若你想更稳可通过环境变量调大。
 PROBE_CACHE_TTL = float(os.getenv('REALM_AGENT_PROBE_TTL', '5'))  # seconds
-PROBE_TIMEOUT = float(os.getenv('REALM_AGENT_PROBE_TIMEOUT', '0.65'))  # per attempt
-PROBE_RETRIES = int(os.getenv('REALM_AGENT_PROBE_RETRIES', '2'))
+PROBE_TIMEOUT = float(os.getenv('REALM_AGENT_PROBE_TIMEOUT', '0.45'))  # per attempt
+PROBE_RETRIES = int(os.getenv('REALM_AGENT_PROBE_RETRIES', '1'))
 PROBE_MAX_WORKERS = int(os.getenv('REALM_AGENT_PROBE_WORKERS', '32'))
 
 _PROBE_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -305,15 +306,22 @@ def _tcp_probe_uncached(host: str, port: int, timeout: float = PROBE_TIMEOUT) ->
     return False, None, sock_err
 
 
-def _tcp_probe(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> tuple[bool, float | None]:
-    """带短缓存 + 重试的 TCP 探测。
+def _tcp_probe_detail(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> Dict[str, Any]:
+    """带短缓存 + 重试的 TCP 探测（返回详细原因）。
+
+    返回结构：
+      { ok: bool, latency_ms?: float, error?: str }
 
     这个函数 **绝不抛异常**，确保 /api/v1/stats 不会因为探测报错或阻塞而失败。
     """
     key = _probe_cache_key(host, port)
     cached = _cache_get(key)
     if cached is not None:
-        return bool(cached.get('ok')), cached.get('latency_ms')
+        return {
+            'ok': bool(cached.get('ok')),
+            'latency_ms': cached.get('latency_ms'),
+            'error': cached.get('error'),
+        }
 
     last_err: str | None = None
     best_latency: float | None = None
@@ -323,14 +331,18 @@ def _tcp_probe(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> tuple[bo
         if ok:
             if latency_ms is not None:
                 best_latency = latency_ms if best_latency is None else min(best_latency, latency_ms)
-            else:
-                best_latency = best_latency if best_latency is not None else None
             _cache_set(key, True, best_latency, None)
-            return True, best_latency
+            return {'ok': True, 'latency_ms': best_latency}
         last_err = err or last_err
 
     _cache_set(key, False, None, last_err)
-    return False, None
+    return {'ok': False, 'error': last_err}
+
+
+def _tcp_probe(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> tuple[bool, float | None]:
+    """兼容旧调用：仅返回 (ok, latency_ms)。"""
+    d = _tcp_probe_detail(host, port, timeout)
+    return bool(d.get('ok')), d.get('latency_ms')
 
 
 def _split_hostport(addr: str) -> tuple[str, int]:
@@ -426,7 +438,8 @@ def _wss_probe_entries(rule: Dict[str, Any]) -> List[Dict[str, str]]:
         except Exception:
             lp = 0
         if lp > 0:
-            entries.append({'key': f"127.0.0.1:{lp}", 'label': f"LISTEN 127.0.0.1:{lp}"})
+            # 为 WSS 接收规则补充本机监听探测，便于确认 listen 端口是否真的在跑。
+            entries.append({'key': f"127.0.0.1:{lp}", 'label': f"本机监听 127.0.0.1:{lp}"})
 
     return entries
 
@@ -560,17 +573,17 @@ def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
                 except Exception:
                     probe_results[key] = {'ok': None, 'message': '目标格式无效'}
                     continue
-                fut = ex.submit(_tcp_probe, host, port, PROBE_TIMEOUT)
+                fut = ex.submit(_tcp_probe_detail, host, port, PROBE_TIMEOUT)
                 fut_map[fut] = key
 
             for fut in as_completed(fut_map):
                 key = fut_map[fut]
                 try:
-                    ok, latency_ms = fut.result(timeout=PROBE_TIMEOUT * max(1, PROBE_RETRIES) + 0.5)
-                    payload: Dict[str, Any] = {'ok': bool(ok)}
-                    if latency_ms is not None:
-                        payload['latency_ms'] = latency_ms
-                    probe_results[key] = payload
+                    payload = fut.result(timeout=PROBE_TIMEOUT * max(1, PROBE_RETRIES) + 0.6)
+                    if not isinstance(payload, dict):
+                        probe_results[key] = {'ok': None, 'message': '探测返回异常'}
+                    else:
+                        probe_results[key] = payload
                 except Exception as exc:
                     probe_results[key] = {'ok': None, 'message': f'探测异常: {exc}'}
 
@@ -613,6 +626,9 @@ def api_stats(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
             payload: Dict[str, Any] = {'target': label, 'ok': bool(res.get('ok'))}
             if res.get('latency_ms') is not None:
                 payload['latency_ms'] = res.get('latency_ms')
+            # 离线原因（面板可展示）
+            if payload['ok'] is False and res.get('error'):
+                payload['error'] = res.get('error')
             health.append(payload)
 
         rules.append({

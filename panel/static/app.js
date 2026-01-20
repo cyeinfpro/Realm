@@ -91,16 +91,41 @@ function renderHealth(healthList, statsError){
   if(!Array.isArray(healthList) || healthList.length === 0){
     return '<span class="muted">暂无检测数据</span>';
   }
-  return healthList.map((item)=>{
+  // 信息收敛：最多展示前 2 个目标，其余用 +N 收起；离线时展示失败原因（tooltip 里有完整信息）
+  const MAX_SHOW = 2;
+
+  function friendlyError(err){
+    const s = String(err || '').trim();
+    if(!s) return '';
+    const t = s.toLowerCase();
+    if(t.includes('timed out') || t.includes('timeout')) return '超时';
+    if(t.includes('refused')) return '拒绝连接';
+    if(t.includes('no route')) return '无路由';
+    if(t.includes('name or service not known') || t.includes('temporary failure in name resolution')) return 'DNS失败';
+    if(t.includes('network is unreachable')) return '网络不可达';
+    if(t.includes('permission denied')) return '无权限';
+    return s.length > 28 ? (s.slice(0, 28) + '…') : s;
+  }
+
+  const shown = healthList.slice(0, MAX_SHOW);
+  const hiddenCount = Math.max(0, healthList.length - MAX_SHOW);
+
+  const chips = shown.map((item)=>{
     const isUnknown = item && item.ok == null;
     const ok = !!item.ok;
     const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
     const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : '离线');
-    return `<div class="row" style="gap:6px;align-items:center;">
-      <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${label}</span>
-      <span class="mono">${escapeHtml(item.target)}</span>
+    const reason = (!isUnknown && !ok) ? friendlyError(item.error || item.message) : '';
+    const title = !isUnknown && !ok ? `离线原因：${String(item.error || item.message || '').trim()}` : '';
+    return `<div class="health-item" title="${escapeHtml(title)}">
+      <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${escapeHtml(label)}</span>
+      <span class="mono health-target">${escapeHtml(item.target)}</span>
+      ${reason ? `<span class="health-reason">(${escapeHtml(reason)})</span>` : ''}
     </div>`;
   }).join('');
+
+  const more = hiddenCount > 0 ? `<span class="pill ghost" title="还有 ${hiddenCount} 个目标未展示">+${hiddenCount}</span>` : '';
+  return `<div class="health-wrap">${chips}${more}</div>`;
 }
 
 function renderRules(){
@@ -139,12 +164,12 @@ function renderRules(){
     tr.innerHTML = `
       <td>${idx+1}</td>
       <td>${statusPill(e)}</td>
-      <td class="listen"><div class="mono">${escapeHtml(e.listen)}</div></td>
+      <td class="listen">
+        <div class="mono">${escapeHtml(e.listen)}</div>
+        <div class="muted sm">${endpointType(e)}</div>
+      </td>
       <td class="health">${healthHtml}</td>
-      <td>${endpointType(e)}</td>
       <td class="stat">${statsError ? '—' : (stats.connections ?? 0)}</td>
-      <td class="stat">${rx == null ? '—' : formatBytes(rx)}</td>
-      <td class="stat">${tx == null ? '—' : formatBytes(tx)}</td>
       <td class="stat">${total == null ? '—' : formatBytes(total)}</td>
       <td class="actions">
         <div class="rules-actions">
