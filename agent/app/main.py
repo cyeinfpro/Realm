@@ -176,6 +176,142 @@ _SS_CACHE_ERR: str | None = None
 SS_CACHE_TTL = float(os.environ.get('REALM_SS_CACHE_TTL', '0.6'))
 SS_RUN_TIMEOUT = float(os.environ.get('REALM_SS_TIMEOUT', '1.0'))
 
+# --- 规则流量统计（更可靠）：优先使用 iptables 计数器，避免 ss 快照漏掉短连接 ---
+# 说明：
+# - ss 方案是“瞬时快照”，如果连接建立/关闭很快，可能在两次扫描之间完全消失，导致统计一直是 0。
+# - iptables 计数器是“内核累计计数”，不会漏掉短连接，也同时适用于 TCP/UDP。
+# - 我们只做计数，不改变放行/阻断逻辑：用自定义链 + RETURN，确保数据准确且对现有防火墙影响最小。
+
+TRAFFIC_COUNTER_MODE = os.environ.get('REALM_TRAFFIC_COUNTER', 'auto').strip().lower()  # auto/iptables/ss/off
+IPT_RUN_TIMEOUT = float(os.environ.get('REALM_IPT_TIMEOUT', '1.2'))
+IPT_TABLE = os.environ.get('REALM_IPT_TABLE', 'mangle')
+IPT_CHAIN_IN = os.environ.get('REALM_IPT_CHAIN_IN', 'REALMCOUNT_IN')
+IPT_CHAIN_OUT = os.environ.get('REALM_IPT_CHAIN_OUT', 'REALMCOUNT_OUT')
+
+_IPT_CACHE_LOCK = threading.Lock()
+_IPT_READY_TS = 0.0
+IPT_READY_TTL = float(os.environ.get('REALM_IPT_READY_TTL', '5.0'))
+
+
+def _iptables_available() -> bool:
+    return bool(shutil.which('iptables'))
+
+
+def _run_iptables(args: list[str]) -> tuple[int, str, str]:
+    try:
+        r = subprocess.run(['iptables', *args], capture_output=True, text=True, timeout=IPT_RUN_TIMEOUT)
+        return r.returncode, (r.stdout or ''), (r.stderr or '')
+    except Exception as exc:
+        return 127, '', str(exc)
+
+
+def _ipt_ensure_chain(table: str, chain: str) -> None:
+    # iptables -t <table> -N <chain> (链已存在会返回非 0)
+    _run_iptables(['-t', table, '-N', chain])
+
+
+def _ipt_ensure_jump(table: str, base_chain: str, target_chain: str) -> None:
+    # 确保 base_chain 顶部有一条跳转到 target_chain 的规则
+    rc, _, _ = _run_iptables(['-t', table, '-C', base_chain, '-j', target_chain])
+    if rc != 0:
+        _run_iptables(['-t', table, '-I', base_chain, '1', '-j', target_chain])
+
+
+def _ipt_ensure_port_rule(table: str, chain: str, proto: str, flag: str, port: int) -> None:
+    # 规则形如：-p tcp --dport 443 -j RETURN
+    args = ['-t', table, '-C', chain, '-p', proto, flag, str(port), '-j', 'RETURN']
+    rc, _, _ = _run_iptables(args)
+    if rc != 0:
+        _run_iptables(['-t', table, '-A', chain, '-p', proto, flag, str(port), '-j', 'RETURN'])
+
+
+def _ensure_traffic_counters(target_ports: set[int]) -> str | None:
+    """确保计数链/规则存在。
+
+    返回：None 表示 OK；否则返回 warning 字符串。
+    """
+    if not target_ports:
+        return None
+    if TRAFFIC_COUNTER_MODE == 'off':
+        return 'traffic counter disabled'
+    if TRAFFIC_COUNTER_MODE in ('auto', 'iptables') and _iptables_available():
+        with _IPT_CACHE_LOCK:
+            now = time.monotonic()
+            if (now - _IPT_READY_TS) <= IPT_READY_TTL:
+                return None
+            # 尽量一次性把基础设施建好（链 + jump）
+            _ipt_ensure_chain(IPT_TABLE, IPT_CHAIN_IN)
+            _ipt_ensure_chain(IPT_TABLE, IPT_CHAIN_OUT)
+            _ipt_ensure_jump(IPT_TABLE, 'PREROUTING', IPT_CHAIN_IN)
+            _ipt_ensure_jump(IPT_TABLE, 'OUTPUT', IPT_CHAIN_OUT)
+            # 端口规则
+            for p in sorted(target_ports):
+                if p <= 0:
+                    continue
+                for proto in ('tcp', 'udp'):
+                    _ipt_ensure_port_rule(IPT_TABLE, IPT_CHAIN_IN, proto, '--dport', p)
+                    _ipt_ensure_port_rule(IPT_TABLE, IPT_CHAIN_OUT, proto, '--sport', p)
+            globals()['_IPT_READY_TS'] = now
+        return None
+    return 'iptables not available'
+
+
+def _parse_iptables_chain_bytes(stdout: str, want: set[int], match_token: str) -> dict[int, int]:
+    """解析 `iptables -nvxL <CHAIN>` 输出，返回 {port: bytes}。
+
+    match_token: 'dpt:' 或 'spt:'
+    """
+    out: dict[int, int] = {p: 0 for p in want}
+    for line in (stdout or '').splitlines():
+        s = line.strip()
+        if not s or s.startswith('Chain ') or s.startswith('pkts ') or s.startswith('num '):
+            continue
+        # 典型：pkts bytes target prot opt in out source destination ... tcp dpt:443
+        parts = s.split()
+        if len(parts) < 2:
+            continue
+        try:
+            b = int(parts[1])
+        except Exception:
+            continue
+        m = re.search(rf"\b{re.escape(match_token)}(\d+)\b", s)
+        if not m:
+            continue
+        try:
+            port = int(m.group(1))
+        except Exception:
+            continue
+        if port in out:
+            out[port] += b
+    return out
+
+
+def _read_traffic_counters(target_ports: set[int]) -> tuple[dict[int, dict[str, int]], str | None]:
+    """读取 iptables 计数器。返回 {port: {rx_bytes, tx_bytes}}。"""
+    if not target_ports:
+        return {}, None
+    warn = _ensure_traffic_counters(target_ports)
+    if warn and TRAFFIC_COUNTER_MODE == 'iptables':
+        # 强制使用 iptables 时，直接报 warning
+        return {p: {'rx_bytes': 0, 'tx_bytes': 0} for p in target_ports}, warn
+
+    if warn and TRAFFIC_COUNTER_MODE in ('auto', 'ss'):
+        # auto 模式下允许回退到 ss
+        return {p: {'rx_bytes': 0, 'tx_bytes': 0} for p in target_ports}, warn
+
+    # 读取链计数
+    rc1, out1, err1 = _run_iptables(['-t', IPT_TABLE, '-nvxL', IPT_CHAIN_IN])
+    rc2, out2, err2 = _run_iptables(['-t', IPT_TABLE, '-nvxL', IPT_CHAIN_OUT])
+    if rc1 != 0 or rc2 != 0:
+        return {p: {'rx_bytes': 0, 'tx_bytes': 0} for p in target_ports}, (err1 or err2 or 'iptables list failed')
+
+    rx_map = _parse_iptables_chain_bytes(out1, target_ports, 'dpt:')
+    tx_map = _parse_iptables_chain_bytes(out2, target_ports, 'spt:')
+    res: dict[int, dict[str, int]] = {}
+    for p in target_ports:
+        res[p] = {'rx_bytes': int(rx_map.get(p, 0)), 'tx_bytes': int(tx_map.get(p, 0))}
+    return res, None
+
 
 def _addr_to_port(addr: str) -> int:
     """从 ss 输出的地址字段解析端口。支持：
@@ -216,6 +352,21 @@ def _scan_ss_once(target_ports: set[int]) -> tuple[Dict[int, Dict[str, int]], st
             'tx_bytes': int(totals.get('sum_tx') or 0),
         }
 
+    # 先尝试用 iptables 读取累计流量（不会漏掉短连接）。
+    # 成功时会直接覆盖 rx/tx；失败则保留 ss 增量累计（兼容旧环境）。
+    used_iptables_bytes = False
+    ipt_warning: str | None = None
+    if TRAFFIC_COUNTER_MODE in ('auto', 'iptables') and _iptables_available():
+        traffic_map, ipt_warning = _read_traffic_counters(target_ports)
+        if ipt_warning is None and isinstance(traffic_map, dict) and traffic_map:
+            used_iptables_bytes = True
+            for p in target_ports:
+                d = traffic_map.get(p) or {}
+                if 'rx_bytes' in d:
+                    result[p]['rx_bytes'] = int(d.get('rx_bytes') or 0)
+                if 'tx_bytes' in d:
+                    result[p]['tx_bytes'] = int(d.get('tx_bytes') or 0)
+
     cmd = ['bash', '-lc', 'ss -Htin state established 2>/dev/null']
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=SS_RUN_TIMEOUT)
@@ -255,17 +406,14 @@ def _scan_ss_once(target_ports: set[int]) -> tuple[Dict[int, Dict[str, int]], st
 
     pending: tuple[int, str] | None = None
 
-    addr_re = re.compile(r"^(?:\\[[^\\]]+\\]|\\*|[0-9A-Fa-f:.]+):\\d+$")
-
     for raw_line in (r.stdout or '').splitlines():
         line = raw_line.strip()
         if not line:
             continue
         parts = line.split()
-        addrs = [p for p in parts if addr_re.match(p)]
-        if len(addrs) >= 2:
-            local = addrs[-2]
-            peer = addrs[-1]
+        if len(parts) >= 5:
+            local = parts[3]
+            peer = parts[4]
             port = _addr_to_port(local)
             if port not in target_ports:
                 pending = None
@@ -297,11 +445,12 @@ def _scan_ss_once(target_ports: set[int]) -> tuple[Dict[int, Dict[str, int]], st
             if k not in seen:
                 del conns[k]
 
-        # 回写累计值到 result
-        result[p]['rx_bytes'] = int(totals.get('sum_rx') or 0)
-        result[p]['tx_bytes'] = int(totals.get('sum_tx') or 0)
+        # 回写累计值到 result（仅在未成功启用 iptables 统计时）
+        if not used_iptables_bytes:
+            result[p]['rx_bytes'] = int(totals.get('sum_rx') or 0)
+            result[p]['tx_bytes'] = int(totals.get('sum_tx') or 0)
 
-    return result, None
+    return result, ipt_warning
 
 
 def _collect_conn_traffic(target_ports: set[int]) -> tuple[Dict[int, Dict[str, int]], str | None]:
