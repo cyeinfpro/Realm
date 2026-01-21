@@ -387,7 +387,6 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
         <span class="pill ghost">${escapeHtml(totalStr)}</span>
       </div>
     </div>
-    <div class="rule-remote-block">${renderRemoteTargets(e, idx)}</div>
     <div class="rule-health-block">
       ${healthHtml}
     </div>
@@ -474,7 +473,6 @@ ${endpointType(e)}`.toLowerCase();
           <div class="mono">${escapeHtml(e.listen)}</div>
           <div class="muted sm">${endpointType(e)}</div>
         </td>
-        <td class="remote">${renderRemoteTargetsExpanded(e)}</td>
         <td class="health">${healthHtml}</td>
         <td class="stat" title="当前已建立连接：${escapeHtml(est)}">${statsError ? '—' : escapeHtml(connActive)}</td>
         <td class="stat">${total == null ? '—' : formatBytes(total)}</td>
@@ -1371,3 +1369,33 @@ document.addEventListener('click', (e)=>{
     return;
   }
 });
+
+// ---------------- Details Menu UX ----------------
+// 目标：
+// 1) 点击页面空白处自动收起所有“更多/操作”菜单
+// 2) 打开一个菜单时，自动关闭其他菜单（避免多个同时展开）
+function closeAllMenus(except){
+  try{
+    document.querySelectorAll('details.menu[open]').forEach((d)=>{
+      if(except && d === except) return;
+      d.removeAttribute('open');
+    });
+  }catch(_e){}
+}
+
+// 当某个 menu 打开时，关掉其它 menu
+document.addEventListener('toggle', (e)=>{
+  const t = e.target;
+  if(!(t instanceof HTMLElement)) return;
+  if(t.matches && t.matches('details.menu') && t.open){
+    closeAllMenus(t);
+  }
+}, true);
+
+// 点击空白区域，关闭所有 menu
+document.addEventListener('click', (e)=>{
+  const inMenu = e.target && e.target.closest && e.target.closest('details.menu');
+  if(!inMenu){
+    closeAllMenus(null);
+  }
+}, true);

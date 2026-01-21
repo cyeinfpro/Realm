@@ -468,6 +468,16 @@ textarea,.textarea{min-height:90px;resize:vertical}
   .icon-btn{width:28px;height:28px;border-radius: 9px;}
 }
 
+/* Node page: phone layout fixes (avoid title/meta becoming ultra-narrow) */
+@media (max-width: 640px){
+  .node-head{flex-wrap:wrap; gap:10px;}
+  .node-head-left{flex:1 1 100%;}
+  .node-head-right{flex:1 1 100%; justify-content:flex-start !important;}
+  .node-main .meta{flex-wrap:wrap;}
+  .node-tools .search-pill{flex:1 1 100%; width:100%;}
+  .node-tools .search-pill input{min-width:0 !important; width:100%;}
+}
+
 
 
 /* Remote targets chips */

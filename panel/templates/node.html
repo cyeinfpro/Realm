@@ -34,8 +34,8 @@
   <main class="node-main">
     <section>
       <div class="card">
-        <div class="card-header" style="align-items:flex-start;">
-          <div style="min-width:0;">
+        <div class="card-header node-head" style="align-items:flex-start;">
+          <div class="node-head-left" style="min-width:0;">
             <div class="card-title">{{ node.name or node.display_ip }} <span class="muted sm">· {{ node.display_ip or '-' }}</span></div>
             <div class="meta" style="margin-top:6px;">
               {% if node.agent_version %}<span class="meta-item">Agent：{{ node.agent_version }}</span>{% endif %}
@@ -43,7 +43,7 @@
             </div>
             <div class="card-sub" style="margin-top:8px;">支持 TCP / UDP / WSS；WSS 发送端可直接选择接收机节点自动同步，无需复制配对码</div>
           </div>
-          <div class="right node-tools" style="gap:10px; flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end;">
+          <div class="right node-tools node-head-right" style="gap:10px; flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end;">
             <div class="search-pill">
               <span class="muted">🔎</span>
               <input class="input sm" id="ruleSearch" placeholder="搜索监听/目标…" oninput="setRuleFilter(this.value)">
@@ -88,7 +88,6 @@
                 <th>#</th>
                 <th>状态</th>
                 <th class="listen">Listen</th>
-                <th class="remote">Remote</th>
                 <th class="health">连通</th>
                 <th class="stat">活跃（30s）</th>
                 <th class="stat">流量</th>
