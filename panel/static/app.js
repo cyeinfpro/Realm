@@ -13,12 +13,49 @@ async function fetchJSON(url, options={}){
   return data;
 }
 
+
+async function loadNodesList(){
+  try{
+    const data = await fetchJSON('/api/nodes');
+    if(data && data.ok && Array.isArray(data.nodes)){
+      NODES_LIST = data.nodes;
+      populateReceiverSelect();
+    }
+  }catch(e){
+    // ignore
+  }
+}
+
+function populateReceiverSelect(){
+  const sel = document.getElementById('f_wss_receiver_node');
+  if(!sel) return;
+  const currentId = window.__NODE_ID__;
+  const keep = sel.value;
+  sel.innerHTML = '<option value="">（不选择=手动配对码模式）</option>';
+  for(const n of (NODES_LIST||[])){
+    if(!n || n.id == null) continue;
+    if(String(n.id) === String(currentId)) continue;
+    const opt = document.createElement('option');
+    opt.value = String(n.id);
+    const show = n.name ? n.name : ('Node #' + n.id);
+    let host = '';
+    try{
+      const u = new URL(n.base_url.includes('://') ? n.base_url : ('http://' + n.base_url));
+      host = u.hostname || '';
+    }catch(e){}
+    opt.textContent = host ? `${show} (${host})` : show;
+    sel.appendChild(opt);
+  }
+  if(keep) sel.value = keep;
+}
+
 function q(id){ return document.getElementById(id); }
 
 let CURRENT_POOL = null;
 let CURRENT_EDIT_INDEX = null;
 let CURRENT_STATS = null;
 let PENDING_COMMAND_TEXT = '';
+let NODES_LIST = [];
 
 function showTab(name){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -39,10 +76,24 @@ function wssMode(e){
 }
 
 function endpointType(e){
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  if(ex && ex.sync_id){
+    if(ex.sync_role === 'receiver') return 'WSS接收(同步)';
+    if(ex.sync_role === 'sender') return 'WSS发送(同步)';
+  }
   const mode = wssMode(e);
   if(mode === 'wss_recv') return 'WSS接收';
   if(mode === 'wss_send') return 'WSS发送';
   return 'TCP/UDP';
+}
+
+function formatRemoteForInput(e){
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  if(ex && ex.sync_role === 'sender' && Array.isArray(ex.sync_original_remotes)){
+    return ex.sync_original_remotes.join('\n');
+  }
+  const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
+  return rs.join('\n');
 }
 
 function formatRemote(e){
@@ -381,6 +432,16 @@ function fillWssFields(e){
 function showWssBox(){
   const mode = q('f_type').value;
   q('wssBox').style.display = (mode === 'tcp') ? 'none' : 'block';
+
+  const autoBox = document.getElementById('wssAutoSyncBox');
+  const manualDetails = document.getElementById('wssManualPairDetails');
+
+  if(autoBox){
+    autoBox.style.display = (mode === 'wss_send') ? 'flex' : 'none';
+  }
+  if(manualDetails){
+    manualDetails.style.display = (mode === 'wss_send' || mode === 'wss_recv') ? 'block' : 'none';
+  }
 }
 
 function encodePairingCode(data){
@@ -521,76 +582,201 @@ function editRule(idx){
 
 async function toggleRule(idx){
   const e = CURRENT_POOL.endpoints[idx];
-  e.disabled = !e.disabled;
-  await savePool(`已${e.disabled?'暂停':'启用'}规则 #${idx+1}`);
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  // Locked receiver rules cannot be edited here
+  if(ex && (ex.sync_lock === true || ex.sync_role === 'receiver')){
+    toast('该规则由发送机同步生成，已锁定不可操作，请在发送机节点操作。', true);
+    return;
+  }
+
+  const newDisabled = !e.disabled;
+
+  // Synced WSS sender: update both sides via panel API
+  if(ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
+    try{
+      setLoading(true);
+      const payload = {
+        sender_node_id: window.__NODE_ID__,
+        receiver_node_id: ex.sync_peer_node_id,
+        listen: e.listen,
+        remotes: ex.sync_original_remotes || [],
+        disabled: newDisabled,
+        balance: e.balance || 'roundrobin',
+        protocol: e.protocol || 'tcp+udp',
+        receiver_port: ex.sync_receiver_port,
+        sync_id: ex.sync_id,
+        wss: {
+          host: ex.remote_ws_host || '',
+          path: ex.remote_ws_path || '',
+          sni: ex.remote_tls_sni || '',
+          tls: ex.remote_tls_enabled !== false,
+          insecure: ex.remote_tls_insecure === true
+        }
+      };
+      const res = await fetchJSON('/api/wss_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
+      if(res && res.ok){
+        CURRENT_POOL = res.sender_pool;
+        renderRules();
+        toast('已同步更新（发送/接收两端）');
+      }else{
+        toast(res && res.error ? res.error : '同步更新失败', true);
+      }
+    }catch(err){
+      toast(String(err), true);
+    }finally{
+      setLoading(false);
+    }
+    return;
+  }
+
+  // Normal rule
+  e.disabled = newDisabled;
+  await savePool();
+  renderRules();
 }
 
 async function deleteRule(idx){
-  if(!confirm('确认删除该规则？')) return;
+  const e = CURRENT_POOL.endpoints[idx];
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+
+  if(ex && (ex.sync_lock === true || ex.sync_role === 'receiver')){
+    toast('该规则由发送机同步生成，已锁定不可删除，请在发送机节点操作。', true);
+    return;
+  }
+
+  // Synced sender: delete both sides
+  if(ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
+    if(!confirm('删除后将同步移除接收机对应规则，确定继续？')) return;
+    try{
+      setLoading(true);
+      const payload = { sender_node_id: window.__NODE_ID__, receiver_node_id: ex.sync_peer_node_id, sync_id: ex.sync_id };
+      const res = await fetchJSON('/api/wss_tunnel/delete', {method:'POST', body: JSON.stringify(payload)});
+      if(res && res.ok){
+        CURRENT_POOL = res.sender_pool;
+        renderRules();
+        toast('已同步删除（发送/接收两端）');
+      }else{
+        toast(res && res.error ? res.error : '同步删除失败', true);
+      }
+    }catch(err){
+      toast(String(err), true);
+    }finally{
+      setLoading(false);
+    }
+    return;
+  }
+
+  if(!confirm('确定删除这条规则？')) return;
   CURRENT_POOL.endpoints.splice(idx,1);
-  await savePool('已删除规则');
+  await savePool();
+  renderRules();
 }
 
 async function saveRule(){
-  const listen = q('f_listen').value.trim();
-  const remotesText = q('f_remotes').value.trim();
-  const remotes = remotesText ? remotesText.split(/\n+/).map(x=>x.trim()).filter(Boolean) : [];
-  if(!listen){ q('modalMsg').textContent='listen 不能为空'; return; }
-  if(remotes.length===0){ q('modalMsg').textContent='remote 至少需要一个目标'; return; }
-
-  const disabled = q('f_disabled').value === '1';
-  const balanceSel = q('f_balance').value;
-  let balance = 'roundrobin';
-  if(balanceSel === 'iphash'){
-    balance = 'iphash';
-  }else{
-    const weights = parseWeights(q('f_weights').value.trim());
-    if(weights.length && weights.length !== remotes.length){
-      q('modalMsg').textContent='权重数量必须与 Remote 数量一致';
-      return;
-    }
-    const finalWeights = weights.length ? weights : remotes.map(()=>1);
-    if(finalWeights.some((w)=>Number.isNaN(w) || w <= 0)){
-      q('modalMsg').textContent='权重必须为正数';
-      return;
-    }
-    balance = `roundrobin: ${finalWeights.join(', ')}`;
-  }
-
   const typeSel = q('f_type').value;
-  const protocolSel = q('f_protocol').value;
-  if(typeSel === 'wss_send' || typeSel === 'wss_recv'){
-    if(!q('f_wss_host').value.trim() || !q('f_wss_path').value.trim()){
-      q('modalMsg').textContent='WSS Host 与 Path 不能为空';
+  const listen = q('f_listen').value.trim();
+  const remotesRaw = q('f_remotes').value || '';
+  const remotes = remotesRaw.split('\n').map(x=>x.trim()).filter(Boolean).map(x=>x.replace('\\r',''));
+  const disabled = (q('f_disabled').value === '1');
+
+  let balTxt = (q('f_balance').value || '').trim();
+  let balance = balTxt ? balTxt.split(':')[0].trim() : 'roundrobin';
+  if(!balance) balance = 'roundrobin';
+
+  const protocol = q('f_protocol').value || 'tcp+udp';
+
+  if(!listen){ toast('本地监听不能为空', true); return; }
+  if(remotes.length === 0){ toast('目标地址不能为空', true); return; }
+
+  // Auto-sync WSS tunnel mode (select receiver node)
+  if(typeSel === 'wss_send' && q('f_wss_receiver_node') && q('f_wss_receiver_node').value){
+    const receiverNodeId = q('f_wss_receiver_node').value.trim();
+    const receiverPortTxt = q('f_wss_receiver_port') ? q('f_wss_receiver_port').value.trim() : '';
+    const wss = readWssFields();
+    if(!wss.host || !wss.path){
+      toast('WSS Host / Path 不能为空', true);
       return;
     }
-  }
-  const ex = readWssFields();
-
-  const endpoint = {
-    listen,
-    disabled,
-    balance,
-    protocol: protocolSel || 'tcp+udp',
-    remotes,
-    extra_config: ex,
-  };
-
-  if(CURRENT_EDIT_INDEX == null){
-    CURRENT_POOL.endpoints.push(endpoint);
-  }else{
-    CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX] = endpoint;
-  }
-
-  try{
-    await savePool('保存成功');
-    closeModal();
-    if(typeSel === 'wss_send'){
-      const code = encodePairingCode(buildPairingPayload());
-      openPairingModal(code);
+    let syncId = '';
+    if(CURRENT_EDIT_INDEX >= 0){
+      const old = CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX];
+      const ex = (old && old.extra_config) ? old.extra_config : {};
+      if(ex && ex.sync_id) syncId = ex.sync_id;
     }
-  }catch(e){
-    q('modalMsg').textContent = e.message;
+    const payload = {
+      sender_node_id: window.__NODE_ID__,
+      receiver_node_id: parseInt(receiverNodeId,10),
+      listen,
+      remotes,
+      disabled,
+      balance,
+      protocol,
+      receiver_port: receiverPortTxt ? parseInt(receiverPortTxt,10) : null,
+      sync_id: syncId || undefined,
+      wss
+    };
+
+    try{
+      setLoading(true);
+      const res = await fetchJSON('/api/wss_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
+      if(res && res.ok){
+        CURRENT_POOL = res.sender_pool;
+        renderRules();
+        closeModal();
+        toast('已保存，并自动同步到接收机');
+      }else{
+        toast((res && res.error) ? res.error : '保存失败', true);
+      }
+    }catch(err){
+      toast(String(err), true);
+    }finally{
+      setLoading(false);
+    }
+    return;
+  }
+
+  // Normal/manual mode (single node)
+  const endpoint = { listen, remotes, disabled, balance, protocol };
+
+  if(typeSel === 'wss_send' || typeSel === 'wss_recv'){
+    const wss = readWssFields();
+    if(!wss.host || !wss.path){
+      toast('WSS Host / Path 不能为空', true);
+      return;
+    }
+    const ex = {};
+    if(typeSel === 'wss_send'){
+      ex.remote_transport = 'ws';
+      ex.remote_ws_host = wss.host;
+      ex.remote_ws_path = wss.path;
+      ex.remote_tls_enabled = wss.tls;
+      ex.remote_tls_insecure = wss.insecure;
+      ex.remote_tls_sni = wss.sni;
+    }else{
+      ex.listen_transport = 'ws';
+      ex.listen_ws_host = wss.host;
+      ex.listen_ws_path = wss.path;
+      ex.listen_tls_enabled = wss.tls;
+      ex.listen_tls_insecure = wss.insecure;
+      ex.listen_tls_servername = wss.sni;
+    }
+    endpoint.extra_config = ex;
+  }
+
+  if(CURRENT_EDIT_INDEX >= 0){
+    CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX] = endpoint;
+  }else{
+    CURRENT_POOL.endpoints.push(endpoint);
+  }
+
+  await savePool();
+  renderRules();
+  closeModal();
+
+  // For manual WSS send: show pairing code helper (optional)
+  if(typeSel === 'wss_send'){
+    const code = buildPairingPayload(endpoint);
+    openPairingModal(code);
   }
 }
 
@@ -639,6 +825,7 @@ async function restoreRules(file){
       throw new Error(data.error || '恢复失败');
     }
     await loadPool();
+  await loadNodesList();
     toast('规则恢复完成');
     return true;
   }catch(e){
@@ -762,6 +949,7 @@ function initNodePage(){
     restoreBtn.addEventListener('click', triggerRestore);
   }
   q('f_type').addEventListener('change', showWssBox);
+  if(q('f_wss_receiver_node')) q('f_wss_receiver_node').addEventListener('change', showWssBox);
   // Load once, then enable auto-refresh by default
   loadPool().finally(()=>{
     try{

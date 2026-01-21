@@ -6,6 +6,7 @@ import time
 import hmac
 import hashlib
 import secrets
+import uuid
 from datetime import datetime
 from urllib.parse import urlparse
 from pathlib import Path
@@ -731,6 +732,68 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     if not isinstance(pool, dict):
         return JSONResponse({"ok": False, "error": "missing pool"}, status_code=400)
 
+
+    # Prevent editing/deleting synced receiver rules from UI
+    try:
+        _, existing_desired = get_desired_pool(node_id)
+        existing_pool = existing_desired
+        if not isinstance(existing_pool, dict):
+            rep = get_last_report(node_id)
+            if isinstance(rep, dict) and isinstance(rep.get("pool"), dict):
+                existing_pool = rep.get("pool")
+        locked: Dict[str, Any] = {}
+        if isinstance(existing_pool, dict):
+            for ep in existing_pool.get("endpoints") or []:
+                if not isinstance(ep, dict):
+                    continue
+                ex0 = ep.get("extra_config") or {}
+                if not isinstance(ex0, dict):
+                    ex0 = {}
+                sid = ex0.get("sync_id")
+                if sid and (ex0.get("sync_lock") is True or ex0.get("sync_role") == "receiver"):
+                    locked[str(sid)] = ep
+
+        if locked:
+            posted: Dict[str, Any] = {}
+            for ep in pool.get("endpoints") or []:
+                if not isinstance(ep, dict):
+                    continue
+                ex0 = ep.get("extra_config") or {}
+                if not isinstance(ex0, dict):
+                    ex0 = {}
+                sid = ex0.get("sync_id")
+                if sid:
+                    posted[str(sid)] = ep
+
+            def _canon(e: Dict[str, Any]) -> Dict[str, Any]:
+                ex = dict(e.get("extra_config") or {})
+                ex.pop("last_sync_at", None)
+                ex.pop("sync_updated_at", None)
+                return {
+                    "listen": e.get("listen"),
+                    "remotes": e.get("remotes") or [],
+                    "disabled": bool(e.get("disabled", False)),
+                    "balance": e.get("balance"),
+                    "protocol": e.get("protocol"),
+                    "extra_config": ex,
+                }
+
+            for sid, old_ep in locked.items():
+                new_ep = posted.get(sid)
+                if not new_ep:
+                    return JSONResponse(
+                        {"ok": False, "error": "该节点存在由发送机同步的锁定规则，无法手动删除/修改（请在发送机上操作）"},
+                        status_code=403,
+                    )
+                if _canon(old_ep) != _canon(new_ep):
+                    return JSONResponse(
+                        {"ok": False, "error": "该节点存在由发送机同步的锁定规则，无法手动删除/修改（请在发送机上操作）"},
+                        status_code=403,
+                    )
+    except Exception:
+        pass
+
+
     # Store desired pool on panel. Agent will pull it on next report.
     desired_ver, _ = set_desired_pool(node_id, pool)
 
@@ -744,6 +807,324 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
         pass
 
     return {"ok": True, "pool": pool, "desired_version": desired_ver, "queued": True, "note": "waiting agent report"}
+
+
+
+# -------------------- WSS tunnel node-to-node sync --------------------
+
+def _split_host_port(addr: str) -> tuple[str, Optional[int]]:
+    addr = (addr or "").strip()
+    if not addr:
+        return "", None
+    if addr.startswith("["):
+        # [IPv6]:port
+        if "]" in addr:
+            host = addr[1: addr.index("]")]
+            rest = addr[addr.index("]") + 1 :]
+            if rest.startswith(":"):
+                try:
+                    return host, int(rest[1:])
+                except Exception:
+                    return host, None
+            return host, None
+        return addr, None
+    if ":" in addr:
+        host, p = addr.rsplit(":", 1)
+        try:
+            return host, int(p)
+        except Exception:
+            return addr, None
+    return addr, None
+
+
+def _format_addr(host: str, port: int) -> str:
+    host = (host or "").strip()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{host}:{int(port)}"
+
+
+def _node_host_for_realm(node: Dict[str, Any]) -> str:
+    base = (node.get("base_url") or "").strip()
+    if not base:
+        return ""
+    if "://" not in base:
+        base = "http://" + base
+    u = urlparse(base)
+    return u.hostname or ""
+
+
+async def _load_pool_for_node(node: Dict[str, Any]) -> Dict[str, Any]:
+    nid = int(node.get("id") or 0)
+    _, desired = get_desired_pool(nid)
+    if isinstance(desired, dict):
+        pool = desired
+    else:
+        rep = get_last_report(nid)
+        if isinstance(rep, dict) and isinstance(rep.get("pool"), dict):
+            pool = rep.get("pool")
+        else:
+            try:
+                data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool", _node_verify_tls(node))
+                pool = data.get("pool") if isinstance(data, dict) else None
+            except Exception:
+                pool = None
+    if not isinstance(pool, dict):
+        pool = {}
+    if not isinstance(pool.get("endpoints"), list):
+        pool["endpoints"] = []
+    return pool
+
+
+def _remove_endpoints_by_sync_id(pool: Dict[str, Any], sync_id: str) -> None:
+    if not isinstance(pool, dict):
+        return
+    eps = pool.get("endpoints")
+    if not isinstance(eps, list):
+        pool["endpoints"] = []
+        return
+    new_eps = []
+    for ep in eps:
+        if not isinstance(ep, dict):
+            continue
+        ex = ep.get("extra_config") or {}
+        sid = ex.get("sync_id") if isinstance(ex, dict) else None
+        if sid and str(sid) == str(sync_id):
+            continue
+        new_eps.append(ep)
+    pool["endpoints"] = new_eps
+
+
+def _choose_receiver_port(receiver_pool: Dict[str, Any], preferred: Optional[int]) -> int:
+    used = set()
+    for ep in receiver_pool.get("endpoints") or []:
+        if not isinstance(ep, dict):
+            continue
+        h, p = _split_host_port(str(ep.get("listen") or ""))
+        if p:
+            used.add(int(p))
+    if preferred and 1 <= int(preferred) <= 65535 and int(preferred) not in used:
+        return int(preferred)
+    # pick a random-ish high port
+    seed = int(uuid.uuid4().int % 20000)
+    port = 20000 + seed
+    for _ in range(20000):
+        if port not in used and 1 <= port <= 65535:
+            return port
+        port += 1
+        if port > 65535:
+            port = 20000
+    # fallback
+    return 33394
+
+
+@app.get("/api/nodes")
+async def api_nodes_list(user: str = Depends(require_login)):
+    out = []
+    for n in list_nodes():
+        out.append({"id": int(n["id"]), "name": n["name"], "base_url": n["base_url"]})
+    return {"ok": True, "nodes": out}
+
+
+@app.post("/api/wss_tunnel/save")
+async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(require_login)):
+    try:
+        sender_id = int(payload.get("sender_node_id") or 0)
+        receiver_id = int(payload.get("receiver_node_id") or 0)
+    except Exception:
+        sender_id = 0
+        receiver_id = 0
+
+    if sender_id <= 0 or receiver_id <= 0 or sender_id == receiver_id:
+        return JSONResponse({"ok": False, "error": "sender_node_id / receiver_node_id 无效"}, status_code=400)
+
+    sender = get_node(sender_id)
+    receiver = get_node(receiver_id)
+    if not sender or not receiver:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+
+    listen = str(payload.get("listen") or "").strip()
+    remotes = payload.get("remotes") or []
+    if isinstance(remotes, str):
+        remotes = [x.strip() for x in remotes.splitlines() if x.strip()]
+    if not isinstance(remotes, list):
+        remotes = []
+    remotes = [str(x).strip() for x in remotes if str(x).strip()]
+    disabled = bool(payload.get("disabled", False))
+    balance = str(payload.get("balance") or "roundrobin").strip()
+    protocol = str(payload.get("protocol") or "tcp+udp").strip() or "tcp+udp"
+
+    wss = payload.get("wss") or {}
+    if not isinstance(wss, dict):
+        wss = {}
+    wss_host = str(wss.get("host") or "").strip()
+    wss_path = str(wss.get("path") or "").strip()
+    wss_sni = str(wss.get("sni") or "").strip()
+    wss_tls = bool(wss.get("tls", True))
+    wss_insecure = bool(wss.get("insecure", False))
+
+    if not listen:
+        return JSONResponse({"ok": False, "error": "listen 不能为空"}, status_code=400)
+    if not remotes:
+        return JSONResponse({"ok": False, "error": "目标地址不能为空"}, status_code=400)
+    if not wss_host or not wss_path:
+        return JSONResponse({"ok": False, "error": "WSS Host / Path 不能为空"}, status_code=400)
+
+    sync_id = str(payload.get("sync_id") or "").strip() or uuid.uuid4().hex
+
+    receiver_port = payload.get("receiver_port")
+    try:
+        receiver_port = int(receiver_port) if receiver_port is not None and receiver_port != "" else None
+    except Exception:
+        receiver_port = None
+
+    # preferred port = sender listen port
+    _, sender_listen_port = _split_host_port(listen)
+    preferred_port = receiver_port or sender_listen_port
+    receiver_pool = await _load_pool_for_node(receiver)
+    receiver_port = _choose_receiver_port(receiver_pool, preferred_port)
+
+    receiver_host = _node_host_for_realm(receiver)
+    if not receiver_host:
+        return JSONResponse({"ok": False, "error": "接收机 base_url 无法解析主机名，请检查节点地址"}, status_code=400)
+    sender_to_receiver = _format_addr(receiver_host, receiver_port)
+
+    now_iso = datetime.utcnow().isoformat() + "Z"
+
+    sender_ep = {
+        "listen": listen,
+        "disabled": disabled,
+        "balance": balance,
+        "protocol": protocol,
+        "remotes": [sender_to_receiver],
+        "extra_config": {
+            "remote_transport": "ws",
+            "remote_ws_host": wss_host,
+            "remote_ws_path": wss_path,
+            "remote_tls_enabled": bool(wss_tls),
+            "remote_tls_insecure": bool(wss_insecure),
+            "remote_tls_sni": wss_sni,
+            # sync meta
+            "sync_id": sync_id,
+            "sync_role": "sender",
+            "sync_peer_node_id": receiver_id,
+            "sync_peer_node_name": receiver.get("name"),
+            "sync_receiver_port": receiver_port,
+            "sync_original_remotes": remotes,
+            "sync_updated_at": now_iso,
+        },
+    }
+
+    receiver_ep = {
+        "listen": _format_addr("0.0.0.0", receiver_port),
+        "disabled": disabled,
+        "balance": balance,
+        "protocol": protocol,
+        "remotes": remotes,
+        "extra_config": {
+            "listen_transport": "ws",
+            "listen_ws_host": wss_host,
+            "listen_ws_path": wss_path,
+            "listen_tls_enabled": bool(wss_tls),
+            "listen_tls_insecure": bool(wss_insecure),
+            "listen_tls_servername": wss_sni,
+            # sync meta
+            "sync_id": sync_id,
+            "sync_role": "receiver",
+            "sync_lock": True,
+            "sync_from_node_id": sender_id,
+            "sync_from_node_name": sender.get("name"),
+            "sync_sender_listen": listen,
+            "sync_original_remotes": remotes,
+            "sync_updated_at": now_iso,
+        },
+    }
+
+    sender_pool = await _load_pool_for_node(sender)
+
+    # upsert by sync_id
+    _remove_endpoints_by_sync_id(sender_pool, sync_id)
+    _remove_endpoints_by_sync_id(receiver_pool, sync_id)
+    sender_pool["endpoints"].append(sender_ep)
+    receiver_pool["endpoints"].append(receiver_ep)
+
+    # persist desired pools on panel
+    s_ver, _ = set_desired_pool(sender_id, sender_pool)
+    r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
+
+    # best-effort immediate apply to both agents
+    async def _apply(node: Dict[str, Any], pool: Dict[str, Any]):
+        try:
+            data = await agent_post(node["base_url"], node["api_key"], "/api/v1/pool", {"pool": pool}, _node_verify_tls(node))
+            if isinstance(data, dict) and data.get("ok", True):
+                await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, _node_verify_tls(node))
+        except Exception:
+            pass
+
+    await _apply(sender, sender_pool)
+    await _apply(receiver, receiver_pool)
+
+    return {
+        "ok": True,
+        "sync_id": sync_id,
+        "receiver_port": receiver_port,
+        "sender_pool": sender_pool,
+        "receiver_pool": receiver_pool,
+        "sender_desired_version": s_ver,
+        "receiver_desired_version": r_ver,
+    }
+
+
+@app.post("/api/wss_tunnel/delete")
+async def api_wss_tunnel_delete(payload: Dict[str, Any], user: str = Depends(require_login)):
+    sync_id = str(payload.get("sync_id") or "").strip()
+    if not sync_id:
+        return JSONResponse({"ok": False, "error": "sync_id 不能为空"}, status_code=400)
+
+    try:
+        sender_id = int(payload.get("sender_node_id") or 0)
+        receiver_id = int(payload.get("receiver_node_id") or 0)
+    except Exception:
+        sender_id = 0
+        receiver_id = 0
+
+    if sender_id <= 0 or receiver_id <= 0 or sender_id == receiver_id:
+        return JSONResponse({"ok": False, "error": "sender_node_id / receiver_node_id 无效"}, status_code=400)
+
+    sender = get_node(sender_id)
+    receiver = get_node(receiver_id)
+    if not sender or not receiver:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+
+    sender_pool = await _load_pool_for_node(sender)
+    receiver_pool = await _load_pool_for_node(receiver)
+
+    _remove_endpoints_by_sync_id(sender_pool, sync_id)
+    _remove_endpoints_by_sync_id(receiver_pool, sync_id)
+
+    s_ver, _ = set_desired_pool(sender_id, sender_pool)
+    r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
+
+    async def _apply(node: Dict[str, Any], pool: Dict[str, Any]):
+        try:
+            data = await agent_post(node["base_url"], node["api_key"], "/api/v1/pool", {"pool": pool}, _node_verify_tls(node))
+            if isinstance(data, dict) and data.get("ok", True):
+                await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, _node_verify_tls(node))
+        except Exception:
+            pass
+
+    await _apply(sender, sender_pool)
+    await _apply(receiver, receiver_pool)
+
+    return {
+        "ok": True,
+        "sync_id": sync_id,
+        "sender_pool": sender_pool,
+        "receiver_pool": receiver_pool,
+        "sender_desired_version": s_ver,
+        "receiver_desired_version": r_ver,
+    }
+
 
 
 @app.post("/api/nodes/{node_id}/apply")

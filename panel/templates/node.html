@@ -123,16 +123,38 @@
       </select>
 
       <div id="wssBox" style="display:none;">
-        <div class="row" style="gap:12px;align-items:center;">
+
+        <div id="wssAutoSyncBox" class="row" style="gap:12px;">
           <div class="col">
-            <label class="label">配对码（粘贴后自动填充）</label>
-            <textarea class="textarea" id="f_pairing" rows="3" placeholder="在另一端生成配对码后粘贴"></textarea>
+            <label class="label">接收机节点（自动同步）</label>
+            <select class="select" id="f_wss_receiver_node">
+              <option value="">（不选择=手动配对码模式）</option>
+            </select>
+            <div class="help">选择接收机后，保存会自动在接收机同步生成对应规则；删除也会自动同步删除。接收机由同步生成的规则将被锁定不可编辑。</div>
           </div>
-          <div class="col right">
-            <button class="btn ghost" type="button" onclick="applyPairingCode()">解析配对码</button>
+          <div class="col">
+            <label class="label">接收端口</label>
+            <input class="input" id="f_wss_receiver_port" placeholder="留空=自动选择">
+            <div class="help">接收端 Realm 监听端口（面板会自动挑选不冲突的端口）。</div>
           </div>
         </div>
-        <div class="row" style="gap:12px;">
+
+        <details id="wssManualPairDetails" style="margin-top:10px;">
+          <summary class="help">高级：使用配对码（兼容旧模式）</summary>
+          <div style="margin-top:10px;">
+            <div class="row" style="gap:12px;align-items:center;">
+              <div class="col">
+                <label class="label">配对码（粘贴后自动填充）</label>
+                <textarea class="textarea" id="f_pairing" rows="3" placeholder="在另一端生成配对码后粘贴"></textarea>
+              </div>
+              <div class="col right">
+                <button class="btn ghost" type="button" onclick="applyPairingCode()">解析配对码</button>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <div class="row" style="gap:12px;margin-top:10px;">
           <div class="col">
             <label class="label">WSS Host</label>
             <input class="input" id="f_wss_host" placeholder="www.bing.com">
@@ -144,7 +166,7 @@
         </div>
         <div class="row" style="gap:12px;align-items:center;">
           <div class="col">
-            <div class="help">建议与服务端证书域名保持一致，TLS 不可用时可关闭。</div>
+            <div class="help">建议与证书域名保持一致；TLS 不可用时可关闭。</div>
           </div>
           <div class="col right">
             <button class="btn ghost" type="button" onclick="randomizeWss()">随机生成参数</button>
@@ -170,6 +192,7 @@
             </select>
           </div>
         </div>
+
       </div>
 
       <div class="row" style="gap:12px; justify-content:flex-end;">
