@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row">
+  <div class="col">
+    <h1 class="h1">控制台</h1>
+    <p class="muted">集中管理节点接入与转发策略</p>
+  </div>
+  <div class="col right">
+    <a class="btn" href="/nodes/new">接入节点</a>
+  </div>
+</div>
+
+<div class="grid">
+  {% for n in nodes %}
+  <div class="card">
+    <div class="row">
+      <div class="col">
+        <div class="h2">{{ n.name or ("节点-" ~ n.id) }}</div>
+        <div class="muted">IP：{{ n.display_ip or "-" }}</div>
+        <div class="muted">上报：{{ n.last_seen_at or "-" }}{% if n.agent_version %} · {{ n.agent_version }}{% endif %}</div>
+      </div>
+      <div class="col right">
+        <a class="btn-secondary" href="/nodes/{{ n.id }}">打开</a>
+      </div>
+    </div>
+    <div class="meta">
+      {% if n.online %}
+      <span class="pill ok">在线</span>
+      {% else %}
+      <span class="pill bad">离线</span>
+      {% endif %}
+    </div>
+  </div>
+  {% else %}
+  <div class="card">
+    <div class="h2">暂无已接入节点</div>
+    <p class="muted">请先在目标机器安装 Realm Agent，再回到此处完成接入。</p>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}
+
+{% block scripts %}{% endblock %}

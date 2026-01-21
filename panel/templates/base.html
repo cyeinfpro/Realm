@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title or "Realm Pro Panel" }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">RP</div>
+      <div>
+        <div class="brand-name">Realm Pro Control</div>
+        <div class="brand-sub">基础设施与转发规则管理</div>
+      </div>
+    </div>
+    <nav class="nav">
+      {% if user %}
+        <a href="/" class="nav-link">控制台</a>
+        <a href="/logout" class="nav-link">退出</a>
+      {% endif %}
+    </nav>
+  </header>
+
+  <main class="container">
+    {% if flash %}
+      <div class="flash">{{ flash }}</div>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="footer">
+    <span>Realm Pro Suite v33</span>
+  </footer>
+
+  {% block scripts %}{% endblock %}
+</body>
+</html>
