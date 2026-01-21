@@ -122,6 +122,10 @@ a{color:inherit}
 .pill.warn{color:var(--warn);border-color:rgba(245,158,11,0.35);background:rgba(245,158,11,0.10)}
 .pill.ghost{color:rgba(226,232,240,0.92);border-color:rgba(148,163,184,0.22);background:rgba(148,163,184,0.10)}
 
+/* pill buttons (e.g. +N expand) */
+button.pill{cursor:pointer;font:inherit}
+button.pill:active{transform:translateY(1px)}
+
 /* Buttons */
 .btn{
   appearance:none;

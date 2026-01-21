@@ -109,15 +109,32 @@ function formatRemote(e){
   return rs.join('\n');
 }
 
-function renderRemoteTargets(e){
+function renderRemoteTargets(e, idx){
   const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
   if(!rs.length) return '<span class="muted">—</span>';
   const MAX = 2;
   const shown = rs.slice(0, MAX);
   const more = Math.max(0, rs.length - MAX);
   const chips = shown.map(r=>`<span class="remote-chip mono" title="${escapeHtml(r)}">${escapeHtml(r)}</span>`).join('');
-  const moreHtml = more>0 ? `<span class="pill ghost" title="${escapeHtml(rs.join('\n'))}">+${more}</span>` : '';
+  const moreHtml = more>0 ? `<button class="pill ghost remote-more" type="button" data-idx="${idx}" title="点击查看全部目标">+${more}</button>` : '';
   return `<div class="remote-wrap">${chips}${moreHtml}</div>`;
+}
+
+function showRemoteDetail(idx){
+  try{
+    const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
+    const e = eps[idx] || {};
+    const ex = e.extra_config || {};
+    // 对于同步 sender，优先展示原始目标
+    if(ex && ex.sync_role === 'sender' && Array.isArray(ex.sync_original_remotes) && ex.sync_original_remotes.length){
+      openCommandModal('Remote 目标详情（原始目标）', ex.sync_original_remotes.join('\n'));
+      return;
+    }
+    const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
+    openCommandModal('Remote 目标详情', rs.join('\n') || '—');
+  }catch(err){
+    openCommandModal('Remote 目标详情', '暂无详情');
+  }
 }
 
 function statusPill(e){
@@ -154,7 +171,7 @@ function buildStatsLookup(){
   return lookup;
 }
 
-function renderHealth(healthList, statsError){
+function renderHealth(healthList, statsError, idx){
   if(statsError){
     return `<span class="muted">检测失败：${escapeHtml(statsError)}</span>`;
   }
@@ -194,7 +211,7 @@ function renderHealth(healthList, statsError){
     </div>`;
   }).join('');
 
-  const more = hiddenCount > 0 ? `<span class="pill ghost" title="还有 ${hiddenCount} 个目标未展示">+${hiddenCount}</span>` : '';
+  const more = hiddenCount > 0 ? `<button class="pill ghost health-more" type="button" data-idx="${idx}" title="点击查看全部目标">+${hiddenCount}</button>` : '';
   return `<div class="health-wrap">${chips}${more}</div>`;
 }
 
@@ -240,7 +257,7 @@ function renderHealthMobile(healthList, statsError, idx){
     </div>`;
   }).join('');
 
-  const more = hiddenCount > 0 ? `<button class="pill ghost health-more" type="button" onclick="showHealthDetail(${idx})">+${hiddenCount}</button>` : '';
+  const more = hiddenCount > 0 ? `<button class="pill ghost health-more" type="button" data-idx="${idx}">+${hiddenCount}</button>` : '';
   return `<div class="health-wrap mobile">${chips}${more}</div>`;
 }
 
@@ -290,7 +307,7 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
         <span class="pill ghost">${escapeHtml(totalStr)}</span>
       </div>
     </div>
-    <div class="rule-remote-block">${renderRemoteTargets(e)}</div>
+    <div class="rule-remote-block">${renderRemoteTargets(e, idx)}</div>
     <div class="rule-health-block">
       ${healthHtml}
     </div>
@@ -362,7 +379,7 @@ ${endpointType(e)}`.toLowerCase();
       card.innerHTML = renderRuleCard(e, idx, rowNo, stats, statsError);
       mobileWrap.appendChild(card.firstElementChild);
     }else{
-      const healthHtml = renderHealth(stats.health, statsLookup.error);
+      const healthHtml = renderHealth(stats.health, statsLookup.error, idx);
       const rx = statsError ? null : (stats.rx_bytes || 0);
       const tx = statsError ? null : (stats.tx_bytes || 0);
       const total = (rx == null || tx == null) ? null : rx + tx;
@@ -377,7 +394,7 @@ ${endpointType(e)}`.toLowerCase();
           <div class="mono">${escapeHtml(e.listen)}</div>
           <div class="muted sm">${endpointType(e)}</div>
         </td>
-        <td class="remote">${renderRemoteTargets(e)}</td>
+        <td class="remote">${renderRemoteTargets(e, idx)}</td>
         <td class="health">${healthHtml}</td>
         <td class="stat" title="当前已建立连接：${escapeHtml(est)}">${statsError ? '—' : escapeHtml(connActive)}</td>
         <td class="stat">${total == null ? '—' : formatBytes(total)}</td>
@@ -1228,5 +1245,25 @@ document.addEventListener("keydown", (e)=>{
   if(e.key === "Escape"){
     const m = document.getElementById("addNodeModal");
     if(m && m.style.display !== "none") closeAddNodeModal();
+  }
+});
+
+// +N 展开按钮（Remote 目标 / 连通检测）
+// 说明：不要依赖 inline onclick（某些浏览器缓存/模板差异会导致 onclick 失效）
+// 统一使用事件委托，确保点击永远有效。
+document.addEventListener('click', (e)=>{
+  const rbtn = e.target.closest && e.target.closest('button.remote-more');
+  if(rbtn){
+    e.preventDefault();
+    const idx = Number(rbtn.dataset.idx);
+    if(!Number.isNaN(idx)) showRemoteDetail(idx);
+    return;
+  }
+  const hbtn = e.target.closest && e.target.closest('button.health-more');
+  if(hbtn){
+    e.preventDefault();
+    const idx = Number(hbtn.dataset.idx);
+    if(!Number.isNaN(idx)) showHealthDetail(idx);
+    return;
   }
 });
