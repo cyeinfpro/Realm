@@ -557,6 +557,10 @@ function newRule(){
   q('f_protocol').value = 'tcp+udp';
   q('f_type').value = 'tcp';
   setField('f_pairing','');
+  // reset autosync receiver fields
+  if(q('f_wss_receiver_node')) setField('f_wss_receiver_node','');
+  if(q('f_wss_receiver_port')) setField('f_wss_receiver_port','');
+  populateReceiverSelect();
   fillWssFields({});
   showWssBox();
   openModal();
@@ -565,15 +569,28 @@ function newRule(){
 function editRule(idx){
   CURRENT_EDIT_INDEX = idx;
   const e = CURRENT_POOL.endpoints[idx];
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+
   q('modalTitle').textContent = `编辑规则 #${idx+1}`;
   setField('f_listen', e.listen || '');
-  setField('f_remotes', formatRemote(e));
+  // synced sender rule should show original targets (not the peer receiver ip:port)
+  setField('f_remotes', formatRemoteForInput(e));
+
   q('f_disabled').value = e.disabled ? '1':'0';
   const balance = e.balance || 'roundrobin';
   q('f_balance').value = balance.startsWith('iphash') ? 'iphash' : 'roundrobin';
   const weights = balance.startsWith('roundrobin:') ? balance.split(':').slice(1).join(':').trim().split(',').map(x=>x.trim()).filter(Boolean) : [];
   setField('f_weights', weights.join(','));
   q('f_protocol').value = e.protocol || 'tcp+udp';
+
+  // infer tunnel mode from endpoint
+  q('f_type').value = wssMode(e);
+
+  // autosync receiver selector (sender role only)
+  if(q('f_wss_receiver_node')) setField('f_wss_receiver_node', ex.sync_role === 'sender' && ex.sync_peer_node_id ? String(ex.sync_peer_node_id) : '');
+  if(q('f_wss_receiver_port')) setField('f_wss_receiver_port', ex.sync_role === 'sender' && ex.sync_receiver_port ? String(ex.sync_receiver_port) : '');
+  populateReceiverSelect();
+
   setField('f_pairing','');
   fillWssFields(e);
   showWssBox();
@@ -950,6 +967,10 @@ function initNodePage(){
   }
   q('f_type').addEventListener('change', showWssBox);
   if(q('f_wss_receiver_node')) q('f_wss_receiver_node').addEventListener('change', showWssBox);
+
+  // ✅ Load nodes list for WSS auto-sync receiver selector
+  // (otherwise the receiver dropdown stays empty and cannot be selected)
+  loadNodesList();
   // Load once, then enable auto-refresh by default
   loadPool().finally(()=>{
     try{
