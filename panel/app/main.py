@@ -1221,6 +1221,32 @@ async def api_stats(request: Request, node_id: int, user: str = Depends(require_
         return {"ok": False, "error": str(exc), "rules": []}
 
 
+
+
+@app.get("/api/nodes/{node_id}/sys")
+async def api_sys(request: Request, node_id: int, user: str = Depends(require_login)):
+    """节点系统信息：CPU/内存/硬盘/交换/在线时长/流量/实时速率。
+
+    优先读取 Agent push-report 缓存（更快、更稳定），否则回退到直连 Agent。
+    """
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+
+    # Push-report cache
+    if _is_report_fresh(node):
+        rep = get_last_report(node_id)
+        if isinstance(rep, dict) and isinstance(rep.get("sys"), dict):
+            out = rep["sys"]
+            out["source"] = "report"
+            return out
+
+    try:
+        data = await agent_get(node["base_url"], node["api_key"], "/api/v1/sys", _node_verify_tls(node))
+        return data
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
 @app.get("/api/nodes/{node_id}/graph")
 async def api_graph(request: Request, node_id: int, user: str = Depends(require_login)):
     node = get_node(node_id)

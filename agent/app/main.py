@@ -51,6 +51,13 @@ PROBE_MAX_WORKERS = int(os.getenv('REALM_AGENT_PROBE_WORKERS', '32'))
 _PROBE_CACHE: Dict[str, Dict[str, Any]] = {}
 _PROBE_LOCK = threading.Lock()
 
+# ---------------- System Snapshot (CPU/Mem/Disk/Net) ----------------
+# 说明：不依赖 psutil，纯 /proc + shutil.disk_usage 实现。
+# 用于面板节点详情展示（CPU/内存/硬盘/交换/在线时长/流量/实时速率），默认 3s 上报一次。
+_SYS_LOCK = threading.Lock()
+_SYS_CPU_LAST: dict | None = None  # {total:int, idle:int, ts:float}
+_SYS_NET_LAST: dict | None = None  # {rx:int, tx:int, ts:float}
+
 
 def _read_text(p: Path) -> str:
     return p.read_text(encoding='utf-8')
@@ -77,6 +84,153 @@ def _read_int(p: Path, default: int = 0) -> int:
 
 def _write_int(p: Path, value: int) -> None:
     _write_text(p, str(int(value)))
+
+
+# ---------------- System Snapshot Helpers ----------------
+
+def _read_first_line(path: str) -> str:
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            return (f.readline() or '').strip()
+    except Exception:
+        return ''
+
+def _read_cpu_model() -> str:
+    try:
+        with open('/proc/cpuinfo', 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                if line.lower().startswith('model name'):
+                    return line.split(':', 1)[-1].strip()
+    except Exception:
+        pass
+    return ''
+
+def _read_cpu_times() -> tuple[int, int]:
+    # returns (total, idle)
+    try:
+        with open('/proc/stat', 'r', encoding='utf-8', errors='ignore') as f:
+            line = f.readline()
+        parts = line.split()
+        if not parts or parts[0] != 'cpu':
+            return (0, 0)
+        nums = [int(x) for x in parts[1:]]
+        # user,nice,system,idle,iowait,irq,softirq,steal,...
+        idle = 0
+        if len(nums) >= 4:
+            idle = nums[3]
+        if len(nums) >= 5:
+            idle += nums[4]
+        total = sum(nums)
+        return (total, idle)
+    except Exception:
+        return (0, 0)
+
+def _read_meminfo() -> dict:
+    out = {}
+    try:
+        with open('/proc/meminfo', 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                if ':' not in line:
+                    continue
+                k, v = line.split(':', 1)
+                v = v.strip().split()
+                if not v:
+                    continue
+                # values are kB
+                try:
+                    out[k.strip()] = int(v[0]) * 1024
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return out
+
+def _read_net_bytes() -> tuple[int, int]:
+    # returns (rx_bytes, tx_bytes) for all non-loopback interfaces
+    rx = 0
+    tx = 0
+    try:
+        with open('/proc/net/dev', 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()[2:]
+        for line in lines:
+            if ':' not in line:
+                continue
+            iface, data = line.split(':', 1)
+            iface = iface.strip()
+            if iface == 'lo':
+                continue
+            fields = data.split()
+            if len(fields) < 16:
+                continue
+            # receive bytes is fields[0], transmit bytes is fields[8]
+            rx += int(fields[0])
+            tx += int(fields[8])
+    except Exception:
+        return (0, 0)
+    return (rx, tx)
+
+def _build_sys_snapshot() -> dict:
+    now = time.time()
+    cpu_model = _read_cpu_model()
+    cores = int(os.cpu_count() or 0)
+    total, idle = _read_cpu_times()
+    rx, tx = _read_net_bytes()
+    mem = _read_meminfo()
+    mem_total = int(mem.get('MemTotal', 0) or 0)
+    mem_avail = int(mem.get('MemAvailable', 0) or 0)
+    mem_used = max(0, mem_total - mem_avail)
+    swap_total = int(mem.get('SwapTotal', 0) or 0)
+    swap_free = int(mem.get('SwapFree', 0) or 0)
+    swap_used = max(0, swap_total - swap_free)
+    disk_total = disk_used = 0
+    try:
+        du = shutil.disk_usage('/')
+        disk_total = int(du.total)
+        disk_used = int(du.used)
+    except Exception:
+        pass
+    uptime_sec = 0.0
+    try:
+        up = _read_first_line('/proc/uptime')
+        uptime_sec = float((up.split() or ['0'])[0])
+    except Exception:
+        uptime_sec = 0.0
+
+    cpu_pct = 0.0
+    rx_bps = 0.0
+    tx_bps = 0.0
+    global _SYS_CPU_LAST, _SYS_NET_LAST
+    with _SYS_LOCK:
+        if _SYS_CPU_LAST and total > 0:
+            dt = max(1e-6, float(now - float(_SYS_CPU_LAST.get('ts', now))))
+            dtotal = int(total - int(_SYS_CPU_LAST.get('total', total)))
+            didle = int(idle - int(_SYS_CPU_LAST.get('idle', idle)))
+            if dtotal > 0:
+                cpu_pct = max(0.0, min(100.0, (dtotal - didle) * 100.0 / dtotal))
+        _SYS_CPU_LAST = {'total': int(total), 'idle': int(idle), 'ts': float(now)}
+        if _SYS_NET_LAST:
+            dt = max(1e-6, float(now - float(_SYS_NET_LAST.get('ts', now))))
+            drx = int(rx - int(_SYS_NET_LAST.get('rx', rx)))
+            dtx = int(tx - int(_SYS_NET_LAST.get('tx', tx)))
+            rx_bps = max(0.0, drx / dt)
+            tx_bps = max(0.0, dtx / dt)
+        _SYS_NET_LAST = {'rx': int(rx), 'tx': int(tx), 'ts': float(now)}
+
+    def pct(used: int, total: int) -> float:
+        if total <= 0:
+            return 0.0
+        return max(0.0, min(100.0, used * 100.0 / total))
+
+    return {
+        'ok': True,
+        'ts': int(now),
+        'cpu': {'model': cpu_model, 'cores': cores, 'usage_pct': round(cpu_pct, 2)},
+        'mem': {'total': mem_total, 'used': mem_used, 'usage_pct': round(pct(mem_used, mem_total), 2)},
+        'swap': {'total': swap_total, 'used': swap_used, 'usage_pct': round(pct(swap_used, swap_total), 2)},
+        'disk': {'path': '/', 'total': disk_total, 'used': disk_used, 'usage_pct': round(pct(disk_used, disk_total), 2)},
+        'net': {'rx_bytes': int(rx), 'tx_bytes': int(tx), 'rx_bps': round(rx_bps, 2), 'tx_bps': round(tx_bps, 2)},
+        'uptime_sec': round(float(uptime_sec), 3),
+    }
 
 
 def _sha256_of_obj(obj: Any) -> str:
@@ -974,6 +1128,7 @@ def _build_push_report() -> Dict[str, Any]:
         'info': info,
         'pool': pool,
         'stats': stats,
+        'sys': _build_sys_snapshot(),
     }
     if _LAST_SYNC_ERROR:
         rep['sync_error'] = _LAST_SYNC_ERROR
@@ -1221,6 +1376,12 @@ def api_info(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
         'hostname': socket.gethostname(),
         'realm_active': any(_service_is_active(name) for name in REALM_SERVICE_NAMES),
     }
+
+
+@app.get('/api/v1/sys')
+def api_sys(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    """节点系统信息：CPU/内存/硬盘/交换/在线时长/流量/速率（用于面板节点详情）。"""
+    return _build_sys_snapshot()
 
 
 @app.get('/api/v1/pool')

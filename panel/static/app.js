@@ -54,6 +54,7 @@ function q(id){ return document.getElementById(id); }
 let CURRENT_POOL = null;
 let CURRENT_EDIT_INDEX = -1;
 let CURRENT_STATS = null;
+let CURRENT_SYS = null;
 let PENDING_COMMAND_TEXT = '';
 let NODES_LIST = [];
 
@@ -205,6 +206,80 @@ function formatBytes(value){
   }
   return `${val.toFixed(val >= 10 || idx === 0 ? 0 : 1)} ${units[idx]}`;
 }
+
+
+function formatBps(value){
+  const v = Number(value) || 0;
+  if(v <= 0) return '0 B/s';
+  return formatBytes(v) + '/s';
+}
+
+function formatDuration(sec){
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m2 = Math.floor((s % 3600) / 60);
+  const s2 = s % 60;
+  const parts = [];
+  if(d) parts.push(d + '天');
+  if(d || h) parts.push(h + '小时');
+  if(d || h || m2) parts.push(m2 + '分');
+  parts.push(s2 + '秒');
+  return parts.join(' ');
+}
+
+function setProgress(elId, pct){
+  const el = document.getElementById(elId);
+  if(!el) return;
+  const v = Math.max(0, Math.min(100, Number(pct) || 0));
+  el.style.width = v.toFixed(0) + '%';
+}
+
+function renderSysCard(sys){
+  const card = document.getElementById('sysCard');
+  if(!card) return;
+  if(!sys || sys.error){ card.style.display = 'none'; return; }
+  card.style.display = '';
+
+  const cpuModel = sys?.cpu?.model || '-';
+  const cores = sys?.cpu?.cores || '-';
+  const cpuPct = sys?.cpu?.usage_pct ?? 0;
+
+  const memUsed = sys?.mem?.used || 0;
+  const memTot = sys?.mem?.total || 0;
+  const memPct = sys?.mem?.usage_pct ?? 0;
+
+  const swapUsed = sys?.swap?.used || 0;
+  const swapTot = sys?.swap?.total || 0;
+  const swapPct = sys?.swap?.usage_pct ?? 0;
+
+  const diskUsed = sys?.disk?.used || 0;
+  const diskTot = sys?.disk?.total || 0;
+  const diskPct = sys?.disk?.usage_pct ?? 0;
+
+  const tx = sys?.net?.tx_bytes || 0;
+  const rx = sys?.net?.rx_bytes || 0;
+  const txBps = sys?.net?.tx_bps || 0;
+  const rxBps = sys?.net?.rx_bps || 0;
+
+  const setText = (id, text) => { const el = document.getElementById(id); if(el) el.textContent = text; };
+
+  setText('sysCpuInfo', `${cores}核心 ${cpuModel}`);
+  setText('sysUptime', formatDuration(sys?.uptime_sec || 0));
+  setText('sysTraffic', `上传 ${formatBytes(tx)} | 下载 ${formatBytes(rx)}`);
+  setText('sysRate', `上传 ${formatBps(txBps)} | 下载 ${formatBps(rxBps)}`);
+
+  setText('sysCpuPct', `${Number(cpuPct).toFixed(0)}%`);
+  setText('sysMemText', `${formatBytes(memUsed)} / ${formatBytes(memTot)}  ${Number(memPct).toFixed(0)}%`);
+  setText('sysSwapText', `${formatBytes(swapUsed)} / ${formatBytes(swapTot)}  ${Number(swapPct).toFixed(0)}%`);
+  setText('sysDiskText', `${formatBytes(diskUsed)} / ${formatBytes(diskTot)}  ${Number(diskPct).toFixed(0)}%`);
+
+  setProgress('sysCpuBar', cpuPct);
+  setProgress('sysMemBar', memPct);
+  setProgress('sysSwapBar', swapPct);
+  setProgress('sysDiskBar', diskPct);
+}
+
 
 function buildStatsLookup(){
   const lookup = { byIdx: {}, byListen: {}, error: null };
@@ -1128,6 +1203,7 @@ async function refreshStats(){
   }catch(e){
     CURRENT_STATS = { ok: false, error: e.message, rules: [] };
   }
+  await refreshSys();
   renderRules();
 }
 
@@ -1152,6 +1228,7 @@ async function loadPool(){
     if(!CURRENT_POOL.endpoints) CURRENT_POOL.endpoints = [];
     CURRENT_STATS = statsData;
     renderRules();
+    await refreshSys();
   }catch(e){
     q('rulesLoading').textContent = '加载失败：' + e.message;
     if(statsLoading){
@@ -1159,6 +1236,25 @@ async function loadPool(){
     }
   }
 }
+
+async function refreshSys(){
+  try{
+    const nodeId = window.__NODE_ID__ || window.NODE_ID || null;
+    if(!nodeId) return;
+    const res = await fetchJSON(`/api/nodes/${nodeId}/sys`);
+    if(res && res.ok){
+      CURRENT_SYS = res.sys;
+      renderSysCard(CURRENT_SYS);
+    }else{
+      CURRENT_SYS = { error: res?.error || '获取失败' };
+      renderSysCard(null);
+    }
+  }catch(err){
+    CURRENT_SYS = { error: String(err) };
+    renderSysCard(null);
+  }
+}
+
 
 function initNodePage(){
   document.querySelectorAll('.tab').forEach(t=>{

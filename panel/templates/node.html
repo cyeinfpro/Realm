@@ -76,6 +76,36 @@
 
         <div id="nodeSummary" class="summary-bar" style="display:none;"></div>
 
+        <!-- Node system info (auto refresh with rules) -->
+        <div id="sysCard" class="sys-card" style="display:none;">
+          <div class="sys-grid">
+            <div class="sys-kv">
+              <div class="sys-row"><div class="sys-k">CPU信息</div><div class="sys-v" id="sysCpuInfo">-</div></div>
+              <div class="sys-row"><div class="sys-k">在线时长</div><div class="sys-v" id="sysUptime">-</div></div>
+              <div class="sys-row"><div class="sys-k">流量使用</div><div class="sys-v" id="sysTraffic">-</div></div>
+              <div class="sys-row"><div class="sys-k">实时速率</div><div class="sys-v" id="sysRate">-</div></div>
+            </div>
+            <div class="sys-bars">
+              <div class="sys-bar">
+                <div class="sys-bar-head"><span>CPU</span><span class="mono" id="sysCpuPct">0%</span></div>
+                <div class="progress"><div class="progress-fill" id="sysCpuBar" style="width:0%"></div></div>
+              </div>
+              <div class="sys-bar">
+                <div class="sys-bar-head"><span>内存</span><span class="mono" id="sysMemText">-</span></div>
+                <div class="progress"><div class="progress-fill" id="sysMemBar" style="width:0%"></div></div>
+              </div>
+              <div class="sys-bar">
+                <div class="sys-bar-head"><span>虚拟</span><span class="mono" id="sysSwapText">-</span></div>
+                <div class="progress"><div class="progress-fill" id="sysSwapBar" style="width:0%"></div></div>
+              </div>
+              <div class="sys-bar">
+                <div class="sys-bar-head"><span>硬盘</span><span class="mono" id="sysDiskText">-</span></div>
+                <div class="progress"><div class="progress-fill" id="sysDiskBar" style="width:0%"></div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div id="rulesLoading" class="muted">正在加载规则…</div>
 
         <!-- Mobile: card list (table is desktop only) -->
