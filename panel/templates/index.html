@@ -1,40 +1,44 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="row">
-  <div class="col">
+<div class="page-head">
+  <div class="page-title">
     <h1 class="h1">控制台</h1>
-    <p class="muted">集中管理节点接入与转发策略</p>
+    <div class="meta">
+      <span class="meta-item">集中管理节点接入、转发规则与 WSS 自动同步</span>
+    </div>
   </div>
-  <div class="col right">
+  <div class="right">
     <button class="btn sm" type="button" onclick="openAddNodeModal()">接入节点</button>
   </div>
 </div>
 
 <div class="grid">
   {% for n in nodes %}
-  <div class="card">
-    <div class="row">
-      <div class="col">
-        <div class="row" style="align-items:center;justify-content:space-between;gap:10px;">
-          <div class="h2">{{ n.name or ("节点-" ~ n.id) }}</div>
+  <div class="card compact">
+    <div class="card-header">
+      <div style="min-width:0;">
+        <div class="row" style="justify-content:space-between;gap:10px;align-items:center;">
+          <div class="h2" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ n.name or ("节点-" ~ n.id) }}</div>
           {% if n.online %}
           <span class="pill ok">在线</span>
           {% else %}
           <span class="pill bad">离线</span>
           {% endif %}
         </div>
-        <div class="muted">IP：{{ n.display_ip or "-" }}</div>
-        <div class="muted">上报：{{ n.last_seen_at or "-" }}{% if n.agent_version %} · {{ n.agent_version }}{% endif %}</div>
+        <div class="meta" style="margin-top:6px;">
+          <span class="meta-item">IP：{{ n.display_ip or "-" }}</span>
+          <span class="meta-item">上报：{{ n.last_seen_at or "-" }}{% if n.agent_version %} · {{ n.agent_version }}{% endif %}</span>
+        </div>
       </div>
-      <div class="col right">
-        <a class="btn xs" href="/nodes/{{ n.id }}">打开</a>
+      <div class="right" style="flex:0 0 auto;">
+        <a class="btn xs secondary" href="/nodes/{{ n.id }}">打开</a>
       </div>
     </div>
   </div>
   {% else %}
   <div class="card">
-    <div class="h2">暂无已接入节点</div>
-    <p class="muted">请先在目标机器安装 Realm Agent，再回到此处完成接入。</p>
+    <div class="card-title">暂无已接入节点</div>
+    <div class="card-sub">请先在目标机器安装 Realm Agent，再回到此处完成接入。</div>
   </div>
   {% endfor %}
 </div>
@@ -65,7 +69,7 @@
       <label class="label">IP/域名</label>
       <input class="input" id="addNodeIp" placeholder="例如：1.2.3.4 或 node.example.com">
 
-      <div class="row" style="gap:12px;align-items:center;margin-top:10px;">
+      <div class="row" style="gap:12px;align-items:center;margin-top:6px;">
         <div class="col">
           <label class="help"><input type="checkbox" id="addNodeVerifyTls" style="transform:translateY(1px);"> 验证 TLS 证书（https 才需要）</label>
         </div>

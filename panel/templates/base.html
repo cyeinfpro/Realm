@@ -3,18 +3,20 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#060816">
   <title>{{ title or "Realm Pro Panel" }}</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">
+    <a class="brand" href="/" aria-label="Realm Pro">
       <div class="logo">RP</div>
-      <div>
-        <div class="brand-name">Realm Pro Control</div>
-        <div class="brand-sub">基础设施与转发规则管理</div>
+      <div class="brand-text">
+        <div class="brand-name">Realm Pro</div>
+        <div class="brand-sub">Control Panel</div>
       </div>
-    </div>
+    </a>
+
     <nav class="nav">
       {% if user %}
         <a href="/" class="nav-link">控制台</a>
