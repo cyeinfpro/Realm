@@ -10,6 +10,7 @@ import os
 import threading
 import hashlib
 import hmac
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +30,12 @@ FALLBACK_RUN_FILTER = Path(__file__).resolve().parents[1] / 'pool_to_run.jq'
 REALM_CONFIG = Path(CFG.realm_config_file)
 TRAFFIC_TOTALS: Dict[int, Dict[str, Any]] = {}
 TCPING_TIMEOUT = 2.0
+
+# 活跃连接统计窗口（秒）：显示最近 N 秒内的新连接数（基于 iptables conntrack NEW 计数）
+CONN_RATE_WINDOW = int(os.getenv('REALM_AGENT_CONN_RATE_WINDOW', '30'))
+_CONN_TOTAL_HISTORY = {}  # port -> deque[(ts, total)]
+_CONN_HISTORY_LOCK = threading.Lock()
+
 
 # 规则连通探测（面板「连通检测」）
 # 目标：
@@ -369,6 +376,36 @@ def _read_conn_counters(target_ports: set[int]) -> tuple[dict[int, int], str | N
 
     pkt_map = _parse_iptables_chain_pkts(out1, target_ports, 'dpt:')
     return {p: int(pkt_map.get(p, 0)) for p in target_ports}, None
+
+
+def _conn_rate_window(port: int, total: int) -> int:
+    """Return NEW-connection delta within CONN_RATE_WINDOW seconds.
+
+    Uses a small in-memory deque per port.
+    """
+    if port <= 0 or CONN_RATE_WINDOW <= 0:
+        return 0
+    now = time.monotonic()
+    with _CONN_HISTORY_LOCK:
+        dq = _CONN_TOTAL_HISTORY.get(port)
+        if dq is None:
+            dq = deque()
+            _CONN_TOTAL_HISTORY[port] = dq
+        # drop too-old samples, keep at least 1
+        cutoff = now - float(CONN_RATE_WINDOW)
+        while len(dq) >= 2 and dq[0][0] < cutoff:
+            dq.popleft()
+        # baseline: oldest sample within window
+        baseline = dq[0][1] if dq else total
+        dq.append((now, int(total)))
+        # prevent unbounded growth
+        while len(dq) > 8:
+            dq.popleft()
+    try:
+        return max(0, int(total) - int(baseline))
+    except Exception:
+        return 0
+
 def _ensure_traffic_counters(target_ports: set[int]) -> str | None:
     """确保计数链/规则存在。
 
@@ -521,6 +558,8 @@ def _scan_ss_once(target_ports: set[int]) -> tuple[Dict[int, Dict[str, int]], st
         if conn_warn is None and isinstance(conn_total_map, dict):
             for p in target_ports:
                 result[p]['connections_total'] = int(conn_total_map.get(p, 0) or 0)
+                # 近 N 秒新连接数（活跃连接）
+                result[p]['connections_active'] = _conn_rate_window(p, result[p]['connections_total'])
         else:
             # keep default 0
             pass
@@ -611,7 +650,11 @@ def _scan_ss_once(target_ports: set[int]) -> tuple[Dict[int, Dict[str, int]], st
             result[p]['tx_bytes'] = int(totals.get('sum_tx') or 0)
 
     for p in target_ports:
-        result[p]['connections_active'] = int(result[p].get('connections') or 0)
+        # 保留当前已建立连接数，前端可用于排查（不展示也不影响）
+        result[p]['connections_established'] = int(result[p].get('connections') or 0)
+        # 如果 conn NEW 计数不可用，则退化为当前已建立连接数
+        if int(result[p].get('connections_total') or 0) <= 0 and int(result[p].get('connections_active') or 0) <= 0:
+            result[p]['connections_active'] = int(result[p].get('connections') or 0)
 
     return result, ipt_warning
 

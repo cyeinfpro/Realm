@@ -2,79 +2,132 @@
 {% block content %}
 <div id="toast" class="toast"></div>
 
-<div class="page-head">
-  <div class="page-title">
-    <h1 class="h1">{{ node.name or node.display_ip }}</h1>
-    <div class="meta">
-      <span class="meta-item">IP：{{ node.display_ip or "-" }}</span>
-      {% if node.agent_version %}<span class="meta-item">Agent：{{ node.agent_version }}</span>{% endif %}
-      <span class="meta-item">上报：{{ node.last_seen_at or "-" }}</span>
-    </div>
-  </div>
-  <div class="right">
-    <a class="btn sm secondary" href="/">返回控制台</a>
-
-    <details class="menu">
-      <summary class="btn sm ghost">更多 ▾</summary>
-      <div class="menu-pop">
-        <button class="menu-item" type="button" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">
-          接入命令 <span class="muted sm">复制</span>
-        </button>
-        <button class="menu-item" type="button" onclick="openCommandModal('一键卸载 Agent', window.__UNINSTALL_CMD__)">
-          卸载 Agent <span class="muted sm">复制</span>
-        </button>
-        <div class="menu-sep"></div>
-        <a class="menu-item" href="/api/nodes/{{ node.id }}/backup">备份规则 <span class="muted sm">下载</span></a>
-        <button class="menu-item" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则 <span class="muted sm">粘贴</span></button>
-        <div class="menu-sep"></div>
-        <form method="post" action="/nodes/{{ node.id }}/delete" style="margin:0;">
-          <button class="menu-item" type="submit" onclick="return confirm('确认移除该节点？')" style="color:var(--bad);">
-            移除节点 <span class="muted sm">危险</span>
-          </button>
-        </form>
-      </div>
-    </details>
-  </div>
-</div>
-
-<section>
-  <div class="card">
+<div class="split-layout">
+  <!-- Left: nodes list -->
+  <aside class="card node-sidebar">
     <div class="card-header">
       <div style="min-width:0;">
-        <div class="card-title">规则</div>
-        <div class="card-sub">支持 TCP / UDP / WSS，显示连通与流量统计；WSS 发送端可选接收机节点自动同步</div>
+        <div class="card-title">Agent 列表</div>
+        <div class="card-sub">点击节点即可切换规则视图</div>
       </div>
-      <div class="right" style="gap:8px;flex:0 0 auto;">
-        <button class="btn xs" type="button" onclick="newRule()">新增规则</button>
-        <button class="btn xs ghost" type="button" id="autoRefreshBtn" onclick="toggleAutoRefresh()">⟳ 自动刷新：开</button>
+      <div class="right" style="flex:0 0 auto;">
+        <button class="btn xs" type="button" onclick="openAddNodeModal()">+ 接入</button>
       </div>
     </div>
-
-    <div id="rulesLoading" class="muted">正在加载规则…</div>
-
-    <!-- Mobile: card list (table is desktop only) -->
-    <div id="rulesMobile" class="rules-mobile" style="display:none;"></div>
-
-    <div class="table-wrap">
-      <table id="rulesTable" class="table rules-table" style="display:none;">
-        <thead>
-          <tr>
-            <th>#</th>
-            <th>状态</th>
-            <th class="listen">Listen</th>
-            <th class="health">连通检测</th>
-            <th class="stat">活跃/累计</th>
-            <th class="stat">总流量</th>
-            <th class="actions">操作</th>
-          </tr>
-        </thead>
-        <tbody id="rulesBody"></tbody>
-      </table>
+    <div class="node-list">
+      {% for n in nodes %}
+      <a class="node-item{% if n.id == node.id %} active{% endif %}" href="/nodes/{{ n.id }}">
+        <span class="dot {% if n.online %}online{% else %}offline{% endif %}"></span>
+        <div class="node-info">
+          <div class="node-name">{{ n.name or n.display_ip or ('节点-' ~ n.id) }}</div>
+          <div class="node-meta mono">{{ n.display_ip or '-' }}</div>
+        </div>
+      </a>
+      {% endfor %}
     </div>
+    <div class="sidebar-foot">
+      <a class="btn xs ghost w100" href="/">返回控制台</a>
+    </div>
+  </aside>
 
-    <div id="statsLoading" class="muted">正在加载流量统计…</div>
+  <!-- Right: current node rules -->
+  <main class="node-main">
+    <section>
+      <div class="card">
+        <div class="card-header" style="align-items:flex-start;">
+          <div style="min-width:0;">
+            <div class="card-title">{{ node.name or node.display_ip }} <span class="muted sm">· {{ node.display_ip or '-' }}</span></div>
+            <div class="meta" style="margin-top:6px;">
+              {% if node.agent_version %}<span class="meta-item">Agent：{{ node.agent_version }}</span>{% endif %}
+              <span class="meta-item">上报：{{ node.last_seen_at or "-" }}</span>
+            </div>
+            <div class="card-sub" style="margin-top:8px;">支持 TCP / UDP / WSS；WSS 发送端可直接选择接收机节点自动同步，无需复制配对码</div>
+          </div>
+          <div class="right node-tools" style="gap:10px; flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end;">
+            <div class="search-pill">
+              <span class="muted">🔎</span>
+              <input class="input sm" id="ruleSearch" placeholder="搜索监听/目标…" oninput="setRuleFilter(this.value)">
+            </div>
+            <button class="btn sm" type="button" onclick="newRule()">+ 创建转发</button>
+            <button class="btn sm ghost" type="button" id="autoRefreshBtn" onclick="toggleAutoRefresh()">⟳ 自动刷新：开</button>
+
+            <details class="menu">
+              <summary class="btn sm ghost">更多 ▾</summary>
+              <div class="menu-pop">
+                <button class="menu-item" type="button" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">
+                  接入命令 <span class="muted sm">复制</span>
+                </button>
+                <button class="menu-item" type="button" onclick="openCommandModal('一键卸载 Agent', window.__UNINSTALL_CMD__)">
+                  卸载 Agent <span class="muted sm">复制</span>
+                </button>
+                <div class="menu-sep"></div>
+                <a class="menu-item" href="/api/nodes/{{ node.id }}/backup">备份规则 <span class="muted sm">下载</span></a>
+                <button class="menu-item" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则 <span class="muted sm">粘贴</span></button>
+                <div class="menu-sep"></div>
+                <form method="post" action="/nodes/{{ node.id }}/delete" style="margin:0;">
+                  <button class="menu-item" type="submit" onclick="return confirm('确认移除该节点？')" style="color:var(--bad);">
+                    移除节点 <span class="muted sm">危险</span>
+                  </button>
+                </form>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <div id="nodeSummary" class="summary-bar" style="display:none;"></div>
+
+        <div id="rulesLoading" class="muted">正在加载规则…</div>
+
+        <!-- Mobile: card list (table is desktop only) -->
+        <div id="rulesMobile" class="rules-mobile" style="display:none;"></div>
+
+        <div class="table-wrap">
+          <table id="rulesTable" class="table rules-table" style="display:none;">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>状态</th>
+                <th class="listen">Listen</th>
+                <th class="remote">Remote</th>
+                <th class="health">连通</th>
+                <th class="stat">活跃（30s）</th>
+                <th class="stat">流量</th>
+                <th class="actions">操作</th>
+              </tr>
+            </thead>
+            <tbody id="rulesBody"></tbody>
+          </table>
+        </div>
+
+        <div id="statsLoading" class="muted">正在加载流量统计…</div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- Add Node Modal (for quick switching / onboarding) -->
+<div id="addNodeModal" class="modal" style="display:none;">
+  <div class="modal-inner">
+    <div class="row" style="justify-content:space-between;align-items:center;">
+      <div class="col"><div class="h2">接入新节点</div></div>
+      <div class="right"><button class="btn xs ghost" type="button" onclick="closeAddNodeModal()">关闭</button></div>
+    </div>
+    <p class="muted" style="margin-top:8px;">填写节点名称与 Agent API 地址（示例：<span class="mono">http://10.0.0.2:18700</span>）。</p>
+    <div class="form" style="margin-top:12px;">
+      <label class="label">节点名称</label>
+      <input class="input" id="addNodeName" placeholder="例如：香港-A" />
+      <label class="label" style="margin-top:10px;">Agent API 地址</label>
+      <input class="input" id="addNodeBaseUrl" placeholder="http://IP:18700" />
+      <label class="label" style="margin-top:10px;">API Key（与 Agent 的 /etc/realm-agent/api.key 一致）</label>
+      <input class="input" id="addNodeApiKey" placeholder="可留空（未启用鉴权时）" />
+
+      <div class="row" style="gap:10px;justify-content:flex-end;margin-top:14px;">
+        <button class="btn xs ghost" type="button" onclick="closeAddNodeModal()">取消</button>
+        <button class="btn xs" type="button" onclick="submitAddNode()">保存</button>
+      </div>
+    </div>
   </div>
-</section>
+</div>
 
 <!-- Edit Modal -->
 <div id="modal" class="modal" style="display:none;">

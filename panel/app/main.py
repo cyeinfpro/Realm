@@ -401,6 +401,13 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
     if not node:
         _set_flash(request, "机器不存在")
         return RedirectResponse(url="/", status_code=303)
+
+    # 用于节点页左侧快速切换列表
+    nodes = list_nodes()
+    for n in nodes:
+        n["display_ip"] = _extract_ip_for_display(n.get("base_url", ""))
+        # 用更宽松的阈值显示在线状态（避免轻微抖动导致频繁显示离线）
+        n["online"] = _is_report_fresh(n, max_age_sec=45)
     show_install_cmd = bool(request.session.pop("show_install_cmd", False))
     base_url = str(request.base_url).rstrip("/")
     node["display_ip"] = _extract_ip_for_display(node.get("base_url", ""))
@@ -417,6 +424,7 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
         {
             "request": request,
             "user": user,
+            "nodes": nodes,
             "node": node,
             "flash": _flash(request),
             "title": node["name"],

@@ -57,6 +57,14 @@ let CURRENT_STATS = null;
 let PENDING_COMMAND_TEXT = '';
 let NODES_LIST = [];
 
+// Rules filter for quick search (listen / remote)
+let RULE_FILTER = '';
+function setRuleFilter(v){
+  RULE_FILTER = (v || '').trim();
+  renderRules();
+}
+window.setRuleFilter = setRuleFilter;
+
 function showTab(name){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
   document.querySelectorAll('.tabpane').forEach(p=>p.classList.remove('show'));
@@ -99,6 +107,17 @@ function formatRemoteForInput(e){
 function formatRemote(e){
   const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
   return rs.join('\n');
+}
+
+function renderRemoteTargets(e){
+  const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
+  if(!rs.length) return '<span class="muted">—</span>';
+  const MAX = 2;
+  const shown = rs.slice(0, MAX);
+  const more = Math.max(0, rs.length - MAX);
+  const chips = shown.map(r=>`<span class="remote-chip mono" title="${escapeHtml(r)}">${escapeHtml(r)}</span>`).join('');
+  const moreHtml = more>0 ? `<span class="pill ghost" title="${escapeHtml(rs.join('\n'))}">+${more}</span>` : '';
+  return `<div class="remote-wrap">${chips}${moreHtml}</div>`;
 }
 
 function statusPill(e){
@@ -246,31 +265,32 @@ function showHealthDetail(idx){
   }
 }
 
-function renderRuleCard(e, idx, stats, statsError){
+function renderRuleCard(e, idx, rowNo, stats, statsError){
   const rx = statsError ? null : (stats.rx_bytes || 0);
   const tx = statsError ? null : (stats.tx_bytes || 0);
   const total = (rx == null || tx == null) ? null : rx + tx;
-  const connActive = statsError ? 0 : (stats.connections_active ?? stats.connections ?? 0);
-  const connTotal = statsError ? 0 : (stats.connections_total ?? 0);
-  const connText = statsError ? '—' : `${connActive}/${connTotal}`;
+  const connActive = statsError ? 0 : (stats.connections_active ?? 0);
+  const est = statsError ? 0 : (stats.connections_established ?? stats.connections ?? 0);
   const totalStr = total == null ? '—' : formatBytes(total);
   const healthHtml = renderHealthMobile(stats.health, statsError, idx);
+  const activeTitle = statsError ? '' : `title="当前已建立连接：${est}"`;
   return `
   <div class="rule-card">
     <div class="rule-head">
       <div class="rule-left">
         <div class="rule-topline">
-          <span class="rule-idx">#${idx+1}</span>
+          <span class="rule-idx">#${rowNo}</span>
           ${statusPill(e)}
         </div>
         <div class="rule-listen mono">${escapeHtml(e.listen)}</div>
         <div class="rule-sub muted sm">${endpointType(e)}</div>
       </div>
       <div class="rule-right">
-        <span class="pill ghost">活跃/累计 ${escapeHtml(connText)}</span>
+        <span class="pill ghost" ${activeTitle}>活跃(30s) ${escapeHtml(connActive)}</span>
         <span class="pill ghost">${escapeHtml(totalStr)}</span>
       </div>
     </div>
+    <div class="rule-remote-block">${renderRemoteTargets(e)}</div>
     <div class="rule-health-block">
       ${healthHtml}
     </div>
@@ -292,11 +312,27 @@ function renderRules(){
   const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
   const statsLookup = buildStatsLookup();
   const statsLoading = q('statsLoading');
-  // 小屏用卡片，大屏用表格（更紧凑，空间利用率更高）
+
+  // 小屏用卡片，大屏用表格
   const isMobile = window.matchMedia('(max-width: 1024px)').matches;
-  if(!eps.length){
+
+  // Filter (listen / remote / remark)
+  const f = (RULE_FILTER || '').trim().toLowerCase();
+  const items = [];
+  eps.forEach((e, idx)=>{
+    if(f){
+      const hay = `${e.listen||''}
+${formatRemote(e)}
+${(e.remark||'')}
+${endpointType(e)}`.toLowerCase();
+      if(!hay.includes(f)) return;
+    }
+    items.push({e, idx});
+  });
+
+  if(!items.length){
     q('rulesLoading').style.display = '';
-    q('rulesLoading').textContent = '暂无规则';
+    q('rulesLoading').textContent = f ? '未找到匹配规则' : '暂无规则';
     table.style.display = 'none';
     if(mobileWrap) mobileWrap.style.display = 'none';
     if(statsLoading){
@@ -304,6 +340,7 @@ function renderRules(){
     }
     return;
   }
+
   if(statsLoading){
     if(statsLookup.error){
       statsLoading.style.display = '';
@@ -312,46 +349,54 @@ function renderRules(){
       statsLoading.style.display = 'none';
     }
   }
-  eps.forEach((e, idx)=>{
+
+  items.forEach((it, i)=>{
+    const e = it.e;
+    const idx = it.idx;
+    const rowNo = i + 1;
     const stats = statsLookup.byIdx[idx] || statsLookup.byListen[e.listen] || {};
     const statsError = statsLookup.error;
 
     if(isMobile && mobileWrap){
-      // Mobile: card list
       const card = document.createElement('div');
-      card.innerHTML = renderRuleCard(e, idx, stats, statsError);
+      card.innerHTML = renderRuleCard(e, idx, rowNo, stats, statsError);
       mobileWrap.appendChild(card.firstElementChild);
     }else{
-      // Desktop: table
       const healthHtml = renderHealth(stats.health, statsLookup.error);
       const rx = statsError ? null : (stats.rx_bytes || 0);
       const tx = statsError ? null : (stats.tx_bytes || 0);
       const total = (rx == null || tx == null) ? null : rx + tx;
-      const connActive = statsError ? 0 : (stats.connections_active ?? stats.connections ?? 0);
-      const connTotal = statsError ? 0 : (stats.connections_total ?? 0);
-      const connText = statsError ? '—' : `${connActive}/${connTotal}`;
+      const connActive = statsError ? 0 : (stats.connections_active ?? 0);
+      const est = statsError ? 0 : (stats.connections_established ?? stats.connections ?? 0);
+
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td>${idx+1}</td>
+        <td>${rowNo}</td>
         <td>${statusPill(e)}</td>
         <td class="listen">
           <div class="mono">${escapeHtml(e.listen)}</div>
           <div class="muted sm">${endpointType(e)}</div>
         </td>
+        <td class="remote">${renderRemoteTargets(e)}</td>
         <td class="health">${healthHtml}</td>
-        <td class="stat">${statsError ? '—' : escapeHtml(connText)}</td>
+        <td class="stat" title="当前已建立连接：${escapeHtml(est)}">${statsError ? '—' : escapeHtml(connActive)}</td>
         <td class="stat">${total == null ? '—' : formatBytes(total)}</td>
         <td class="actions">
-          <div class="rules-actions">
-            <button class="btn xs icon ghost" title="编辑" onclick="editRule(${idx})">✎</button>
-            <button class="btn xs icon" title="${e.disabled?'启用':'暂停'}" onclick="toggleRule(${idx})">${e.disabled?'▶':'⏸'}</button>
-            <button class="btn xs icon ghost" title="删除" onclick="deleteRule(${idx})">🗑</button>
-          </div>
+          <details class="menu">
+            <summary class="btn xs icon ghost icon-btn" title="操作">⋯</summary>
+            <div class="menu-pop">
+              <button class="menu-item" type="button" onclick="editRule(${idx}); this.closest('details').removeAttribute('open');">编辑</button>
+              <button class="menu-item" type="button" onclick="toggleRule(${idx}); this.closest('details').removeAttribute('open');">${e.disabled?'启用':'暂停'}</button>
+              <div class="menu-sep"></div>
+              <button class="menu-item danger" type="button" onclick="deleteRule(${idx}); this.closest('details').removeAttribute('open');">删除</button>
+            </div>
+          </details>
         </td>
       `;
       tbody.appendChild(tr);
     }
   });
+
   if(isMobile && mobileWrap){
     mobileWrap.style.display = '';
     table.style.display = 'none';
