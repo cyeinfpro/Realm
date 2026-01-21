@@ -918,6 +918,43 @@ def _choose_receiver_port(receiver_pool: Dict[str, Any], preferred: Optional[int
     return 33394
 
 
+
+@app.post("/api/nodes/create")
+async def api_nodes_create(request: Request, user: str = Depends(require_login)):
+    """Dashboard 快速接入节点（弹窗模式）。返回 JSON，前端可直接跳转节点详情页。"""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    name = str(data.get("name") or "").strip()
+    ip_address = str(data.get("ip_address") or "").strip()
+    scheme = str(data.get("scheme") or "http").strip().lower()
+    verify_tls = bool(data.get("verify_tls") or False)
+
+    if scheme not in ("http", "https"):
+        return JSONResponse({"ok": False, "error": "协议仅支持 http 或 https"}, status_code=400)
+    if not ip_address:
+        return JSONResponse({"ok": False, "error": "IP/域名不能为空"}, status_code=400)
+
+    # 端口在 UI 中隐藏：默认 18700；如用户自带 :port 则兼容解析（仍不展示）
+    if "://" not in ip_address:
+        ip_address = f"{scheme}://{ip_address}"
+
+    port_value = DEFAULT_AGENT_PORT
+    host, parsed_port, has_port, scheme = _split_host_and_port(ip_address, port_value)
+    if not host:
+        return JSONResponse({"ok": False, "error": "IP/域名不能为空"}, status_code=400)
+    if has_port:
+        port_value = parsed_port
+
+    base_url = f"{scheme}://{_format_host_for_url(host)}"
+    api_key = _generate_api_key()
+
+    display_name = name or _extract_ip_for_display(base_url)
+    node_id = add_node(display_name, base_url, api_key, verify_tls=verify_tls)
+    return JSONResponse({"ok": True, "node_id": node_id, "redirect_url": f"/nodes/{node_id}"})
+
+
 @app.get("/api/nodes")
 async def api_nodes_list(user: str = Depends(require_login)):
     out = []

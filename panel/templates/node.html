@@ -14,12 +14,19 @@
   </div>
 </div>
 
-<div class="card" style="margin-top:16px;">
-  <div class="row">
-    <div class="col">
+<div class="card compact" style="margin-top:16px;">
+  <div class="toolbar-row">
+    <div>
       <h2 class="h2">一键操作</h2>
-      <p class="muted">需要时查看接入或卸载命令</p>
+      <div class="muted sm">需要时查看接入或卸载命令</div>
     </div>
+    <div class="toolbar-actions">
+      <button class="btn xs ghost" type="button" id="installCmdBtn" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">接入命令</button>
+      <button class="btn xs ghost" type="button" id="uninstallCmdBtn" onclick="openCommandModal('一键卸载 Agent', window.__UNINSTALL_CMD__)">卸载Agent</button>
+    </div>
+  </div>
+</div>
+
     <div class="col right">
       <div class="row" style="gap:10px;justify-content:flex-end;">
 <button class="btn ghost" type="button" id="installCmdBtn" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">查看接入命令</button>
@@ -38,10 +45,10 @@
       </div>
       <div class="col right">
         <div class="row" style="gap:10px;justify-content:flex-end;flex-wrap:wrap;">
-          <a class="btn ghost" href="/api/nodes/{{ node.id }}/backup">备份规则</a>
-          <button class="btn ghost" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则</button>
-          <button class="btn" onclick="newRule()">新增规则</button>
-<button class="btn ghost" id="autoRefreshBtn" onclick="toggleAutoRefresh()">自动刷新：开</button>
+          <a class="btn xs ghost" href="/api/nodes/{{ node.id }}/backup">备份规则</a>
+          <button class="btn xs ghost" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则</button>
+          <button class="btn xs" onclick="newRule()">新增规则</button>
+<button class="btn xs ghost" id="autoRefreshBtn" onclick="toggleAutoRefresh()">自动刷新：开</button>
         </div>
       </div>
     </div>

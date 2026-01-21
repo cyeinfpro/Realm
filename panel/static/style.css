@@ -59,6 +59,10 @@ body{
   backdrop-filter:blur(20px);
   box-shadow:var(--glow);
 }
+
+.card.compact{padding:14px}
+.toolbar-row{display:flex;gap:12px;align-items:center;justify-content:space-between}
+.toolbar-actions{display:flex;gap:8px;align-items:center;justify-content:flex-end;flex-wrap:wrap}
 .grid{display:grid;grid-template-columns:repeat(auto-fit, minmax(260px,1fr));gap:14px;margin-top:14px}
 .row{display:flex;gap:14px;align-items:center}
 .col{flex:1}
@@ -137,6 +141,7 @@ body{
 
 /* 小按钮（用于规则操作） */
 .btn.sm{min-height:34px;padding:7px 12px;border-radius:10px;font-size:12px}
+.btn.xs{min-height:28px;padding:5px 10px;border-radius:10px;font-size:11px}
 .table{width:100%;border-collapse:collapse;margin-top:12px}
 .table th,.table td{padding:10px 8px;border-bottom:1px solid var(--line);text-align:left;font-size:13px}
 .table th{color:var(--muted);font-weight:600}
@@ -147,8 +152,8 @@ body{
 .rules-table th.health,.rules-table td.health{min-width:260px;white-space:normal}
 .rules-table th.stat,.rules-table td.stat{text-align:right}
 .rules-table th.stat,.rules-table td.stat{min-width:90px}
-.rules-table th.actions,.rules-table td.actions{text-align:right;min-width:190px}
-.rules-actions{display:flex;gap:8px;flex-wrap:nowrap;justify-content:flex-end}
+.rules-table th.actions,.rules-table td.actions{text-align:right;min-width:150px}
+.rules-actions{display:flex;gap:6px;flex-wrap:nowrap;justify-content:flex-end}
 
 /* Rules (card layout, all devices) */
 /* 默认单列；平板双列；桌面三列，更紧凑 */
@@ -179,7 +184,7 @@ body{
 .rule-listen{font-size:15px;font-weight:700;word-break:break-all}
 .rule-right{display:flex;flex-direction:column;gap:8px;align-items:flex-end;flex-shrink:0}
 .rule-health-block{margin-top:10px}
-.rule-actions{display:grid;grid-template-columns:repeat(3, 1fr);gap:8px;margin-top:10px}
+.rule-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;margin-top:10px}
 
 /* Mobile health list */
 .health-wrap.mobile{flex-direction:column;align-items:stretch}

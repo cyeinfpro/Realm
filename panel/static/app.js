@@ -275,9 +275,9 @@ function renderRuleCard(e, idx, stats, statsError){
       ${healthHtml}
     </div>
     <div class="rule-actions">
-      <button class="btn sm ghost" onclick="editRule(${idx})">编辑</button>
-      <button class="btn sm" onclick="toggleRule(${idx})">${e.disabled?'启用':'暂停'}</button>
-      <button class="btn sm ghost" onclick="deleteRule(${idx})">删除</button>
+      <button class="btn xs ghost" onclick="editRule(${idx})">编辑</button>
+      <button class="btn xs" onclick="toggleRule(${idx})">${e.disabled?'启用':'暂停'}</button>
+      <button class="btn xs ghost" onclick="deleteRule(${idx})">删除</button>
     </div>
   </div>`;
 }
@@ -343,9 +343,9 @@ function renderRules(){
         <td class="stat">${total == null ? '—' : formatBytes(total)}</td>
         <td class="actions">
           <div class="rules-actions">
-            <button class="btn sm ghost" onclick="editRule(${idx})">编辑</button>
-            <button class="btn sm" onclick="toggleRule(${idx})">${e.disabled?'启用':'暂停'}</button>
-            <button class="btn sm ghost" onclick="deleteRule(${idx})">删除</button>
+            <button class="btn xs ghost" onclick="editRule(${idx})">编辑</button>
+            <button class="btn xs" onclick="toggleRule(${idx})">${e.disabled?'启用':'暂停'}</button>
+            <button class="btn xs ghost" onclick="deleteRule(${idx})">删除</button>
           </div>
         </td>
       `;
@@ -1079,3 +1079,78 @@ async function copyText(text){
 
 window.toggleAutoRefresh = toggleAutoRefresh;
 window.copyText = copyText;
+
+
+// ---------------- Dashboard: Add Node Modal ----------------
+function openAddNodeModal(){
+  const m = document.getElementById("addNodeModal");
+  if(!m) return;
+  m.style.display = "flex";
+  // focus
+  const ip = document.getElementById("addNodeIp");
+  if(ip) setTimeout(()=>ip.focus(), 30);
+}
+function closeAddNodeModal(){
+  const m = document.getElementById("addNodeModal");
+  if(!m) return;
+  m.style.display = "none";
+}
+async function createNodeFromModal(){
+  const err = document.getElementById("addNodeError");
+  const btn = document.getElementById("addNodeSubmit");
+  try{
+    if(err) err.textContent = "";
+    if(btn){ btn.disabled = true; btn.textContent = "创建中…"; }
+    const name = (document.getElementById("addNodeName")?.value || "").trim();
+    const ip_address = (document.getElementById("addNodeIp")?.value || "").trim();
+    const scheme = (document.getElementById("addNodeScheme")?.value || "http").trim();
+    const verify_tls = !!document.getElementById("addNodeVerifyTls")?.checked;
+
+    if(!ip_address){
+      if(err) err.textContent = "请填写 IP/域名";
+      if(btn){ btn.disabled = false; btn.textContent = "创建并进入"; }
+      return;
+    }
+
+    const resp = await fetch("/api/nodes/create", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({name, ip_address, scheme, verify_tls})
+    });
+
+    const data = await resp.json().catch(()=>({ok:false,error:"返回解析失败"}));
+    if(!resp.ok || !data.ok){
+      if(err) err.textContent = data.error || ("创建失败（HTTP " + resp.status + "）");
+      if(btn){ btn.disabled = false; btn.textContent = "创建并进入"; }
+      return;
+    }
+
+    closeAddNodeModal();
+    if(data.redirect_url){
+      window.location.href = data.redirect_url;
+    }else if(data.node_id){
+      window.location.href = "/nodes/" + data.node_id;
+    }else{
+      window.location.reload();
+    }
+  }catch(e){
+    if(err) err.textContent = String(e);
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = "创建并进入"; }
+  }
+}
+
+// 点击遮罩关闭
+document.addEventListener("click", (e)=>{
+  const m = document.getElementById("addNodeModal");
+  if(!m || m.style.display === "none") return;
+  if(e.target === m) closeAddNodeModal();
+});
+
+// ESC 关闭
+document.addEventListener("keydown", (e)=>{
+  if(e.key === "Escape"){
+    const m = document.getElementById("addNodeModal");
+    if(m && m.style.display !== "none") closeAddNodeModal();
+  }
+});
