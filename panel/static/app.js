@@ -729,9 +729,18 @@ async function saveRule(){
   const remotes = remotesRaw.split('\n').map(x=>x.trim()).filter(Boolean).map(x=>x.replace('\\r',''));
   const disabled = (q('f_disabled').value === '1');
 
+  // optional weights for roundrobin (comma separated)
+  const weightsRaw = q('f_weights') ? (q('f_weights').value || '').trim() : '';
+  const weights = weightsRaw ? weightsRaw.split(',').map(x=>x.trim()).filter(Boolean) : [];
+
   let balTxt = (q('f_balance').value || '').trim();
   let balance = balTxt ? balTxt.split(':')[0].trim() : 'roundrobin';
   if(!balance) balance = 'roundrobin';
+
+  let balanceStr = balance;
+  if(balance === 'roundrobin' && weights.length > 0){
+    balanceStr = `roundrobin: ${weights.join(',')}`;
+  }
 
   const protocol = q('f_protocol').value || 'tcp+udp';
 
@@ -759,7 +768,7 @@ async function saveRule(){
       listen,
       remotes,
       disabled,
-      balance,
+      balance: balanceStr,
       protocol,
       receiver_port: receiverPortTxt ? parseInt(receiverPortTxt,10) : null,
       sync_id: syncId || undefined,
@@ -786,7 +795,7 @@ async function saveRule(){
   }
 
   // Normal/manual mode (single node)
-  const endpoint = { listen, remotes, disabled, balance, protocol };
+  const endpoint = { listen, remotes, disabled, balance: balanceStr, protocol };
 
   if(typeSel === 'wss_send' || typeSel === 'wss_recv'){
     const wss = readWssFields();
@@ -813,34 +822,56 @@ async function saveRule(){
     endpoint.extra_config = ex;
   }
 
-  if(CURRENT_EDIT_INDEX >= 0){
-    CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX] = endpoint;
-  }else{
-    CURRENT_POOL.endpoints.push(endpoint);
+    try{
+      setLoading(true);
+  
+      if(CURRENT_EDIT_INDEX >= 0){
+        CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX] = endpoint;
+      }else{
+        CURRENT_POOL.endpoints.push(endpoint);
+      }
+  
+      await savePool('已保存');
+      renderRules();
+      closeModal();
+  
+      // For manual WSS send: show pairing code helper (optional)
+      if(typeSel === 'wss_send'){
+        const code = buildPairingPayload(endpoint);
+        openPairingModal(code);
+      }
+    }catch(err){
+      const msg = (err && err.message) ? err.message : String(err || '保存失败');
+      toast(msg, true);
+      // revert local changes
+      try{ await loadPool(); }catch(e){}
+    }finally{
+      setLoading(false);
+    }
   }
-
-  await savePool();
-  renderRules();
-  closeModal();
-
-  // For manual WSS send: show pairing code helper (optional)
-  if(typeSel === 'wss_send'){
-    const code = buildPairingPayload(endpoint);
-    openPairingModal(code);
-  }
-}
 
 async function savePool(msg){
   q('modalMsg') && (q('modalMsg').textContent = '');
   const id = window.__NODE_ID__;
-  const res = await fetchJSON(`/api/nodes/${id}/pool`, {
-    method:'POST',
-    body: JSON.stringify({ pool: CURRENT_POOL })
-  });
-  if(res.ok){
-    CURRENT_POOL = res.pool;
-    renderRules();
-    if(msg) toast(msg);
+  try{
+    const res = await fetchJSON(`/api/nodes/${id}/pool`, {
+      method:'POST',
+      body: JSON.stringify({ pool: CURRENT_POOL })
+    });
+    if(res && res.ok){
+      CURRENT_POOL = res.pool;
+      renderRules();
+      if(msg) toast(msg);
+      return true;
+    }
+    const err = (res && res.error) ? res.error : '保存失败';
+    q('modalMsg') && (q('modalMsg').textContent = err);
+    throw new Error(err);
+  }catch(e){
+    const m = (e && e.message) ? e.message : String(e || '保存失败');
+    q('modalMsg') && (q('modalMsg').textContent = m);
+    toast(m, true);
+    throw e;
   }
 }
 

@@ -107,3 +107,4 @@ svg.topo-lines{position:absolute;inset:0;pointer-events:none}
 .toast.show{display:block}
 .toast .t{font-weight:900}
 .toast .s{color:var(--muted);margin-top:4px;font-size:12px}
+.toast.error{border-color:rgba(255,90,90,.55);background:rgba(60,10,10,.9)}
