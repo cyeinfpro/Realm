@@ -545,7 +545,8 @@ textarea,.textarea{min-height:90px;resize:vertical}
 .sys-card.mini .progress{ height: 9px; }
 
 @media (min-width: 1100px){
-  .sys-card.mini .sys-grid{ grid-template-columns: 1.15fr 1fr; }
+  /* Dashboard node tiles are narrow even on large screens; keep single-column to avoid overflow */
+  .sys-card.mini .sys-grid{ grid-template-columns: 1fr; }
 }
 
 .sys-grid{

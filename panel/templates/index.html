@@ -40,10 +40,6 @@
       <div class="sys-grid">
         <div class="sys-kv">
           <div class="sys-row">
-            <div class="sys-k">CPU</div>
-            <div class="sys-v" data-sys="cpuInfo">加载中…</div>
-          </div>
-          <div class="sys-row">
             <div class="sys-k">在线时长</div>
             <div class="sys-v" data-sys="uptime">—</div>
           </div>
@@ -57,10 +53,6 @@
           </div>
         </div>
         <div class="sys-bars">
-          <div class="sys-bar">
-            <div class="sys-bar-head"><span>CPU</span><span class="mono" data-sys="cpuPct">0%</span></div>
-            <div class="progress"><div class="progress-fill" data-sys-bar="cpu"></div></div>
-          </div>
           <div class="sys-bar">
             <div class="sys-bar-head"><span>内存</span><span class="mono" data-sys="memText">—</span></div>
             <div class="progress"><div class="progress-fill" data-sys-bar="mem"></div></div>
@@ -127,5 +119,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=34.1"></script>
+<script src="/static/app.js?v=34.2"></script>
 {% endblock %}

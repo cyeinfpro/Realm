@@ -401,79 +401,26 @@ function renderSysCard(sys){
 
 // ================= Dashboard: Node mini system info =================
 function renderMiniSysOnCard(cardEl, sys){
-  if(!cardEl) return;
-  const sysCard = cardEl.querySelector('[data-sys-card]');
-  if(!sysCard) return;
-
-  const hintEl = cardEl.querySelector('[data-sys="hint"]');
-  const setField = (key, text) => {
+  // Dashboard tile system info (auto-refresh). Keep it compact and robust.
+  const setField = (key, val) => {
     const el = cardEl.querySelector(`[data-sys="${key}"]`);
-    if(el) el.textContent = text;
+    if(el) el.textContent = val;
   };
   const setBar = (key, pct) => {
-    const el = cardEl.querySelector(`[data-sys-bar="${key}"]`);
-    setProgressEl(el, pct);
+    const el = cardEl.querySelector(`[data-sys="${key}"] .bar > i`);
+    if(el) el.style.width = `${clampPct(pct)}%`;
   };
 
-  if(!sys || sys.error || sys.ok === false){
-    // Keep a friendly placeholder in dashboard tiles.
-    setField('cpuInfo', '暂无数据');
-    setField('uptime', '—');
-    setField('traffic', '—');
-    setField('rate', '—');
-    setField('cpuPct', '0%');
-    setField('memText', '—');
-    setField('diskText', '—');
-    setBar('cpu', 0);
-    setBar('mem', 0);
-    setBar('disk', 0);
-    if(hintEl){ hintEl.style.display = ''; }
-    return;
-  }
-  if(hintEl){ hintEl.style.display = 'none'; }
+  // Note: CPU item removed per UI requirement
+  setField('uptime', fmtUptime(sys.uptime_seconds));
+  setField('traffic', `上传 ${fmtBytes(sys.traffic_up_bytes)} | 下载 ${fmtBytes(sys.traffic_down_bytes)}`);
+  setField('rate', `上传 ${fmtRate(sys.tx_rate_bps)} | 下载 ${fmtRate(sys.rx_rate_bps)}`);
 
-  const cpuModel = sys?.cpu?.model || '-';
-  const cores = sys?.cpu?.cores || '-';
-  const cpuPct = sys?.cpu?.usage_pct ?? 0;
+  setField('memText', `${fmtMB(sys.mem_used_mb)} / ${fmtMB(sys.mem_total_mb)}  ${fmtPct(sys.mem_percent)}`);
+  setField('diskText', `${fmtGB(sys.disk_used_gb)} / ${fmtGB(sys.disk_total_gb)}  ${fmtPct(sys.disk_percent)}`);
 
-  const memUsed = sys?.mem?.used || 0;
-  const memTot = sys?.mem?.total || 0;
-  const memPct = sys?.mem?.usage_pct ?? 0;
-
-  const diskUsed = sys?.disk?.used || 0;
-  const diskTot = sys?.disk?.total || 0;
-  const diskPct = sys?.disk?.usage_pct ?? 0;
-
-  const tx = sys?.net?.tx_bytes || 0;
-  const rx = sys?.net?.rx_bytes || 0;
-  const txBps = sys?.net?.tx_bps || 0;
-  const rxBps = sys?.net?.rx_bps || 0;
-
-  // CPU 型号信息太占空间：只展示核心数
-  setField('cpuInfo', `${cores}核`);
-  setField('uptime', formatDuration(sys?.uptime_sec || 0));
-  setField('traffic', `上传 ${formatBytes(tx)} | 下载 ${formatBytes(rx)}`);
-  setField('rate', `上传 ${formatBps(txBps)} | 下载 ${formatBps(rxBps)}`);
-  setField('cpuPct', `${Number(cpuPct).toFixed(0)}%`);
-  setField('memText', `${formatBytes(memUsed)} / ${formatBytes(memTot)}  ${Number(memPct).toFixed(0)}%`);
-  setField('diskText', `${formatBytes(diskUsed)} / ${formatBytes(diskTot)}  ${Number(diskPct).toFixed(0)}%`);
-
-  setBar('cpu', cpuPct);
-  setBar('mem', memPct);
-  setBar('disk', diskPct);
-}
-
-async function fetchJSONTimeout(url, timeoutMs){
-  const ms = Number(timeoutMs) || 2500;
-  const ctl = new AbortController();
-  const t = setTimeout(()=>{ try{ ctl.abort(); }catch(e){} }, ms);
-  try{
-    const res = await fetch(url, { signal: ctl.signal });
-    const data = await res.json().catch(()=> ({}));
-    return data;
-  } finally {
-    clearTimeout(t);
-  }
+  setBar('mem', sys.mem_percent);
+  setBar('disk', sys.disk_percent);
 }
 
 function initDashboardMiniSys(){
