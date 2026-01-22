@@ -43,7 +43,7 @@
             </div>
             <div class="meta" style="margin-top:6px;">
               {% if node.agent_version %}<span class="meta-item">Agent：{{ node.agent_version }}</span>{% endif %}
-              <span class="meta-item">心跳 <span id="nodeLastSeen" class="mono" data-last-seen="{{ node.last_seen_at or '' }}">{{ node.last_seen_at or "-" }}</span></span>
+              <span class="meta-item">心跳 <span id="nodeLastSeen" class="mono" data-last-seen-mode="full" data-last-seen="{{ node.last_seen_at or '' }}" >{{ node.last_seen_at or "-" }}</span></span>
             </div>
             <div class="card-sub" style="margin-top:8px;">支持 TCP/UDP/WSS · WSS 自动同步（生成规则锁定）</div>
           </div>
@@ -317,7 +317,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=41.0"></script>
+<script src="/static/app.js?v=41.1"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};

@@ -182,7 +182,7 @@ def _single_rule_ops(base_pool: Dict[str, Any], desired_pool: Dict[str, Any]) ->
     return [{"op": "remove", "listen": payload}]
 
 
-def _is_report_fresh(node: Dict[str, Any], max_age_sec: int = 15) -> bool:
+def _is_report_fresh(node: Dict[str, Any], max_age_sec: int = 90) -> bool:
     ts = node.get("last_seen_at")
     if not ts:
         return False
@@ -502,10 +502,13 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
     for n in nodes:
         n["display_ip"] = _extract_ip_for_display(n.get("base_url", ""))
         # 用更宽松的阈值显示在线状态（避免轻微抖动导致频繁显示离线）
-        n["online"] = _is_report_fresh(n, max_age_sec=45)
+        n["online"] = _is_report_fresh(n, max_age_sec=90)
     show_install_cmd = bool(request.session.pop("show_install_cmd", False))
     base_url = _panel_public_base_url(request)
     node["display_ip"] = _extract_ip_for_display(node.get("base_url", ""))
+
+    # 在线判定：默认心跳 30s，取 3 倍窗口避免误判
+    node["online"] = _is_report_fresh(node, max_age_sec=90)
 
     # ✅ 一键接入 / 卸载命令（短命令，避免超长）
     # 说明：使用 node.api_key 作为 join token，脚本由面板返回并带参数执行。

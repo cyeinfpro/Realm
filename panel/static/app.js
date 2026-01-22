@@ -287,7 +287,15 @@ function refreshDashboardLastSeenShort(){
   const els = document.querySelectorAll('[data-last-seen]');
   els.forEach((el)=>{
     const raw = el.getAttribute('data-last-seen') || '';
-    // Keep full in title; show short in content
+    const mode = (el.getAttribute('data-last-seen-mode') || '').trim();
+    // Keep full raw time on elements that explicitly request it
+    if(mode === 'full' || mode === 'raw'){
+      const v = raw && raw.trim() ? raw.trim() : '-';
+      if(v !== '-') el.setAttribute('title', v);
+      el.textContent = v;
+      return;
+    }
+    // Default: show compact time ago (keep full in title)
     if(raw && raw.trim()) el.setAttribute('title', raw.trim());
     el.textContent = formatAgoShort(raw);
   });
