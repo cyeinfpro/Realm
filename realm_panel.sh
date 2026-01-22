@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v34"
+VERSION="v35"
 REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
 
 info(){ echo -e "\033[33m[提示]\033[0m $*" >&2; }
@@ -54,9 +54,17 @@ prompt(){
 prompt_secret(){
   local msg="$1"; local out
   # -s：输入不回显；用于密码/密钥类信息
-  read -r -s -p "$msg: " out || true
-  echo
-  echo "$out"
+  # 注意：该函数常用于命令替换：pass="$(prompt_secret ...)"
+  # 如果把换行输出到 stdout，会被命令替换捕获，导致密码前多出不可见字符（\n），登录会失败。
+  # 因此：换行输出到 /dev/tty（或 stderr），stdout 只输出纯密码。
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    read -r -s -p "$msg: " out </dev/tty || true
+    echo >/dev/tty
+  else
+    read -r -s -p "$msg: " out || true
+    echo >&2
+  fi
+  printf '%s' "$out"
 }
 
 # --- Panel public URL (domain / reverse proxy) ---
@@ -210,8 +218,15 @@ install_panel(){
   user="$(prompt "设置面板登录用户名" "admin")"
   while true; do
     pass="$(prompt_secret "设置面板登录密码（输入时不显示，必填）")"
-    [[ -n "$pass" ]] && break
-    err "密码不能为空"
+    [[ -n "$pass" ]] || { err "密码不能为空"; continue; }
+    if [[ ${#pass} -lt 6 ]]; then
+      err "密码至少 6 位"
+      continue
+    fi
+    local pass2
+    pass2="$(prompt_secret "再次输入密码确认")"
+    [[ "$pass" == "$pass2" ]] || { err "两次输入的密码不一致"; continue; }
+    break
   done
   port="$(prompt "面板端口" "6080")"
 
