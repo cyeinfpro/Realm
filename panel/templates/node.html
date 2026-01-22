@@ -11,7 +11,7 @@
         <div class="card-sub">切换查看该节点的转发规则</div>
       </div>
       <div class="right" style="flex:0 0 auto;">
-        <button class="btn xs" type="button" onclick="openAddNodeModal()">+ 接入</button>
+        <button class="btn xs" type="button" onclick="openAddNodeModal()">接入节点</button>
       </div>
     </div>
     <div class="node-list">
@@ -120,8 +120,6 @@
       <div class="col"><div class="h2">接入节点</div></div>
       <div class="col right"><button class="btn xs ghost" type="button" onclick="closeAddNodeModal()">关闭</button></div>
     </div>
-
-    <p class="muted" style="margin-top:8px;">填写节点地址即可；默认端口 <span class="mono">18700</span>（如有自定义，请在地址中附带 <span class="mono">:port</span>）。</p>
 
     <div class="form" style="margin-top:10px;">
       <div class="row" style="gap:12px;">
@@ -319,7 +317,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=40.0"></script>
+<script src="/static/app.js?v=41.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};
