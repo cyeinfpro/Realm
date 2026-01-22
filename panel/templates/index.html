@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div class="page-title">
+    <h1 class="h1">控制台</h1>
+    <div class="meta">
+      <span class="meta-item">集中管理节点接入、转发规则与 WSS 自动同步</span>
+    </div>
+  </div>
+  <div class="right">
+    <button class="btn sm" type="button" onclick="openAddNodeModal()">接入节点</button>
+  </div>
+</div>
+
+<div class="grid" id="dashboardGrid">
+  {% for n in nodes %}
+  <div class="card compact node-card" data-node-id="{{ n.id }}" data-online="{{ '1' if n.online else '0' }}">
+    <div class="card-header">
+      <div style="min-width:0;">
+        <div class="row" style="justify-content:space-between;gap:10px;align-items:center;">
+          <div class="h2" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ n.name or ("节点-" ~ n.id) }}</div>
+          {% if n.online %}
+          <span class="pill ok">在线</span>
+          {% else %}
+          <span class="pill bad">离线</span>
+          {% endif %}
+        </div>
+        <div class="meta" style="margin-top:6px;">
+          <span class="meta-item">IP：{{ n.display_ip or "-" }}</span>
+          <span class="meta-item">上报：{{ n.last_seen_at or "-" }}{% if n.agent_version %} · {{ n.agent_version }}{% endif %}</span>
+        </div>
+      </div>
+      <div class="right" style="flex:0 0 auto;">
+        <a class="btn xs secondary" href="/nodes/{{ n.id }}">打开</a>
+      </div>
+    </div>
+
+    <!-- Mini system info (auto refresh 3s) -->
+    <div class="sys-card mini" data-sys-card>
+      <div class="sys-grid">
+        <div class="sys-kv">
+          <div class="sys-row">
+            <div class="sys-k">在线时长</div>
+            <div class="sys-v" data-sys="uptime">—</div>
+          </div>
+          <div class="sys-row">
+            <div class="sys-k">流量使用</div>
+            <div class="sys-v" data-sys="traffic">—</div>
+          </div>
+          <div class="sys-row">
+            <div class="sys-k">实时速率</div>
+            <div class="sys-v" data-sys="rate">—</div>
+          </div>
+        </div>
+        <div class="sys-bars">
+          
+          <div class="sys-bar">
+            <div class="sys-bar-head"><span>CPU</span><span class="mono" data-sys="cpuPct">—</span></div>
+            <div class="progress"><div class="progress-fill" data-sys-bar="cpu"></div></div>
+          </div>
+          <div class="sys-bar">
+            <div class="sys-bar-head"><span>内存</span><span class="mono" data-sys="memText">—</span></div>
+            <div class="progress"><div class="progress-fill" data-sys-bar="mem"></div></div>
+          </div>
+          <div class="sys-bar">
+            <div class="sys-bar-head"><span>硬盘</span><span class="mono" data-sys="diskText">—</span></div>
+            <div class="progress"><div class="progress-fill" data-sys-bar="disk"></div></div>
+          </div>
+        </div>
+      </div>
+      <div class="muted" data-sys="hint" style="margin-top:8px;display:none;">系统信息暂无数据（等待 Agent 上报）</div>
+    </div>
+  </div>
+  {% else %}
+  <div class="card">
+    <div class="card-title">暂无已接入节点</div>
+    <div class="card-sub">请先在目标机器安装 Realm Agent，再回到此处完成接入。</div>
+  </div>
+  {% endfor %}
+</div>
+
+<!-- Add Node Modal -->
+<div id="addNodeModal" class="modal" style="display:none;">
+  <div class="modal-inner" style="max-width:560px;">
+    <div class="row" style="align-items:center;">
+      <div class="col"><div class="h2">接入节点</div></div>
+      <div class="col right"><button class="btn xs ghost" type="button" onclick="closeAddNodeModal()">关闭</button></div>
+    </div>
+
+    <div class="form" style="margin-top:10px;">
+      <div class="row" style="gap:12px;">
+        <div class="col">
+          <label class="label">节点名称（可选）</label>
+          <input class="input" id="addNodeName" placeholder="例如：香港-01 / US-Edge">
+        </div>
+        <div class="col" style="max-width:180px;">
+          <label class="label">协议</label>
+          <select class="select" id="addNodeScheme">
+            <option value="http">http</option>
+            <option value="https">https</option>
+          </select>
+        </div>
+      </div>
+
+      <label class="label">IP/域名</label>
+      <input class="input" id="addNodeIp" placeholder="例如：1.2.3.4 或 node.example.com">
+
+      <div class="row" style="gap:12px;align-items:center;margin-top:6px;">
+        <div class="col">
+          <label class="help"><input type="checkbox" id="addNodeVerifyTls" style="transform:translateY(1px);"> 验证 TLS 证书（https 才需要）</label>
+        </div>
+      </div>
+
+      <div id="addNodeError" class="muted" style="margin-top:8px;color:#ffb3b3;"></div>
+
+      <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
+        <button class="btn xs ghost" type="button" onclick="closeAddNodeModal()">取消</button>
+        <button class="btn xs" id="addNodeSubmit" type="button" onclick="createNodeFromModal()">创建并进入</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/app.js?v=34.2"></script>
+{% endblock %}
