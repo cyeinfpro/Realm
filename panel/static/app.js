@@ -267,7 +267,15 @@ function renderSysMini(cardEl, sys){
     setBar('cpu', 0);
     setBar('mem', 0);
     setBar('disk', 0);
-    if(hint) hint.style.display = '';
+    if(hint){
+      const raw = String((sys && sys.error) ? sys.error : '').toLowerCase();
+      let msg = '系统信息暂无数据（等待 Agent 上报）';
+      if(raw.includes('offline')) msg = '节点离线（系统信息暂停刷新）';
+      else if(raw.includes('timeout')) msg = '系统信息获取超时（请检查网络/Agent）';
+      else if(raw.includes('no data') || raw.includes('no_data')) msg = '系统信息暂无数据（等待 Agent 上报）';
+      hint.textContent = msg;
+      hint.style.display = '';
+    }
     return;
   }
 
@@ -990,7 +998,7 @@ async function toggleRule(idx){
         renderRules();
         toast('已同步更新（发送/接收两端）');
       }else{
-        toast(res && res.error ? res.error : '同步更新失败', true);
+        toast(res && res.error ? res.error : '同步更新失败，请稍后重试', true);
       }
     }catch(err){
       toast(String(err), true);
@@ -1017,7 +1025,7 @@ async function deleteRule(idx){
 
   // Synced sender: delete both sides
   if(ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
-    if(!confirm('删除后将同步移除接收机对应规则，确定继续？')) return;
+    if(!confirm('这将同时删除接收机对应规则，确定继续？（不可恢复）')) return;
     try{
       setLoading(true);
       const payload = { sender_node_id: window.__NODE_ID__, receiver_node_id: ex.sync_peer_node_id, sync_id: ex.sync_id };
@@ -1027,7 +1035,7 @@ async function deleteRule(idx){
         renderRules();
         toast('已同步删除（发送/接收两端）');
       }else{
-        toast(res && res.error ? res.error : '同步删除失败', true);
+        toast(res && res.error ? res.error : '同步删除失败，请稍后重试', true);
       }
     }catch(err){
       toast(String(err), true);
@@ -1037,7 +1045,7 @@ async function deleteRule(idx){
     return;
   }
 
-  if(!confirm('确定删除这条规则？')) return;
+  if(!confirm('确定删除这条规则吗？（不可恢复）')) return;
   CURRENT_POOL.endpoints.splice(idx,1);
   await savePool();
   renderRules();
@@ -1109,7 +1117,7 @@ async function saveRule(){
         closeModal();
         toast('已保存，并自动同步到接收机');
       }else{
-        toast((res && res.error) ? res.error : '保存失败', true);
+        toast((res && res.error) ? res.error : '保存失败，请检查节点是否在线', true);
       }
     }catch(err){
       toast(String(err), true);
@@ -1223,7 +1231,7 @@ async function restoreRules(file){
     toast('规则恢复完成');
     return true;
   }catch(e){
-    alert('恢复失败：' + e.message);
+    toast('恢复失败：' + e.message, true);
     return false;
   }
 }
@@ -1255,14 +1263,14 @@ async function restoreFromText(){
   if(!textarea) return;
   const raw = textarea.value.trim();
   if(!raw){
-    alert('请先粘贴备份内容');
+    alert('请先粘贴备份内容（JSON）');
     return;
   }
   let payload;
   try{
     payload = JSON.parse(raw);
   }catch(e){
-    alert('内容不是有效的 JSON：' + e.message);
+    alert('备份内容不是有效的 JSON：' + e.message);
     return;
   }
   const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
@@ -1418,7 +1426,7 @@ async function copyText(text){
     await navigator.clipboard.writeText(str);
     toast('已复制');
   }catch(e){
-    alert('复制失败，请手动复制');
+    alert('复制失败：浏览器未授予剪贴板权限，请手动复制');
   }
 }
 
@@ -1463,9 +1471,9 @@ async function createNodeFromModal(){
       body: JSON.stringify({name, ip_address, scheme, verify_tls})
     });
 
-    const data = await resp.json().catch(()=>({ok:false,error:"返回解析失败"}));
+    const data = await resp.json().catch(()=>({ok:false,error:"接口返回异常"}));
     if(!resp.ok || !data.ok){
-      if(err) err.textContent = data.error || ("创建失败（HTTP " + resp.status + "）");
+      if(err) err.textContent = data.error || ("创建失败（HTTP " + resp.status + "）。请检查 IP/域名与协议是否正确");
       if(btn){ btn.disabled = false; btn.textContent = "创建并进入"; }
       return;
     }

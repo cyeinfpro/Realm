@@ -7,8 +7,8 @@
   <aside class="card node-sidebar">
     <div class="card-header">
       <div style="min-width:0;">
-        <div class="card-title">Agent 列表</div>
-        <div class="card-sub">点击节点即可切换规则视图</div>
+        <div class="card-title">节点列表</div>
+        <div class="card-sub">点击节点即可切换到该节点的规则</div>
       </div>
       <div class="right" style="flex:0 0 auto;">
         <button class="btn xs" type="button" onclick="openAddNodeModal()">+ 接入</button>
@@ -65,7 +65,9 @@
                 <button class="menu-item" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则 <span class="muted sm">粘贴</span></button>
                 <div class="menu-sep"></div>
                 <form method="post" action="/nodes/{{ node.id }}/delete" style="margin:0;">
-                  <button class="menu-item" type="submit" onclick="return confirm('确认移除该节点？')" style="color:var(--bad);">
+                  <button class="menu-item" type="submit" onclick="return confirm('确定移除该节点吗？
+
+说明：此操作仅从面板移除节点，不会卸载该机器上的 Agent。')" style="color:var(--bad);">
                     移除节点 <span class="muted sm">危险</span>
                   </button>
                 </form>
@@ -89,7 +91,7 @@
               <tr>
                 <th>#</th>
                 <th>状态</th>
-                <th class="listen">Listen</th>
+                <th class="listen">监听</th>
                 <th class="health">连通</th>
                 <th class="stat">活跃</th>
                 <th class="stat">流量</th>
@@ -107,24 +109,45 @@
 </div>
 
 <!-- Add Node Modal (for quick switching / onboarding) -->
+<!-- Add Node Modal -->
 <div id="addNodeModal" class="modal" style="display:none;">
-  <div class="modal-inner">
-    <div class="row" style="justify-content:space-between;align-items:center;">
-      <div class="col"><div class="h2">接入新节点</div></div>
-      <div class="right"><button class="btn xs ghost" type="button" onclick="closeAddNodeModal()">关闭</button></div>
+  <div class="modal-inner" style="max-width:560px;">
+    <div class="row" style="align-items:center;">
+      <div class="col"><div class="h2">接入节点</div></div>
+      <div class="col right"><button class="btn xs ghost" type="button" onclick="closeAddNodeModal()">关闭</button></div>
     </div>
-    <p class="muted" style="margin-top:8px;">填写节点名称与 Agent API 地址（示例：<span class="mono">http://10.0.0.2:18700</span>）。</p>
-    <div class="form" style="margin-top:12px;">
-      <label class="label">节点名称</label>
-      <input class="input" id="addNodeName" placeholder="例如：香港-A" />
-      <label class="label" style="margin-top:10px;">Agent API 地址</label>
-      <input class="input" id="addNodeBaseUrl" placeholder="http://IP:18700" />
-      <label class="label" style="margin-top:10px;">API Key（与 Agent 的 /etc/realm-agent/api.key 一致）</label>
-      <input class="input" id="addNodeApiKey" placeholder="可留空（未启用鉴权时）" />
 
-      <div class="row" style="gap:10px;justify-content:flex-end;margin-top:14px;">
+    <p class="muted" style="margin-top:8px;">只需填写 <b>IP/域名</b>，端口默认使用 <span class="mono">18700</span>（Agent 默认端口）。如你改过端口，请在 IP/域名里自行带上 <span class="mono">:端口</span>。</p>
+
+    <div class="form" style="margin-top:10px;">
+      <div class="row" style="gap:12px;">
+        <div class="col">
+          <label class="label">节点名称（可选）</label>
+          <input class="input" id="addNodeName" placeholder="例如：香港-01 / US-Edge">
+        </div>
+        <div class="col" style="max-width:180px;">
+          <label class="label">协议</label>
+          <select class="select" id="addNodeScheme">
+            <option value="http">http</option>
+            <option value="https">https</option>
+          </select>
+        </div>
+      </div>
+
+      <label class="label">IP/域名</label>
+      <input class="input" id="addNodeIp" placeholder="例如：1.2.3.4 或 node.example.com">
+
+      <div class="row" style="gap:12px;align-items:center;margin-top:6px;">
+        <div class="col">
+          <label class="help"><input type="checkbox" id="addNodeVerifyTls" style="transform:translateY(1px);"> 验证 TLS 证书（https 才需要）</label>
+        </div>
+      </div>
+
+      <div id="addNodeError" class="muted" style="margin-top:8px;color:#ffb3b3;"></div>
+
+      <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
         <button class="btn xs ghost" type="button" onclick="closeAddNodeModal()">取消</button>
-        <button class="btn xs" type="button" onclick="submitAddNode()">保存</button>
+        <button class="btn xs" id="addNodeSubmit" type="button" onclick="createNodeFromModal()">创建并进入</button>
       </div>
     </div>
   </div>
@@ -141,7 +164,7 @@
     <div class="form">
       <div class="row" style="gap:12px;">
         <div class="col">
-          <label class="label">Listen（例如 0.0.0.0:443）</label>
+          <label class="label">监听（例如 0.0.0.0:443）</label>
           <input class="input" id="f_listen" placeholder="0.0.0.0:443">
         </div>
         <div class="col" style="max-width:220px;">
@@ -153,7 +176,7 @@
         </div>
       </div>
 
-      <label class="label">Remote 目标（每行一个 host:port）</label>
+      <label class="label">目标地址（Remote，每行一个 host:port）</label>
       <textarea class="textarea" id="f_remotes" rows="5" placeholder="203.0.113.10:443\n198.51.100.8:443"></textarea>
 
       <div class="row" style="gap:12px;">
@@ -292,7 +315,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=34.3"></script>
+<script src="/static/app.js?v=34.4"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};
@@ -313,7 +336,7 @@ document.querySelectorAll('[data-copy-target]').forEach((btn)=>{
       btn.textContent = '已复制';
       setTimeout(()=>{ btn.textContent = original; }, 1200);
     }catch(e){
-      alert('复制失败，请手动复制');
+      alert('复制失败：浏览器不允许访问剪贴板，请手动复制。');
     }
   });
 });

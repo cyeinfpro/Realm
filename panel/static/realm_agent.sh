@@ -9,11 +9,11 @@ DEFAULT_HOST="0.0.0.0"
 
 info(){ printf "[提示] %s\n" "$*"; }
 ok(){ printf "[OK] %s\n" "$*"; }
-err(){ printf "[ERR ] %s\n" "$*" >&2; }
+err(){ printf "[错误] %s\n" "$*" >&2; }
 
 need_root(){
   if [[ "$(id -u)" -ne 0 ]]; then
-    err "请使用 root 运行：sudo -i"
+    err "请使用 root 运行（sudo -i / su -）"
     exit 1
   fi
 }

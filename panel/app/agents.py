@@ -41,7 +41,7 @@ async def agent_post(
 async def agent_ping(base_url: str, api_key: str, verify_tls: bool) -> Dict[str, Any]:
     host, port = _extract_host_port(base_url, DEFAULT_AGENT_PORT)
     if not host:
-        return {"ok": False, "error": "invalid agent host"}
+        return {"ok": False, "error": "Agent 地址无效"}
     try:
         latency_ms = await _tcp_ping(host, port)
         return {"ok": True, "latency_ms": latency_ms}
@@ -60,15 +60,32 @@ def _parse_agent_json(response: httpx.Response) -> Dict[str, Any]:
 
 
 def _format_agent_error(response: httpx.Response) -> str:
+    """把 Agent 的报错整理成更友好的提示。"""
     data = _parse_agent_json(response)
-    error = data.get("error") if isinstance(data, dict) else None
+    error = data.get('error') if isinstance(data, dict) else None
+    detail = data.get('detail') if isinstance(data, dict) else None
     if not error:
-        error = data.get("detail") if isinstance(data, dict) else None
+        error = data.get('detail') if isinstance(data, dict) else None
     if not error:
         error = response.text.strip()
     if not error:
         error = f"HTTP {response.status_code}"
-    return f"Agent请求失败({response.status_code}): {error}"
+
+    # 常见错误码翻译
+    code_map = {
+        'jq_failed': '生成配置失败（规则格式异常或 jq 不可用）',
+        'restart_failed': '重启 realm 服务失败',
+        'invalid api key': 'API Key 无效',
+    }
+    friendly = code_map.get(str(error).strip(), None)
+    msg = friendly or str(error).strip()
+    if detail and str(detail).strip() and str(detail).strip() not in msg:
+        # detail 可能很长，做个简单截断
+        d = str(detail).strip()
+        if len(d) > 240:
+            d = d[:240] + '…'
+        msg = f"{msg}：{d}"
+    return f"Agent 请求失败（{response.status_code}）：{msg}"
 
 
 def _extract_host_port(base_url: str, fallback_port: int) -> Tuple[str, int]:

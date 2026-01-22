@@ -38,7 +38,7 @@ def parse_pair_code(code: str) -> Dict[str, Any]:
     raw = b64url_decode(code)
     obj = json.loads(raw.decode())
     if not isinstance(obj, dict):
-        raise ValueError("invalid pair payload")
+        raise ValueError("配对码内容不合法")
     return obj
 
 

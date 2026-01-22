@@ -318,7 +318,7 @@ def _restart_realm() -> None:
             if r.returncode == 0:
                 return
             errors.append(f"rc-service {svc}: {r.stderr.strip() or r.stdout.strip()}")
-    detail = "; ".join([e for e in errors if e]) or "unknown error"
+    detail = "; ".join([e for e in errors if e]) or "未知错误"
     raise RuntimeError(f'无法重启 realm 服务（尝试 {", ".join(services)} 失败）：{detail}')
 
 
@@ -526,7 +526,7 @@ def _read_conn_counters(target_ports: set[int]) -> tuple[dict[int, int], str | N
 
     rc, out1, err1 = _run_iptables(['-t', IPT_TABLE, '-nvxL', IPT_CHAIN_CONN_IN])
     if rc != 0:
-        return {p: 0 for p in target_ports}, (err1 or 'iptables list failed')
+        return {p: 0 for p in target_ports}, (err1 or '读取 iptables 失败（可能未安装或无权限）')
 
     pkt_map = _parse_iptables_chain_pkts(out1, target_ports, 'dpt:')
     return {p: int(pkt_map.get(p, 0)) for p in target_ports}, None
@@ -638,7 +638,7 @@ def _read_traffic_counters(target_ports: set[int]) -> tuple[dict[int, dict[str, 
     rc1, out1, err1 = _run_iptables(['-t', IPT_TABLE, '-nvxL', IPT_CHAIN_IN])
     rc2, out2, err2 = _run_iptables(['-t', IPT_TABLE, '-nvxL', IPT_CHAIN_OUT])
     if rc1 != 0 or rc2 != 0:
-        return {p: {'rx_bytes': 0, 'tx_bytes': 0} for p in target_ports}, (err1 or err2 or 'iptables list failed')
+        return {p: {'rx_bytes': 0, 'tx_bytes': 0} for p in target_ports}, (err1 or err2 or '读取 iptables 失败（可能未安装或无权限）')
 
     rx_map = _parse_iptables_chain_bytes(out1, target_ports, 'dpt:')
     tx_map = _parse_iptables_chain_bytes(out2, target_ports, 'spt:')
@@ -1150,7 +1150,7 @@ def _apply_sync_pool_cmd(cmd: Dict[str, Any]) -> None:
 
     pool = cmd.get('pool')
     if not isinstance(pool, dict):
-        _LAST_SYNC_ERROR = 'sync_pool: pool not dict'
+        _LAST_SYNC_ERROR = '同步规则失败：pool 不是对象'
         return
 
     do_apply = bool(cmd.get('apply', True))
@@ -1168,7 +1168,7 @@ def _apply_sync_pool_cmd(cmd: Dict[str, Any]) -> None:
             _write_int(ACK_VER_FILE, ver)
             _LAST_SYNC_ERROR = None
         except Exception as exc:
-            _LAST_SYNC_ERROR = f"sync_pool failed: {exc}"
+            _LAST_SYNC_ERROR = f"同步规则失败：{exc}"
 
 
 
@@ -1198,12 +1198,12 @@ def _apply_pool_patch_cmd(cmd: Dict[str, Any]) -> None:
 
     # Patch only allowed when agent is exactly at base_version
     if ack != base_ver:
-        _LAST_SYNC_ERROR = f'pool_patch: base_version mismatch (ack={ack}, base={base_ver})'
+        _LAST_SYNC_ERROR = f'增量同步失败：版本不匹配（ack={ack}, base={base_ver}）'
         return
 
     ops = cmd.get('ops')
     if not isinstance(ops, list) or len(ops) != 1:
-        _LAST_SYNC_ERROR = 'pool_patch: ops invalid'
+        _LAST_SYNC_ERROR = '增量同步失败：ops 不合法'
         return
 
     do_apply = bool(cmd.get('apply', True))
@@ -1229,19 +1229,19 @@ def _apply_pool_patch_cmd(cmd: Dict[str, Any]) -> None:
             if typ == 'upsert':
                 ep = op.get('endpoint')
                 if not isinstance(ep, dict) or not str(ep.get('listen') or '').strip():
-                    _LAST_SYNC_ERROR = 'pool_patch: endpoint invalid'
+                    _LAST_SYNC_ERROR = '增量同步失败：endpoint 不合法'
                     return
                 ep.setdefault('disabled', False)
                 mp[str(ep.get('listen')).strip()] = ep
             elif typ == 'remove':
                 listen = str(op.get('listen') or '').strip()
                 if not listen:
-                    _LAST_SYNC_ERROR = 'pool_patch: listen invalid'
+                    _LAST_SYNC_ERROR = '增量同步失败：listen 不合法'
                     return
                 mp.pop(listen, None)
                 base_order = [x for x in base_order if x != listen]
             else:
-                _LAST_SYNC_ERROR = f'pool_patch: unknown op {typ}'
+                _LAST_SYNC_ERROR = f'增量同步失败：未知操作 {typ}'
                 return
 
             # rebuild endpoints list preserving prior order
@@ -1268,7 +1268,7 @@ def _apply_pool_patch_cmd(cmd: Dict[str, Any]) -> None:
             _write_int(ACK_VER_FILE, ver)
             _LAST_SYNC_ERROR = None
         except Exception as exc:
-            _LAST_SYNC_ERROR = f"pool_patch failed: {exc}"
+            _LAST_SYNC_ERROR = f"增量同步失败：{exc}"
 
 def _handle_panel_commands(cmds: Any) -> None:
     if not isinstance(cmds, list) or not cmds:
@@ -1285,7 +1285,7 @@ def _handle_panel_commands(cmds: Any) -> None:
             if not api_key or not _verify_cmd_sig(cmd, api_key):
                 # do not crash; keep reporting error for UI
                 global _LAST_SYNC_ERROR
-                _LAST_SYNC_ERROR = f'{t}: bad signature'
+                _LAST_SYNC_ERROR = f'{t}：签名校验失败'
                 continue
 
         if t == 'sync_pool':

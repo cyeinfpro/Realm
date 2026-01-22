@@ -1,38 +1,41 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{{ app_name }}</title>
-  <link rel="stylesheet" href="/static/style.css" />
-  <script defer src="/static/app.js"></script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#060816">
+  <title>{{ title or "Realm Pro Panel" }}</title>
+<link rel="stylesheet" href="/static/style.css?v=34.2">
 </head>
 <body>
-  <div class="bg"></div>
-
   <header class="topbar">
-    <div class="brand">
-      <div class="logo"></div>
-      <div>
-        <div class="title">Realm</div>
-        <div class="sub">Panel</div>
+    <a class="brand" href="/" aria-label="Realm Pro">
+      <div class="logo">RP</div>
+      <div class="brand-text">
+        <div class="brand-name">Realm Pro</div>
+        <div class="brand-sub">Control Panel</div>
       </div>
-    </div>
+    </a>
 
     <nav class="nav">
       {% if user %}
-        <a href="/" class="navlink">控制台</a>
-        <a href="/logout" class="navlink">退出</a>
+        <a href="/" class="nav-link">控制台</a>
+        <a href="/logout" class="nav-link">退出</a>
       {% endif %}
     </nav>
   </header>
 
   <main class="container">
+    {% if flash %}
+      <div class="flash">{{ flash }}</div>
+    {% endif %}
     {% block content %}{% endblock %}
   </main>
 
   <footer class="footer">
-    <span>Realm Panel v21</span>
+    <span>Realm Pro Suite v34</span>
   </footer>
+
+  {% block scripts %}{% endblock %}
 </body>
 </html>

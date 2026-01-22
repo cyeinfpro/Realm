@@ -449,7 +449,9 @@ async def join_script(request: Request, token: str):
 
     node = get_node_by_api_key(token)
     if not node:
-        return PlainTextResponse("echo '[ERR] invalid token'\n", status_code=404)
+        return PlainTextResponse("""echo '[错误] 接入链接无效：token 不存在或已失效' >&2
+exit 1
+""", status_code=404)
 
     base_url = str(request.base_url).rstrip("/")
     node_id = int(node.get("id"))
@@ -468,14 +470,14 @@ if [[ \"$(id -u)\" -ne 0 ]]; then
     echo \"[提示] 需要 root，自动尝试 sudo...\" >&2
     exec sudo -E bash -c \"curl -fsSL $PANEL_URL/join/{api_key} | bash\"
   fi
-  echo \"[ERR ] 需要 root 权限运行（当前机器无 sudo）。请先 su - 后重试。\" >&2
+  echo \"[错误] 需要 root 权限运行，但系统未安装 sudo。请切换到 root 后重试（sudo -i / su -）。\" >&2
   exit 1
 fi
 
 mkdir -p /etc/realm-agent
 echo \"$API_KEY\" > /etc/realm-agent/api.key
 
-echo \"[提示] 正在安装/更新 Agent...\" >&2
+echo \"[提示] 正在安装/更新 Realm Agent…\" >&2
 curl -fsSL $PANEL_URL/static/realm_agent.sh | \
   REALM_AGENT_REPO_ZIP_URL=\"{repo_zip_url}\" \
   REALM_AGENT_FORCE_UPDATE=1 \
@@ -496,7 +498,9 @@ async def uninstall_script(request: Request, token: str):
 
     node = get_node_by_api_key(token)
     if not node:
-        return PlainTextResponse("echo '[ERR] invalid token'\n", status_code=404)
+        return PlainTextResponse("""echo '[错误] 接入链接无效：token 不存在或已失效' >&2
+exit 1
+""", status_code=404)
 
     base_url = str(request.base_url).rstrip("/")
     api_key = str(node.get("api_key"))
@@ -510,11 +514,11 @@ if [[ \"$(id -u)\" -ne 0 ]]; then
     echo \"[提示] 需要 root，自动尝试 sudo...\" >&2
     exec sudo -E bash -c \"curl -fsSL $PANEL_URL/uninstall/{api_key} | bash\"
   fi
-  echo \"[ERR ] 需要 root 权限运行（当前机器无 sudo）。请先 su - 后重试。\" >&2
+  echo \"[错误] 需要 root 权限运行，但系统未安装 sudo。请切换到 root 后重试（sudo -i / su -）。\" >&2
   exit 1
 fi
 
-echo \"[提示] 卸载 Agent / Realm...\" >&2
+echo \"[提示] 正在卸载 Realm Agent / Realm…\" >&2
 systemctl disable --now realm-agent.service realm-agent-https.service realm.service realm \
   >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/realm-agent.service /etc/systemd/system/realm-agent-https.service \
@@ -524,7 +528,7 @@ systemctl daemon-reload || true
 rm -rf /opt/realm-agent /etc/realm-agent /etc/realm /opt/realm || true
 rm -f /usr/local/bin/realm /usr/bin/realm || true
 
-echo \"[OK] 已卸载\" >&2
+echo \"[OK] 卸载完成\" >&2
 """
     return PlainTextResponse(script, media_type="text/plain; charset=utf-8")
 
@@ -547,13 +551,13 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
     try:
         node_id = int(node_id_raw)
     except Exception:
-        return JSONResponse({"ok": False, "error": "invalid node_id"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "节点 ID 无效"}, status_code=400)
 
     node = get_node(node_id)
     if not node:
-        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
     if not api_key or api_key != node.get("api_key"):
-        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=403)
+        return JSONResponse({"ok": False, "error": "无权限（API Key 不正确）"}, status_code=403)
 
     # report_json：尽量只保存 report 字段（更干净），但也兼容直接上报全量
     report = payload.get("report") if isinstance(payload, dict) else None
@@ -625,7 +629,7 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
 async def api_ping(request: Request, node_id: int, user: str = Depends(require_login)):
     node = get_node(node_id)
     if not node:
-        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
 
     # Push-report mode: agent has reported recently -> online (no need panel->agent reachability)
     if _is_report_fresh(node):
@@ -649,7 +653,7 @@ async def api_ping(request: Request, node_id: int, user: str = Depends(require_l
 async def api_pool_get(request: Request, node_id: int, user: str = Depends(require_login)):
     node = get_node(node_id)
     if not node:
-        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
 
     # Push-report mode: prefer desired pool stored on panel
     desired_ver, desired_pool = get_desired_pool(node_id)
@@ -671,7 +675,7 @@ async def api_pool_get(request: Request, node_id: int, user: str = Depends(requi
 async def api_backup(request: Request, node_id: int, user: str = Depends(require_login)):
     node = get_node(node_id)
     if not node:
-        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
     # Prefer panel-desired pool (push mode), then cached report, then pull from agent
     desired_ver, desired_pool = get_desired_pool(node_id)
     if isinstance(desired_pool, dict):
@@ -700,17 +704,17 @@ async def api_restore(
 ):
     node = get_node(node_id)
     if not node:
-        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
     try:
         raw = await file.read()
         payload = json.loads(raw.decode("utf-8"))
     except Exception as exc:
-        return JSONResponse({"ok": False, "error": f"invalid backup file: {exc}"}, status_code=400)
+        return JSONResponse({"ok": False, "error": f"备份文件解析失败：{exc}"}, status_code=400)
     pool = payload.get("pool") if isinstance(payload, dict) else None
     if pool is None:
         pool = payload
     if not isinstance(pool, dict):
-        return JSONResponse({"ok": False, "error": "backup missing pool data"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "备份内容缺少 pool 数据"}, status_code=400)
     # Store on panel and attempt immediate apply if agent reachable.
     desired_ver, _ = set_desired_pool(node_id, pool)
     try:
@@ -732,13 +736,13 @@ async def api_restore(
 async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], user: str = Depends(require_login)):
     node = get_node(node_id)
     if not node:
-        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
     pool = payload.get("pool") if isinstance(payload, dict) else None
     if pool is None and isinstance(payload, dict):
         # some callers may post the pool dict directly
         pool = payload
     if not isinstance(pool, dict):
-        return JSONResponse({"ok": False, "error": "missing pool"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "请求缺少 pool 字段"}, status_code=400)
 
 
     # Prevent editing/deleting synced receiver rules from UI
@@ -1176,7 +1180,7 @@ async def api_wss_tunnel_delete(payload: Dict[str, Any], user: str = Depends(req
 async def api_apply(request: Request, node_id: int, user: str = Depends(require_login)):
     node = get_node(node_id)
     if not node:
-        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
     try:
         data = await agent_post(
             node["base_url"],
@@ -1186,7 +1190,7 @@ async def api_apply(request: Request, node_id: int, user: str = Depends(require_
             _node_verify_tls(node),
         )
         if not data.get("ok", True):
-            return JSONResponse({"ok": False, "error": data.get("error", "agent apply failed")}, status_code=502)
+            return JSONResponse({"ok": False, "error": data.get("error", "Agent 应用配置失败")}, status_code=502)
         return data
     except Exception:
         # Push-report fallback: bump desired version to trigger a re-sync/apply on agent
@@ -1194,14 +1198,14 @@ async def api_apply(request: Request, node_id: int, user: str = Depends(require_
         if isinstance(desired_pool, dict):
             new_ver, _ = set_desired_pool(node_id, desired_pool)
             return {"ok": True, "queued": True, "desired_version": new_ver}
-        return {"ok": False, "error": "agent unreachable and no desired pool found"}
+        return {"ok": False, "error": "Agent 无法访问，且面板无缓存规则（请检查网络或等待 Agent 上报）"}
 
 
 @app.get("/api/nodes/{node_id}/stats")
 async def api_stats(request: Request, node_id: int, user: str = Depends(require_login)):
     node = get_node(node_id)
     if not node:
-        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
 
     # Push-report cache
     if _is_report_fresh(node):
@@ -1232,7 +1236,7 @@ async def api_sys(request: Request, node_id: int, cached: int = 0, user: str = D
     """
     node = get_node(node_id)
     if not node:
-        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
 
     sys_data = None
     source = None
@@ -1262,7 +1266,7 @@ async def api_sys(request: Request, node_id: int, cached: int = 0, user: str = D
                 "ok": True,
                 "sys": {
                     "ok": False,
-                    "error": "no sys in report (please update agent)",
+                    "error": "Agent 尚未上报系统信息（请升级 Agent 或稍后重试）",
                     "source": "report",
                 },
             }
@@ -1273,7 +1277,7 @@ async def api_sys(request: Request, node_id: int, cached: int = 0, user: str = D
                 sys_data = dict(data)  # copy
                 source = "agent"
             else:
-                return {"ok": False, "error": (data.get("error") if isinstance(data, dict) else "invalid response")}
+                return {"ok": False, "error": (data.get("error") if isinstance(data, dict) else "响应格式异常")}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -1285,7 +1289,7 @@ async def api_sys(request: Request, node_id: int, cached: int = 0, user: str = D
 async def api_graph(request: Request, node_id: int, user: str = Depends(require_login)):
     node = get_node(node_id)
     if not node:
-        return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
     desired_ver, desired_pool = get_desired_pool(node_id)
     pool = desired_pool if isinstance(desired_pool, dict) else None
 

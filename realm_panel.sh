@@ -6,10 +6,10 @@ REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main
 
 info(){ echo -e "\033[33m[提示]\033[0m $*" >&2; }
 ok(){ echo -e "\033[32m[OK]\033[0m $*" >&2; }
-err(){ echo -e "\033[31m[ERR]\033[0m $*" >&2; }
+err(){ echo -e "\033[31m[错误]\033[0m $*" >&2; }
 need_root(){
   if [[ "$(id -u)" -ne 0 ]]; then
-    err "请使用 root 运行：sudo -i"
+    err "请使用 root 运行（sudo -i / su -）"
     exit 1
   fi
 }
@@ -49,6 +49,14 @@ prompt(){
     read -r -p "$msg: " out || true
     echo "$out"
   fi
+}
+
+prompt_secret(){
+  local msg="$1"; local out
+  # -s：输入不回显；用于密码/密钥类信息
+  read -r -s -p "$msg: " out || true
+  echo
+  echo "$out"
 }
 
 TMPDIR=""
@@ -143,7 +151,7 @@ EOF
 
 install_panel(){
   need_root
-  echo "Realm Pro Panel Installer ${VERSION}"
+  echo "Realm Pro Panel 安装向导 ${VERSION}"
   echo "------------------------------------------------------------"
   echo "1) 在线安装（推荐）"
   echo "2) 离线安装（手动下载）"
@@ -168,7 +176,7 @@ install_panel(){
   local user pass port
   user="$(prompt "设置面板登录用户名" "admin")"
   while true; do
-    pass="$(prompt "设置面板登录密码 (必填)" "")"
+    pass="$(prompt_secret "设置面板登录密码（输入时不显示，必填）")"
     [[ -n "$pass" ]] && break
     err "密码不能为空"
   done
@@ -205,9 +213,9 @@ PY
   systemctl restart realm-panel.service
 
   ok "面板已启动"
-  echo "访问: http://<你的IP>:${port}"
-  echo "用户名: ${user}"
-  echo "密码: (你刚刚输入的)"
+  echo "访问地址：http://<你的IP>:${port}"
+  echo "用户名：${user}"
+  echo "密码：（你刚刚设置的）"
 }
 
 update_panel(){
