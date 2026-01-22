@@ -490,19 +490,32 @@ function initDashboardMiniSys(){
         const nodeId = card.dataset.nodeId;
         const online = card.dataset.online === '1';
         const hintEl = card.querySelector('[data-sys="hint"]');
-        if(!online){
-          if(hintEl){ hintEl.textContent = '节点离线（系统信息暂停刷新）'; hintEl.style.display = ''; }
-          renderMiniSysOnCard(card, { ok:false, error:'offline' });
-          continue;
-        }
-        // Dashboard: 优先读取 panel 的 push-report 缓存，避免直连 agent 卡住
-        const data = await fetchJSONTimeout(`/api/nodes/${nodeId}/sys?cached=1`, 2200);
-        // api returns {ok:true, sys:{...}} or {ok:false, error:'...'}
-        if(data && data.ok && data.sys){
-          renderMiniSysOnCard(card, data.sys);
-        }else{
-          if(hintEl){ hintEl.textContent = '系统信息暂无数据（等待 Agent 上报）'; }
-          renderMiniSysOnCard(card, { ok:false, error: data?.error || 'no_data' });
+        try{
+          if(!online){
+            if(hintEl){ hintEl.textContent = '节点离线（系统信息暂停刷新）'; hintEl.style.display = ''; }
+            renderMiniSysOnCard(card, { ok:false, error:'offline' });
+            continue;
+          }
+
+          // Dashboard: 优先读取 panel 的 push-report 缓存（不直连 Agent），避免因网络不可达导致卡死
+          const data = await fetchJSONTimeout(`/api/nodes/${nodeId}/sys?cached=1`, 2200);
+
+          // api returns {ok:true, sys:{...}} or {ok:false, error:'...'}
+          if(data && data.ok && data.sys){
+            if(data.sys.ok === false){
+              if(hintEl){ hintEl.textContent = '系统信息暂无数据（等待 Agent 上报）'; hintEl.style.display = ''; }
+            }else{
+              if(hintEl){ hintEl.style.display = 'none'; }
+            }
+            renderMiniSysOnCard(card, data.sys);
+          }else{
+            if(hintEl){ hintEl.textContent = '系统信息获取失败（请稍后重试）'; hintEl.style.display = ''; }
+            renderMiniSysOnCard(card, { ok:false, error: data?.error || 'no_data' });
+          }
+        }catch(e){
+          // 单节点请求失败时，不影响其它节点的刷新
+          if(hintEl){ hintEl.textContent = '系统信息请求超时（请检查网络/Agent 上报）'; hintEl.style.display = ''; }
+          renderMiniSysOnCard(card, { ok:false, error: 'timeout' });
         }
       }
     }catch(e){

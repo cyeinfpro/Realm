@@ -1253,7 +1253,20 @@ async def api_sys(request: Request, node_id: int, cached: int = 0, user: str = D
                 source = "report"
 
     # 2) Fallback：直连 Agent
+    # 说明：控制台首页（Dashboard）会带 cached=1 来避免直连 Agent。
+    # 因为在 Push 模式下，Panel 可能无法直接访问 Agent 的 base_url（私网/防火墙等）。
+    # 若 cached=1 且 report 中没有 sys 数据，直接返回占位信息，避免前端“长时间加载中”。
     if sys_data is None:
+        if cached:
+            return {
+                "ok": True,
+                "sys": {
+                    "ok": False,
+                    "error": "no sys in report (please update agent)",
+                    "source": "report",
+                },
+            }
+
         try:
             data = await agent_get(node["base_url"], node["api_key"], "/api/v1/sys", _node_verify_tls(node))
             if isinstance(data, dict) and data.get("ok") is True:
