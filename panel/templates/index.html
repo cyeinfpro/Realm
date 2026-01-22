@@ -54,7 +54,7 @@
       </div>
       <div class="kpi" title="{{ n.last_seen_at or '-' }}{% if n.agent_version %} · {{ n.agent_version }}{% endif %}">
         <div class="k">最后心跳</div>
-        <div class="v mono">{{ n.last_seen_at or "-" }}</div>
+        <div class="v mono" data-last-seen="{{ n.last_seen_at or '' }}">{{ n.last_seen_at or "-" }}</div>
       </div>
     </div>
 

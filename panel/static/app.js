@@ -226,6 +226,73 @@ function formatDuration(sec){
   return parts.join(' ');
 }
 
+// Compact duration for dashboard tiles: keep at most 2 units, use d/h/m/s (more professional & shorter)
+function formatDurationShort(sec){
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m2 = Math.floor((s % 3600) / 60);
+  const s2 = s % 60;
+  if(d > 0){
+    return h > 0 ? `${d}d ${h}h` : `${d}d`;
+  }
+  if(h > 0){
+    return m2 > 0 ? `${h}h ${m2}m` : `${h}h`;
+  }
+  if(m2 > 0){
+    // keep seconds only when very small to avoid flicker; otherwise show minutes only
+    if(m2 < 10 && s2 > 0) return `${m2}m ${s2}s`;
+    return `${m2}m`;
+  }
+  return `${s2}s`;
+}
+
+function parseDateTimeLocal(str){
+  const t = String(str || '').trim();
+  if(!t || t === '-') return null;
+  // Supports: YYYY-MM-DD HH:MM:SS / YYYY-MM-DDTHH:MM:SS / with optional ms
+  const m = t.match(/(\d{4})-(\d{1,2})-(\d{1,2})[T\s](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/);
+  if(!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]) - 1;
+  const d = Number(m[3]);
+  const hh = Number(m[4]);
+  const mm = Number(m[5]);
+  const ss = Number(m[6] || 0);
+  const dt = new Date(y, mo, d, hh, mm, ss);
+  if(Number.isNaN(dt.getTime())) return null;
+  return dt;
+}
+
+// Compact "time ago" for dashboard tiles
+function formatAgoShort(dateStr){
+  const dt = parseDateTimeLocal(dateStr);
+  if(!dt) return (dateStr && String(dateStr).trim()) ? String(dateStr).trim() : '-';
+  const diff = Math.max(0, Math.floor((Date.now() - dt.getTime()) / 1000));
+  if(diff < 5) return '刚刚';
+  if(diff < 60) return `${diff}s`;
+  const m2 = Math.floor(diff / 60);
+  if(m2 < 60) return `${m2}m`;
+  const h = Math.floor(m2 / 60);
+  if(h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  if(d < 7) return `${d}d`;
+  // older: show MM-DD (keep full value in title)
+  const mm = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  return `${mm}-${dd}`;
+}
+
+function refreshDashboardLastSeenShort(){
+  const els = document.querySelectorAll('[data-last-seen]');
+  els.forEach((el)=>{
+    const raw = el.getAttribute('data-last-seen') || '';
+    // Keep full in title; show short in content
+    if(raw && raw.trim()) el.setAttribute('title', raw.trim());
+    el.textContent = formatAgoShort(raw);
+  });
+}
+
 function setProgress(elId, pct){
   const el = document.getElementById(elId);
   if(!el) return;
@@ -300,7 +367,10 @@ function renderSysMini(cardEl, sys){
   const rxBps = sys?.net?.rx_bps || 0;
 
   // Compact tile texts
-  setText('uptime', formatDuration(sys?.uptime_sec || 0));
+  const uptimeSec = sys?.uptime_sec || 0;
+  // Short in value, full in tooltip
+  setText('uptime', formatDurationShort(uptimeSec));
+  setTitle('uptime', formatDuration(uptimeSec));
   setText('traffic', `↑ ${formatBytes(tx)} · ↓ ${formatBytes(rx)}`);
   setText('rate', `↑ ${formatBps(txBps)} · ↓ ${formatBps(rxBps)}`);
   setText('cpuPct', `${Number(cpuPct).toFixed(0)}%`);
@@ -359,10 +429,14 @@ async function refreshDashboardMiniSys(){
 function initDashboardMiniSys(){
   const grid = document.getElementById('dashboardGrid');
   if(!grid) return;
+  // First paint for compact "last seen" time
+  try{ refreshDashboardLastSeenShort(); }catch(_e){}
   // First paint
   refreshDashboardMiniSys();
   // Same refresh cadence as rules: 3s
   setInterval(refreshDashboardMiniSys, 3000);
+  // Update "last seen" display every 5s (no network request)
+  setInterval(()=>{ try{ refreshDashboardLastSeenShort(); }catch(_e){} }, 5000);
 }
 
 function renderSysCard(sys){
