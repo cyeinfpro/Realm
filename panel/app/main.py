@@ -1227,25 +1227,38 @@ async def api_stats(request: Request, node_id: int, user: str = Depends(require_
 async def api_sys(request: Request, node_id: int, user: str = Depends(require_login)):
     """节点系统信息：CPU/内存/硬盘/交换/在线时长/流量/实时速率。
 
-    优先读取 Agent push-report 缓存（更快、更稳定），否则回退到直连 Agent。
+    返回格式统一为：{ ok: true, sys: {...} }
+    前端会据此渲染节点详情页的系统信息卡片。
     """
     node = get_node(node_id)
     if not node:
         return JSONResponse({"ok": False, "error": "node not found"}, status_code=404)
 
-    # Push-report cache
+    sys_data = None
+    source = None
+
+    # 1) Push-report cache（更快、更稳定）
     if _is_report_fresh(node):
         rep = get_last_report(node_id)
         if isinstance(rep, dict) and isinstance(rep.get("sys"), dict):
-            out = rep["sys"]
-            out["source"] = "report"
-            return out
+            sys_data = dict(rep["sys"])  # copy
+            source = "report"
 
-    try:
-        data = await agent_get(node["base_url"], node["api_key"], "/api/v1/sys", _node_verify_tls(node))
-        return data
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+    # 2) Fallback：直连 Agent
+    if sys_data is None:
+        try:
+            data = await agent_get(node["base_url"], node["api_key"], "/api/v1/sys", _node_verify_tls(node))
+            if isinstance(data, dict) and data.get("ok") is True:
+                sys_data = dict(data)  # copy
+                source = "agent"
+            else:
+                return {"ok": False, "error": (data.get("error") if isinstance(data, dict) else "invalid response")}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    sys_data["source"] = source or "unknown"
+    return {"ok": True, "sys": sys_data}
+
 
 @app.get("/api/nodes/{node_id}/graph")
 async def api_graph(request: Request, node_id: int, user: str = Depends(require_login)):
