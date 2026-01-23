@@ -140,6 +140,11 @@ a{color:inherit}
 .meta{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .meta-item{color:var(--muted);font-size:12px}
 
+@media (max-width: 640px){
+  .page-head{flex-direction:column;align-items:stretch;}
+  .page-head .right{justify-content:flex-start;}
+}
+
 /* Typography */
 .h1{margin:0;font-size:22px;letter-spacing:0.2px}
 .h2{margin:0;font-size:15px;letter-spacing:0.2px}
@@ -207,8 +212,14 @@ a{color:inherit}
 .mini-progress{height:6px;border-radius:999px;background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.06);overflow:hidden}
 .mini-fill{height:100%;width:0%;border-radius:999px;background:linear-gradient(90deg, rgba(121,97,255,0.86), rgba(90,238,199,0.86))}
 
-@media (max-width: 520px){
+@media (max-width: 720px){
   .grid.node-grid{grid-template-columns:repeat(2,minmax(0,1fr));}
+}
+
+@media (max-width: 520px){
+  .grid.node-grid{grid-template-columns:1fr;}
+  .node-kpis{flex-wrap:wrap;}
+  .kpi{flex:1 1 50%;}
   .node-bars{grid-template-columns:1fr;}
   .mbar .head .mono{max-width:none}
 }
@@ -521,13 +532,18 @@ textarea,.textarea{min-height:90px;resize:vertical}
   border:1px solid rgba(148,163,184,0.18);
   background: rgba(2,6,23,0.20);
   min-height: 34px;
+  flex: 1 1 320px;
+  max-width: 420px;
 }
+
 .node-tools .search-pill input{
   border:none;
   outline:none;
   background:transparent;
   padding: 0;
-  min-width: 200px;
+  flex: 1 1 auto;
+  width: 220px;
+  min-width: 0;
   color: var(--text);
   font-size: 12px;
 }
@@ -585,6 +601,9 @@ textarea,.textarea{min-height:90px;resize:vertical}
 @media (max-width: 520px){
   .node-tools{gap:8px}
   .node-tools .search-pill{min-height:34px}
+  .node-tools{width:100%;}
+  .node-tools .btn, .node-tools details.menu{flex:1 1 48%;}
+  .node-tools details.menu summary{width:100%; text-align:center;}
   .node-item{min-width: 160px; padding: 9px; border-radius: 12px;}
   .node-sidebar .node-meta{display:none;}
   .icon-btn{width:28px;height:28px;border-radius: 9px;}
@@ -636,6 +655,16 @@ textarea,.textarea{min-height:90px;resize:vertical}
   backdrop-filter: blur(16px);
   border-bottom:1px solid rgba(148,163,184,0.18);
 }
+
+/* Node rules table: disable sticky header to avoid overlap glitches in some browsers */
+.node-main .table thead th{
+  position:static;
+  top:auto;
+  z-index:auto;
+  background: rgba(2,6,23,0.28);
+  backdrop-filter: blur(12px);
+}
+
 .table tbody tr:nth-child(2n) td{background: rgba(148,163,184,0.015);}
 .table tbody tr:hover td{background: rgba(148,163,184,0.06);}
 
