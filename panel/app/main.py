@@ -416,6 +416,7 @@ async def node_new_page(request: Request, user: str = Depends(require_login_page
 async def node_new_action(
     request: Request,
     name: str = Form(""),
+    group_name: str = Form("默认分组"),
     ip_address: str = Form(...),
     scheme: str = Form("http"),
     api_key: str = Form(""),
@@ -448,12 +449,12 @@ async def node_new_action(
     if has_port:
         port_value = parsed_port
 
-    base_url = f"{scheme}://{_format_host_for_url(host)}"  # 不在 UI 展示端口
+    base_url = f"{scheme}://{_format_host_for_url(host)}:{port_value}"  # 不在 UI 展示端口
 
     # name 为空则默认使用“纯 IP/Host”
     display_name = (name or "").strip() or _extract_ip_for_display(base_url)
 
-    node_id = add_node(display_name, base_url, api_key, verify_tls=bool(verify_tls))
+    node_id = add_node(display_name, base_url, api_key, verify_tls=bool(verify_tls), group_name=group_name)
     request.session["show_install_cmd"] = True
     _set_flash(request, "已添加机器")
     return RedirectResponse(url=f"/nodes/{node_id}", status_code=303)
@@ -463,6 +464,7 @@ async def node_new_action(
 async def node_add_action(
     request: Request,
     name: str = Form(""),
+    group_name: str = Form("默认分组"),
     base_url: str = Form(...),
     api_key: str = Form(...),
     verify_tls: Optional[str] = Form(None),
@@ -476,7 +478,7 @@ async def node_add_action(
         _set_flash(request, "API 地址与 Token 不能为空")
         return RedirectResponse(url="/", status_code=303)
 
-    node_id = add_node(name or base_url, base_url, api_key, verify_tls=bool(verify_tls))
+    node_id = add_node(name or base_url, base_url, api_key, verify_tls=bool(verify_tls), group_name=group_name)
     _set_flash(request, "已添加节点")
     return RedirectResponse(url=f"/nodes/{node_id}", status_code=303)
 
@@ -504,6 +506,7 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
         # 用更宽松的阈值显示在线状态（避免轻微抖动导致频繁显示离线）
         n["online"] = _is_report_fresh(n, max_age_sec=90)
     show_install_cmd = bool(request.session.pop("show_install_cmd", False))
+    show_edit_node = str(request.query_params.get("edit") or "").strip() in ("1", "true", "yes")
     base_url = _panel_public_base_url(request)
     node["display_ip"] = _extract_ip_for_display(node.get("base_url", ""))
 
@@ -530,6 +533,7 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
             "install_cmd": install_cmd,
             "uninstall_cmd": uninstall_cmd,
             "show_install_cmd": show_install_cmd,
+            "show_edit_node": show_edit_node,
         },
     )
 
@@ -833,6 +837,7 @@ async def api_backup_full(request: Request, user: str = Depends(require_login)):
                 "base_url": n.get("base_url"),
                 "api_key": n.get("api_key"),
                 "verify_tls": bool(n.get("verify_tls", 0)),
+                "group_name": n.get("group_name") or "默认分组",
             }
             for n in nodes
         ],
@@ -920,6 +925,8 @@ async def api_restore_nodes(
         base_url = (item.get("base_url") or "").strip().rstrip('/')
         api_key = (item.get("api_key") or "").strip()
         verify_tls = bool(item.get("verify_tls", False))
+        group_name = (item.get("group_name") or "默认分组").strip() if isinstance(item.get("group_name"), str) else ("默认分组" if not item.get("group_name") else str(item.get("group_name")))
+        group_name = (group_name or "默认分组").strip() or "默认分组"
         source_id = item.get("source_id")
         try:
             source_id_i = int(source_id) if source_id is not None else None
@@ -938,12 +945,13 @@ async def api_restore_nodes(
                 base_url,
                 api_key,
                 verify_tls=verify_tls,
+                group_name=group_name,
             )
             updated += 1
             if source_id_i is not None:
                 mapping[str(source_id_i)] = int(existing["id"])
         else:
-            new_id = add_node(name or _extract_ip_for_display(base_url), base_url, api_key, verify_tls=verify_tls)
+            new_id = add_node(name or _extract_ip_for_display(base_url), base_url, api_key, verify_tls=verify_tls, group_name=group_name)
             added += 1
             if source_id_i is not None:
                 mapping[str(source_id_i)] = int(new_id)
@@ -1020,6 +1028,8 @@ async def api_restore_full(
         base_url = (item.get('base_url') or '').strip().rstrip('/')
         api_key = (item.get('api_key') or '').strip()
         verify_tls = bool(item.get('verify_tls', False))
+        group_name = (item.get('group_name') or '默认分组')
+        group_name = (str(group_name).strip() or '默认分组')
         source_id = item.get('source_id')
         try:
             source_id_i = int(source_id) if source_id is not None else None
@@ -1041,11 +1051,12 @@ async def api_restore_full(
                 base_url,
                 api_key,
                 verify_tls=verify_tls,
+                group_name=group_name,
             )
             updated += 1
             node_id = int(existing['id'])
         else:
-            node_id = int(add_node(name or _extract_ip_for_display(base_url), base_url, api_key, verify_tls=verify_tls))
+            node_id = int(add_node(name or _extract_ip_for_display(base_url), base_url, api_key, verify_tls=verify_tls, group_name=group_name))
             added += 1
 
         baseurl_to_nodeid[base_url] = node_id
@@ -1454,6 +1465,7 @@ async def api_nodes_create(request: Request, user: str = Depends(require_login))
     ip_address = str(data.get("ip_address") or "").strip()
     scheme = str(data.get("scheme") or "http").strip().lower()
     verify_tls = bool(data.get("verify_tls") or False)
+    group_name = str(data.get("group_name") or "").strip() or "默认分组"
 
     if scheme not in ("http", "https"):
         return JSONResponse({"ok": False, "error": "协议仅支持 http 或 https"}, status_code=400)
@@ -1471,19 +1483,119 @@ async def api_nodes_create(request: Request, user: str = Depends(require_login))
     if has_port:
         port_value = parsed_port
 
-    base_url = f"{scheme}://{_format_host_for_url(host)}"
+    base_url = f"{scheme}://{_format_host_for_url(host)}:{port_value}"
     api_key = _generate_api_key()
 
     display_name = name or _extract_ip_for_display(base_url)
-    node_id = add_node(display_name, base_url, api_key, verify_tls=verify_tls)
+    node_id = add_node(display_name, base_url, api_key, verify_tls=verify_tls, group_name=group_name)
     return JSONResponse({"ok": True, "node_id": node_id, "redirect_url": f"/nodes/{node_id}"})
+
+@app.post("/api/nodes/{node_id}/update")
+async def api_nodes_update(node_id: int, request: Request, user: str = Depends(require_login)):
+    """编辑节点：修改名称 / 地址 / 分组（不改 api_key）。"""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    node = get_node(int(node_id))
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+
+    name_in = data.get("name", None)
+    ip_in = data.get("ip_address", None)
+    scheme_in = data.get("scheme", None)
+    group_in = data.get("group_name", None)
+
+    # verify_tls: only update when provided
+    if "verify_tls" in data:
+        verify_tls = bool(data.get("verify_tls") or False)
+    else:
+        verify_tls = bool(node.get("verify_tls", 0))
+
+    # group name
+    if group_in is None:
+        group_name = str(node.get("group_name") or "默认分组").strip() or "默认分组"
+    else:
+        group_name = str(group_in or "").strip() or "默认分组"
+
+    # parse existing base_url
+    raw_old = str(node.get("base_url") or "").strip()
+    if not raw_old:
+        return JSONResponse({"ok": False, "error": "节点地址异常"}, status_code=400)
+    if "://" not in raw_old:
+        raw_old = "http://" + raw_old
+    parsed_old = urlparse(raw_old)
+    old_scheme = (parsed_old.scheme or "http").lower()
+    old_host = parsed_old.hostname or ""
+    old_port = parsed_old.port
+    old_has_port = parsed_old.port is not None
+
+    scheme = str(scheme_in or old_scheme).strip().lower() or "http"
+    if scheme not in ("http", "https"):
+        return JSONResponse({"ok": False, "error": "协议仅支持 http 或 https"}, status_code=400)
+
+    host = old_host
+    port_value = old_port
+    has_port = old_has_port
+
+    if ip_in is not None:
+        ip_address = str(ip_in or "").strip()
+        if not ip_address:
+            return JSONResponse({"ok": False, "error": "节点地址不能为空"}, status_code=400)
+
+        # allow user paste full url
+        ip_full = ip_address
+        if "://" not in ip_full:
+            ip_full = f"{scheme}://{ip_full}"
+
+        fallback_port = int(old_port) if old_has_port and old_port else DEFAULT_AGENT_PORT
+        h, p, has_p, parsed_scheme = _split_host_and_port(ip_full, fallback_port)
+        if not h:
+            return JSONResponse({"ok": False, "error": "节点地址不能为空"}, status_code=400)
+
+        # only override scheme when user explicitly provided scheme
+        if "://" in ip_address:
+            scheme = (parsed_scheme or scheme).lower()
+        host = h
+
+        if has_p:
+            port_value = int(p)
+            has_port = True
+        else:
+            # preserve old explicit port; otherwise keep no-port
+            if old_has_port and old_port:
+                port_value = int(old_port)
+                has_port = True
+            else:
+                port_value = None
+                has_port = False
+
+    base_url = f"{scheme}://{_format_host_for_url(host)}"
+    if has_port and port_value:
+        base_url += f":{int(port_value)}"
+
+    # prevent duplicates
+    other = get_node_by_base_url(base_url)
+    if other and int(other.get("id") or 0) != int(node_id):
+        return JSONResponse({"ok": False, "error": "该节点地址已被其他节点使用"}, status_code=400)
+
+    # name
+    if name_in is None:
+        name = str(node.get("name") or "").strip() or _extract_ip_for_display(base_url)
+    else:
+        name = str(name_in or "").strip() or _extract_ip_for_display(base_url)
+
+    update_node_basic(int(node_id), name, base_url, str(node.get("api_key") or ""), verify_tls=verify_tls, group_name=group_name)
+    return JSONResponse({"ok": True})
+
 
 
 @app.get("/api/nodes")
 async def api_nodes_list(user: str = Depends(require_login)):
     out = []
     for n in list_nodes():
-        out.append({"id": int(n["id"]), "name": n["name"], "base_url": n["base_url"]})
+        out.append({"id": int(n["id"]), "name": n["name"], "base_url": n["base_url"], "group_name": n.get("group_name")})
     return {"ok": True, "nodes": out}
 
 

@@ -1478,6 +1478,13 @@ function initNodePage(){
       if(!AUTO_REFRESH_TIMER) toggleAutoRefresh();
     }catch(e){}
   });
+
+  // Auto open edit-node modal when coming from dashboard
+  try{
+    if(window.__AUTO_OPEN_EDIT_NODE__){
+      setTimeout(()=>{ try{ openEditNodeModal(); }catch(_e){} }, 80);
+    }
+  }catch(_e){}
 }
 
 window.initNodePage = initNodePage;
@@ -1534,12 +1541,140 @@ function openAddNodeModal(){
   const m = document.getElementById("addNodeModal");
   if(!m) return;
   m.style.display = "flex";
+  // prefill group
+  try{
+    const g = localStorage.getItem("realm_last_group") || "";
+    const gi = document.getElementById("addNodeGroup");
+    if(gi && g) gi.value = g;
+  }catch(_e){}
   // focus
   const ip = document.getElementById("addNodeIp");
   if(ip) setTimeout(()=>ip.focus(), 30);
 }
 
 
+
+
+// ---------------- Node: Edit Node Modal ----------------
+function openEditNodeModal(){
+  const m = document.getElementById('editNodeModal');
+  if(!m) return;
+  // fill current values
+  const name = window.__NODE_NAME__ || '';
+  const group = window.__NODE_GROUP__ || '默认分组';
+  const base = window.__NODE_BASE_URL__ || '';
+  const vt = !!window.__NODE_VERIFY_TLS__;
+
+  let scheme = 'http';
+  let host = '';
+  let port = '';
+  try{
+    const u = new URL(base.includes('://') ? base : ('http://' + base));
+    scheme = (u.protocol || 'http:').replace(':','') || 'http';
+    host = u.hostname || '';
+    port = u.port || '';
+  }catch(e){
+    host = String(base || '').replace(/^https?:\/\//,'').replace(/\/.*/,'');
+  }
+
+  const nameEl = document.getElementById('editNodeName');
+  const groupEl = document.getElementById('editNodeGroup');
+  const schemeEl = document.getElementById('editNodeScheme');
+  const ipEl = document.getElementById('editNodeIp');
+  const vtEl = document.getElementById('editNodeVerifyTls');
+  const err = document.getElementById('editNodeError');
+  const btn = document.getElementById('editNodeSubmit');
+
+  if(err) err.textContent = '';
+  if(btn){ btn.disabled = false; btn.textContent = '保存'; }
+
+  if(nameEl) nameEl.value = String(name || '').trim();
+  if(groupEl) groupEl.value = String(group || '').trim();
+  if(schemeEl) schemeEl.value = scheme;
+  if(vtEl) vtEl.checked = !!vt;
+
+  // Show host (append :port only when non-default and present)
+  let ipVal = host;
+  try{
+    const def = '18700';
+    if(port && port !== def) ipVal = host + ':' + port;
+  }catch(_e){}
+  if(ipEl) ipEl.value = ipVal;
+
+  m.style.display = 'flex';
+  if(nameEl) setTimeout(()=>nameEl.focus(), 30);
+}
+
+function closeEditNodeModal(){
+  const m = document.getElementById('editNodeModal');
+  if(!m) return;
+  m.style.display = 'none';
+}
+
+async function saveEditNode(){
+  const err = document.getElementById('editNodeError');
+  const btn = document.getElementById('editNodeSubmit');
+  try{
+    if(err) err.textContent = '';
+    if(btn){ btn.disabled = true; btn.textContent = '保存中…'; }
+
+    const name = (document.getElementById('editNodeName')?.value || '').trim();
+    const group_name = (document.getElementById('editNodeGroup')?.value || '').trim();
+    const scheme = (document.getElementById('editNodeScheme')?.value || 'http').trim();
+    const ip_address = (document.getElementById('editNodeIp')?.value || '').trim();
+    const verify_tls = !!document.getElementById('editNodeVerifyTls')?.checked;
+
+    if(!ip_address){
+      if(err) err.textContent = '节点地址不能为空';
+      return;
+    }
+
+    const nodeId = window.__NODE_ID__;
+    const resp = await fetch(`/api/nodes/${nodeId}/update`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      credentials: 'same-origin',
+      body: JSON.stringify({ name, group_name, scheme, ip_address, verify_tls })
+    });
+    const data = await resp.json().catch(()=>({ok:false,error:'接口返回异常'}));
+    if(!resp.ok || !data.ok){
+      const msg = data.error || ('保存失败（HTTP ' + resp.status + '）');
+      if(err) err.textContent = msg;
+      toast(msg, true);
+      return;
+    }
+    toast('已保存');
+    closeEditNodeModal();
+    setTimeout(()=>window.location.reload(), 200);
+  }catch(e){
+    const msg = (e && e.message) ? e.message : String(e || '保存失败');
+    if(err) err.textContent = msg;
+    toast(msg, true);
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '保存'; }
+  }
+}
+
+window.openEditNodeModal = openEditNodeModal;
+window.closeEditNodeModal = closeEditNodeModal;
+window.saveEditNode = saveEditNode;
+
+// click backdrop to close
+
+document.addEventListener('click', (e)=>{
+  const m = document.getElementById('editNodeModal');
+  if(!m || m.style.display === 'none') return;
+  if(e.target === m) closeEditNodeModal();
+});
+
+// ESC to close edit modal
+
+document.addEventListener('keydown', (e)=>{
+  if(e.key === 'Escape'){
+    const m = document.getElementById('editNodeModal');
+    if(m && m.style.display !== 'none') closeEditNodeModal();
+  }
+});
 // ---------------- Dashboard: Full Restore Modal ----------------
 function openRestoreFullModal(){
   const m = document.getElementById('restoreFullModal');
@@ -1611,6 +1746,7 @@ async function createNodeFromModal(){
     const ip_address = (document.getElementById("addNodeIp")?.value || "").trim();
     const scheme = (document.getElementById("addNodeScheme")?.value || "http").trim();
     const verify_tls = !!document.getElementById("addNodeVerifyTls")?.checked;
+    const group_name = (document.getElementById("addNodeGroup")?.value || "").trim();
 
     if(!ip_address){
       if(err) err.textContent = "节点地址不能为空";
@@ -1621,7 +1757,7 @@ async function createNodeFromModal(){
     const resp = await fetch("/api/nodes/create", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({name, ip_address, scheme, verify_tls})
+      body: JSON.stringify({name, ip_address, scheme, verify_tls, group_name})
     });
 
     const data = await resp.json().catch(()=>({ok:false,error:"接口返回异常"}));
@@ -1631,6 +1767,7 @@ async function createNodeFromModal(){
       return;
     }
 
+    try{ if(group_name) localStorage.setItem("realm_last_group", group_name); }catch(_e){}
     closeAddNodeModal();
     if(data.redirect_url){
       window.location.href = data.redirect_url;

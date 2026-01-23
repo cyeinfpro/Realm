@@ -7,6 +7,10 @@
     <label class="label">节点名称</label>
     <input class="input" name="name" placeholder="例如：北京-主机01">
 
+    <label class="label">分组名称</label>
+    <input class="input" name="group_name" placeholder="例如：香港 / 美国 / 客户A" value="默认分组">
+    <div class="help">仅用于面板分类；不影响规则与转发。</div>
+
     <label class="label">节点 IP 地址</label>
     <input class="input" name="ip_address" placeholder="10.0.0.2" required>
     <div class="help">请输入主机/IP；默认端口 {{ default_port }}（无需填写）。</div>

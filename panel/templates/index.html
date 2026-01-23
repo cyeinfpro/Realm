@@ -36,6 +36,7 @@
       <div class="node-left" style="min-width:0;">
         <div class="node-name" title="{{ n.name or ("节点-" ~ n.id) }}">{{ n.name or ("节点-" ~ n.id) }}</div>
         <div class="node-host mono" title="{{ n.display_ip or "-" }}">{{ n.display_ip or "-" }}</div>
+        <div class="node-group muted sm" title="{{ n.group_name or '默认分组' }}">{{ n.group_name or '默认分组' }}</div>
       </div>
 
       <div class="node-right">
@@ -43,6 +44,7 @@
           <span class="node-dot {{ 'online' if n.online else 'offline' }}"></span>
           <span>{{ '在线' if n.online else '离线' }}</span>
         </div>
+        <a class="btn icon xs ghost" href="/nodes/{{ n.id }}?edit=1" title="编辑">✎</a>
         <a class="btn icon xs secondary" href="/nodes/{{ n.id }}" title="进入">↗</a>
       </div>
     </div>
@@ -117,6 +119,10 @@
         </div>
       </div>
 
+      <label class="label">分组名称</label>
+      <input class="input" id="addNodeGroup" placeholder="例如：香港 / 美国 / 客户A" value="默认分组">
+      <div class="help">仅用于面板分类；不影响规则与转发。</div>
+
       <label class="label">IP/域名</label>
       <input class="input" id="addNodeIp" placeholder="例如：1.2.3.4 或 node.example.com">
 
@@ -167,5 +173,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=41.2"></script>
+<script src="/static/app.js?v=41.3"></script>
 {% endblock %}
