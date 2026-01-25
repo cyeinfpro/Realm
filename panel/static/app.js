@@ -2093,6 +2093,7 @@ function openAgentUpdateModal(){
   const m = document.getElementById('agentUpdateModal');
   if(!m) return;
   m.style.display = 'flex';
+  document.body.classList.add('modal-open');
 
   // reset UI
   __AGENT_UPDATE_ID__ = '';
@@ -2101,13 +2102,16 @@ function openAgentUpdateModal(){
   const id = document.getElementById('agentUpdateId');
   const sum = document.getElementById('agentUpdateSummary');
   const bar = document.getElementById('agentUpdateBar');
-  const tb = document.getElementById('agentUpdateTable');
+  const list = document.getElementById('agentUpdateList');
+  const pills = document.getElementById('agentUpdatePills');
   const btn = document.getElementById('agentUpdateStartBtn');
+
   if(t) t.textContent = '—';
   if(id) id.textContent = '';
   if(sum) sum.textContent = '—';
   if(bar) bar.style.width = '0%';
-  if(tb) tb.innerHTML = '';
+  if(list) list.innerHTML = '';
+  if(pills) pills.innerHTML = '';
   if(btn){ btn.disabled = false; btn.textContent = '开始更新'; }
 
   // fetch latest agent version bundled with panel
@@ -2126,6 +2130,7 @@ function closeAgentUpdateModal(){
   const m = document.getElementById('agentUpdateModal');
   if(!m) return;
   m.style.display = 'none';
+  document.body.classList.remove('modal-open');
   if(__AGENT_UPDATE_TIMER__){
     clearInterval(__AGENT_UPDATE_TIMER__);
     __AGENT_UPDATE_TIMER__ = null;
@@ -2143,50 +2148,102 @@ function _stateText(st){
   return st || '—';
 }
 
+function _badgeClass(st){
+  const s = String(st || '').toLowerCase();
+  if(s === 'done') return 'ok';
+  if(s === 'failed') return 'bad';
+  if(s === 'installing') return 'warn';
+  if(s === 'sent') return 'info';
+  if(s === 'queued') return 'muted';
+  if(s === 'offline') return 'muted';
+  return 'muted';
+}
+
+function _renderPills(summary){
+  const pills = document.getElementById('agentUpdatePills');
+  if(!pills) return;
+  const s = summary || {};
+  const items = [
+    {k:'done', label:'完成', cls:'ok'},
+    {k:'failed', label:'失败', cls:'bad'},
+    {k:'installing', label:'安装中', cls:'warn'},
+    {k:'sent', label:'已下发', cls:'info'},
+    {k:'queued', label:'排队', cls:'muted'},
+    {k:'offline', label:'离线', cls:'muted'},
+  ];
+  pills.innerHTML = items.map(it=>{
+    const v = Number(s[it.k] || 0);
+    return `<span class="pill-stat ${it.cls}">${escapeHtml(it.label)} <strong>${escapeHtml(String(v))}</strong></span>`;
+  }).join('');
+}
+
+function _renderList(rows){
+  const list = document.getElementById('agentUpdateList');
+  if(!list) return;
+  const arr = Array.isArray(rows) ? rows : [];
+  if(arr.length === 0){
+    list.innerHTML = `<div class="au-item"><div class="au-left"><div class="au-name">暂无数据</div><div class="au-sub"><span class="badge muted">等待下发或节点上报…</span></div></div></div>`;
+    return;
+  }
+  list.innerHTML = arr.map(n=>{
+    const name = (n.name || ('节点-' + n.id));
+    const stRaw = (n.state || '');
+    const stTxt = _stateText(stRaw);
+    const badge = _badgeClass(stRaw);
+    const cur = (n.agent_version || '-');
+    const des = (n.desired_version || '-');
+    const msg = (n.msg || '');
+    const msgText = msg ? String(msg) : '';
+    const msgTitle = msgText ? ` title="${escapeHtml(msgText)}"` : '';
+    const msgCell = msgText ? `<div class="au-msg"${msgTitle}>${escapeHtml(msgText)}</div>` : `<div class="au-msg">—</div>`;
+    return `<div class="au-item">
+      <div class="au-left">
+        <div class="au-name">${escapeHtml(String(name))}</div>
+        <div class="au-sub">
+          <span class="badge ${badge}">${escapeHtml(String(stTxt))}</span>
+          <span class="kv-mini mono">当前 ${escapeHtml(String(cur))}</span>
+          <span class="kv-mini mono">目标 ${escapeHtml(String(des))}</span>
+        </div>
+      </div>
+      <div class="au-right">${msgCell}</div>
+    </div>`;
+  }).join('');
+}
+
 async function _pollAgentUpdate(){
   if(!__AGENT_UPDATE_ID__) return;
-  const sum = document.getElementById('agentUpdateSummary');
+  const sumEl = document.getElementById('agentUpdateSummary');
   const bar = document.getElementById('agentUpdateBar');
-  const tb = document.getElementById('agentUpdateTable');
   const id = document.getElementById('agentUpdateId');
-  if(id) id.textContent = __AGENT_UPDATE_ID__ ? ('更新批次：' + __AGENT_UPDATE_ID__) : '';
+
+  if(id) id.textContent = __AGENT_UPDATE_ID__ ? ('批次：' + __AGENT_UPDATE_ID__) : '';
 
   try{
     const r = await fetch('/api/agents/update_progress?update_id=' + encodeURIComponent(__AGENT_UPDATE_ID__), { credentials: 'include' });
     const d = await r.json().catch(()=>({ok:false}));
     if(!r.ok || !d.ok) return;
+
     const s = d.summary || {};
     const total = Number(s.total || 0);
     const done = Number(s.done || 0);
-    const offline = Number(s.offline || 0);
     const failed = Number(s.failed || 0);
+    const offline = Number(s.offline || 0);
+    const installing = Number(s.installing || 0);
     const sent = Number(s.sent || 0);
     const queued = Number(s.queued || 0);
 
-    if(sum){
-      sum.textContent = `进度：${done}/${total} · 失败 ${failed} · 离线 ${offline} · 已下发 ${sent} · 排队 ${queued}`;
+    if(sumEl){
+      sumEl.textContent = `进度：${done}/${total} · 安装中 ${installing} · 失败 ${failed} · 离线 ${offline} · 已下发 ${sent} · 排队 ${queued}`;
     }
+
     if(bar){
       const pct = total ? Math.max(0, Math.min(100, Math.round(done * 100 / total))) : 0;
       bar.style.width = pct + '%';
     }
-    if(tb){
-      const rows = Array.isArray(d.nodes) ? d.nodes : [];
-      tb.innerHTML = rows.map(n=>{
-        const name = (n.name || ('节点-' + n.id));
-        const st = _stateText(n.state);
-        const cur = (n.agent_version || '-');
-        const des = (n.desired_version || '-');
-        const msg = (n.msg || '');
-        return `<tr>
-          <td>${escapeHtml(String(name))}</td>
-          <td>${escapeHtml(String(st))}</td>
-          <td class="mono">${escapeHtml(String(cur))}</td>
-          <td class="mono">${escapeHtml(String(des))}</td>
-          <td>${escapeHtml(String(msg))}</td>
-        </tr>`;
-      }).join('');
-    }
+
+    _renderPills(s);
+    _renderList(d.nodes);
+
   }catch(_e){}
 }
 
@@ -2202,13 +2259,17 @@ async function startAgentUpdateAll(){
       if(btn){ btn.disabled = false; btn.textContent = '开始更新'; }
       return;
     }
+
     __AGENT_UPDATE_ID__ = String(d.update_id || '').trim();
     __AGENT_UPDATE_TARGET__ = String(d.target_version || '').trim();
     if(t) t.textContent = __AGENT_UPDATE_TARGET__ || '—';
+
     toast('已下发更新任务');
+
     if(__AGENT_UPDATE_TIMER__){ clearInterval(__AGENT_UPDATE_TIMER__); }
-    __AGENT_UPDATE_TIMER__ = setInterval(_pollAgentUpdate, 2000);
+    __AGENT_UPDATE_TIMER__ = setInterval(_pollAgentUpdate, 1800);
     await _pollAgentUpdate();
+
   }catch(e){
     toast((e && e.message) ? e.message : '更新失败', true);
   }finally{
@@ -2221,16 +2282,19 @@ window.closeAgentUpdateModal = closeAgentUpdateModal;
 window.startAgentUpdateAll = startAgentUpdateAll;
 
 // close agent update modal on backdrop click / ESC
+
 document.addEventListener('click', (e)=>{
   const m = document.getElementById('agentUpdateModal');
   if(!m || m.style.display === 'none') return;
   if(e.target === m) closeAgentUpdateModal();
 });
+
 document.addEventListener('keydown', (e)=>{
   const m = document.getElementById('agentUpdateModal');
   if(!m || m.style.display === 'none') return;
   if(e.key === 'Escape') closeAgentUpdateModal();
 });
+
 
 
 // ---------------- Dashboard: Full Restore Modal ----------------
