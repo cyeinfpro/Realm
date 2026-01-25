@@ -15,15 +15,26 @@
       </div>
     </div>
     <div class="node-list">
-      {% for n in nodes %}
-      <a class="node-item{% if n.id == node.id %} active{% endif %}" href="/nodes/{{ n.id }}">
-        <span class="dot {% if n.online %}online{% else %}offline{% endif %}"></span>
-        <div class="node-info">
-          <div class="node-name">{{ n.name or n.display_ip or ('节点-' ~ n.id) }}</div>
-          <div class="node-meta mono">{{ n.display_ip or '-' }}</div>
-          <div class="muted sm">{{ n.group_name or '默认分组' }}</div>
+      {% for g in (node_groups or []) %}
+        {% if not loop.first %}<div class="node-group-divider" aria-hidden="true"></div>{% endif %}
+        <div class="node-group">
+          <div class="node-group-head">
+            <div class="node-group-name">{{ g.name or '默认分组' }}</div>
+            <div class="node-group-count muted sm">{{ g.online }}/{{ g.total }}</div>
+          </div>
+          <div class="node-group-items">
+            {% for n in (g.nodes or []) %}
+            <a class="node-item{% if n.id == node.id %} active{% endif %}" href="/nodes/{{ n.id }}">
+              <span class="dot {% if n.online %}online{% else %}offline{% endif %}"></span>
+              <div class="node-info">
+                <div class="node-name">{{ n.name or n.display_ip or ('节点-' ~ n.id) }}</div>
+                <div class="node-meta mono">{{ n.display_ip or '-' }}</div>
+                <div class="muted sm">{{ n.group_name or '默认分组' }}</div>
+              </div>
+            </a>
+            {% endfor %}
+          </div>
         </div>
-      </a>
       {% endfor %}
     </div>
     <div class="sidebar-foot">
@@ -372,7 +383,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=41.4"></script>
+<script src="/static/app.js?v=41.5"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};

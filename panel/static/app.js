@@ -1678,6 +1678,9 @@ async function saveEditNode(){
     if(err) err.textContent = '';
     if(btn){ btn.disabled = true; btn.textContent = '保存中…'; }
 
+    // If group changes, we may need a lightweight refresh to re-render sidebar grouping.
+    const prevGroup = String(window.__NODE_GROUP__ || '默认分组').trim() || '默认分组';
+
     const name = (document.getElementById('editNodeName')?.value || '').trim();
     const group_name = (document.getElementById('editNodeGroup')?.value || '').trim();
     const scheme = (document.getElementById('editNodeScheme')?.value || 'http').trim();
@@ -1721,6 +1724,15 @@ async function saveEditNode(){
     try{ applyEditedNodeToPage(patch); }catch(_e){}
     try{ stripEditQueryParam(); }catch(_e){}
     closeEditNodeModal();
+
+    // Re-render grouped sidebar when group changed
+    try{
+      const nextGroup = String(patch.group_name || patch.group || '').trim() || '默认分组';
+      if(nextGroup !== prevGroup){
+        // Ensure no lingering ?edit=1 then refresh to move the node into correct group section
+        setTimeout(()=>{ window.location.href = window.location.pathname; }, 50);
+      }
+    }catch(_e){}
   }catch(e){
     const msg = (e && e.message) ? e.message : String(e || '保存失败');
     if(err) err.textContent = msg;

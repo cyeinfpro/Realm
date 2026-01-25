@@ -13,7 +13,7 @@ import zipfile
 from datetime import datetime
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response, PlainTextResponse
@@ -505,6 +505,53 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
         n["display_ip"] = _extract_ip_for_display(n.get("base_url", ""))
         # 用更宽松的阈值显示在线状态（避免轻微抖动导致频繁显示离线）
         n["online"] = _is_report_fresh(n, max_age_sec=90)
+
+    # 节点页左侧列表：按分组聚合展示
+    # - 分组名为空时统一归入“默认分组”
+    # - 组内排序：在线优先，其次按 id 倒序
+    def _gn(x: Dict[str, Any]) -> str:
+        g = str(x.get("group_name") or "").strip()
+        return g or "默认分组"
+
+    for n in nodes:
+        n["group_name"] = _gn(n)
+
+    nodes_sorted = sorted(
+        nodes,
+        key=lambda x: (
+            _gn(x),
+            0 if bool(x.get("online")) else 1,
+            -int(x.get("id") or 0),
+        ),
+    )
+    node_groups: List[Dict[str, Any]] = []
+    cur = None
+    buf: List[Dict[str, Any]] = []
+    for n in nodes_sorted:
+        g = _gn(n)
+        if cur is None:
+            cur = g
+        if g != cur:
+            node_groups.append(
+                {
+                    "name": cur,
+                    "nodes": buf,
+                    "online": sum(1 for i in buf if i.get("online")),
+                    "total": len(buf),
+                }
+            )
+            cur = g
+            buf = []
+        buf.append(n)
+    if cur is not None:
+        node_groups.append(
+            {
+                "name": cur,
+                "nodes": buf,
+                "online": sum(1 for i in buf if i.get("online")),
+                "total": len(buf),
+            }
+        )
     show_install_cmd = bool(request.session.pop("show_install_cmd", False))
     show_edit_node = str(request.query_params.get("edit") or "").strip() in ("1", "true", "yes")
     base_url = _panel_public_base_url(request)
@@ -526,6 +573,7 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
             "request": request,
             "user": user,
             "nodes": nodes,
+            "node_groups": node_groups,
             "node": node,
             "flash": _flash(request),
             "title": node["name"],
