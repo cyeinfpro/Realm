@@ -26,12 +26,14 @@ from .db import (
     add_node,
     delete_node,
     ensure_db,
+    get_group_orders,
     get_node,
     get_node_by_api_key,
     get_node_by_base_url,
     get_desired_pool,
     get_last_report,
     list_nodes,
+    upsert_group_order,
     set_desired_pool,
     set_desired_pool_exact,
     set_desired_pool_version_exact,
@@ -388,6 +390,17 @@ async def setup_action(
 async def index(request: Request, user: str = Depends(require_login_page)):
     nodes = list_nodes()
 
+    group_orders = get_group_orders()
+
+    def _gk(name: str) -> tuple[int, str]:
+        """Group sort key: user-defined sort_order (smaller first), then name."""
+        n = (name or '').strip() or '默认分组'
+        try:
+            order = int(group_orders.get(n, 1000))
+        except Exception:
+            order = 1000
+        return (order, n)
+
     def _gn(x: dict) -> str:
         g = str(x.get("group_name") or "").strip()
         return g or "默认分组"
@@ -403,7 +416,7 @@ async def index(request: Request, user: str = Depends(require_login_page)):
     nodes_sorted = sorted(
         nodes,
         key=lambda x: (
-            _gn(x),
+            _gk(_gn(x)),
             0 if bool(x.get("online")) else 1,
             -int(x.get("id") or 0),
         ),
@@ -420,6 +433,7 @@ async def index(request: Request, user: str = Depends(require_login_page)):
             dashboard_groups.append(
                 {
                     "name": cur,
+                    "sort_order": _gk(cur)[0],
                     "nodes": buf,
                     "online": sum(1 for i in buf if i.get("online")),
                     "total": len(buf),
@@ -433,6 +447,7 @@ async def index(request: Request, user: str = Depends(require_login_page)):
         dashboard_groups.append(
             {
                 "name": cur,
+                "sort_order": _gk(cur)[0],
                 "nodes": buf,
                 "online": sum(1 for i in buf if i.get("online")),
                 "total": len(buf),
@@ -558,6 +573,16 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
 
     # 用于节点页左侧快速切换列表
     nodes = list_nodes()
+
+    group_orders = get_group_orders()
+
+    def _gk(name: str) -> tuple[int, str]:
+        n = (name or '').strip() or '默认分组'
+        try:
+            order = int(group_orders.get(n, 1000))
+        except Exception:
+            order = 1000
+        return (order, n)
     for n in nodes:
         n["display_ip"] = _extract_ip_for_display(n.get("base_url", ""))
         # 用更宽松的阈值显示在线状态（避免轻微抖动导致频繁显示离线）
@@ -576,7 +601,7 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
     nodes_sorted = sorted(
         nodes,
         key=lambda x: (
-            _gn(x),
+            _gk(_gn(x)),
             0 if bool(x.get("online")) else 1,
             -int(x.get("id") or 0),
         ),
@@ -592,6 +617,7 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
             node_groups.append(
                 {
                     "name": cur,
+                    "sort_order": _gk(cur)[0],
                     "nodes": buf,
                     "online": sum(1 for i in buf if i.get("online")),
                     "total": len(buf),
@@ -604,6 +630,7 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
         node_groups.append(
             {
                 "name": cur,
+                "sort_order": _gk(cur)[0],
                 "nodes": buf,
                 "online": sum(1 for i in buf if i.get("online")),
                 "total": len(buf),
@@ -907,6 +934,7 @@ async def api_backup(request: Request, node_id: int, user: str = Depends(require
 async def api_backup_full(request: Request, user: str = Depends(require_login)):
     """Download a full backup zip: nodes list + per-node rules."""
     nodes = list_nodes()
+    group_orders = get_group_orders()
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
 
     # Build backup payloads (fetch missing pools concurrently)
@@ -935,6 +963,9 @@ async def api_backup_full(request: Request, user: str = Depends(require_login)):
         "kind": "realm_full_backup",
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "panel_public_url": _panel_public_base_url(request),
+        "group_orders": [
+            {"group_name": k, "sort_order": int(v)} for k, v in sorted(group_orders.items(), key=lambda kv: (kv[1], kv[0]))
+        ],
         "nodes": [
             {
                 "source_id": int(n.get("id") or 0),
@@ -1016,6 +1047,24 @@ async def api_restore_nodes(
 
     if not isinstance(nodes_list, list):
         return JSONResponse({"ok": False, "error": "备份内容缺少 nodes 列表"}, status_code=400)
+
+    # Optional: restore group orders (UI sorting)
+    try:
+        go = payload.get('group_orders') if isinstance(payload, dict) else None
+        items: list[dict[str, Any]] = []
+        if isinstance(go, dict):
+            items = [{"group_name": k, "sort_order": v} for k, v in go.items()]
+        elif isinstance(go, list):
+            items = [x for x in go if isinstance(x, dict)]
+        for it in items:
+            gname = str(it.get('group_name') or it.get('name') or '').strip() or '默认分组'
+            try:
+                s = int(it.get('sort_order', it.get('order', 1000)))
+            except Exception:
+                continue
+            upsert_group_order(gname, s)
+    except Exception:
+        pass
 
     added = 0
     updated = 0
@@ -1116,6 +1165,24 @@ async def api_restore_full(
 
     if not isinstance(nodes_list, list):
         return JSONResponse({"ok": False, "error": "备份内容缺少 nodes 列表"}, status_code=400)
+
+    # Optional: restore group orders (UI sorting)
+    try:
+        go = nodes_payload.get('group_orders') if isinstance(nodes_payload, dict) else None
+        items: list[dict[str, Any]] = []
+        if isinstance(go, dict):
+            items = [{"group_name": k, "sort_order": v} for k, v in go.items()]
+        elif isinstance(go, list):
+            items = [x for x in go if isinstance(x, dict)]
+        for it in items:
+            gname = str(it.get('group_name') or it.get('name') or '').strip() or '默认分组'
+            try:
+                s = int(it.get('sort_order', it.get('order', 1000)))
+            except Exception:
+                continue
+            upsert_group_order(gname, s)
+    except Exception:
+        pass
 
     # ---- restore nodes ----
     added = 0
@@ -1718,6 +1785,31 @@ async def api_nodes_list(user: str = Depends(require_login)):
     for n in list_nodes():
         out.append({"id": int(n["id"]), "name": n["name"], "base_url": n["base_url"], "group_name": n.get("group_name")})
     return {"ok": True, "nodes": out}
+
+
+@app.post("/api/groups/order")
+async def api_groups_order(request: Request, user: str = Depends(require_login)):
+    """Update group sort order (UI only)."""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    name = str(data.get("group_name") or "").strip() or "默认分组"
+    raw = data.get("sort_order", data.get("order", 1000))
+    try:
+        order = int(raw)
+    except Exception:
+        return JSONResponse({"ok": False, "error": "排序序号必须是数字"}, status_code=400)
+
+    # keep within a reasonable range to prevent weird UI
+    if order < -999999:
+        order = -999999
+    if order > 999999:
+        order = 999999
+
+    upsert_group_order(name, order)
+    return {"ok": True, "group_name": name, "sort_order": order}
 
 
 @app.post("/api/wss_tunnel/save")

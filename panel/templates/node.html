@@ -19,7 +19,7 @@
         {% if not loop.first %}<div class="node-group-divider" aria-hidden="true"></div>{% endif %}
         <div class="node-group">
           <div class="node-group-head">
-            <div class="node-group-name">{{ g.name or '默认分组' }}</div>
+            <div class="node-group-name" role="button" tabindex="0" data-group-name="{{ g.name or '默认分组' }}" data-group-order="{{ g.sort_order }}" title="点击设置分组排序 · 当前：{{ g.sort_order }}">{{ g.name or '默认分组' }}</div>
             <div class="node-group-count muted sm">{{ g.online }}/{{ g.total }}</div>
           </div>
           <div class="node-group-items">
@@ -383,7 +383,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=41.6"></script>
+<script src="/static/app.js?v=41.7"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};

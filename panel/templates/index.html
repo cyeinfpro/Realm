@@ -33,7 +33,7 @@
   {% for g in (dashboard_groups or []) %}
     <div class="dash-group-head"{% if loop.first %} style="margin-top:0;"{% endif %}>
       <div class="dash-group-left">
-        <div class="dash-group-name" title="{{ g.name or '默认分组' }}">{{ g.name or '默认分组' }}</div>
+        <div class="dash-group-name" role="button" tabindex="0" data-group-name="{{ g.name or '默认分组' }}" data-group-order="{{ g.sort_order }}" title="点击设置分组排序 · 当前：{{ g.sort_order }}">{{ g.name or '默认分组' }}</div>
         <div class="dash-group-line" aria-hidden="true"></div>
       </div>
       <div class="dash-group-count muted sm">在线 <strong>{{ g.online }}</strong>/<strong>{{ g.total }}</strong></div>
@@ -183,5 +183,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=41.6"></script>
+<script src="/static/app.js?v=41.7"></script>
 {% endblock %}

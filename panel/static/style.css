@@ -181,7 +181,9 @@ a{color:inherit}
 /* Dashboard groups */
 .dash-group-head{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:6px 2px 2px 2px;}
 .dash-group-left{display:flex;align-items:center;gap:10px;min-width:0;flex:1 1 auto;}
-.dash-group-name{font-size:12px;font-weight:850;letter-spacing:0.2px;color:rgba(226,232,240,0.92);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.dash-group-name{font-size:12px;font-weight:850;letter-spacing:0.2px;color:rgba(226,232,240,0.92);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;padding:2px 6px;border-radius:999px;}
+.dash-group-name:hover{background:rgba(148,163,184,0.08);}
+.dash-group-name:focus{outline:2px solid rgba(124,58,237,0.45);outline-offset:2px;}
 .dash-group-line{height:1px;flex:1 1 auto;border-radius:999px;background:rgba(148,163,184,0.18);}
 .dash-group-count{flex:0 0 auto;white-space:nowrap;}
 
@@ -508,7 +510,9 @@ textarea,.textarea{min-height:90px;resize:vertical}
   border: 1px solid rgba(148,163,184,0.14);
   background: rgba(2,6,23,0.10);
 }
-.node-group-name{font-weight:800; font-size: 12px; color: rgba(226,232,240,0.88);}
+.node-group-name{font-weight:800; font-size: 12px; color: rgba(226,232,240,0.88);cursor:pointer;padding:2px 6px;border-radius:999px;}
+.node-group-name:hover{background:rgba(148,163,184,0.08);}
+.node-group-name:focus{outline:2px solid rgba(124,58,237,0.45);outline-offset:2px;}
 .node-group-count{font-variant-numeric: tabular-nums;}
 .node-group-items{display:flex; flex-direction:column; gap:6px;}
 .node-group-divider{display:none;}

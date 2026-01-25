@@ -22,6 +22,13 @@ CREATE TABLE IF NOT EXISTS nodes (
   agent_ack_version INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Group order metadata (pure UI sorting)
+CREATE TABLE IF NOT EXISTS group_orders (
+  group_name TEXT PRIMARY KEY,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -192,6 +199,36 @@ def list_nodes(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
     with connect(db_path) as conn:
         rows = conn.execute("SELECT * FROM nodes ORDER BY id DESC").fetchall()
     return [dict(r) for r in rows]
+
+
+def get_group_orders(db_path: str = DEFAULT_DB_PATH) -> Dict[str, int]:
+    """Return mapping group_name -> sort_order."""
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT group_name, sort_order FROM group_orders").fetchall()
+    out: Dict[str, int] = {}
+    for r in rows:
+        try:
+            out[str(r["group_name"]) or ""] = int(r["sort_order"])
+        except Exception:
+            continue
+    return out
+
+
+def upsert_group_order(group_name: str, sort_order: int, db_path: str = DEFAULT_DB_PATH) -> None:
+    name = (group_name or "").strip() or "默认分组"
+    order = int(sort_order or 0)
+    with connect(db_path) as conn:
+        # Update first for compatibility with older sqlite versions.
+        cur = conn.execute(
+            "UPDATE group_orders SET sort_order=?, updated_at=datetime('now') WHERE group_name=?",
+            (order, name),
+        )
+        if cur.rowcount == 0:
+            conn.execute(
+                "INSERT INTO group_orders(group_name, sort_order, updated_at) VALUES(?,?,datetime('now'))",
+                (name, order),
+            )
+        conn.commit()
 
 
 def get_node(node_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:

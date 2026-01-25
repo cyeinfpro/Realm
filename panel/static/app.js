@@ -1552,6 +1552,131 @@ window.toggleAutoRefresh = toggleAutoRefresh;
 window.copyText = copyText;
 
 
+// ---------------- Groups: Order Modal ----------------
+function openGroupOrderModal(groupName, groupOrder){
+  const m = document.getElementById('groupOrderModal');
+  if(!m) return;
+  const name = String(groupName || '').trim() || '默认分组';
+  let order = String(groupOrder ?? '').trim();
+  if(order === '') order = '1000';
+  const nameEl = document.getElementById('groupOrderName');
+  const valEl = document.getElementById('groupOrderValue');
+  const err = document.getElementById('groupOrderError');
+  const btn = document.getElementById('groupOrderSubmit');
+  if(nameEl) nameEl.value = name;
+  if(valEl) valEl.value = order;
+  if(err) err.textContent = '';
+  if(btn){ btn.disabled = false; btn.textContent = '保存'; }
+  m.style.display = 'flex';
+  if(valEl) setTimeout(()=>valEl.focus(), 30);
+}
+
+function closeGroupOrderModal(){
+  const m = document.getElementById('groupOrderModal');
+  if(!m) return;
+  m.style.display = 'none';
+}
+
+async function saveGroupOrder(){
+  const err = document.getElementById('groupOrderError');
+  const btn = document.getElementById('groupOrderSubmit');
+  try{
+    if(err) err.textContent = '';
+    if(btn){ btn.disabled = true; btn.textContent = '保存中…'; }
+
+    const name = (document.getElementById('groupOrderName')?.value || '').trim() || '默认分组';
+    const raw = (document.getElementById('groupOrderValue')?.value || '').trim();
+    if(raw === ''){
+      if(err) err.textContent = '请输入排序序号（数字）';
+      return;
+    }
+    const sort_order = parseInt(raw, 10);
+    if(Number.isNaN(sort_order)){
+      if(err) err.textContent = '排序序号必须是数字';
+      return;
+    }
+
+    const resp = await fetch('/api/groups/order', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      credentials: 'same-origin',
+      body: JSON.stringify({group_name: name, sort_order})
+    });
+    const data = await resp.json().catch(()=>({ok:false,error:'接口返回异常'}));
+    if(!resp.ok || !data.ok){
+      const msg = data.error || ('保存失败（HTTP ' + resp.status + '）');
+      if(err) err.textContent = msg;
+      try{ toast(msg, true); }catch(_e){}
+      return;
+    }
+    try{ toast('已更新分组排序'); }catch(_e){}
+    closeGroupOrderModal();
+    // Refresh current page without query string (avoid ?edit=1 side effects)
+    setTimeout(()=>{ window.location.href = window.location.pathname; }, 60);
+  }catch(e){
+    const msg = (e && e.message) ? e.message : String(e || '保存失败');
+    if(err) err.textContent = msg;
+    try{ toast(msg, true); }catch(_e){}
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '保存'; }
+  }
+}
+
+window.openGroupOrderModal = openGroupOrderModal;
+window.closeGroupOrderModal = closeGroupOrderModal;
+window.saveGroupOrder = saveGroupOrder;
+
+// Click group headers to edit order
+document.addEventListener('click', (e)=>{
+  const el = e.target && e.target.closest ? e.target.closest('.dash-group-name, .node-group-name') : null;
+  if(!el) return;
+  const name = (el.getAttribute('data-group-name') || el.textContent || '').trim();
+  const order = el.getAttribute('data-group-order');
+  if(name){
+    e.preventDefault();
+    openGroupOrderModal(name, order);
+  }
+});
+
+// Keyboard accessibility (Enter to open)
+document.addEventListener('keydown', (e)=>{
+  if(e.key !== 'Enter') return;
+  const el = e.target && e.target.classList ? e.target : null;
+  if(!el) return;
+  if(!(el.classList.contains('dash-group-name') || el.classList.contains('node-group-name'))) return;
+  const name = (el.getAttribute('data-group-name') || el.textContent || '').trim();
+  const order = el.getAttribute('data-group-order');
+  if(name){
+    e.preventDefault();
+    openGroupOrderModal(name, order);
+  }
+});
+
+// Close group modal on backdrop click
+document.addEventListener('click', (e)=>{
+  const m = document.getElementById('groupOrderModal');
+  if(!m || m.style.display === 'none') return;
+  if(e.target === m) closeGroupOrderModal();
+});
+
+// ESC / Enter for group modal
+document.addEventListener('keydown', (e)=>{
+  const m = document.getElementById('groupOrderModal');
+  if(!m || m.style.display === 'none') return;
+  if(e.key === 'Escape'){
+    closeGroupOrderModal();
+    return;
+  }
+  if(e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey){
+    const t = (e.target && e.target.tagName) ? String(e.target.tagName).toLowerCase() : '';
+    if(t === 'input'){
+      e.preventDefault();
+      try{ saveGroupOrder(); }catch(_e){}
+    }
+  }
+});
+
+
 // ---------------- Dashboard: Add Node Modal ----------------
 function openAddNodeModal(){
   const m = document.getElementById("addNodeModal");
