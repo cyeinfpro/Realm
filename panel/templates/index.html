@@ -24,19 +24,31 @@
 {% set total_count = nodes|length %}
 {% set online_count = nodes|selectattr('online')|list|length %}
 {% set offline_count = total_count - online_count %}
-<div class="summary-bar" style="margin: 0 0 8px 0;">
-  <div class="summary-pill">在线 <strong>{{ online_count }}</strong>/<strong>{{ total_count }}</strong></div>
-  <div class="summary-pill">离线 <strong>{{ offline_count }}</strong></div>
+<div class="dashboard-toolbar" id="dashboardToolbar">
+  <div class="dash-filters" role="tablist" aria-label="节点筛选">
+    <button class="chip" type="button" data-filter="all" aria-selected="true">全部 <strong>{{ total_count }}</strong></button>
+    <button class="chip" type="button" data-filter="online">在线 <strong>{{ online_count }}</strong></button>
+    <button class="chip" type="button" data-filter="offline">离线 <strong>{{ offline_count }}</strong></button>
+  </div>
+
+  <div class="dash-search" role="search">
+    <span class="dash-search-ico" aria-hidden="true">⌕</span>
+    <input id="dashboardSearch" class="dash-search-input" placeholder="搜索节点 / IP" autocomplete="off" />
+    <button id="dashboardSearchClear" class="dash-search-clear" type="button" title="清空">×</button>
+  </div>
 </div>
 
 <div class="grid node-grid" id="dashboardGrid">
   {% for g in (dashboard_groups or []) %}
-    <div class="dash-group-head"{% if loop.first %} style="margin-top:0;"{% endif %}>
+    <div class="dash-group-head" data-group="{{ g.name or '默认分组' }}"{% if loop.first %} style="margin-top:0;"{% endif %}>
       <div class="dash-group-left">
         <div class="dash-group-name" role="button" tabindex="0" data-group-name="{{ g.name or '默认分组' }}" data-group-order="{{ g.sort_order }}" title="点击设置分组排序 · 当前：{{ g.sort_order }}">{{ g.name or '默认分组' }}</div>
         <div class="dash-group-line" aria-hidden="true"></div>
       </div>
-      <div class="dash-group-count muted sm">在线 <strong>{{ g.online }}</strong>/<strong>{{ g.total }}</strong></div>
+      <div class="dash-group-right">
+        <div class="dash-group-count muted sm">在线 <strong>{{ g.online }}</strong>/<strong>{{ g.total }}</strong></div>
+        <button class="btn icon xs ghost dash-group-toggle" type="button" data-group-toggle="{{ g.name or '默认分组' }}" title="折叠/展开">▾</button>
+      </div>
     </div>
 
     {% for n in (g.nodes or []) %}
@@ -45,7 +57,6 @@
         <div class="node-left" style="min-width:0;">
           <div class="node-name" title="{{ n.name or ("节点-" ~ n.id) }}">{{ n.name or ("节点-" ~ n.id) }}</div>
           <div class="node-host mono" title="{{ n.display_ip or "-" }}">{{ n.display_ip or "-" }}</div>
-          <div class="node-group muted sm" title="{{ n.group_name or '默认分组' }}">{{ n.group_name or '默认分组' }}</div>
         </div>
 
         <div class="node-right">
@@ -58,25 +69,20 @@
         </div>
       </div>
 
-      <div class="node-kpis">
-        <div class="kpi">
-          <div class="k">已在线</div>
-          <div class="v mono" data-sys="uptime">—</div>
-        </div>
-        <div class="kpi" title="{{ n.last_seen_at or '-' }}{% if n.agent_version %} · {{ n.agent_version }}{% endif %}">
-          <div class="k">最后心跳</div>
-          <div class="v mono" data-last-seen="{{ n.last_seen_at or '' }}">{{ n.last_seen_at or "-" }}</div>
-        </div>
+      <div class="node-meta" title="{{ n.last_seen_at or '-' }}{% if n.agent_version %} · {{ n.agent_version }}{% endif %}">
+        <div class="node-meta-item">在线 <span class="mono" data-sys="uptime">—</span></div>
+        <div class="node-meta-sep" aria-hidden="true">·</div>
+        <div class="node-meta-item">心跳 <span class="mono" data-last-seen="{{ n.last_seen_at or '' }}">{{ n.last_seen_at or "-" }}</span></div>
       </div>
 
-      <div class="node-lines">
-        <div class="kvline">
-          <div class="k">累计流量</div>
-          <div class="v mono" data-sys="traffic">—</div>
+      <div class="node-metrics">
+        <div class="metric" title="累计流量">
+          <span class="k">流量</span>
+          <span class="v mono" data-sys="traffic">—</span>
         </div>
-        <div class="kvline">
-          <div class="k">当前速率</div>
-          <div class="v mono" data-sys="rate">—</div>
+        <div class="metric" title="当前速率">
+          <span class="k">速率</span>
+          <span class="v mono" data-sys="rate">—</span>
         </div>
       </div>
 
@@ -183,5 +189,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=41.7"></script>
+<script src="/static/app.js?v=41.8"></script>
 {% endblock %}

@@ -459,6 +459,169 @@ function initDashboardMiniSys(){
   setInterval(()=>{ try{ refreshDashboardLastSeenShort(); }catch(_e){} }, 5000);
 }
 
+// ================= Dashboard: compact controls (filters/search/group collapse) =================
+function initDashboardViewControls(){
+  const grid = document.getElementById('dashboardGrid');
+  const toolbar = document.getElementById('dashboardToolbar');
+  if(!grid || !toolbar) return;
+
+  const searchEl = document.getElementById('dashboardSearch');
+  const clearEl = document.getElementById('dashboardSearchClear');
+  const chips = Array.from(toolbar.querySelectorAll('.chip[data-filter]'));
+
+  // Build group blocks (based on DOM order: head -> cards -> next head)
+  const children = Array.from(grid.children);
+  const groups = [];
+  let cur = null;
+  for(const el of children){
+    if(el && el.classList && el.classList.contains('dash-group-head')){
+      const name = (el.getAttribute('data-group') || '').trim();
+      cur = { head: el, name, cards: [] };
+      groups.push(cur);
+      continue;
+    }
+    if(cur && el && el.classList && el.classList.contains('node-card')){
+      cur.cards.push(el);
+    }
+  }
+
+  // Pre-index search text for each card
+  for(const g of groups){
+    for(const card of g.cards){
+      const name = (card.querySelector('.node-name')?.textContent || '').trim();
+      const host = (card.querySelector('.node-host')?.textContent || '').trim();
+      card.dataset.searchText = (name + ' ' + host).toLowerCase();
+    }
+  }
+
+  const LS_FILTER = 'realm_dash_filter';
+  const LS_QUERY = 'realm_dash_query';
+  const LS_COLLAPSED = 'realm_dash_collapsed_groups';
+
+  let filter = (localStorage.getItem(LS_FILTER) || 'all').trim();
+  if(!['all','online','offline'].includes(filter)) filter = 'all';
+  let query = localStorage.getItem(LS_QUERY) || '';
+
+  let collapsed = new Set();
+  try{
+    const raw = localStorage.getItem(LS_COLLAPSED);
+    const arr = raw ? JSON.parse(raw) : [];
+    if(Array.isArray(arr)) collapsed = new Set(arr.map(v=>String(v||'').trim()).filter(Boolean));
+  }catch(_e){ collapsed = new Set(); }
+
+  const setChipActive = () => {
+    chips.forEach((c)=>{
+      const v = (c.getAttribute('data-filter') || '').trim();
+      const on = v === filter;
+      c.classList.toggle('active', on);
+      c.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+  };
+
+  const saveCollapsed = () => {
+    try{ localStorage.setItem(LS_COLLAPSED, JSON.stringify(Array.from(collapsed))); }catch(_e){}
+  };
+
+  const apply = () => {
+    const q = (query || '').trim().toLowerCase();
+
+    if(clearEl){
+      clearEl.style.visibility = q ? 'visible' : 'hidden';
+    }
+
+    for(const g of groups){
+      const isCollapsed = collapsed.has(g.name);
+      let visibleCount = 0;
+      let onlineCount = 0;
+      const total = g.cards.length;
+
+      for(const card of g.cards){
+        const isOnline = card.dataset.online === '1';
+        if(isOnline) onlineCount += 1;
+        let show = true;
+        if(filter === 'online' && !isOnline) show = false;
+        if(filter === 'offline' && isOnline) show = false;
+        if(show && q){
+          const st = (card.dataset.searchText || '').toLowerCase();
+          if(!st.includes(q)) show = false;
+        }
+        if(show && isCollapsed) show = false;
+
+        card.style.display = show ? '' : 'none';
+        if(show) visibleCount += 1;
+      }
+
+      // Hide group header when no cards are visible under current filter/search
+      if(g.head){
+        g.head.style.display = (visibleCount > 0) ? '' : 'none';
+        g.head.classList.toggle('collapsed', isCollapsed);
+        const countEl = g.head.querySelector('.dash-group-count');
+        if(countEl){
+          if(q || filter !== 'all'){
+            countEl.innerHTML = `显示 <strong>${visibleCount}</strong>/<strong>${total}</strong>`;
+          }else{
+            countEl.innerHTML = `在线 <strong>${onlineCount}</strong>/<strong>${total}</strong>`;
+          }
+        }
+      }
+    }
+  };
+
+  // Init values
+  if(searchEl && typeof query === 'string') searchEl.value = query;
+  setChipActive();
+  apply();
+
+  // Chips
+  chips.forEach((chip)=>{
+    chip.addEventListener('click', ()=>{
+      const v = (chip.getAttribute('data-filter') || 'all').trim();
+      if(!['all','online','offline'].includes(v)) return;
+      filter = v;
+      try{ localStorage.setItem(LS_FILTER, filter); }catch(_e){}
+      setChipActive();
+      apply();
+    });
+  });
+
+  // Search
+  if(searchEl){
+    let t = null;
+    searchEl.addEventListener('input', ()=>{
+      if(t) clearTimeout(t);
+      t = setTimeout(()=>{
+        query = searchEl.value || '';
+        try{ localStorage.setItem(LS_QUERY, query); }catch(_e){}
+        apply();
+      }, 80);
+    });
+  }
+
+  if(clearEl){
+    clearEl.addEventListener('click', ()=>{
+      query = '';
+      try{ localStorage.setItem(LS_QUERY, ''); }catch(_e){}
+      if(searchEl) searchEl.value = '';
+      apply();
+      try{ searchEl?.focus(); }catch(_e){}
+    });
+  }
+
+  // Group collapse toggle
+  grid.addEventListener('click', (e)=>{
+    const btn = e.target && e.target.closest ? e.target.closest('.dash-group-toggle') : null;
+    if(!btn) return;
+    const name = (btn.getAttribute('data-group-toggle') || '').trim();
+    if(!name) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if(collapsed.has(name)) collapsed.delete(name);
+    else collapsed.add(name);
+    saveCollapsed();
+    apply();
+  }, true);
+}
+
 function renderSysCard(sys){
   const card = document.getElementById('sysCard');
   if(!card) return;
@@ -2105,3 +2268,5 @@ document.addEventListener('click', (e)=>{
 
 // Auto-init dashboard mini system info (safe no-op on non-dashboard pages)
 try{ initDashboardMiniSys(); }catch(_e){}
+// Auto-init dashboard filters/search/group collapse
+try{ initDashboardViewControls(); }catch(_e){}
