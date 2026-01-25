@@ -23,6 +23,7 @@ from .config import CFG
 
 API_KEY_FILE = Path('/etc/realm-agent/api.key')
 ACK_VER_FILE = Path('/etc/realm-agent/panel_ack.version')
+UPDATE_STATE_FILE = Path('/etc/realm-agent/agent_update.json')
 POOL_FULL = Path('/etc/realm/pool_full.json')
 POOL_ACTIVE = Path('/etc/realm/pool.json')
 POOL_RUN_FILTER = Path('/etc/realm/pool_to_run.jq')
@@ -84,6 +85,37 @@ def _read_int(p: Path, default: int = 0) -> int:
 
 def _write_int(p: Path, value: int) -> None:
     _write_text(p, str(int(value)))
+
+
+def _load_update_state() -> Dict[str, Any]:
+    st = _read_json(UPDATE_STATE_FILE, {})
+    return st if isinstance(st, dict) else {}
+
+
+def _save_update_state(st: Dict[str, Any]) -> None:
+    try:
+        UPDATE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        UPDATE_STATE_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+
+def _reconcile_update_state() -> None:
+    """If we restarted into a newer agent, flip update state to done."""
+    st = _load_update_state()
+    if not st:
+        return
+    try:
+        desired = int(str(st.get('desired_version') or 0))
+    except Exception:
+        desired = 0
+    state = str(st.get('state') or '').strip().lower()
+    if desired > 0 and int(str(app.version)) >= desired and state in ('installing', 'sent', 'queued', 'pending'):
+        st['state'] = 'done'
+        st['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        st.setdefault('from_version', st.get('from_version') or '')
+        st['agent_version'] = str(app.version)
+        _save_update_state(st)
 
 
 # ---------------- System Snapshot Helpers ----------------
@@ -1066,7 +1098,7 @@ def _wss_probe_entries(rule: Dict[str, Any]) -> List[Dict[str, str]]:
     return entries
 
 
-app = FastAPI(title='Realm Agent', version='31')
+app = FastAPI(title='Realm Agent', version='32')
 REALM_SERVICE_NAMES = [s for s in [CFG.realm_service, 'realm.service', 'realm'] if s]
 
 
@@ -1270,6 +1302,185 @@ def _apply_pool_patch_cmd(cmd: Dict[str, Any]) -> None:
         except Exception as exc:
             _LAST_SYNC_ERROR = f"增量同步失败：{exc}"
 
+
+def _get_current_agent_bind() -> tuple[str, int]:
+    """Best-effort: parse current bind host/port from systemd unit."""
+    host = '0.0.0.0'
+    port = 18700
+    for unit_path in (Path('/etc/systemd/system/realm-agent.service'), Path('/etc/systemd/system/realm-agent-https.service')):
+        if not unit_path.exists():
+            continue
+        try:
+            txt = unit_path.read_text(encoding='utf-8', errors='ignore')
+        except Exception:
+            continue
+        m_host = re.search(r"--host\s+([^\s]+)", txt)
+        m_port = re.search(r"--port\s+([0-9]+)", txt)
+        if m_host:
+            host = m_host.group(1).strip() or host
+        if m_port:
+            try:
+                port = int(m_port.group(1))
+            except Exception:
+                pass
+        break
+    return host, port
+
+
+def _apply_update_agent_cmd(cmd: Dict[str, Any]) -> None:
+    """Self-update agent using panel-provided installer + zip.
+
+    IMPORTANT: must run updater in a separate transient systemd unit (systemd-run),
+    otherwise stopping realm-agent.service would kill the updater (same cgroup).
+    """
+    try:
+        desired_ver = str(cmd.get('desired_version') or '').strip()
+        update_id = str(cmd.get('update_id') or '').strip()
+        sh_url = str(cmd.get('sh_url') or '').strip()
+        zip_url = str(cmd.get('zip_url') or '').strip()
+        zip_sha256 = str(cmd.get('zip_sha256') or '').strip()
+        force = bool(cmd.get('force', True))
+
+        if not update_id or not desired_ver or not sh_url or not zip_url:
+            st = _load_update_state()
+            st.update({
+                'update_id': update_id,
+                'desired_version': desired_ver,
+                'state': 'failed',
+                'error': 'update_agent：缺少必要参数',
+                'finished_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            })
+            _save_update_state(st)
+            return
+
+        # Already on desired (or newer)
+        try:
+            if int(str(app.version)) >= int(desired_ver) and int(desired_ver) > 0:
+                st = _load_update_state()
+                st.update({
+                    'update_id': update_id,
+                    'desired_version': desired_ver,
+                    'from_version': st.get('from_version') or str(app.version),
+                    'state': 'done',
+                    'finished_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'agent_version': str(app.version),
+                })
+                _save_update_state(st)
+                return
+        except Exception:
+            pass
+
+        st0 = _load_update_state()
+        if (not force) and str(st0.get('update_id') or '').strip() == update_id and str(st0.get('state') or '').strip().lower() in ('installing', 'done'):
+            return
+
+        host, port = _get_current_agent_bind()
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        st = {
+            'update_id': update_id,
+            'desired_version': desired_ver,
+            'from_version': str(app.version),
+            'state': 'installing',
+            'started_at': now,
+            'agent_version': str(app.version),
+        }
+        _save_update_state(st)
+
+        # Build updater script
+        script_path = Path(f"/tmp/realm-agent-update-{update_id}.sh")
+        log_path = Path(f"/var/log/realm-agent-update-{update_id}.log")
+        script = f"""#!/usr/bin/env bash
+set -euo pipefail
+
+TMP_ZIP=\"/tmp/realm-agent-repo-{update_id}.zip\"
+LOG=\"{log_path}\"
+STATE=\"{UPDATE_STATE_FILE}\"
+
+mkdir -p \"$(dirname \"$LOG\")\" || true
+
+fail() {{
+  local code=\"$1\"; shift || true
+  local msg=\"$*\"
+  python3 - <<'PY'
+import json, pathlib, datetime, os
+p=pathlib.Path(os.environ.get('STATE','/etc/realm-agent/agent_update.json'))
+st={{}}
+try:
+  st=json.loads(p.read_text(encoding='utf-8'))
+except Exception:
+  st={{}}
+st['state']='failed'
+st['error']=os.environ.get('ERR_MSG','update failed')
+st['finished_at']=datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding='utf-8')
+PY
+  exit \"$code\"
+}}
+
+trap 'export ERR_MSG=\"line $LINENO: $BASH_COMMAND\"; fail $?' ERR
+
+echo \"[update] download zip...\" | tee -a \"$LOG\"
+curl -fsSL \"{zip_url}\" -o \"$TMP_ZIP\"
+if [[ -n \"{zip_sha256}\" ]]; then
+  echo \"{zip_sha256}  $TMP_ZIP\" | sha256sum -c -
+fi
+
+export REALM_AGENT_ASSUME_YES=1
+export REALM_AGENT_MODE=1
+export REALM_AGENT_ONLY=1
+export REALM_AGENT_HOST=\"{host}\"
+export REALM_AGENT_PORT=\"{port}\"
+export REALM_AGENT_REPO_ZIP_URL=\"file://$TMP_ZIP\"
+
+echo \"[update] run installer...\" | tee -a \"$LOG\"
+curl -fsSL \"{sh_url}\" | bash
+
+python3 - <<'PY'
+import json, pathlib, datetime
+p=pathlib.Path(r\"{UPDATE_STATE_FILE}\")
+st={{}}
+try:
+  st=json.loads(p.read_text(encoding='utf-8'))
+except Exception:
+  st={{}}
+st['state']='done'
+st['finished_at']=datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding='utf-8')
+PY
+
+echo \"[update] done\" | tee -a \"$LOG\"
+"""
+        script_path.write_text(script, encoding='utf-8')
+        script_path.chmod(0o755)
+
+        # Run updater outside current service cgroup
+        if shutil.which('systemd-run'):
+            unit = f"realm-agent-update-{update_id}"
+            subprocess.Popen(
+                ['systemd-run', '--unit', unit, '--collect', '--quiet', '/bin/bash', str(script_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        else:
+            st = _load_update_state()
+            st.update({
+                'state': 'failed',
+                'error': '缺少 systemd-run，无法安全执行自更新（避免被 systemd cgroup 一并杀掉）',
+                'finished_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            })
+            _save_update_state(st)
+    except Exception as exc:
+        st = _load_update_state()
+        st.update({
+            'state': 'failed',
+            'error': f'update_agent 异常：{exc}',
+            'finished_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        })
+        _save_update_state(st)
+
 def _handle_panel_commands(cmds: Any) -> None:
     if not isinstance(cmds, list) or not cmds:
         return
@@ -1279,9 +1490,9 @@ def _handle_panel_commands(cmds: Any) -> None:
         if not isinstance(cmd, dict):
             continue
 
-        # Signature required for rule sync commands
+        # Signature required for panel commands that modify state
         t = str(cmd.get('type') or '').strip()
-        if t in ('sync_pool', 'pool_patch'):
+        if t in ('sync_pool', 'pool_patch', 'update_agent'):
             if not api_key or not _verify_cmd_sig(cmd, api_key):
                 # do not crash; keep reporting error for UI
                 global _LAST_SYNC_ERROR
@@ -1292,6 +1503,8 @@ def _handle_panel_commands(cmds: Any) -> None:
             _apply_sync_pool_cmd(cmd)
         elif t == 'pool_patch':
             _apply_pool_patch_cmd(cmd)
+        elif t == 'update_agent':
+            _apply_update_agent_cmd(cmd)
 
 def _push_loop() -> None:
     """后台上报线程。"""
@@ -1309,6 +1522,12 @@ def _push_loop() -> None:
         'User-Agent': f"realm-agent/{app.version} push-report",
     }
 
+    # If we just restarted into a newer agent, flip update state.
+    try:
+        _reconcile_update_state()
+    except Exception:
+        pass
+
     # 失败退避：连续失败会指数退避，避免刷爆日志/网络
     backoff = 0.0
     max_backoff = 30.0
@@ -1320,6 +1539,8 @@ def _push_loop() -> None:
             payload = {
                 'node_id': AGENT_ID,
                 'ack_version': ack,
+                'agent_version': str(app.version),
+                'agent_update': _load_update_state(),
                 'report': _build_push_report(),
             }
             r = sess.post(url, json=payload, headers=headers, timeout=3)
@@ -1359,6 +1580,10 @@ def _stop_push_reporter() -> None:
 @app.on_event('startup')
 def _on_startup() -> None:
     # Agent 启动后自动开启上报（若配置了 REALM_PANEL_URL + REALM_AGENT_ID）
+    try:
+        _reconcile_update_state()
+    except Exception:
+        pass
     _start_push_reporter()
 
 

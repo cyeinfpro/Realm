@@ -453,9 +453,12 @@ main(){
   info "安装依赖..."
   apt_install
   install_tcping
-  install_realm
-  install_realm_service
-  apply_sysctl_tuning
+  # 仅更新 Agent（不更新 Realm 转发）
+  if [[ "${REALM_AGENT_ONLY:-0}" != "1" ]]; then
+    install_realm
+    install_realm_service
+    apply_sysctl_tuning
+  fi
 
   local tmpdir
   tmpdir=$(mktemp -d)

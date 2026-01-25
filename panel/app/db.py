@@ -20,6 +20,14 @@ CREATE TABLE IF NOT EXISTS nodes (
   desired_pool_json TEXT,
   desired_pool_version INTEGER NOT NULL DEFAULT 0,
   agent_ack_version INTEGER NOT NULL DEFAULT 0,
+
+  -- Agent software update (panel -> agent)
+  desired_agent_version TEXT NOT NULL DEFAULT '',
+  desired_agent_update_id TEXT NOT NULL DEFAULT '',
+  agent_reported_version TEXT NOT NULL DEFAULT '',
+  agent_update_state TEXT NOT NULL DEFAULT '',
+  agent_update_msg TEXT NOT NULL DEFAULT '',
+  agent_update_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -63,6 +71,69 @@ def ensure_db(db_path: str = DEFAULT_DB_PATH) -> None:
             conn.execute("ALTER TABLE nodes ADD COLUMN desired_pool_version INTEGER NOT NULL DEFAULT 0")
         if "agent_ack_version" not in columns:
             conn.execute("ALTER TABLE nodes ADD COLUMN agent_ack_version INTEGER NOT NULL DEFAULT 0")
+
+        # Agent update related columns
+        if "desired_agent_version" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN desired_agent_version TEXT NOT NULL DEFAULT ''")
+        if "desired_agent_update_id" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN desired_agent_update_id TEXT NOT NULL DEFAULT ''")
+        if "agent_reported_version" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN agent_reported_version TEXT NOT NULL DEFAULT ''")
+        if "agent_update_state" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN agent_update_state TEXT NOT NULL DEFAULT ''")
+        if "agent_update_msg" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN agent_update_msg TEXT NOT NULL DEFAULT ''")
+        if "agent_update_at" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN agent_update_at TEXT")
+        conn.commit()
+
+
+def set_agent_rollout_all(
+    desired_version: str,
+    update_id: str,
+    state: str = "queued",
+    msg: str = "",
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    """Set desired agent version for all nodes, returns affected row count."""
+    ver = (desired_version or "").strip()
+    uid = (update_id or "").strip()
+    st = (state or "").strip()
+    m = (msg or "").strip()
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE nodes SET desired_agent_version=?, desired_agent_update_id=?, agent_update_state=?, agent_update_msg=?, agent_update_at=datetime('now')",
+            (ver, uid, st, m),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def update_agent_status(
+    node_id: int,
+    agent_reported_version: str | None = None,
+    state: str | None = None,
+    msg: str | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    fields = []
+    vals = []
+    if agent_reported_version is not None:
+        fields.append("agent_reported_version=?")
+        vals.append(str(agent_reported_version))
+    if state is not None:
+        fields.append("agent_update_state=?")
+        vals.append(str(state))
+        fields.append("agent_update_at=datetime('now')")
+    if msg is not None:
+        fields.append("agent_update_msg=?")
+        vals.append(str(msg))
+        fields.append("agent_update_at=datetime('now')")
+    if not fields:
+        return
+    vals.append(int(node_id))
+    with connect(db_path) as conn:
+        conn.execute(f"UPDATE nodes SET {', '.join(fields)} WHERE id=?", tuple(vals))
         conn.commit()
 
 

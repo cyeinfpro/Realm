@@ -39,6 +39,8 @@ from .db import (
     set_desired_pool_version_exact,
     update_node_basic,
     update_node_report,
+    set_agent_rollout_all,
+    update_agent_status,
 )
 from .agents import agent_get, agent_post, agent_ping
 
@@ -47,6 +49,59 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
 
 DEFAULT_AGENT_PORT = 18700
+
+
+def _read_latest_agent_version() -> str:
+    """Return latest agent version shipped with this panel.
+
+    We read it from panel/static/realm-agent.zip -> agent/app/main.py -> FastAPI(..., version='XX').
+    """
+    zpath = STATIC_DIR / "realm-agent.zip"
+    try:
+        with zipfile.ZipFile(str(zpath), "r") as z:
+            raw = z.read("agent/app/main.py").decode("utf-8", errors="ignore")
+        # FastAPI(title='Realm Agent', version='31')
+        import re
+
+        m = re.search(r"FastAPI\([^\)]*version\s*=\s*['\"]([^'\"]+)['\"]", raw)
+        if m:
+            return str(m.group(1)).strip()
+    except Exception:
+        pass
+    return ""
+
+
+LATEST_AGENT_VERSION = _read_latest_agent_version()
+
+
+def _parse_agent_version_from_ua(ua: str) -> str:
+    try:
+        import re
+
+        m = re.search(r"realm-agent\/([0-9A-Za-z._-]+)", ua or "", re.I)
+        return (m.group(1) if m else "")
+    except Exception:
+        return ""
+
+
+def _ver_int(v: str) -> int:
+    try:
+        return int(str(v or '').strip())
+    except Exception:
+        return 0
+
+
+def _file_sha256(p: Path) -> str:
+    try:
+        h = hashlib.sha256()
+        with open(p, 'rb') as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
 
 
 def _panel_asset_source() -> str:
@@ -436,6 +491,9 @@ async def index(request: Request, user: str = Depends(require_login_page)):
         n["online"] = _is_report_fresh(n)
         # 分组名为空时统一归入“默认分组”
         n["group_name"] = _gn(n)
+        # For UI display
+        if "agent_version" not in n:
+            n["agent_version"] = str(n.get("agent_reported_version") or "").strip()
 
     # 控制台卡片：按分组聚合展示
     # - 组内排序：在线优先，其次按 id 倒序
@@ -823,6 +881,17 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
     if not api_key or api_key != node.get("api_key"):
         return JSONResponse({"ok": False, "error": "无权限（API Key 不正确）"}, status_code=403)
 
+    # Agent software/update meta (optional)
+    agent_version = str(payload.get("agent_version") or "").strip()
+    if not agent_version:
+        agent_version = _parse_agent_version_from_ua(
+            (request.headers.get("User-Agent") or request.headers.get("user-agent") or "").strip()
+        )
+
+    agent_update = payload.get("agent_update")
+    if not isinstance(agent_update, dict):
+        agent_update = {}
+
     # report_json：尽量只保存 report 字段（更干净），但也兼容直接上报全量
     report = payload.get("report") if isinstance(payload, dict) else None
     if report is None:
@@ -844,6 +913,14 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
         )
     except Exception:
         # 不要让写库失败影响 agent
+        pass
+
+    # Persist agent version + update status (best-effort)
+    try:
+        st = str(agent_update.get('state') or '').strip() if isinstance(agent_update, dict) else ''
+        msg = str(agent_update.get('error') or agent_update.get('msg') or '').strip() if isinstance(agent_update, dict) else ''
+        update_agent_status(node_id=node_id, agent_reported_version=agent_version or None, state=st or None, msg=msg or None)
+    except Exception:
         pass
 
     # 若面板尚无 desired_pool，则尝试把 agent 当前 pool 作为初始 desired_pool。
@@ -895,10 +972,134 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
 
         cmds.append(_sign_cmd(str(node.get("api_key") or ""), cmd))
 
+    # 下发命令：Agent 自更新（可选）
+    try:
+        desired_agent_ver = str(node.get('desired_agent_version') or '').strip()
+        desired_update_id = str(node.get('desired_agent_update_id') or '').strip()
+        cur_agent_ver = (agent_version or str(node.get('agent_reported_version') or '')).strip()
+
+        if desired_agent_ver and desired_update_id:
+            if _ver_int(cur_agent_ver) >= _ver_int(desired_agent_ver) and _ver_int(desired_agent_ver) > 0:
+                # already on desired (or newer)
+                if str(node.get('agent_update_state') or '').strip() != 'done':
+                    try:
+                        update_agent_status(node_id=node_id, state='done', msg='')
+                    except Exception:
+                        pass
+            else:
+                # 自更新能力从 v32 开始（更老版本会忽略 update_agent 命令）
+                if _ver_int(cur_agent_ver) and _ver_int(cur_agent_ver) < 32:
+                    try:
+                        update_agent_status(node_id=node_id, state='failed', msg='Agent 版本过旧（<32），不支持一键自更新：请先在节点上手动运行 realm_agent.sh 更新一次')
+                    except Exception:
+                        pass
+                    return {"ok": True, "server_time": now, "desired_version": desired_ver, "commands": cmds}
+                panel_base = _panel_public_base_url(request)
+                sh_url, zip_url, github_only = _agent_asset_urls(panel_base)
+                zip_sha256 = _file_sha256(STATIC_DIR / 'realm-agent.zip')
+                ucmd: Dict[str, Any] = {
+                    'type': 'update_agent',
+                    'update_id': desired_update_id,
+                    'desired_version': desired_agent_ver,
+                    'panel_url': panel_base,
+                    'sh_url': sh_url,
+                    'zip_url': zip_url,
+                    'zip_sha256': zip_sha256,
+                    'github_only': bool(github_only),
+                    'force': True,
+                }
+                cmds.append(_sign_cmd(str(node.get('api_key') or ''), ucmd))
+                # mark queued->sent (best-effort)
+                if str(node.get('agent_update_state') or '').strip() in ('', 'queued'):
+                    try:
+                        update_agent_status(node_id=node_id, state='sent')
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
     return {"ok": True, "server_time": now, "desired_version": desired_ver, "commands": cmds}
 
 
 # ------------------------ API (needs login) ------------------------
+
+
+@app.get('/api/agents/latest')
+async def api_agents_latest(_: Request, user: str = Depends(require_login)):
+    """Return the latest agent version bundled with this panel."""
+    zip_sha256 = _file_sha256(STATIC_DIR / 'realm-agent.zip')
+    return {
+        'ok': True,
+        'latest_version': LATEST_AGENT_VERSION,
+        'zip_sha256': zip_sha256,
+    }
+
+
+@app.post('/api/agents/update_all')
+async def api_agents_update_all(request: Request, user: str = Depends(require_login)):
+    """Trigger an agent rollout to all nodes."""
+    target = (LATEST_AGENT_VERSION or '').strip()
+    if not target:
+        return JSONResponse({'ok': False, 'error': '无法确定当前面板内置的 Agent 版本（realm-agent.zip 缺失或不可解析）'}, status_code=500)
+
+    update_id = uuid.uuid4().hex
+    affected = 0
+    try:
+        affected = set_agent_rollout_all(desired_version=target, update_id=update_id, state='queued', msg='')
+    except Exception:
+        affected = 0
+
+    return {
+        'ok': True,
+        'update_id': update_id,
+        'target_version': target,
+        'affected': affected,
+        'server_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+
+
+@app.get('/api/agents/update_progress')
+async def api_agents_update_progress(update_id: str = '', user: str = Depends(require_login)):
+    """Return rollout progress."""
+    uid = (update_id or '').strip()
+    nodes = list_nodes()
+    items = []
+    summary = {'total': 0, 'done': 0, 'failed': 0, 'installing': 0, 'sent': 0, 'queued': 0, 'offline': 0, 'other': 0}
+    for n in nodes:
+        nuid = str(n.get('desired_agent_update_id') or '').strip()
+        if uid and nuid != uid:
+            continue
+        summary['total'] += 1
+        online = _is_report_fresh(n)
+        desired = str(n.get('desired_agent_version') or '').strip()
+        cur = str(n.get('agent_reported_version') or '').strip()
+        st = str(n.get('agent_update_state') or '').strip() or 'queued'
+        if not online:
+            st2 = 'offline'
+        else:
+            if desired and _ver_int(cur) >= _ver_int(desired) and _ver_int(desired) > 0:
+                st2 = 'done'
+            else:
+                st2 = st
+
+        if st2 in summary:
+            summary[st2] += 1
+        else:
+            summary['other'] += 1
+
+        items.append({
+            'id': n.get('id'),
+            'name': n.get('name'),
+            'group_name': n.get('group_name'),
+            'online': bool(online),
+            'agent_version': cur,
+            'desired_version': desired,
+            'state': st2,
+            'msg': str(n.get('agent_update_msg') or '').strip(),
+            'last_seen_at': n.get('last_seen_at'),
+        })
+
+    return {'ok': True, 'update_id': uid, 'summary': summary, 'nodes': items}
 
 @app.get("/api/nodes/{node_id}/ping")
 async def api_ping(request: Request, node_id: int, user: str = Depends(require_login)):

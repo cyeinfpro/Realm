@@ -17,6 +17,7 @@
         <button class="menu-item" type="button" onclick="openRestoreFullModal()">全量恢复</button>
       </div>
     </details>
+    <button class="btn sm secondary" type="button" onclick="openAgentUpdateModal()">一键更新 Agent</button>
     <button class="btn sm" type="button" onclick="openAddNodeModal()">接入节点</button>
   </div>
 </div>
@@ -153,6 +154,47 @@
       <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
         <button class="btn xs ghost" type="button" onclick="closeAddNodeModal()">取消</button>
         <button class="btn xs" id="addNodeSubmit" type="button" onclick="createNodeFromModal()">创建并进入</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Agent Update Modal -->
+<div id="agentUpdateModal" class="modal" style="display:none;">
+  <div class="modal-inner" style="max-width:720px;">
+    <div class="row" style="align-items:center;">
+      <div class="col"><div class="h2">一键更新 Agent</div></div>
+      <div class="col right"><button class="btn xs ghost" type="button" onclick="closeAgentUpdateModal()">关闭</button></div>
+    </div>
+
+    <div class="muted" style="margin-top:8px;">点击“开始更新”后，面板会在节点下一次心跳/上报时下发更新命令（离线节点会在上线后自动补更）。</div>
+
+    <div class="card" style="margin-top:12px; padding:12px;">
+      <div class="row" style="align-items:center; gap:10px;">
+        <div class="col" style="min-width:0;">
+          <div class="muted sm">目标版本</div>
+          <div class="mono" id="agentUpdateTarget" style="font-size:16px;">—</div>
+        </div>
+        <div class="col right">
+          <button class="btn xs" id="agentUpdateStartBtn" type="button" onclick="startAgentUpdateAll()">开始更新</button>
+        </div>
+      </div>
+
+      <div style="margin-top:10px;">
+        <div class="mini-progress" style="height:10px;"><div class="mini-fill" id="agentUpdateBar" style="width:0%"></div></div>
+        <div class="row" style="margin-top:8px; align-items:center;">
+          <div class="col muted sm" id="agentUpdateSummary">—</div>
+          <div class="col right muted sm" id="agentUpdateId" style="white-space:nowrap;"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px; padding:0; overflow:hidden;">
+      <div class="table-wrap" style="max-height:360px; overflow:auto;">
+        <table class="table">
+          <thead><tr><th>节点</th><th>状态</th><th>当前</th><th>目标</th><th>备注</th></tr></thead>
+          <tbody id="agentUpdateTable"></tbody>
+        </table>
       </div>
     </div>
   </div>
