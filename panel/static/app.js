@@ -2379,7 +2379,9 @@ async function createNodeFromModal(){
     const resp = await fetch("/api/nodes/create", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({name, ip_address, scheme, verify_tls, group_name})
+      body: JSON.stringify({name, ip_address, scheme, verify_tls, group_name}),
+      // 需要允许后端写入 Session Cookie（用于跳转到节点页后自动弹出接入命令窗口）
+      credentials: "include",
     });
 
     const data = await resp.json().catch(()=>({ok:false,error:"接口返回异常"}));

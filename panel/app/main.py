@@ -1891,6 +1891,12 @@ async def api_nodes_create(request: Request, user: str = Depends(require_login))
 
     display_name = name or _extract_ip_for_display(base_url)
     node_id = add_node(display_name, base_url, api_key, verify_tls=verify_tls, group_name=group_name)
+    # 创建完成后，进入节点详情页时自动弹出“接入命令”窗口
+    # 说明：会通过 SessionMiddleware 写入签名 Cookie；前端跳转到 /nodes/{id} 后读取并触发弹窗。
+    try:
+        request.session["show_install_cmd"] = True
+    except Exception:
+        pass
     return JSONResponse({"ok": True, "node_id": node_id, "redirect_url": f"/nodes/{node_id}"})
 
 @app.post("/api/nodes/{node_id}/update")
