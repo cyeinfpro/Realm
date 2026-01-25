@@ -99,6 +99,17 @@ detect_ip(){
   echo "${ip:-127.0.0.1}"
 }
 
+# 当面板机器不是公网 IP（例如内网部署/无反代暴露）时，
+# 需要优先使用本机内网 IP 来生成访问地址（避免误用出口公网 IP）。
+detect_local_ip(){
+  local ip=""
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  if [[ -z "$ip" ]] && command -v ip >/dev/null 2>&1; then
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' || true)"
+  fi
+  echo "${ip:-127.0.0.1}"
+}
+
 TMPDIR=""
 EXTRACT_ROOT=""
 PANEL_DIR=""
@@ -230,20 +241,44 @@ install_panel(){
   done
   port="$(prompt "面板端口" "6080")"
 
-  local panel_domain public_url
-  panel_domain="$(prompt "面板域名/外网地址（可选：反向代理/HTTPS 场景；留空使用 IP+端口）" "")"
-  if [[ -n "$panel_domain" ]]; then
-    public_url="$(normalize_public_url "$panel_domain")"
+  # ✅ 新增：是否为公网 IP
+  # - 是：继续询问是否输入域名（反代/HTTPS）；否则使用公网 IP+端口
+  # - 否：后续给节点拉取安装文件统一走 GitHub（包括 agent），面板仅用于控制/上报
+  local is_public asset_source
+  is_public="$(prompt "当前面板机器是否为公网 IP？(y/n)" "y")"
+  is_public="${is_public,,}"
+  if [[ "$is_public" == "n" || "$is_public" == "no" || "$is_public" == "0" ]]; then
+    asset_source="github"
   else
-    public_url="http://$(detect_ip):${port}"
+    asset_source="panel"
+  fi
+
+  local panel_domain public_url
+  if [[ "$asset_source" == "panel" ]]; then
+    panel_domain="$(prompt "面板域名/外网地址（可选：反向代理/HTTPS 场景；留空使用 IP+端口）" "")"
+    if [[ -n "$panel_domain" ]]; then
+      public_url="$(normalize_public_url "$panel_domain")"
+    else
+      public_url="http://$(detect_ip):${port}"
+    fi
+  else
+    panel_domain=""
+    public_url="http://$(detect_local_ip):${port}"
+    info "检测为非公网 IP：节点安装文件将默认从 GitHub 拉取（包括 Agent/realm），面板不再作为下载源。"
   fi
 
   info "部署到 /opt/realm-panel ..."
   rm -rf /opt/realm-panel
   mkdir -p /opt/realm-panel
   cp -a "$PANEL_DIR" /opt/realm-panel/panel
-  prepare_agent_bundle "$EXTRACT_ROOT"
-  prepare_realm_assets
+
+  if [[ "$asset_source" == "panel" ]]; then
+    prepare_agent_bundle "$EXTRACT_ROOT"
+    prepare_realm_assets
+  else
+    # 仍确保静态目录存在（面板自身静态资源需要）
+    mkdir -p /opt/realm-panel/panel/static
+  fi
 
   info "创建虚拟环境..."
   python3 -m venv /opt/realm-panel/venv
@@ -255,6 +290,7 @@ install_panel(){
   cat > /etc/realm-panel/panel.env <<EOF
 REALM_PANEL_PUBLIC_URL=${public_url}
 REALM_PANEL_DB=/etc/realm-panel/panel.db
+REALM_PANEL_ASSET_SOURCE=${asset_source}
 EOF
   export PANEL_USER="$user"
   export PANEL_PASS="$pass"

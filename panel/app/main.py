@@ -48,6 +48,32 @@ STATIC_DIR = BASE_DIR / "static"
 
 DEFAULT_AGENT_PORT = 18700
 
+
+def _panel_asset_source() -> str:
+    """Return where nodes should fetch installer assets.
+
+    Values:
+      - "panel"  : fetch from panel /static (default)
+      - "github" : fetch from GitHub (for private panel without public reachability)
+    """
+
+    return (os.getenv("REALM_PANEL_ASSET_SOURCE") or "panel").strip().lower() or "panel"
+
+
+def _agent_asset_urls(base_url: str) -> tuple[str, str, bool]:
+    """Return (agent_sh_url, agent_zip_url, github_only)."""
+    src = _panel_asset_source()
+    if src == "github":
+        sh_url = (os.getenv("REALM_PANEL_AGENT_SH_URL") or "").strip() or (
+            "https://raw.githubusercontent.com/cyeinfpro/Realm/main/realm_agent.sh"
+        )
+        zip_url = (os.getenv("REALM_PANEL_AGENT_ZIP_URL") or "").strip() or (
+            "https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
+        )
+        return sh_url, zip_url, True
+
+    return f"{base_url}/static/realm_agent.sh", f"{base_url}/static/realm-agent.zip", False
+
 def _panel_public_base_url(request: Request) -> str:
     """Return panel public base URL for generating scripts/links.
 
@@ -677,8 +703,11 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
 async def join_script(request: Request, token: str):
     """短命令接入脚本：curl .../join/<token> | bash
 
-    token = node.api_key（用于定位节点），脚本内部会写入 /etc/realm-agent/api.key，
-    并从面板 /static 拉取 realm_agent.sh 以及 realm-agent.zip。
+    token = node.api_key（用于定位节点），脚本内部会写入 /etc/realm-agent/api.key。
+
+    资产拉取策略：
+    - 默认：从面板 /static 拉取 realm_agent.sh + realm-agent.zip
+    - 若 REALM_PANEL_ASSET_SOURCE=github：从 GitHub 拉取（适用于面板非公网可达）
     """
 
     node = get_node_by_api_key(token)
@@ -690,7 +719,8 @@ exit 1
     base_url = _panel_public_base_url(request)
     node_id = int(node.get("id"))
     api_key = str(node.get("api_key"))
-    repo_zip_url = f"{base_url}/static/realm-agent.zip"
+    agent_sh_url, repo_zip_url, github_only = _agent_asset_urls(base_url)
+    gh_only_env = "  REALM_AGENT_GITHUB_ONLY=1 \\\n" if github_only else ""
 
     script = f"""#!/usr/bin/env bash
 set -euo pipefail
@@ -712,8 +742,8 @@ mkdir -p /etc/realm-agent
 echo \"$API_KEY\" > /etc/realm-agent/api.key
 
 echo \"[提示] 正在安装/更新 Realm Agent…\" >&2
-curl -fsSL $PANEL_URL/static/realm_agent.sh | \
-  REALM_AGENT_REPO_ZIP_URL=\"{repo_zip_url}\" \
+curl -fsSL \"{agent_sh_url}\" | \
+{gh_only_env}  REALM_AGENT_REPO_ZIP_URL=\"{repo_zip_url}\" \
   REALM_AGENT_FORCE_UPDATE=1 \
   REALM_AGENT_MODE=1 \
   REALM_AGENT_PORT={DEFAULT_AGENT_PORT} \

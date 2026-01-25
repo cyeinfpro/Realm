@@ -73,7 +73,9 @@ install_realm(){
   local urls=()
   local panel_base
   panel_base="$(normalize_panel_url "${REALM_PANEL_URL:-}")"
-  if [[ -n "${panel_base}" ]]; then
+  # 当面板机器非公网可达时，可通过 REALM_AGENT_GITHUB_ONLY=1 强制所有安装资产走 GitHub，
+  # 避免依赖面板提供 /static 下载（例如 realm 二进制）。
+  if [[ -n "${panel_base}" && "${REALM_AGENT_GITHUB_ONLY:-}" != "1" ]]; then
     urls+=(
       "${panel_base}/static/realm/realm-${arch}-unknown-linux-gnu.tar.gz"
       "${panel_base}/static/realm/realm-${arch}-unknown-linux-musl.tar.gz"
