@@ -532,35 +532,58 @@ function initDashboardViewControls(){
     for(const g of groups){
       const isCollapsed = collapsed.has(g.name);
       let visibleCount = 0;
+      let matchCount = 0;
       let onlineCount = 0;
       const total = g.cards.length;
 
       for(const card of g.cards){
         const isOnline = card.dataset.online === '1';
         if(isOnline) onlineCount += 1;
-        let show = true;
-        if(filter === 'online' && !isOnline) show = false;
-        if(filter === 'offline' && isOnline) show = false;
-        if(show && q){
-          const st = (card.dataset.searchText || '').toLowerCase();
-          if(!st.includes(q)) show = false;
-        }
-        if(show && isCollapsed) show = false;
 
+        // First: whether it matches current filter/search (ignoring collapse)
+        let match = true;
+        if(filter === 'online' && !isOnline) match = false;
+        if(filter === 'offline' && isOnline) match = false;
+        if(match && q){
+          const st = (card.dataset.searchText || '').toLowerCase();
+          if(!st.includes(q)) match = false;
+        }
+        if(match) matchCount += 1;
+
+        // Second: whether it should be visible (collapse hides cards but NOT the group header)
+        const show = match && !isCollapsed;
         card.style.display = show ? '' : 'none';
         if(show) visibleCount += 1;
       }
 
-      // Hide group header when no cards are visible under current filter/search
+      // Group header should remain visible when collapsed, as long as there are matches
       if(g.head){
-        g.head.style.display = (visibleCount > 0) ? '' : 'none';
+        g.head.style.display = (matchCount > 0) ? '' : 'none';
         g.head.classList.toggle('collapsed', isCollapsed);
+
+        // aria-expanded for accessibility
+        const toggleBtn = g.head.querySelector('.dash-group-toggle');
+        if(toggleBtn){
+          toggleBtn.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
+        }
+
         const countEl = g.head.querySelector('.dash-group-count');
         if(countEl){
-          if(q || filter !== 'all'){
-            countEl.innerHTML = `显示 <strong>${visibleCount}</strong>/<strong>${total}</strong>`;
+          const hasFilterOrQuery = !!q || filter !== 'all';
+          if(hasFilterOrQuery){
+            // When filtered/searched, show matched count; add "已折叠" label when collapsed
+            if(isCollapsed){
+              countEl.innerHTML = `已折叠 <strong>${matchCount}</strong>/<strong>${total}</strong>`;
+            }else{
+              countEl.innerHTML = `显示 <strong>${visibleCount}</strong>/<strong>${total}</strong>`;
+            }
           }else{
-            countEl.innerHTML = `在线 <strong>${onlineCount}</strong>/<strong>${total}</strong>`;
+            // Default view: online/total; add "已折叠" label when collapsed
+            if(isCollapsed){
+              countEl.innerHTML = `已折叠 · 在线 <strong>${onlineCount}</strong>/<strong>${total}</strong>`;
+            }else{
+              countEl.innerHTML = `在线 <strong>${onlineCount}</strong>/<strong>${total}</strong>`;
+            }
           }
         }
       }

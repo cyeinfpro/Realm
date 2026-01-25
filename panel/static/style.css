@@ -278,6 +278,10 @@ a{color:inherit}
   opacity: .9;
 }
 
+/* Collapsed groups should still feel "present" */
+.dash-group-head.collapsed{opacity:.95}
+.dash-group-head.collapsed .dash-group-count{color:rgba(226,232,240,0.70)}
+
 .dash-group-head.collapsed .dash-group-toggle{
   transform: rotate(-90deg);
 }
@@ -377,11 +381,30 @@ a{color:inherit}
 
 @media (max-width: 520px){
   .grid.node-grid{grid-template-columns:1fr;}
-  .dashboard-toolbar{gap:8px;}
+  /* Mobile dashboard: stacked + swipeable filter chips */
+  .dashboard-toolbar{flex-direction:column;align-items:stretch;gap:10px;}
+  .dash-filters{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding-bottom:2px;}
+  .dash-filters::-webkit-scrollbar{display:none}
+  .chip{flex:0 0 auto}
   .dash-search{flex:1 1 100%; max-width:none;}
+
+  /* Mobile node tile: denser */
+  .node-tile{padding:8px;border-radius:14px;}
+  .node-right{gap:6px;}
+  .node-state{padding:5px 7px;}
+
+  /* Put traffic + rate side-by-side on mobile */
+  .node-metrics{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
+  .metric{padding:6px 8px;}
+
+  /* CPU/MEM/DISK: show as compact inline chips (hide progress bar) */
+  .node-bars{display:flex;gap:6px;margin-top:8px;}
+  .mbar{flex:1 1 0;padding:6px 8px;}
+  .mbar .head{margin-bottom:0;}
+  .mini-progress{display:none;}
+
   .node-meta{flex-wrap:wrap; white-space:normal;}
   .node-meta-sep{display:none;}
-  .node-bars{grid-template-columns:1fr;}
   .mbar .head .mono{max-width:none}
 }
 
