@@ -34,7 +34,10 @@ def to_arr(x): if x==null then [] elif (x|type)=="array" then x elif (x|type)=="
   network: ({ no_tcp: false, use_udp: true } + obj(.network)),
   endpoints:
     ((.endpoints//[])
+      # Skip disabled rules
       | map(select((.disabled//false)|not))
+      # Intranet tunnel rules are handled by realm-agent, not realm binary.
+      | map(select(((obj(.extra_config).intranet_role // "") == "")))
       | map(. as $e
           | ($e.extra_config//{}) as $x
           | ($e.remote//$e.remotes//null) as $r0

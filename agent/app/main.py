@@ -10,6 +10,7 @@ import os
 import threading
 import hashlib
 import hmac
+import ssl
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -20,6 +21,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 import requests
 
 from .config import CFG
+from .intranet_tunnel import IntranetManager, load_server_cert_pem
 
 API_KEY_FILE = Path('/etc/realm-agent/api.key')
 ACK_VER_FILE = Path('/etc/realm-agent/panel_ack.version')
@@ -1126,6 +1128,14 @@ _PUSH_THREAD: threading.Thread | None = None
 _PUSH_LOCK = threading.Lock()  # 避免与 API 同时写 pool 文件导致竞争
 _LAST_SYNC_ERROR: str | None = None
 
+# ------------------------ Intranet Tunnel Supervisor ------------------------
+# 说明：公网节点(A) 与 内网节点(B) 之间的一对一“内网穿透”由 Agent 负责：
+# - A 侧监听规则的 listen 端口，并把流量通过加密隧道转发给 B；
+# - B 侧主动连 A 的隧道端口（默认 18443），按需建立 data 连接并转发到内网目标。
+# 这些规则在 pool 中以 extra_config.intranet_role 标记，realm 本体不会接管。
+
+_INTRANET = IntranetManager(node_id=AGENT_ID)
+
 
 def _read_agent_api_key() -> str:
     try:
@@ -1584,6 +1594,11 @@ def _on_startup() -> None:
         _reconcile_update_state()
     except Exception:
         pass
+    # Apply intranet tunnel rules on boot (if any were persisted)
+    try:
+        _INTRANET.apply_from_pool(_load_full_pool())
+    except Exception:
+        pass
     _start_push_reporter()
 
 
@@ -1627,6 +1642,26 @@ def api_pool(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
     return {'ok': True, 'pool': full}
 
 
+@app.get('/api/v1/intranet/cert')
+def api_intranet_cert(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    """返回内网穿透隧道服务端证书。
+
+    面板可从公网节点(A)拉取证书 PEM 并下发给内网节点(B)，用于 TLS 校验（更严格）。
+    """
+    pem = load_server_cert_pem()
+    return {'ok': True, 'cert_pem': pem}
+
+
+@app.get('/api/v1/intranet/status')
+def api_intranet_status(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    """内网穿透运行状态（调试用）。"""
+    try:
+        st = _INTRANET.status()
+    except Exception as exc:
+        st = {'error': str(exc)}
+    return {'ok': True, 'status': st}
+
+
 @app.post('/api/v1/pool')
 def api_pool_save(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
     pool = payload.get('pool') if isinstance(payload, dict) else None
@@ -1649,6 +1684,12 @@ def api_apply(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
         _sync_active_pool()
         _apply_pool_to_config()
         _restart_realm()
+        # Apply intranet tunnel rules (handled by agent, not realm)
+        try:
+            _INTRANET.apply_from_pool(_load_full_pool())
+        except Exception:
+            # do not fail apply for tunnel supervisor issues
+            pass
     except Exception as exc:
         return {'ok': False, 'error': str(exc)}
     return {'ok': True}
@@ -1674,6 +1715,21 @@ def _build_stats_snapshot() -> Dict[str, Any]:
     all_probe_set: set[str] = set()
 
     for e in eps:
+        # Intranet tunnel rules are handled by agent (not realm). Avoid probing the "remotes" directly,
+        # because they are typically LAN addresses that are unreachable from the public node.
+        ex = e.get('extra_config') if isinstance(e, dict) and isinstance(e.get('extra_config'), dict) else {}
+        if isinstance(ex, dict) and (ex.get('intranet_role') or ex.get('intranet_token')):
+            role = str(ex.get('intranet_role') or '').strip()
+            peer = ex.get('intranet_peer_node_name') or ex.get('intranet_peer_host') or ex.get('intranet_peer_node_id') or ''
+            if role == 'server':
+                entries = [{'key': '—', 'label': f'内网穿透 → {peer}', 'message': '通过隧道转发（本机不直接探测内网目标）'}]
+            elif role == 'client':
+                entries = [{'key': '—', 'label': f'内网穿透客户端 → {peer}', 'message': '客户端主动连接公网入口（本机不做目标探测）'}]
+            else:
+                entries = [{'key': '—', 'label': '内网穿透', 'message': '由隧道转发（跳过目标探测）'}]
+            per_rule_entries.append(entries)
+            continue
+
         entries: List[Dict[str, str]] = []
         if e.get('disabled'):
             # 规则暂停：无需探测，但仍保证面板有可渲染内容

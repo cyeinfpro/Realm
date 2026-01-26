@@ -20,10 +20,35 @@ async function loadNodesList(){
     if(data && data.ok && Array.isArray(data.nodes)){
       NODES_LIST = data.nodes;
       populateReceiverSelect();
+      populateIntranetReceiverSelect();
     }
   }catch(e){
     // ignore
   }
+}
+
+function populateIntranetReceiverSelect(){
+  const sel = document.getElementById('f_intranet_receiver_node');
+  if(!sel) return;
+  const currentId = window.__NODE_ID__;
+  const keep = sel.value;
+  sel.innerHTML = '<option value="">请选择内网节点…</option>';
+  for(const n of (NODES_LIST||[])){
+    if(!n || n.id == null) continue;
+    if(String(n.id) === String(currentId)) continue;
+    if(!n.is_private) continue;
+    const opt = document.createElement('option');
+    opt.value = String(n.id);
+    const show = n.name ? n.name : ('Node #' + n.id);
+    let host = '';
+    try{
+      const u = new URL(n.base_url.includes('://') ? n.base_url : ('http://' + n.base_url));
+      host = u.hostname || '';
+    }catch(e){}
+    opt.textContent = host ? `${show} (${host})` : show;
+    sel.appendChild(opt);
+  }
+  if(keep) sel.value = keep;
 }
 
 function populateReceiverSelect(){
@@ -86,6 +111,8 @@ function showTab(name){
 }
 
 function wssMode(e){
+  // intranet tunnels are handled separately
+  if(intranetMode(e)) return 'intranet';
   const ex = e.extra_config || {};
   const listenTransport = e.listen_transport || ex.listen_transport || '';
   const remoteTransport = e.remote_transport || ex.remote_transport || '';
@@ -95,14 +122,35 @@ function wssMode(e){
   return 'tcp';
 }
 
+function intranetMode(e){
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  return !!(ex && (ex.intranet_role || ex.intranet_peer_node_id || ex.intranet_token || ex.intranet_server_port));
+}
+
+function tunnelMode(e){
+  const m = wssMode(e);
+  return m;
+}
+
+function intranetIsLocked(e){
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  return !!(ex && (ex.intranet_lock === true || ex.intranet_role === 'client'));
+}
+
 function endpointType(e){
   const ex = (e && e.extra_config) ? e.extra_config : {};
+  if(ex && ex.intranet_role){
+    if(ex.intranet_role === 'client') return '内网穿透(内网出口·同步)';
+    if(ex.intranet_role === 'server') return '内网穿透(公网入口)';
+    return '内网穿透';
+  }
   if(ex && ex.sync_id){
     if(ex.sync_role === 'receiver') return 'WSS隧道(接收·同步)';
     if(ex.sync_role === 'sender') return 'WSS隧道(发送·同步)';
   }
   const mode = wssMode(e);
   if(mode === 'wss') return 'WSS隧道';
+  if(mode === 'intranet') return '内网穿透';
   return 'TCP/UDP';
 }
 
@@ -1141,9 +1189,20 @@ function fillWssFields(e){
   q('f_wss_insecure').checked = (insecure !== false);
 }
 
+function fillIntranetFields(e){
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  // sender side: choose intranet (LAN) node
+  const peerId = ex.intranet_peer_node_id ? String(ex.intranet_peer_node_id) : '';
+  const port = ex.intranet_server_port != null ? String(ex.intranet_server_port) : '18443';
+  if(q('f_intranet_receiver_node')) setField('f_intranet_receiver_node', peerId);
+  if(q('f_intranet_server_port')) setField('f_intranet_server_port', port);
+  populateIntranetReceiverSelect();
+}
+
 function showWssBox(){
   const mode = q('f_type').value;
-  q('wssBox').style.display = (mode === 'wss') ? 'block' : 'none';
+  if(q('wssBox')) q('wssBox').style.display = (mode === 'wss') ? 'block' : 'none';
+  if(q('intranetBox')) q('intranetBox').style.display = (mode === 'intranet') ? 'block' : 'none';
 
   // WSS 隧道统一走“选择接收机自动同步”
   const autoBox = document.getElementById('wssAutoSyncBox');
@@ -1212,8 +1271,12 @@ function newRule(){
   // reset autosync receiver fields
   if(q('f_wss_receiver_node')) setField('f_wss_receiver_node','');
   if(q('f_wss_receiver_port')) setField('f_wss_receiver_port','');
+  if(q('f_intranet_receiver_node')) setField('f_intranet_receiver_node','');
+  if(q('f_intranet_server_port')) setField('f_intranet_server_port','18443');
   populateReceiverSelect();
+  populateIntranetReceiverSelect();
   fillWssFields({});
+  fillIntranetFields({});
   showWssBox();
   openModal();
 }
@@ -1238,12 +1301,25 @@ function editRule(idx){
   // infer tunnel mode from endpoint
   q('f_type').value = wssMode(e);
 
-  // autosync receiver selector (sender role only)
-  if(q('f_wss_receiver_node')) setField('f_wss_receiver_node', ex.sync_role === 'sender' && ex.sync_peer_node_id ? String(ex.sync_peer_node_id) : '');
-  if(q('f_wss_receiver_port')) setField('f_wss_receiver_port', ex.sync_role === 'sender' && ex.sync_receiver_port ? String(ex.sync_receiver_port) : '');
-  populateReceiverSelect();
+  // autosync receiver selector (WSS sender role only)
+  const mode = q('f_type').value;
+  if(mode === 'wss'){
+    if(q('f_wss_receiver_node')) setField('f_wss_receiver_node', ex.sync_role === 'sender' && ex.sync_peer_node_id ? String(ex.sync_peer_node_id) : '');
+    if(q('f_wss_receiver_port')) setField('f_wss_receiver_port', ex.sync_role === 'sender' && ex.sync_receiver_port ? String(ex.sync_receiver_port) : '');
+    populateReceiverSelect();
+    fillWssFields(e);
+  }else{
+    if(q('f_wss_receiver_node')) setField('f_wss_receiver_node','');
+    if(q('f_wss_receiver_port')) setField('f_wss_receiver_port','');
+    fillWssFields({});
+  }
 
-  fillWssFields(e);
+  // intranet tunnel fields
+  if(mode === 'intranet'){
+    fillIntranetFields(e);
+  }else{
+    fillIntranetFields({});
+  }
   showWssBox();
   openModal();
 }
@@ -1254,6 +1330,11 @@ async function toggleRule(idx){
   // Locked receiver rules cannot be edited here
   if(ex && (ex.sync_lock === true || ex.sync_role === 'receiver')){
     toast('该规则由发送机同步生成，已锁定不可操作，请在发送机节点操作。', true);
+    return;
+  }
+
+  if(intranetIsLocked(e)){
+    toast('该规则由公网入口同步生成，已锁定不可操作，请在公网入口节点操作。', true);
     return;
   }
 
@@ -1297,6 +1378,37 @@ async function toggleRule(idx){
     return;
   }
 
+  // Intranet tunnel sender: update both sides via panel API
+  if(ex && ex.sync_id && ex.intranet_role === 'server' && ex.intranet_peer_node_id){
+    try{
+      setLoading(true);
+      const payload = {
+        sender_node_id: window.__NODE_ID__,
+        receiver_node_id: ex.intranet_peer_node_id,
+        listen: e.listen,
+        remotes: ex.intranet_original_remotes || e.remotes || [],
+        disabled: newDisabled,
+        balance: e.balance || 'roundrobin',
+        protocol: e.protocol || 'tcp+udp',
+        server_port: ex.intranet_server_port || 18443,
+        sync_id: ex.sync_id
+      };
+      const res = await fetchJSON('/api/intranet_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
+      if(res && res.ok){
+        CURRENT_POOL = res.sender_pool;
+        renderRules();
+        toast('已同步更新（公网入口/内网出口两端）');
+      }else{
+        toast(res && res.error ? res.error : '同步更新失败，请稍后重试', true);
+      }
+    }catch(err){
+      toast(String(err), true);
+    }finally{
+      setLoading(false);
+    }
+    return;
+  }
+
   // Normal rule
   e.disabled = newDisabled;
   await savePool();
@@ -1312,6 +1424,11 @@ async function deleteRule(idx){
     return;
   }
 
+  if(intranetIsLocked(e)){
+    toast('该规则由公网入口同步生成，已锁定不可删除，请在公网入口节点操作。', true);
+    return;
+  }
+
   // Synced sender: delete both sides
   if(ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
     if(!confirm('这将同时删除接收机对应规则，确定继续？（不可恢复）')) return;
@@ -1323,6 +1440,28 @@ async function deleteRule(idx){
         CURRENT_POOL = res.sender_pool;
         renderRules();
         toast('已同步删除（发送/接收两端）');
+      }else{
+        toast(res && res.error ? res.error : '同步删除失败，请稍后重试', true);
+      }
+    }catch(err){
+      toast(String(err), true);
+    }finally{
+      setLoading(false);
+    }
+    return;
+  }
+
+  // Intranet tunnel sender: delete both sides
+  if(ex && ex.sync_id && ex.intranet_role === 'server' && ex.intranet_peer_node_id){
+    if(!confirm('这将同时删除内网出口节点对应配置，确定继续？（不可恢复）')) return;
+    try{
+      setLoading(true);
+      const payload = { sender_node_id: window.__NODE_ID__, receiver_node_id: ex.intranet_peer_node_id, sync_id: ex.sync_id };
+      const res = await fetchJSON('/api/intranet_tunnel/delete', {method:'POST', body: JSON.stringify(payload)});
+      if(res && res.ok){
+        CURRENT_POOL = res.sender_pool;
+        renderRules();
+        toast('已同步删除（公网入口/内网出口两端）');
       }else{
         toast(res && res.error ? res.error : '同步删除失败，请稍后重试', true);
       }
@@ -1405,6 +1544,52 @@ async function saveRule(){
         renderRules();
         closeModal();
         toast('已保存，并自动同步到接收机');
+      }else{
+        toast((res && res.error) ? res.error : '保存失败，请检查节点是否在线', true);
+      }
+    }catch(err){
+      toast(String(err), true);
+    }finally{
+      setLoading(false);
+    }
+    return;
+  }
+
+  // 内网穿透：公网入口(本节点) -> 选择的内网节点（内网节点主动连回公网入口）
+  if(typeSel === 'intranet'){
+    const receiverNodeId = q('f_intranet_receiver_node') ? q('f_intranet_receiver_node').value.trim() : '';
+    if(!receiverNodeId){
+      toast('内网穿透必须选择内网节点', true);
+      return;
+    }
+    const portTxt = q('f_intranet_server_port') ? q('f_intranet_server_port').value.trim() : '';
+    const server_port = portTxt ? parseInt(portTxt,10) : 18443;
+    let syncId = '';
+    if(CURRENT_EDIT_INDEX >= 0){
+      const old = CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX];
+      const ex = (old && old.extra_config) ? old.extra_config : {};
+      if(ex && ex.sync_id) syncId = ex.sync_id;
+    }
+    const payload = {
+      sender_node_id: window.__NODE_ID__,
+      receiver_node_id: parseInt(receiverNodeId,10),
+      listen,
+      remotes,
+      disabled,
+      balance: balanceStr,
+      protocol,
+      server_port,
+      sync_id: syncId || undefined
+    };
+
+    try{
+      setLoading(true);
+      const res = await fetchJSON('/api/intranet_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
+      if(res && res.ok){
+        CURRENT_POOL = res.sender_pool;
+        renderRules();
+        closeModal();
+        toast('已保存，并自动下发到内网节点');
       }else{
         toast((res && res.error) ? res.error : '保存失败，请检查节点是否在线', true);
       }
@@ -1891,6 +2076,7 @@ function openEditNodeModal(){
   const group = window.__NODE_GROUP__ || '默认分组';
   const base = window.__NODE_BASE_URL__ || '';
   const vt = !!window.__NODE_VERIFY_TLS__;
+  const ipri = !!window.__NODE_IS_PRIVATE__;
 
   let scheme = 'http';
   let host = '';
@@ -1909,6 +2095,7 @@ function openEditNodeModal(){
   const schemeEl = document.getElementById('editNodeScheme');
   const ipEl = document.getElementById('editNodeIp');
   const vtEl = document.getElementById('editNodeVerifyTls');
+  const iprEl = document.getElementById('editNodeIsPrivate');
   const err = document.getElementById('editNodeError');
   const btn = document.getElementById('editNodeSubmit');
 
@@ -1919,6 +2106,7 @@ function openEditNodeModal(){
   if(groupEl) groupEl.value = String(group || '').trim();
   if(schemeEl) schemeEl.value = scheme;
   if(vtEl) vtEl.checked = !!vt;
+  if(iprEl) iprEl.checked = !!ipri;
 
   // Show host (append :port only when non-default and present)
   let ipVal = host;
@@ -1946,12 +2134,14 @@ function applyEditedNodeToPage(data){
     const group = String(data.group_name || '').trim() || '默认分组';
     const baseUrl = String(data.base_url || '').trim();
     const verifyTls = !!data.verify_tls;
+    const isPrivate = !!data.is_private;
 
     // update globals (for next time opening the modal)
     if(name) window.__NODE_NAME__ = name;
     if(baseUrl) window.__NODE_BASE_URL__ = baseUrl;
     window.__NODE_GROUP__ = group;
     window.__NODE_VERIFY_TLS__ = verifyTls ? 1 : 0;
+    window.__NODE_IS_PRIVATE__ = isPrivate ? 1 : 0;
 
     // header title
     const titleEl = document.querySelector('.node-title');
@@ -1997,6 +2187,7 @@ async function saveEditNode(){
     const scheme = (document.getElementById('editNodeScheme')?.value || 'http').trim();
     const ip_address = (document.getElementById('editNodeIp')?.value || '').trim();
     const verify_tls = !!document.getElementById('editNodeVerifyTls')?.checked;
+    const is_private = !!document.getElementById('editNodeIsPrivate')?.checked;
 
     if(!ip_address){
       if(err) err.textContent = '节点地址不能为空';
@@ -2008,7 +2199,7 @@ async function saveEditNode(){
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       credentials: 'same-origin',
-      body: JSON.stringify({ name, group_name, scheme, ip_address, verify_tls })
+      body: JSON.stringify({ name, group_name, scheme, ip_address, verify_tls, is_private })
     });
     const data = await resp.json().catch(()=>({ok:false,error:'接口返回异常'}));
     if(!resp.ok || !data.ok){
@@ -2368,6 +2559,7 @@ async function createNodeFromModal(){
     const ip_address = (document.getElementById("addNodeIp")?.value || "").trim();
     const scheme = (document.getElementById("addNodeScheme")?.value || "http").trim();
     const verify_tls = !!document.getElementById("addNodeVerifyTls")?.checked;
+    const is_private = !!document.getElementById("addNodeIsPrivate")?.checked;
     const group_name = (document.getElementById("addNodeGroup")?.value || "").trim();
 
     if(!ip_address){
@@ -2379,7 +2571,7 @@ async function createNodeFromModal(){
     const resp = await fetch("/api/nodes/create", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({name, ip_address, scheme, verify_tls, group_name}),
+      body: JSON.stringify({name, ip_address, scheme, verify_tls, is_private, group_name}),
       // 需要允许后端写入 Session Cookie（用于跳转到节点页后自动弹出接入命令窗口）
       credentials: "include",
     });

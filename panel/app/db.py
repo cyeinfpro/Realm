@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS nodes (
   base_url TEXT NOT NULL,
   api_key TEXT NOT NULL,
   verify_tls INTEGER NOT NULL DEFAULT 0,
+  -- Mark as "LAN-only" node (for reverse tunnel / intranet penetration)
+  is_private INTEGER NOT NULL DEFAULT 0,
   group_name TEXT NOT NULL DEFAULT '默认分组',
   -- Agent push-report state (agent -> panel)
   last_seen_at TEXT,
@@ -59,6 +61,8 @@ def ensure_db(db_path: str = DEFAULT_DB_PATH) -> None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(nodes)").fetchall()}
         if "verify_tls" not in columns:
             conn.execute("ALTER TABLE nodes ADD COLUMN verify_tls INTEGER NOT NULL DEFAULT 0")
+        if "is_private" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN is_private INTEGER NOT NULL DEFAULT 0")
         if "group_name" not in columns:
             conn.execute("ALTER TABLE nodes ADD COLUMN group_name TEXT NOT NULL DEFAULT '默认分组'")
         if "last_seen_at" not in columns:
@@ -332,18 +336,20 @@ def update_node_basic(
     base_url: str,
     api_key: str,
     verify_tls: bool = False,
+    is_private: bool = False,
     group_name: str = '默认分组',
     db_path: str = DEFAULT_DB_PATH,
 ) -> None:
     """Update basic node fields without touching reports/pools."""
     with connect(db_path) as conn:
         conn.execute(
-            "UPDATE nodes SET name=?, base_url=?, api_key=?, verify_tls=?, group_name=? WHERE id=?",
+            "UPDATE nodes SET name=?, base_url=?, api_key=?, verify_tls=?, is_private=?, group_name=? WHERE id=?",
             (
                 (name or "").strip(),
                 (base_url or "").strip().rstrip('/'),
                 (api_key or "").strip(),
                 1 if verify_tls else 0,
+                1 if is_private else 0,
                 (group_name or '默认分组').strip() or '默认分组',
                 int(node_id),
             ),
@@ -356,13 +362,14 @@ def add_node(
     base_url: str,
     api_key: str,
     verify_tls: bool = False,
+    is_private: bool = False,
     group_name: str = '默认分组',
     db_path: str = DEFAULT_DB_PATH,
 ) -> int:
     with connect(db_path) as conn:
         cur = conn.execute(
-            "INSERT INTO nodes(name, base_url, api_key, verify_tls, group_name) VALUES(?,?,?,?,?)",
-            (name.strip(), base_url.strip().rstrip('/'), api_key.strip(), 1 if verify_tls else 0, (group_name or '默认分组').strip() or '默认分组'),
+            "INSERT INTO nodes(name, base_url, api_key, verify_tls, is_private, group_name) VALUES(?,?,?,?,?,?)",
+            (name.strip(), base_url.strip().rstrip('/'), api_key.strip(), 1 if verify_tls else 0, 1 if is_private else 0, (group_name or '默认分组').strip() or '默认分组'),
         )
         conn.commit()
         return int(cur.lastrowid)

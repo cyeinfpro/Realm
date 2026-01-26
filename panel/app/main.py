@@ -573,6 +573,7 @@ async def node_new_action(
     request: Request,
     name: str = Form(""),
     group_name: str = Form("默认分组"),
+    is_private: Optional[str] = Form(None),
     ip_address: str = Form(...),
     scheme: str = Form("http"),
     api_key: str = Form(""),
@@ -610,7 +611,14 @@ async def node_new_action(
     # name 为空则默认使用“纯 IP/Host”
     display_name = (name or "").strip() or _extract_ip_for_display(base_url)
 
-    node_id = add_node(display_name, base_url, api_key, verify_tls=bool(verify_tls), group_name=group_name)
+    node_id = add_node(
+        display_name,
+        base_url,
+        api_key,
+        verify_tls=bool(verify_tls),
+        is_private=bool(is_private),
+        group_name=group_name,
+    )
     request.session["show_install_cmd"] = True
     _set_flash(request, "已添加机器")
     return RedirectResponse(url=f"/nodes/{node_id}", status_code=303)
@@ -621,6 +629,7 @@ async def node_add_action(
     request: Request,
     name: str = Form(""),
     group_name: str = Form("默认分组"),
+    is_private: Optional[str] = Form(None),
     base_url: str = Form(...),
     api_key: str = Form(...),
     verify_tls: Optional[str] = Form(None),
@@ -634,7 +643,14 @@ async def node_add_action(
         _set_flash(request, "API 地址与 Token 不能为空")
         return RedirectResponse(url="/", status_code=303)
 
-    node_id = add_node(name or base_url, base_url, api_key, verify_tls=bool(verify_tls), group_name=group_name)
+    node_id = add_node(
+        name or base_url,
+        base_url,
+        api_key,
+        verify_tls=bool(verify_tls),
+        is_private=bool(is_private),
+        group_name=group_name,
+    )
     _set_flash(request, "已添加节点")
     return RedirectResponse(url=f"/nodes/{node_id}", status_code=303)
 
@@ -1310,6 +1326,7 @@ async def api_restore_nodes(
         base_url = (item.get("base_url") or "").strip().rstrip('/')
         api_key = (item.get("api_key") or "").strip()
         verify_tls = bool(item.get("verify_tls", False))
+        is_private = bool(item.get("is_private", False))
         group_name = (item.get("group_name") or "默认分组").strip() if isinstance(item.get("group_name"), str) else ("默认分组" if not item.get("group_name") else str(item.get("group_name")))
         group_name = (group_name or "默认分组").strip() or "默认分组"
         source_id = item.get("source_id")
@@ -1330,13 +1347,21 @@ async def api_restore_nodes(
                 base_url,
                 api_key,
                 verify_tls=verify_tls,
+                is_private=is_private,
                 group_name=group_name,
             )
             updated += 1
             if source_id_i is not None:
                 mapping[str(source_id_i)] = int(existing["id"])
         else:
-            new_id = add_node(name or _extract_ip_for_display(base_url), base_url, api_key, verify_tls=verify_tls, group_name=group_name)
+            new_id = add_node(
+                name or _extract_ip_for_display(base_url),
+                base_url,
+                api_key,
+                verify_tls=verify_tls,
+                is_private=is_private,
+                group_name=group_name,
+            )
             added += 1
             if source_id_i is not None:
                 mapping[str(source_id_i)] = int(new_id)
@@ -1431,6 +1456,7 @@ async def api_restore_full(
         base_url = (item.get('base_url') or '').strip().rstrip('/')
         api_key = (item.get('api_key') or '').strip()
         verify_tls = bool(item.get('verify_tls', False))
+        is_private = bool(item.get('is_private', False))
         group_name = (item.get('group_name') or '默认分组')
         group_name = (str(group_name).strip() or '默认分组')
         source_id = item.get('source_id')
@@ -1454,12 +1480,13 @@ async def api_restore_full(
                 base_url,
                 api_key,
                 verify_tls=verify_tls,
+                is_private=is_private,
                 group_name=group_name,
             )
             updated += 1
             node_id = int(existing['id'])
         else:
-            node_id = int(add_node(name or _extract_ip_for_display(base_url), base_url, api_key, verify_tls=verify_tls, group_name=group_name))
+            node_id = int(add_node(name or _extract_ip_for_display(base_url), base_url, api_key, verify_tls=verify_tls, is_private=is_private, group_name=group_name))
             added += 1
 
         baseurl_to_nodeid[base_url] = node_id
@@ -1868,6 +1895,7 @@ async def api_nodes_create(request: Request, user: str = Depends(require_login))
     ip_address = str(data.get("ip_address") or "").strip()
     scheme = str(data.get("scheme") or "http").strip().lower()
     verify_tls = bool(data.get("verify_tls") or False)
+    is_private = bool(data.get("is_private") or False)
     group_name = str(data.get("group_name") or "").strip() or "默认分组"
 
     if scheme not in ("http", "https"):
@@ -1890,7 +1918,7 @@ async def api_nodes_create(request: Request, user: str = Depends(require_login))
     api_key = _generate_api_key()
 
     display_name = name or _extract_ip_for_display(base_url)
-    node_id = add_node(display_name, base_url, api_key, verify_tls=verify_tls, group_name=group_name)
+    node_id = add_node(display_name, base_url, api_key, verify_tls=verify_tls, is_private=is_private, group_name=group_name)
     # 创建完成后，进入节点详情页时自动弹出“接入命令”窗口
     # 说明：会通过 SessionMiddleware 写入签名 Cookie；前端跳转到 /nodes/{id} 后读取并触发弹窗。
     try:
@@ -1915,6 +1943,12 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
     ip_in = data.get("ip_address", None)
     scheme_in = data.get("scheme", None)
     group_in = data.get("group_name", None)
+
+    # is_private: only update when provided
+    if "is_private" in data:
+        is_private = bool(data.get("is_private") or False)
+    else:
+        is_private = bool(node.get("is_private", 0))
 
     # verify_tls: only update when provided
     if "verify_tls" in data:
@@ -1995,7 +2029,15 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
     else:
         name = str(name_in or "").strip() or _extract_ip_for_display(base_url)
 
-    update_node_basic(int(node_id), name, base_url, str(node.get("api_key") or ""), verify_tls=verify_tls, group_name=group_name)
+    update_node_basic(
+        int(node_id),
+        name,
+        base_url,
+        str(node.get("api_key") or ""),
+        verify_tls=verify_tls,
+        is_private=is_private,
+        group_name=group_name,
+    )
 
     # Return updated fields for client-side UI refresh (avoid full page reload)
     updated = get_node(int(node_id)) or {}
@@ -2010,6 +2052,7 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
                 "group_name": str(updated.get("group_name") or group_name),
                 "display_ip": display_ip,
                 "verify_tls": bool(updated.get("verify_tls") or verify_tls),
+                "is_private": bool(updated.get("is_private") or is_private),
             },
         }
     )
@@ -2020,7 +2063,13 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
 async def api_nodes_list(user: str = Depends(require_login)):
     out = []
     for n in list_nodes():
-        out.append({"id": int(n["id"]), "name": n["name"], "base_url": n["base_url"], "group_name": n.get("group_name")})
+        out.append({
+            "id": int(n["id"]),
+            "name": n["name"],
+            "base_url": n["base_url"],
+            "group_name": n.get("group_name"),
+            "is_private": bool(n.get("is_private") or 0),
+        })
     return {"ok": True, "nodes": out}
 
 
@@ -2200,6 +2249,194 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
 
 @app.post("/api/wss_tunnel/delete")
 async def api_wss_tunnel_delete(payload: Dict[str, Any], user: str = Depends(require_login)):
+    sync_id = str(payload.get("sync_id") or "").strip()
+    if not sync_id:
+        return JSONResponse({"ok": False, "error": "sync_id 不能为空"}, status_code=400)
+
+    try:
+        sender_id = int(payload.get("sender_node_id") or 0)
+        receiver_id = int(payload.get("receiver_node_id") or 0)
+    except Exception:
+        sender_id = 0
+        receiver_id = 0
+
+    if sender_id <= 0 or receiver_id <= 0 or sender_id == receiver_id:
+        return JSONResponse({"ok": False, "error": "sender_node_id / receiver_node_id 无效"}, status_code=400)
+
+    sender = get_node(sender_id)
+    receiver = get_node(receiver_id)
+    if not sender or not receiver:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+
+    sender_pool = await _load_pool_for_node(sender)
+    receiver_pool = await _load_pool_for_node(receiver)
+
+    _remove_endpoints_by_sync_id(sender_pool, sync_id)
+    _remove_endpoints_by_sync_id(receiver_pool, sync_id)
+
+    s_ver, _ = set_desired_pool(sender_id, sender_pool)
+    r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
+
+    async def _apply(node: Dict[str, Any], pool: Dict[str, Any]):
+        try:
+            data = await agent_post(node["base_url"], node["api_key"], "/api/v1/pool", {"pool": pool}, _node_verify_tls(node))
+            if isinstance(data, dict) and data.get("ok", True):
+                await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, _node_verify_tls(node))
+        except Exception:
+            pass
+
+    await _apply(sender, sender_pool)
+    await _apply(receiver, receiver_pool)
+
+    return {
+        "ok": True,
+        "sync_id": sync_id,
+        "sender_pool": sender_pool,
+        "receiver_pool": receiver_pool,
+        "sender_desired_version": s_ver,
+        "receiver_desired_version": r_ver,
+    }
+
+
+@app.post("/api/intranet_tunnel/save")
+async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(require_login)):
+    try:
+        sender_id = int(payload.get("sender_node_id") or 0)
+        receiver_id = int(payload.get("receiver_node_id") or 0)
+    except Exception:
+        sender_id = 0
+        receiver_id = 0
+
+    if sender_id <= 0 or receiver_id <= 0 or sender_id == receiver_id:
+        return JSONResponse({"ok": False, "error": "sender_node_id / receiver_node_id 无效"}, status_code=400)
+
+    sender = get_node(sender_id)
+    receiver = get_node(receiver_id)
+    if not sender or not receiver:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+
+    # receiver must be marked as LAN/private node
+    if not bool(receiver.get("is_private") or False):
+        return JSONResponse({"ok": False, "error": "所选节点未标记为内网机器，请在节点设置中勾选“内网机器”"}, status_code=400)
+
+    listen = str(payload.get("listen") or "").strip()
+    remotes = payload.get("remotes") or []
+    if isinstance(remotes, str):
+        remotes = [x.strip() for x in remotes.splitlines() if x.strip()]
+    if not isinstance(remotes, list):
+        remotes = []
+    remotes = [str(x).strip() for x in remotes if str(x).strip()]
+    disabled = bool(payload.get("disabled", False))
+    balance = str(payload.get("balance") or "roundrobin").strip() or "roundrobin"
+    protocol = str(payload.get("protocol") or "tcp+udp").strip() or "tcp+udp"
+
+    try:
+        server_port = int(payload.get("server_port") or 18443)
+    except Exception:
+        server_port = 18443
+    if server_port <= 0 or server_port > 65535:
+        return JSONResponse({"ok": False, "error": "隧道端口无效"}, status_code=400)
+
+    if not listen:
+        return JSONResponse({"ok": False, "error": "listen 不能为空"}, status_code=400)
+    if not remotes:
+        return JSONResponse({"ok": False, "error": "目标地址不能为空"}, status_code=400)
+
+    sync_id = str(payload.get("sync_id") or "").strip() or uuid.uuid4().hex
+    token = str(payload.get("token") or "").strip() or uuid.uuid4().hex
+
+    sender_host = _node_host_for_realm(sender)
+    if not sender_host:
+        return JSONResponse({"ok": False, "error": "公网入口 base_url 无法解析主机名，请检查节点地址"}, status_code=400)
+
+    # Best-effort: fetch A-side tunnel server cert and embed into B config for TLS verification.
+    server_cert_pem = ""
+    try:
+        cert = await agent_get(sender.get("base_url", ""), sender.get("api_key", ""), "/api/v1/intranet/cert", _node_verify_tls(sender))
+        if isinstance(cert, dict) and cert.get("ok") is True:
+            server_cert_pem = str(cert.get("cert_pem") or "").strip()
+    except Exception:
+        server_cert_pem = ""
+
+    now_iso = datetime.utcnow().isoformat() + "Z"
+
+    sender_ep = {
+        "listen": listen,
+        "disabled": disabled,
+        "balance": balance,
+        "protocol": protocol,
+        "remotes": remotes,
+        "extra_config": {
+            "intranet_role": "server",
+            "intranet_peer_node_id": receiver_id,
+            "intranet_peer_node_name": receiver.get("name"),
+            "intranet_server_port": server_port,
+            "intranet_token": token,
+            "intranet_original_remotes": remotes,
+            "sync_id": sync_id,
+            "intranet_updated_at": now_iso,
+        },
+    }
+
+    receiver_ep = {
+        # placeholder listen; actual reverse tunnel is initiated outbound by receiver
+        "listen": _format_addr("0.0.0.0", 0),
+        "disabled": disabled,
+        "balance": balance,
+        "protocol": protocol,
+        "remotes": remotes,
+        "extra_config": {
+            "intranet_role": "client",
+            "intranet_lock": True,
+            "intranet_peer_node_id": sender_id,
+            "intranet_peer_node_name": sender.get("name"),
+            "intranet_peer_host": sender_host,
+            "intranet_server_port": server_port,
+            "intranet_token": token,
+            "intranet_server_cert_pem": server_cert_pem,
+            "intranet_tls_verify": bool(server_cert_pem),
+            "intranet_sender_listen": listen,
+            "intranet_original_remotes": remotes,
+            "sync_id": sync_id,
+            "intranet_updated_at": now_iso,
+        },
+    }
+
+    sender_pool = await _load_pool_for_node(sender)
+    receiver_pool = await _load_pool_for_node(receiver)
+
+    # upsert by sync_id
+    _remove_endpoints_by_sync_id(sender_pool, sync_id)
+    _remove_endpoints_by_sync_id(receiver_pool, sync_id)
+    sender_pool["endpoints"].append(sender_ep)
+    receiver_pool["endpoints"].append(receiver_ep)
+
+    s_ver, _ = set_desired_pool(sender_id, sender_pool)
+    r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
+
+    async def _apply(node: Dict[str, Any], pool: Dict[str, Any]):
+        try:
+            data = await agent_post(node["base_url"], node["api_key"], "/api/v1/pool", {"pool": pool}, _node_verify_tls(node))
+            if isinstance(data, dict) and data.get("ok", True):
+                await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, _node_verify_tls(node))
+        except Exception:
+            pass
+
+    await _apply(sender, sender_pool)
+    await _apply(receiver, receiver_pool)
+
+    return {
+        "ok": True,
+        "sync_id": sync_id,
+        "sender_pool": sender_pool,
+        "receiver_pool": receiver_pool,
+        "sender_desired_version": s_ver,
+        "receiver_desired_version": r_ver,
+    }
+
+
+@app.post("/api/intranet_tunnel/delete")
+async def api_intranet_tunnel_delete(payload: Dict[str, Any], user: str = Depends(require_login)):
     sync_id = str(payload.get("sync_id") or "").strip()
     if not sync_id:
         return JSONResponse({"ok": False, "error": "sync_id 不能为空"}, status_code=400)
