@@ -2454,42 +2454,16 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     s_ver, _ = set_desired_pool(sender_id, sender_pool)
     r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
 
-    async def _apply(node: Dict[str, Any], pool: Dict[str, Any]) -> Dict[str, Any]:
-        """Best-effort direct apply.
-
-        Even if this fails (LAN node behind NAT), the desired_pool_version was already bumped,
-        so the agent can still receive the change on next push-report.
-        """
-        out: Dict[str, Any] = {
-            'reachable': False,
-            'pool_pushed': False,
-            'applied': False,
-            'error': '',
-            'intranet': None,
-        }
+    async def _apply(node: Dict[str, Any], pool: Dict[str, Any]):
         try:
-            data = await agent_post(node.get("base_url", ""), node.get("api_key", ""), "/api/v1/pool", {"pool": pool}, _node_verify_tls(node))
-            out['reachable'] = True
-            out['pool_pushed'] = True
+            data = await agent_post(node["base_url"], node["api_key"], "/api/v1/pool", {"pool": pool}, _node_verify_tls(node))
             if isinstance(data, dict) and data.get("ok", True):
-                await agent_post(node.get("base_url", ""), node.get("api_key", ""), "/api/v1/apply", {}, _node_verify_tls(node))
-                out['applied'] = True
-        except Exception as exc:
-            out['error'] = str(exc)
+                await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, _node_verify_tls(node))
+        except Exception:
+            pass
 
-        # fetch intranet status for fast troubleshooting (best-effort)
-        if out.get('reachable'):
-            try:
-                st = await agent_get(node.get("base_url", ""), node.get("api_key", ""), "/api/v1/intranet/status", _node_verify_tls(node))
-                if isinstance(st, dict):
-                    # keep full response: includes warnings
-                    out['intranet'] = st
-            except Exception:
-                pass
-        return out
-
-    sender_apply = await _apply(sender, sender_pool)
-    receiver_apply = await _apply(receiver, receiver_pool)
+    await _apply(sender, sender_pool)
+    await _apply(receiver, receiver_pool)
 
     return {
         "ok": True,
@@ -2498,10 +2472,6 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         "receiver_pool": receiver_pool,
         "sender_desired_version": s_ver,
         "receiver_desired_version": r_ver,
-        "apply": {
-            "sender": sender_apply,
-            "receiver": receiver_apply,
-        },
     }
 
 
@@ -2535,26 +2505,16 @@ async def api_intranet_tunnel_delete(payload: Dict[str, Any], user: str = Depend
     s_ver, _ = set_desired_pool(sender_id, sender_pool)
     r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
 
-    async def _apply(node: Dict[str, Any], pool: Dict[str, Any]) -> Dict[str, Any]:
-        out: Dict[str, Any] = {
-            'reachable': False,
-            'pool_pushed': False,
-            'applied': False,
-            'error': '',
-        }
+    async def _apply(node: Dict[str, Any], pool: Dict[str, Any]):
         try:
-            data = await agent_post(node.get("base_url", ""), node.get("api_key", ""), "/api/v1/pool", {"pool": pool}, _node_verify_tls(node))
-            out['reachable'] = True
-            out['pool_pushed'] = True
+            data = await agent_post(node["base_url"], node["api_key"], "/api/v1/pool", {"pool": pool}, _node_verify_tls(node))
             if isinstance(data, dict) and data.get("ok", True):
-                await agent_post(node.get("base_url", ""), node.get("api_key", ""), "/api/v1/apply", {}, _node_verify_tls(node))
-                out['applied'] = True
-        except Exception as exc:
-            out['error'] = str(exc)
-        return out
+                await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, _node_verify_tls(node))
+        except Exception:
+            pass
 
-    sender_apply = await _apply(sender, sender_pool)
-    receiver_apply = await _apply(receiver, receiver_pool)
+    await _apply(sender, sender_pool)
+    await _apply(receiver, receiver_pool)
 
     return {
         "ok": True,
@@ -2563,7 +2523,6 @@ async def api_intranet_tunnel_delete(payload: Dict[str, Any], user: str = Depend
         "receiver_pool": receiver_pool,
         "sender_desired_version": s_ver,
         "receiver_desired_version": r_ver,
-        "apply": {"sender": sender_apply, "receiver": receiver_apply},
     }
 
 

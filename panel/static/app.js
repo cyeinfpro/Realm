@@ -202,6 +202,23 @@ function renderHealthExpanded(healthList, statsError){
     const s = String(err || '').trim();
     if(!s) return '';
     const t = s.toLowerCase();
+    // 内网穿透握手错误码（agent 提供）
+    if(t === 'no_client_connected') return '未检测到客户端连接';
+    if(t === 'client_not_running') return '客户端未启动';
+    if(t === 'server_not_running') return '入口未启动';
+    if(t === 'client_not_running') return '客户端未启动';
+    if(t === 'peer_is_http_proxy') return '走了HTTP反代/代理';
+    if(t === 'sig_invalid') return '签名校验失败';
+    if(t === 'magic_mismatch') return '协议不匹配';
+    if(t === 'version_mismatch') return '版本不匹配';
+    if(t === 'ts_skew') return '时间偏差过大';
+    if(t === 'pong_timeout') return '心跳超时';
+    if(t === 'control_closed') return '连接断开';
+    if(t.startsWith('dial_failed')) return '连接失败';
+    if(t.startsWith('dial_tls_failed')) return 'TLS握手失败';
+    if(t.startsWith('tls_verify_failed')) return '证书校验失败';
+    if(t.startsWith('hello_timeout')) return '握手超时';
+    if(t.startsWith('hello_')) return '握手失败';
     if(t.includes('timed out') || t.includes('timeout')) return '超时';
     if(t.includes('refused')) return '拒绝连接';
     if(t.includes('no route')) return '无路由';
@@ -214,9 +231,9 @@ function renderHealthExpanded(healthList, statsError){
     const isUnknown = item && item.ok == null;
     const ok = !!item.ok;
     const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
-    const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : '离线');
+    const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : ((item && item.kind === 'handshake') ? '未连接' : '离线'));
     const reason = (!isUnknown && !ok) ? friendlyError(item.error || item.message) : '';
-    const title = !isUnknown && !ok ? `离线原因：${String(item.error || item.message || '').trim()}` : '';
+    const title = !isUnknown && !ok ? `${(item && item.kind === 'handshake') ? '未连接' : '离线'}原因：${String(item.error || item.message || '').trim()}` : '';
     return `<div class="health-item" title="${escapeHtml(title)}">
       <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${escapeHtml(label)}</span>
       <span class="mono health-target">${escapeHtml(item.target)}</span>
@@ -844,6 +861,23 @@ function renderHealth(healthList, statsError, idx){
     const s = String(err || '').trim();
     if(!s) return '';
     const t = s.toLowerCase();
+    // 内网穿透握手错误码（agent 提供）
+    if(t === 'no_client_connected') return '未检测到客户端连接';
+    if(t === 'client_not_running') return '客户端未启动';
+    if(t === 'server_not_running') return '入口未启动';
+    if(t === 'client_not_running') return '客户端未启动';
+    if(t === 'peer_is_http_proxy') return '走了HTTP反代/代理';
+    if(t === 'sig_invalid') return '签名校验失败';
+    if(t === 'magic_mismatch') return '协议不匹配';
+    if(t === 'version_mismatch') return '版本不匹配';
+    if(t === 'ts_skew') return '时间偏差过大';
+    if(t === 'pong_timeout') return '心跳超时';
+    if(t === 'control_closed') return '连接断开';
+    if(t.startsWith('dial_failed')) return '连接失败';
+    if(t.startsWith('dial_tls_failed')) return 'TLS握手失败';
+    if(t.startsWith('tls_verify_failed')) return '证书校验失败';
+    if(t.startsWith('hello_timeout')) return '握手超时';
+    if(t.startsWith('hello_')) return '握手失败';
     if(t.includes('timed out') || t.includes('timeout')) return '超时';
     if(t.includes('refused')) return '拒绝连接';
     if(t.includes('no route')) return '无路由';
@@ -860,9 +894,9 @@ function renderHealth(healthList, statsError, idx){
     const isUnknown = item && item.ok == null;
     const ok = !!item.ok;
     const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
-    const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : '离线');
+    const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : ((item && item.kind === 'handshake') ? '未连接' : '离线'));
     const reason = (!isUnknown && !ok) ? friendlyError(item.error || item.message) : '';
-    const title = !isUnknown && !ok ? `离线原因：${String(item.error || item.message || '').trim()}` : '';
+    const title = !isUnknown && !ok ? `${(item && item.kind === 'handshake') ? '未连接' : '离线'}原因：${String(item.error || item.message || '').trim()}` : '';
     return `<div class="health-item" title="${escapeHtml(title)}">
       <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${escapeHtml(label)}</span>
       <span class="mono health-target">${escapeHtml(item.target)}</span>
@@ -876,9 +910,9 @@ function renderHealth(healthList, statsError, idx){
       const isUnknown = item && item.ok == null;
       const ok = !!item.ok;
       const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
-      const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : '离线');
+      const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : ((item && item.kind === 'handshake') ? '未连接' : '离线'));
       const reason = (!isUnknown && !ok) ? friendlyError(item.error || item.message) : '';
-      const title = !isUnknown && !ok ? `离线原因：${String(item.error || item.message || '').trim()}` : '';
+      const title = !isUnknown && !ok ? `${(item && item.kind === 'handshake') ? '未连接' : '离线'}原因：${String(item.error || item.message || '').trim()}` : '';
       return `<div class="health-item" title="${escapeHtml(title)}">
         <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${escapeHtml(label)}</span>
         <span class="mono health-target">${escapeHtml(item.target)}</span>
@@ -903,6 +937,23 @@ function renderHealthMobile(healthList, statsError, idx){
     const s = String(err || '').trim();
     if(!s) return '';
     const t = s.toLowerCase();
+    // 内网穿透握手错误码（agent 提供）
+    if(t === 'no_client_connected') return '未检测到客户端连接';
+    if(t === 'client_not_running') return '客户端未启动';
+    if(t === 'server_not_running') return '入口未启动';
+    if(t === 'client_not_running') return '客户端未启动';
+    if(t === 'peer_is_http_proxy') return '走了HTTP反代/代理';
+    if(t === 'sig_invalid') return '签名校验失败';
+    if(t === 'magic_mismatch') return '协议不匹配';
+    if(t === 'version_mismatch') return '版本不匹配';
+    if(t === 'ts_skew') return '时间偏差过大';
+    if(t === 'pong_timeout') return '心跳超时';
+    if(t === 'control_closed') return '连接断开';
+    if(t.startsWith('dial_failed')) return '连接失败';
+    if(t.startsWith('dial_tls_failed')) return 'TLS握手失败';
+    if(t.startsWith('tls_verify_failed')) return '证书校验失败';
+    if(t.startsWith('hello_timeout')) return '握手超时';
+    if(t.startsWith('hello_')) return '握手失败';
     if(t.includes('timed out') || t.includes('timeout')) return '超时';
     if(t.includes('refused')) return '拒绝连接';
     if(t.includes('no route')) return '无路由';
@@ -918,9 +969,9 @@ function renderHealthMobile(healthList, statsError, idx){
     const isUnknown = item && item.ok == null;
     const ok = !!item.ok;
     const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
-    const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : '离线');
+    const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : ((item && item.kind === 'handshake') ? '未连接' : '离线'));
     const reason = (!isUnknown && !ok) ? friendlyError(item.error || item.message) : '';
-    const title = (!isUnknown && !ok) ? `离线原因：${String(item.error || item.message || '').trim()}` : '';
+    const title = (!isUnknown && !ok) ? `${(item && item.kind === 'handshake') ? '未连接' : '离线'}原因：${String(item.error || item.message || '').trim()}` : '';
 
     return `<div class="health-item mobile" title="${escapeHtml(title)}">
       <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${escapeHtml(label)}</span>
@@ -937,9 +988,9 @@ function renderHealthMobile(healthList, statsError, idx){
       const isUnknown = item && item.ok == null;
       const ok = !!item.ok;
       const latencyMs = item && item.latency_ms != null ? item.latency_ms : item && item.latency != null ? item.latency : null;
-      const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : '离线');
+      const label = isUnknown ? (item.message || '不可检测') : (ok ? `${latencyMs != null ? latencyMs : '—'} ms` : ((item && item.kind === 'handshake') ? '未连接' : '离线'));
       const reason = (!isUnknown && !ok) ? friendlyError(item.error || item.message) : '';
-      const title = (!isUnknown && !ok) ? `离线原因：${String(item.error || item.message || '').trim()}` : '';
+      const title = (!isUnknown && !ok) ? `${(item && item.kind === 'handshake') ? '未连接' : '离线'}原因：${String(item.error || item.message || '').trim()}` : '';
 
       return `<div class="health-item mobile" title="${escapeHtml(title)}">
         <span class="pill ${isUnknown ? 'warn' : (ok ? 'ok' : 'bad')}">${escapeHtml(label)}</span>
@@ -965,7 +1016,8 @@ function showHealthDetail(idx){
       const ok = it && it.ok === true;
       const isUnknown = it && it.ok == null;
       const latency = it && it.latency_ms != null ? `${it.latency_ms} ms` : (it && it.latency != null ? `${it.latency} ms` : '—');
-      const state = isUnknown ? '不可检测' : (ok ? '在线' : '离线');
+      const isHandshake = it && it.kind === 'handshake';
+      const state = isUnknown ? '不可检测' : (ok ? (isHandshake ? '已连接' : '在线') : (isHandshake ? '未连接' : '离线'));
       const reason = (!isUnknown && !ok) ? (it.error || it.message || '') : '';
       return `${state}  ${latency}  ${it.target}${reason ? `\n  原因：${reason}` : ''}`;
     });
@@ -1400,7 +1452,6 @@ async function toggleRule(idx){
         CURRENT_POOL = res.sender_pool;
         renderRules();
         toast('已同步更新（公网入口/内网出口两端）');
-        showApplyHint(res);
       }else{
         toast(res && res.error ? res.error : '同步更新失败，请稍后重试', true);
       }
@@ -1465,7 +1516,6 @@ async function deleteRule(idx){
         CURRENT_POOL = res.sender_pool;
         renderRules();
         toast('已同步删除（公网入口/内网出口两端）');
-        showApplyHint(res);
       }else{
         toast(res && res.error ? res.error : '同步删除失败，请稍后重试', true);
       }
@@ -1596,7 +1646,6 @@ async function saveRule(){
         renderRules();
         closeModal();
         toast('已保存，并自动下发到内网节点');
-        showApplyHint(res);
       }else{
         toast((res && res.error) ? res.error : '保存失败，请检查节点是否在线', true);
       }
@@ -1683,31 +1732,6 @@ function toast(text, isError=false){
 
   // Last resort
   alert(msg);
-}
-
-// For NAT/LAN nodes, panel may not be able to directly call agent. In that case the desired_pool
-// will still be delivered on next agent push-report. This helper summarizes the direct-apply result.
-function showApplyHint(res){
-  try{
-    if(!res || !res.apply) return;
-    const s = res.apply.sender || {};
-    const r = res.apply.receiver || {};
-    const msgs = [];
-    if(s.reachable === false) msgs.push('公网入口节点直连下发失败：将等待节点上报自动同步');
-    if(r.reachable === false) msgs.push('内网节点直连下发失败：将等待节点上报自动同步');
-    // If reachable, surface the first warning from agent diagnosis.
-    const pickWarn = (x) => {
-      if(!x || !x.intranet) return '';
-      const diag = x.intranet;
-      const w = (diag && diag.warnings && diag.warnings.length) ? diag.warnings[0] : '';
-      return w;
-    };
-    const sw = pickWarn(s);
-    const rw = pickWarn(r);
-    if(sw) msgs.push('公网入口诊断：' + sw);
-    if(rw) msgs.push('内网节点诊断：' + rw);
-    if(msgs.length) toast(msgs.join(' | '));
-  }catch(e){}
 }
 
 async function restoreRules(file){

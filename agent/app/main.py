@@ -1171,8 +1171,6 @@ def _build_push_report() -> Dict[str, Any]:
         'pool': pool,
         'stats': stats,
         'sys': _build_sys_snapshot(),
-        # Intranet tunnel runtime status (helps debug LAN nodes when panel cannot reach agent port)
-        'intranet': (_INTRANET.diagnose() if _INTRANET else {}),
     }
     if _LAST_SYNC_ERROR:
         rep['sync_error'] = _LAST_SYNC_ERROR
@@ -1670,17 +1668,10 @@ def api_intranet_cert(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
 def api_intranet_status(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
     """内网穿透运行状态（调试用）。"""
     try:
-        diag = _INTRANET.diagnose()
+        st = _INTRANET.status()
     except Exception as exc:
-        diag = {'ok': False, 'status': {}, 'warnings': [], 'error': str(exc)}
-    # Keep backward compatible: status.servers/clients... stays at top-level "status".
-    return {
-        'ok': True,
-        'status': (diag.get('status') if isinstance(diag, dict) else {}),
-        'warnings': (diag.get('warnings') if isinstance(diag, dict) else []),
-        'diag_ok': bool(diag.get('ok')) if isinstance(diag, dict) else False,
-        'error': diag.get('error', '') if isinstance(diag, dict) else '',
-    }
+        st = {'error': str(exc)}
+    return {'ok': True, 'status': st}
 
 
 @app.post('/api/v1/pool')
@@ -1696,6 +1687,11 @@ def api_pool_save(payload: Dict[str, Any], _: None = Depends(_api_key_required))
             e.setdefault('disabled', False)
     _write_json(POOL_FULL, pool)
     _sync_active_pool()
+    # Keep intranet tunnel supervisor in sync even if caller forgets to call /apply
+    try:
+        _INTRANET.apply_from_pool(_load_full_pool())
+    except Exception:
+        pass
     return {'ok': True}
 
 
@@ -1734,21 +1730,12 @@ def _build_stats_snapshot() -> Dict[str, Any]:
     per_rule_entries: List[List[Dict[str, str]]] = []
     all_probe_keys: List[str] = []
     all_probe_set: set[str] = set()
-
     for e in eps:
-        # Intranet tunnel rules are handled by agent (not realm). Avoid probing the "remotes" directly,
-        # because they are typically LAN addresses that are unreachable from the public node.
+        # Intranet tunnel rules are handled by agent (not realm).
+        # Skip probing the inner LAN remotes here; we will expose a deterministic "handshake" health entry later.
         ex = e.get('extra_config') if isinstance(e, dict) and isinstance(e.get('extra_config'), dict) else {}
         if isinstance(ex, dict) and (ex.get('intranet_role') or ex.get('intranet_token')):
-            role = str(ex.get('intranet_role') or '').strip()
-            peer = ex.get('intranet_peer_node_name') or ex.get('intranet_peer_host') or ex.get('intranet_peer_node_id') or ''
-            if role == 'server':
-                entries = [{'key': '—', 'label': f'内网穿透 → {peer}', 'message': '通过隧道转发（本机不直接探测内网目标）'}]
-            elif role == 'client':
-                entries = [{'key': '—', 'label': f'内网穿透客户端 → {peer}', 'message': '客户端主动连接公网入口（本机不做目标探测）'}]
-            else:
-                entries = [{'key': '—', 'label': '内网穿透', 'message': '由隧道转发（跳过目标探测）'}]
-            per_rule_entries.append(entries)
+            per_rule_entries.append([])
             continue
 
         entries: List[Dict[str, str]] = []
@@ -1846,6 +1833,43 @@ def _build_stats_snapshot() -> Dict[str, Any]:
         entries = per_rule_entries[idx] if idx < len(per_rule_entries) else []
         protocol = str(e.get('protocol') or 'tcp+udp').lower()
         tcp_probe_enabled = ('tcp' in protocol) and (not bool(e.get('disabled')))
+
+        # Intranet tunnel rules: expose "handshake" health instead of probing LAN remotes.
+        ex = e.get('extra_config') if isinstance(e, dict) and isinstance(e.get('extra_config'), dict) else {}
+        if isinstance(ex, dict) and (ex.get('intranet_role') or ex.get('intranet_token')):
+            if bool(e.get('disabled')):
+                health.append({'target': '—', 'ok': None, 'message': '规则已暂停'})
+            else:
+                peer = ex.get('intranet_peer_node_name') or ex.get('intranet_peer_host') or ex.get('intranet_peer_node_id') or ''
+                sync_id = str(ex.get('sync_id') or '')
+                hh = _INTRANET.handshake_health(sync_id, ex)
+                item: Dict[str, Any] = {'kind': 'handshake', 'target': f'握手 → {peer}' if peer else '握手'}
+                if hh.get('ok') is None:
+                    item['ok'] = None
+                    item['message'] = hh.get('message') or '不可检测'
+                elif hh.get('ok') is True:
+                    item['ok'] = True
+                    if hh.get('latency_ms') is not None:
+                        item['latency_ms'] = hh.get('latency_ms')
+                    if hh.get('message'):
+                        item['message'] = hh.get('message')
+                else:
+                    item['ok'] = False
+                    item['error'] = hh.get('error') or hh.get('message') or '未连接'
+                health.append(item)
+
+            rules.append({
+                'idx': idx,
+                'listen': listen,
+                'disabled': bool(e.get('disabled')),
+                'connections': int(ct.get('connections') or 0),
+                'connections_active': int(ct.get('connections_active') or ct.get('connections') or 0),
+                'connections_total': int(ct.get('connections_total') or 0),
+                'rx_bytes': rx_bytes,
+                'tx_bytes': tx_bytes,
+                'health': health,
+            })
+            continue
 
         for it in entries:
             label = it.get('label', '—')

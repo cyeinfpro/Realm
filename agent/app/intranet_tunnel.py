@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import socket
@@ -9,19 +11,24 @@ import subprocess
 import threading
 import time
 import uuid
-from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# -----------------------------
+# Intranet tunnel (A<->B)
+# -----------------------------
+# Goals:
+# - Deterministic handshakes (HMAC) to avoid "connected but not really" black boxes
+# - Ping/pong heartbeats + stale-session cleanup to avoid zombie sessions
+# - Rich runtime state for panel "握手检查"
+# - Keep deps minimal (no cryptography)
 
 INTRA_DIR = Path(os.getenv('REALM_AGENT_INTRANET_DIR', '/etc/realm-agent/intranet'))
 SERVER_KEY = INTRA_DIR / 'server.key'
 SERVER_CERT = INTRA_DIR / 'server.crt'
 SERVER_PEM = INTRA_DIR / 'server.pem'
-
 LOG_FILE = INTRA_DIR / 'intranet.log'
-_LOG_LOCK = threading.Lock()
 
 DEFAULT_TUNNEL_PORT = int(os.getenv('REALM_INTRANET_TUNNEL_PORT', '18443'))
 OPEN_TIMEOUT = float(os.getenv('REALM_INTRANET_OPEN_TIMEOUT', '8.0'))
@@ -29,47 +36,68 @@ TCP_BACKLOG = int(os.getenv('REALM_INTRANET_TCP_BACKLOG', '256'))
 UDP_SESSION_TTL = float(os.getenv('REALM_INTRANET_UDP_TTL', '60.0'))
 MAX_FRAME = int(os.getenv('REALM_INTRANET_MAX_UDP_FRAME', '65535'))
 
+# Handshake/heartbeat
+INTRANET_MAGIC = os.getenv('REALM_INTRANET_MAGIC', 'realm-intranet')
+INTRANET_PROTO_VER = int(os.getenv('REALM_INTRANET_PROTO_VER', '3'))
+HELLO_TIMEOUT = float(os.getenv('REALM_INTRANET_HELLO_TIMEOUT', '6.0'))
+PING_INTERVAL = float(os.getenv('REALM_INTRANET_PING_INTERVAL', '15.0'))
+PONG_TIMEOUT = float(os.getenv('REALM_INTRANET_PONG_TIMEOUT', '45.0'))
+SESSION_STALE = float(os.getenv('REALM_INTRANET_SESSION_STALE', '65.0'))
+TS_SKEW_SEC = int(os.getenv('REALM_INTRANET_TS_SKEW_SEC', '300'))
+
 # Fallback to plaintext only when the server side has no TLS (e.g. openssl missing on A).
 # Keep it enabled by default to maximize connectivity; set REALM_INTRANET_ALLOW_PLAINTEXT=0 to force TLS-only.
 ALLOW_PLAINTEXT_FALLBACK = bool(int(os.getenv('REALM_INTRANET_ALLOW_PLAINTEXT', '1') or '1'))
 
-
-def _log(event: str, **fields: Any) -> None:
-    """Best-effort structured log for intranet tunnel.
-
-    Writes JSONL to /etc/realm-agent/intranet/intranet.log. Never raises.
-    """
-    try:
-        INTRA_DIR.mkdir(parents=True, exist_ok=True)
-        rec = {
-            'ts': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
-            'event': str(event or 'event'),
-        }
-        for k, v in fields.items():
-            try:
-                json.dumps(v)
-                rec[k] = v
-            except Exception:
-                rec[k] = str(v)
-        line = json.dumps(rec, ensure_ascii=False, separators=(',', ':')) + '\n'
-        with _LOG_LOCK:
-            LOG_FILE.open('a', encoding='utf-8').write(line)
-    except Exception:
-        pass
+# Log can be disabled in extreme IO constrained env
+ENABLE_LOG = bool(int(os.getenv('REALM_INTRANET_LOG', '1') or '1'))
 
 
 def _now() -> float:
     return time.time()
 
 
+def _now_ms() -> int:
+    return int(_now() * 1000)
+
+
+_LOG_LOCK = threading.Lock()
+
+
+def _log(event: str, **fields: Any) -> None:
+    if not ENABLE_LOG:
+        return
+    try:
+        INTRA_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {'ts': int(_now()), 'event': event}
+        payload.update(fields)
+        line = (json.dumps(payload, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8')
+        with _LOG_LOCK:
+            with open(LOG_FILE, 'ab', buffering=0) as f:
+                f.write(line)
+    except Exception:
+        pass
+
+
+def _mask_token(t: str) -> str:
+    t = str(t or '')
+    if len(t) <= 10:
+        return t
+    return t[:4] + '…' + t[-4:]
+
+
 def _json_line(obj: Dict[str, Any]) -> bytes:
     return (json.dumps(obj, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8')
 
 
-def _recv_line(sock: ssl.SSLSocket, max_len: int = 65536) -> str:
+def _recv_line(sock: Any, max_len: int = 65536) -> str:
+    # socket/SSLSocket compatible
     buf = bytearray()
     while True:
-        ch = sock.recv(1)
+        try:
+            ch = sock.recv(1)
+        except Exception:
+            break
         if not ch:
             break
         if ch == b'\n':
@@ -87,19 +115,13 @@ def _safe_close(s: Any) -> None:
         pass
 
 
-def _set_tcp_keepalive(sock: socket.socket) -> None:
-    """Best-effort TCP keepalive to reduce silent half-open tunnels."""
+def shutil_which(cmd: str) -> Optional[str]:
+    # local minimal which, avoid importing shutil at module import time in agent
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        # Linux-specific knobs; ignore on platforms that don't have them.
-        if hasattr(socket, 'TCP_KEEPIDLE'):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
-        if hasattr(socket, 'TCP_KEEPINTVL'):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-        if hasattr(socket, 'TCP_KEEPCNT'):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        import shutil
+        return shutil.which(cmd)
     except Exception:
-        pass
+        return None
 
 
 def ensure_server_cert() -> None:
@@ -116,30 +138,28 @@ def ensure_server_cert() -> None:
     if SERVER_CERT.exists() and SERVER_KEY.exists():
         return
 
-    # Try openssl
     openssl = shutil_which('openssl')
     if not openssl:
         return
+
     try:
-        # Generate cert+key if missing
-        if not SERVER_KEY.exists() or not SERVER_CERT.exists():
-            cmd = [
-                openssl,
-                'req',
-                '-x509',
-                '-nodes',
-                '-newkey',
-                'rsa:2048',
-                '-keyout',
-                str(SERVER_KEY),
-                '-out',
-                str(SERVER_CERT),
-                '-days',
-                '3650',
-                '-subj',
-                '/CN=realm-intranet',
-            ]
-            subprocess.run(cmd, capture_output=True, text=True, check=False)
+        cmd = [
+            openssl,
+            'req',
+            '-x509',
+            '-nodes',
+            '-newkey',
+            'rsa:2048',
+            '-keyout',
+            str(SERVER_KEY),
+            '-out',
+            str(SERVER_CERT),
+            '-days',
+            '3650',
+            '-subj',
+            '/CN=realm-intranet',
+        ]
+        subprocess.run(cmd, capture_output=True, text=True, check=False)
         if SERVER_KEY.exists() and SERVER_CERT.exists():
             pem = (SERVER_KEY.read_text(encoding='utf-8') + '\n' + SERVER_CERT.read_text(encoding='utf-8')).strip() + '\n'
             SERVER_PEM.write_text(pem, encoding='utf-8')
@@ -155,22 +175,12 @@ def load_server_cert_pem() -> str:
         return ''
 
 
-def shutil_which(cmd: str) -> Optional[str]:
-    # local minimal which, avoid importing shutil at module import time in agent
-    try:
-        import shutil
-        return shutil.which(cmd)
-    except Exception:
-        return None
-
-
 def _mk_server_ssl_context() -> Optional[ssl.SSLContext]:
     ensure_server_cert()
     if not SERVER_CERT.exists() or not SERVER_KEY.exists():
         return None
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        # prefer modern settings; Python defaults are OK.
         ctx.options |= ssl.OP_NO_SSLv2
         ctx.options |= ssl.OP_NO_SSLv3
         ctx.options |= ssl.OP_NO_COMPRESSION
@@ -191,11 +201,32 @@ def _mk_client_ssl_context(server_cert_pem: str | None) -> ssl.SSLContext:
         try:
             ctx.load_verify_locations(cadata=server_cert_pem)
         except Exception:
-            # fallback to insecure if invalid
             ctx.verify_mode = ssl.CERT_NONE
     else:
         ctx.verify_mode = ssl.CERT_NONE
     return ctx
+
+
+def _set_keepalive(sock_obj: socket.socket) -> None:
+    try:
+        sock_obj.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except Exception:
+        return
+    # Best effort for Linux. Ignore failures.
+    try:
+        if hasattr(socket, 'TCP_KEEPIDLE'):
+            sock_obj.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+        if hasattr(socket, 'TCP_KEEPINTVL'):
+            sock_obj.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+        if hasattr(socket, 'TCP_KEEPCNT'):
+            sock_obj.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    except Exception:
+        pass
+
+
+def _hmac_sig(token: str, node_id: int, ts: int, nonce: str) -> str:
+    msg = f"{INTRANET_MAGIC}|{INTRANET_PROTO_VER}|{node_id}|{ts}|{nonce}".encode('utf-8')
+    return hmac.new(token.encode('utf-8'), msg, hashlib.sha256).hexdigest()
 
 
 @dataclass
@@ -213,28 +244,22 @@ class IntranetRule:
     server_cert_pem: str = ''  # for client verification
 
 
-@dataclass
-class ClientRuntimeState:
-    key: str
-    peer_host: str
-    peer_port: int
-    token: str
-    tls_verify: bool
-    connected: bool = False
-    last_connect_at: float = 0.0
-    last_hello_at: float = 0.0
-    last_error: str = ''
-    last_dial_mode: str = ''  # tls/plain
-
-
 class _ControlSession:
-    def __init__(self, token: str, node_id: int, sock: ssl.SSLSocket):
+    def __init__(self, token: str, node_id: int, sock: Any, dial_mode: str, legacy: bool = False):
         self.token = token
         self.node_id = node_id
         self.sock = sock
+        self.dial_mode = dial_mode
+        self.legacy = legacy
+
         self.lock = threading.Lock()
         self.closed = False
-        self.last_seen = _now()
+
+        self.connected_at = _now()
+        self.hello_ok_at = self.connected_at
+        self.last_seen = self.connected_at
+        self.last_ping_at = 0.0
+        self.rtt_ms: Optional[int] = None
 
     def send(self, obj: Dict[str, Any]) -> bool:
         if self.closed:
@@ -249,9 +274,12 @@ class _ControlSession:
             _safe_close(self.sock)
             return False
 
-    def close(self) -> None:
+    def close(self, reason: str = '') -> None:
         self.closed = True
-        _safe_close(self.sock)
+        try:
+            _safe_close(self.sock)
+        finally:
+            _log('control_closed', token=_mask_token(self.token), node_id=self.node_id, reason=reason)
 
 
 class _TunnelServer:
@@ -261,9 +289,10 @@ class _TunnelServer:
     """
 
     def __init__(self, port: int):
-        self.port = port
+        self.port = int(port)
         self._stop = threading.Event()
         self._th: Optional[threading.Thread] = None
+        self._janitor_th: Optional[threading.Thread] = None
         self._sock: Optional[socket.socket] = None
         self._ssl_ctx = _mk_server_ssl_context()
 
@@ -283,13 +312,20 @@ class _TunnelServer:
         with self._sessions_lock:
             for t in list(self._sessions.keys()):
                 if t not in tokens:
-                    self._sessions[t].close()
+                    self._sessions[t].close('token_removed')
                     self._sessions.pop(t, None)
 
     def get_session(self, token: str) -> Optional[_ControlSession]:
         with self._sessions_lock:
             s = self._sessions.get(token)
         if s and not s.closed:
+            # stale protection
+            if (_now() - s.last_seen) > SESSION_STALE:
+                s.close('stale')
+                with self._sessions_lock:
+                    if self._sessions.get(token) is s:
+                        self._sessions.pop(token, None)
+                return None
             return s
         return None
 
@@ -301,6 +337,10 @@ class _TunnelServer:
         th.start()
         self._th = th
 
+        jt = threading.Thread(target=self._janitor_loop, name=f'intranet-janitor:{self.port}', daemon=True)
+        jt.start()
+        self._janitor_th = jt
+
     def stop(self) -> None:
         self._stop.set()
         try:
@@ -310,44 +350,28 @@ class _TunnelServer:
             pass
         with self._sessions_lock:
             for s in self._sessions.values():
-                s.close()
+                s.close('server_stop')
             self._sessions.clear()
 
-    def _wrap(self, conn: socket.socket) -> Optional[ssl.SSLSocket]:
-        """Wrap with TLS if possible.
-
-        Important: In the wild, mismatched TLS/plaintext is the #1 reason tunnels “look ok” but never connect.
-        We support a tolerant mode:
-        - If TLS context is available, we *detect* whether the peer speaks TLS by peeking the first byte.
-        - If peer is not TLS, we accept plaintext when REALM_INTRANET_ALLOW_PLAINTEXT=1.
-        This makes deployments far more robust (especially behind reverse proxies / stripped TLS ports).
-        """
+    def _wrap(self, conn: socket.socket) -> Tuple[Optional[Any], str]:
+        # Returns (socket_like, dial_mode)
         if self._ssl_ctx is None:
-            return conn  # type: ignore
-
-        # Detect TLS handshake record (0x16) / SSLv2 compatible hello (0x80).
-        first = b''
+            try:
+                conn.settimeout(None)
+                _set_keepalive(conn)
+            except Exception:
+                pass
+            return conn, 'plain'
         try:
-            first = conn.recv(1, socket.MSG_PEEK)
-        except Exception:
-            first = b''
-
-        is_tls = bool(first and first[:1] in (b'\x16', b'\x80'))
-        if not is_tls:
-            if ALLOW_PLAINTEXT_FALLBACK:
-                return conn  # type: ignore
-            _safe_close(conn)
-            return None
-
-        try:
-            return self._ssl_ctx.wrap_socket(conn, server_side=True)
+            conn.settimeout(None)
+            _set_keepalive(conn)
+            ss = self._ssl_ctx.wrap_socket(conn, server_side=True)
+            ss.settimeout(None)
+            return ss, 'tls'
         except Exception as exc:
-            _log('server_tls_wrap_failed', port=self.port, err=str(exc))
-            if ALLOW_PLAINTEXT_FALLBACK:
-                # last resort: accept as plaintext
-                return conn  # type: ignore
+            _log('accept_wrap_failed', port=self.port, error=str(exc))
             _safe_close(conn)
-            return None
+            return None, 'tls'
 
     def _serve(self) -> None:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -356,24 +380,31 @@ class _TunnelServer:
         s.listen(TCP_BACKLOG)
         s.settimeout(1.0)
         self._sock = s
+        _log('server_listen', port=self.port, tls=bool(self._ssl_ctx is not None))
         while not self._stop.is_set():
             try:
-                conn, _addr = s.accept()
+                conn, addr = s.accept()
             except socket.timeout:
                 continue
             except Exception:
                 continue
-            th = threading.Thread(target=self._handle_conn, args=(conn,), daemon=True)
+            th = threading.Thread(target=self._handle_conn, args=(conn, addr), daemon=True)
             th.start()
 
-    def _handle_conn(self, conn: socket.socket) -> None:
-        _set_tcp_keepalive(conn)
-        ss = self._wrap(conn)
+    def _handle_conn(self, conn: socket.socket, addr: Any) -> None:
+        ss, dial_mode = self._wrap(conn)
         if ss is None:
             return
+
+        # Read first line
         try:
             line = _recv_line(ss)
             if not line:
+                _safe_close(ss)
+                return
+            # Detect HTTP proxy / wrong port quickly
+            if line.startswith('GET ') or line.startswith('POST ') or line.startswith('HTTP/'):
+                _log('reject_http', port=self.port, from_addr=str(addr), head=line[:64])
                 _safe_close(ss)
                 return
             msg = json.loads(line)
@@ -383,7 +414,7 @@ class _TunnelServer:
 
         mtype = str(msg.get('type') or '')
         if mtype == 'hello':
-            self._handle_control(ss, msg)
+            self._handle_control(ss, dial_mode, msg, addr)
             return
         if mtype in ('data', 'data_udp'):
             self._handle_data(ss, msg)
@@ -394,56 +425,113 @@ class _TunnelServer:
         with self._allowed_tokens_lock:
             return token in self._allowed_tokens if self._allowed_tokens else True
 
-    def _handle_control(self, ss: ssl.SSLSocket, hello: Dict[str, Any]) -> None:
+    def _send_hello_err(self, ss: Any, err: str) -> None:
+        try:
+            ss.sendall(_json_line({'type': 'hello_err', 'error': err}))
+        except Exception:
+            pass
+
+    def _handle_control(self, ss: Any, dial_mode: str, hello: Dict[str, Any], addr: Any) -> None:
         token = str(hello.get('token') or '')
         try:
             node_id = int(hello.get('node_id') or 0)
         except Exception:
             node_id = 0
+
         if not token or not self._token_allowed(token):
-            try:
-                ss.sendall(_json_line({'type': 'hello_err', 'error': 'token_invalid'}))
-            except Exception:
-                pass
+            self._send_hello_err(ss, 'token_invalid')
             _safe_close(ss)
             return
 
-        sess = _ControlSession(token=token, node_id=node_id, sock=ss)
+        # HMAC handshake (ver=3). Also accept legacy hello for compatibility.
+        legacy = False
+        if 'sig' not in hello:
+            legacy = True
+        else:
+            magic = str(hello.get('magic') or '')
+            try:
+                ver = int(hello.get('ver') or 0)
+            except Exception:
+                ver = 0
+            try:
+                ts = int(hello.get('ts') or 0)
+            except Exception:
+                ts = 0
+            nonce = str(hello.get('nonce') or '')
+            sig = str(hello.get('sig') or '')
+
+            if magic != INTRANET_MAGIC:
+                self._send_hello_err(ss, 'magic_mismatch')
+                _safe_close(ss)
+                return
+            if ver != INTRANET_PROTO_VER:
+                self._send_hello_err(ss, 'version_mismatch')
+                _safe_close(ss)
+                return
+            if not nonce or not sig or ts <= 0:
+                self._send_hello_err(ss, 'hello_invalid')
+                _safe_close(ss)
+                return
+            if abs(int(_now()) - ts) > TS_SKEW_SEC:
+                self._send_hello_err(ss, 'ts_skew')
+                _safe_close(ss)
+                return
+            exp = _hmac_sig(token, node_id, ts, nonce)
+            if not hmac.compare_digest(exp, sig):
+                self._send_hello_err(ss, 'sig_invalid')
+                _safe_close(ss)
+                return
+
+        sess = _ControlSession(token=token, node_id=node_id, sock=ss, dial_mode=dial_mode, legacy=legacy)
         with self._sessions_lock:
             old = self._sessions.get(token)
             if old:
-                old.close()
+                old.close('replaced')
             self._sessions[token] = sess
 
-        _log('control_connected', port=self.port, token=_mask_token(token), node_id=node_id)
+        sess.send({'type': 'hello_ok', 'ver': INTRANET_PROTO_VER, 'server_ts': int(_now())})
+        _log('control_connected', port=self.port, token=_mask_token(token), node_id=node_id, dial_mode=dial_mode, legacy=legacy, from_addr=str(addr))
 
-        try:
-            sess.send({'type': 'hello_ok'})
-        except Exception:
-            sess.close()
-            return
-
-        # Keep reading to detect disconnect; also handle optional ping.
+        # Keep reading to detect disconnect; also handle ping.
         while not self._stop.is_set() and not sess.closed:
             try:
                 line = _recv_line(ss)
                 if not line:
                     break
+                if line.startswith('GET ') or line.startswith('POST ') or line.startswith('HTTP/'):
+                    break
                 msg = json.loads(line)
-                t = str(msg.get('type') or '')
-                sess.last_seen = _now()
-                if t == 'ping':
-                    sess.send({'type': 'pong', 'ts': int(_now())})
             except Exception:
                 break
 
-        sess.close()
-        _log('control_disconnected', port=self.port, token=_mask_token(token), node_id=node_id)
+            t = str(msg.get('type') or '')
+            sess.last_seen = _now()
+
+            if t == 'ping':
+                sess.last_ping_at = sess.last_seen
+                # client may report last measured rtt
+                try:
+                    rtt = msg.get('rtt_ms')
+                    if rtt is not None:
+                        sess.rtt_ms = int(rtt)
+                except Exception:
+                    pass
+                try:
+                    seq = int(msg.get('seq') or 0)
+                except Exception:
+                    seq = 0
+                try:
+                    echo_ts = int(msg.get('ts') or 0)
+                except Exception:
+                    echo_ts = 0
+                sess.send({'type': 'pong', 'seq': seq, 'echo_ts': echo_ts, 'server_ts': _now_ms()})
+
+        sess.close('disconnect')
         with self._sessions_lock:
             if self._sessions.get(token) is sess:
                 self._sessions.pop(token, None)
 
-    def _handle_data(self, ss: ssl.SSLSocket, msg: Dict[str, Any]) -> None:
+    def _handle_data(self, ss: Any, msg: Dict[str, Any]) -> None:
         token = str(msg.get('token') or '')
         conn_id = str(msg.get('conn_id') or '')
         ok = bool(msg.get('ok', True))
@@ -471,6 +559,26 @@ class _TunnelServer:
         with self._pending_lock:
             return self._pending.pop((token, conn_id), None)
 
+    def _janitor_loop(self) -> None:
+        while not self._stop.is_set():
+            time.sleep(2.0)
+            now = _now()
+            # cleanup stale sessions
+            with self._sessions_lock:
+                for tok, sess in list(self._sessions.items()):
+                    if sess.closed:
+                        self._sessions.pop(tok, None)
+                        continue
+                    if (now - sess.last_seen) > SESSION_STALE:
+                        sess.close('stale')
+                        self._sessions.pop(tok, None)
+            # cleanup pending opens that were never popped (belt & suspenders)
+            with self._pending_lock:
+                for key, pend in list(self._pending.items()):
+                    created = float(pend.get('created_at') or 0.0)
+                    if created and (now - created) > max(OPEN_TIMEOUT * 3.0, 30.0):
+                        self._pending.pop(key, None)
+
 
 class _TCPListener:
     def __init__(self, rule: IntranetRule, tunnel: _TunnelServer):
@@ -479,7 +587,7 @@ class _TCPListener:
         self._stop = threading.Event()
         self._th: Optional[threading.Thread] = None
         self._sock: Optional[socket.socket] = None
-        self._rr = -1
+        self._rr = 0
 
     def start(self) -> None:
         if self._th and self._th.is_alive():
@@ -501,9 +609,10 @@ class _TCPListener:
         rs = self.rule.remotes or []
         if not rs:
             return ''
-        # roundrobin (fix off-by-one)
+        # round-robin (fix off-by-one)
+        target = rs[self._rr % len(rs)]
         self._rr = (self._rr + 1) % len(rs)
-        return rs[self._rr]
+        return target
 
     def _serve(self) -> None:
         host, port = _split_hostport(self.rule.listen)
@@ -516,6 +625,7 @@ class _TCPListener:
         while not self._stop.is_set():
             try:
                 c, _addr = s.accept()
+                _set_keepalive(c)
             except socket.timeout:
                 continue
             except Exception:
@@ -524,7 +634,6 @@ class _TCPListener:
             th.start()
 
     def _handle_client(self, client: socket.socket) -> None:
-        _set_tcp_keepalive(client)
         token = self.rule.token
         sess = self.tunnel.get_session(token)
         if not sess:
@@ -537,7 +646,7 @@ class _TCPListener:
 
         conn_id = uuid.uuid4().hex
         ev = threading.Event()
-        pend = {'event': ev, 'client_sock': client, 'proto': 'tcp'}
+        pend = {'event': ev, 'client_sock': client, 'proto': 'tcp', 'created_at': _now()}
         self.tunnel.register_pending(token, conn_id, pend)
 
         # ask B to open
@@ -556,7 +665,6 @@ class _TCPListener:
             _safe_close(data_sock)
             return
 
-        # relay
         _relay_tcp(client, data_sock)
 
 
@@ -568,7 +676,7 @@ class _UDPSession:
         self.tunnel = tunnel
         self.target = target
         self.conn_id = uuid.uuid4().hex
-        self.data_sock: Optional[ssl.SSLSocket] = None
+        self.data_sock: Optional[Any] = None
         self.ok = False
         self.last_seen = _now()
         self._send_lock = threading.Lock()
@@ -579,7 +687,7 @@ class _UDPSession:
         if not sess:
             return False
         ev = threading.Event()
-        pend = {'event': ev, 'proto': 'udp'}
+        pend = {'event': ev, 'proto': 'udp', 'created_at': _now()}
         self.tunnel.register_pending(self.token, self.conn_id, pend)
         sess.send({'type': 'open', 'conn_id': self.conn_id, 'proto': 'udp', 'target': self.target})
         if not ev.wait(timeout=OPEN_TIMEOUT):
@@ -647,7 +755,7 @@ class _UDPListener:
         self._sock: Optional[socket.socket] = None
         self._sessions: Dict[Tuple[str, int], _UDPSession] = {}
         self._lock = threading.Lock()
-        self._rr = -1
+        self._rr = 0
 
     def start(self) -> None:
         if self._th and self._th.is_alive():
@@ -673,8 +781,9 @@ class _UDPListener:
         rs = self.rule.remotes or []
         if not rs:
             return ''
+        target = rs[self._rr % len(rs)]
         self._rr = (self._rr + 1) % len(rs)
-        return rs[self._rr]
+        return target
 
     def _serve(self) -> None:
         host, port = _split_hostport(self.rule.listen)
@@ -684,7 +793,6 @@ class _UDPListener:
         s.settimeout(1.0)
         self._sock = s
 
-        # cleanup thread
         threading.Thread(target=self._cleanup_loop, daemon=True).start()
 
         while not self._stop.is_set():
@@ -725,25 +833,37 @@ class _UDPListener:
                         s.close()
 
 
+@dataclass
+class _ClientState:
+    peer_host: str
+    peer_port: int
+    token: str
+    node_id: int
+    connected: bool = False
+    dial_mode: str = ''
+    last_attempt_at: float = 0.0
+    last_connected_at: float = 0.0
+    last_hello_ok_at: float = 0.0
+    last_pong_at: float = 0.0
+    rtt_ms: Optional[int] = None
+    handshake_ms: Optional[int] = None
+    last_error: str = ''
+
+
 class _TunnelClient:
     """B-side client maintaining control connection to A, and opening data connections on demand."""
 
-    def __init__(self, key: str, peer_host: str, peer_port: int, token: str, node_id: int, server_cert_pem: str = ''):
-        self.key = str(key or '').strip() or f"{peer_host}:{peer_port}:{_mask_token(token)}"
+    def __init__(self, peer_host: str, peer_port: int, token: str, node_id: int, server_cert_pem: str = ''):
         self.peer_host = peer_host
         self.peer_port = int(peer_port)
         self.token = token
         self.node_id = int(node_id)
         self.server_cert_pem = server_cert_pem or ''
-        self.state = ClientRuntimeState(
-            key=self.key,
-            peer_host=self.peer_host,
-            peer_port=self.peer_port,
-            token=_mask_token(self.token),
-            tls_verify=bool(self.server_cert_pem),
-        )
         self._stop = threading.Event()
         self._th: Optional[threading.Thread] = None
+
+        self._state_lock = threading.Lock()
+        self._state = _ClientState(peer_host=self.peer_host, peer_port=self.peer_port, token=self.token, node_id=self.node_id)
 
     def start(self) -> None:
         if self._th and self._th.is_alive():
@@ -756,82 +876,190 @@ class _TunnelClient:
     def stop(self) -> None:
         self._stop.set()
 
-    def _dial(self) -> Optional[Any]:
-        """Dial A side tunnel port.
+    def get_state(self) -> Dict[str, Any]:
+        with self._state_lock:
+            st = self._state
+            return {
+                'peer_host': st.peer_host,
+                'peer_port': st.peer_port,
+                'token': _mask_token(st.token),
+                'connected': st.connected,
+                'dial_mode': st.dial_mode,
+                'last_attempt_at': int(st.last_attempt_at) if st.last_attempt_at else 0,
+                'last_connected_at': int(st.last_connected_at) if st.last_connected_at else 0,
+                'last_hello_ok_at': int(st.last_hello_ok_at) if st.last_hello_ok_at else 0,
+                'last_pong_at': int(st.last_pong_at) if st.last_pong_at else 0,
+                'rtt_ms': st.rtt_ms,
+                'handshake_ms': st.handshake_ms,
+                'last_error': st.last_error,
+            }
+
+    def _set_state(self, **kwargs: Any) -> None:
+        with self._state_lock:
+            for k, v in kwargs.items():
+                if hasattr(self._state, k):
+                    setattr(self._state, k, v)
+
+    def _dial(self) -> Tuple[Optional[Any], str, str]:
+        """Dial A-side tunnel port.
 
         Prefer TLS. If A cannot enable TLS (e.g. missing openssl and no cert provisioned),
         the TLS handshake usually fails with WRONG_VERSION_NUMBER/UNKNOWN_PROTOCOL.
         In that case, and only when verification is not required, we fall back to plaintext
         to keep connectivity (still authenticated by token).
-        """
-        need_verify = bool(self.server_cert_pem)
 
-        # 1) Prefer TLS
+        Returns: (socket_like, dial_mode, error)
+        """
         try:
             raw = socket.create_connection((self.peer_host, self.peer_port), timeout=6)
-            _set_tcp_keepalive(raw)
+            raw.settimeout(None)
+            _set_keepalive(raw)
+        except Exception as exc:
+            return None, '', f'dial_failed: {exc}'
+
+        # TLS first
+        try:
             ctx = _mk_client_ssl_context(self.server_cert_pem or None)
             ss = ctx.wrap_socket(raw, server_hostname=None)
             ss.settimeout(None)
-            self.state.last_dial_mode = 'tls'
-            return ss
+            return ss, 'tls', ''
+        except ssl.SSLCertVerificationError as exc:
+            _safe_close(raw)
+            return None, '', f'tls_verify_failed: {exc}'
+        except ssl.SSLError as exc:
+            msg = str(exc).upper()
+            # Only fall back when TLS is not required and error indicates server is plaintext/HTTP.
+            if (not self.server_cert_pem) and ALLOW_PLAINTEXT_FALLBACK and (
+                'WRONG_VERSION_NUMBER' in msg or 'UNKNOWN_PROTOCOL' in msg or 'HTTP_REQUEST' in msg
+            ):
+                # Re-dial plaintext
+                try:
+                    raw2 = socket.create_connection((self.peer_host, self.peer_port), timeout=6)
+                    raw2.settimeout(None)
+                    _set_keepalive(raw2)
+                    return raw2, 'plain', ''
+                except Exception as exc2:
+                    return None, '', f'dial_failed: {exc2}'
+            _safe_close(raw)
+            return None, '', f'dial_tls_failed: {exc}'
         except Exception as exc:
-            # 2) Fallback to plaintext: only when verification is not required and explicitly allowed.
-            if need_verify or (not ALLOW_PLAINTEXT_FALLBACK):
-                self.state.last_error = f"dial_tls_failed: {exc}"
-                return None
-            try:
-                raw = socket.create_connection((self.peer_host, self.peer_port), timeout=6)
-                _set_tcp_keepalive(raw)
-                raw.settimeout(None)
-                self.state.last_dial_mode = 'plain'
-                return raw
-            except Exception as exc2:
-                self.state.last_error = f"dial_failed: {exc2}"
-                return None
+            _safe_close(raw)
+            return None, '', f'dial_tls_failed: {exc}'
+
+    def _hello(self, ss: Any, dial_mode: str) -> Tuple[bool, str, Optional[int]]:
+        """Perform authenticated hello.
+
+        Returns: (ok, err, handshake_ms)
+        """
+        t0 = _now()
+        nonce = uuid.uuid4().hex
+        ts = int(_now())
+        sig = _hmac_sig(self.token, self.node_id, ts, nonce)
+
+        hello = {
+            'type': 'hello',
+            'magic': INTRANET_MAGIC,
+            'ver': INTRANET_PROTO_VER,
+            'node_id': self.node_id,
+            'token': self.token,
+            'ts': ts,
+            'nonce': nonce,
+            'sig': sig,
+            'dial_mode': dial_mode,
+        }
+
+        try:
+            ss.sendall(_json_line(hello))
+        except Exception as exc:
+            return False, f'hello_send_failed: {exc}', None
+
+        try:
+            # Wait hello_ok
+            ss.settimeout(HELLO_TIMEOUT)
+            line = _recv_line(ss)
+            ss.settimeout(None)
+        except Exception as exc:
+            return False, f'hello_timeout: {exc}', None
+
+        if not line:
+            return False, 'hello_no_response', None
+
+        if line.startswith('HTTP/') or line.startswith('GET ') or line.startswith('POST '):
+            return False, 'peer_is_http_proxy', None
+
+        try:
+            resp = json.loads(line)
+        except Exception:
+            return False, 'hello_bad_response', None
+
+        if str(resp.get('type') or '') == 'hello_ok':
+            hs = int((_now() - t0) * 1000)
+            return True, '', hs
+
+        if str(resp.get('type') or '') == 'hello_err':
+            return False, str(resp.get('error') or 'hello_err'), None
+
+        return False, 'hello_unexpected_response', None
 
     def _loop(self) -> None:
         backoff = 1.0
+        seq = 0
+        last_rtt: Optional[int] = None
+
         while not self._stop.is_set():
-            ss = self._dial()
+            self._set_state(last_attempt_at=_now(), connected=False)
+            ss, dial_mode, dial_err = self._dial()
             if not ss:
+                self._set_state(last_error=dial_err, dial_mode='', connected=False)
                 time.sleep(min(10.0, backoff))
                 backoff = min(10.0, backoff * 1.6 + 0.2)
                 continue
-            backoff = 1.0
-            self.state.last_connect_at = _now()
-            self.state.connected = False
-            try:
-                ss.sendall(_json_line({'type': 'hello', 'ver': 2, 'node_id': self.node_id, 'token': self.token}))
-                line = _recv_line(ss)
-                if not line:
-                    _safe_close(ss)
-                    continue
-                resp = json.loads(line)
-                if str(resp.get('type')) != 'hello_ok':
-                    self.state.last_error = str(resp.get('error') or 'hello_failed')
-                    _safe_close(ss)
-                    continue
-            except Exception:
-                self.state.last_error = 'hello_io_failed'
+
+            # hello
+            ok, herr, hs_ms = self._hello(ss, dial_mode)
+            if not ok:
+                self._set_state(last_error=herr, dial_mode=dial_mode, connected=False, handshake_ms=None)
+                _log('client_hello_failed', peer=f'{self.peer_host}:{self.peer_port}', token=_mask_token(self.token), dial_mode=dial_mode, error=herr)
                 _safe_close(ss)
+                time.sleep(min(10.0, backoff))
+                backoff = min(10.0, backoff * 1.6 + 0.2)
                 continue
 
-            self.state.connected = True
-            self.state.last_hello_at = _now()
-            self.state.last_error = ''
-            _log('client_connected', key=self.key, peer=f"{self.peer_host}:{self.peer_port}", mode=self.state.last_dial_mode)
+            backoff = 1.0
+            now = _now()
+            self._set_state(
+                connected=True,
+                dial_mode=dial_mode,
+                last_connected_at=now,
+                last_hello_ok_at=now,
+                last_pong_at=now,
+                rtt_ms=None,
+                handshake_ms=hs_ms,
+                last_error='',
+            )
+            _log('client_connected', peer=f'{self.peer_host}:{self.peer_port}', token=_mask_token(self.token), dial_mode=dial_mode, handshake_ms=hs_ms)
 
-            # main loop
-            last_ping = _now()
+            last_ping = 0.0
             while not self._stop.is_set():
-                # send keepalive ping
-                if _now() - last_ping > 20:
+                # send ping
+                if (_now() - last_ping) >= PING_INTERVAL:
+                    seq += 1
+                    ping = {'type': 'ping', 'seq': seq, 'ts': _now_ms()}
+                    if last_rtt is not None:
+                        ping['rtt_ms'] = int(last_rtt)
                     try:
-                        ss.sendall(_json_line({'type': 'ping', 'ts': int(_now())}))
-                    except Exception:
+                        ss.sendall(_json_line(ping))
+                    except Exception as exc:
+                        self._set_state(last_error=f'control_send_failed: {exc}')
                         break
                     last_ping = _now()
+
+                # pong timeout protection
+                st = self.get_state()
+                lp = float(st.get('last_pong_at') or 0)
+                if lp and (_now() - lp) > PONG_TIMEOUT:
+                    self._set_state(last_error='pong_timeout')
+                    break
 
                 try:
                     ss.settimeout(2.0)
@@ -839,23 +1067,52 @@ class _TunnelClient:
                     ss.settimeout(None)
                 except socket.timeout:
                     continue
-                except Exception:
+                except Exception as exc:
+                    self._set_state(last_error=f'control_recv_failed: {exc}')
                     break
+
                 if not line:
+                    self._set_state(last_error='control_closed')
                     break
+
+                if line.startswith('HTTP/') or line.startswith('GET ') or line.startswith('POST '):
+                    self._set_state(last_error='peer_is_http_proxy')
+                    break
+
                 try:
                     msg = json.loads(line)
                 except Exception:
                     continue
-                if str(msg.get('type')) == 'open':
-                    threading.Thread(target=self._handle_open, args=(msg,), daemon=True).start()
-            _safe_close(ss)
-            if self.state.connected:
-                _log('client_disconnected', key=self.key, peer=f"{self.peer_host}:{self.peer_port}")
-            self.state.connected = False
 
-    def _open_data(self) -> Optional[Any]:
-        return self._dial()
+                t = str(msg.get('type') or '')
+
+                if t == 'pong':
+                    try:
+                        echo_ts = int(msg.get('echo_ts') or 0)
+                    except Exception:
+                        echo_ts = 0
+                    if echo_ts > 0:
+                        rtt = max(0, _now_ms() - echo_ts)
+                        last_rtt = int(rtt)
+                        self._set_state(rtt_ms=int(rtt), last_pong_at=_now())
+                    else:
+                        self._set_state(last_pong_at=_now())
+                    continue
+
+                if t == 'open':
+                    threading.Thread(target=self._handle_open, args=(msg,), daemon=True).start()
+                    continue
+
+            # disconnected
+            self._set_state(connected=False)
+            _safe_close(ss)
+            # next loop with backoff
+
+    def _open_data(self) -> Tuple[Optional[Any], str]:
+        ss, dial_mode, err = self._dial()
+        if not ss:
+            return None, err
+        return ss, ''
 
     def _handle_open(self, msg: Dict[str, Any]) -> None:
         conn_id = str(msg.get('conn_id') or '')
@@ -872,21 +1129,24 @@ class _TunnelClient:
         try:
             host, port = _split_hostport(target)
             out = socket.create_connection((host, port), timeout=6)
-            _set_tcp_keepalive(out)
             out.settimeout(None)
+            _set_keepalive(out)
         except Exception as exc:
-            ds = self._open_data()
+            ds, err = self._open_data()
             if ds:
                 try:
                     ds.sendall(_json_line({'type': 'data', 'proto': 'tcp', 'token': self.token, 'conn_id': conn_id, 'ok': False, 'error': str(exc)}))
                 except Exception:
                     pass
                 _safe_close(ds)
+            else:
+                _log('data_open_failed', target=target, proto='tcp', error=err)
             return
 
-        ds = self._open_data()
+        ds, err = self._open_data()
         if not ds:
             _safe_close(out)
+            _log('data_dial_failed', target=target, proto='tcp', error=err)
             return
         try:
             ds.sendall(_json_line({'type': 'data', 'proto': 'tcp', 'token': self.token, 'conn_id': conn_id, 'ok': True}))
@@ -903,18 +1163,21 @@ class _TunnelClient:
             us.connect((host, port))
             us.settimeout(1.0)
         except Exception as exc:
-            ds = self._open_data()
+            ds, err = self._open_data()
             if ds:
                 try:
                     ds.sendall(_json_line({'type': 'data_udp', 'proto': 'udp', 'token': self.token, 'conn_id': conn_id, 'ok': False, 'error': str(exc)}))
                 except Exception:
                     pass
                 _safe_close(ds)
+            else:
+                _log('data_open_failed', target=target, proto='udp', error=err)
             return
 
-        ds = self._open_data()
+        ds, err = self._open_data()
         if not ds:
             _safe_close(us)
+            _log('data_dial_failed', target=target, proto='udp', error=err)
             return
         try:
             ds.sendall(_json_line({'type': 'data_udp', 'proto': 'udp', 'token': self.token, 'conn_id': conn_id, 'ok': True}))
@@ -923,29 +1186,30 @@ class _TunnelClient:
             _safe_close(us)
             return
 
-        # Start bidirectional udp frame relay
         stop = threading.Event()
         threading.Thread(target=_udp_from_data_to_target, args=(ds, us, stop), daemon=True).start()
         threading.Thread(target=_udp_from_target_to_data, args=(ds, us, stop), daemon=True).start()
-        # wait until closed
         while not stop.is_set():
             time.sleep(0.5)
         _safe_close(ds)
         _safe_close(us)
 
 
-def _recv_exact(sock: ssl.SSLSocket, n: int) -> bytes:
+def _recv_exact(sock: Any, n: int) -> bytes:
     buf = b''
     while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
+        try:
+            chunk = sock.recv(n - len(buf))
+        except Exception:
+            return b''
         if not chunk:
             return b''
         buf += chunk
     return buf
 
 
-def _relay_tcp(a: socket.socket, b: ssl.SSLSocket) -> None:
-    """Bidirectional relay between a plain TCP socket and a (TLS) tunnel socket."""
+def _relay_tcp(a: socket.socket, b: Any) -> None:
+    """Bidirectional relay between a plain TCP socket and a (TLS/plain) tunnel socket."""
     stop = threading.Event()
 
     def _pump(src, dst):
@@ -963,14 +1227,13 @@ def _relay_tcp(a: socket.socket, b: ssl.SSLSocket) -> None:
     t2 = threading.Thread(target=_pump, args=(b, a), daemon=True)
     t1.start()
     t2.start()
-    # wait
     while not stop.is_set():
         time.sleep(0.2)
     _safe_close(a)
     _safe_close(b)
 
 
-def _udp_from_data_to_target(data_sock: ssl.SSLSocket, udp_sock: socket.socket, stop: threading.Event) -> None:
+def _udp_from_data_to_target(data_sock: Any, udp_sock: socket.socket, stop: threading.Event) -> None:
     try:
         while not stop.is_set():
             hdr = _recv_exact(data_sock, 4)
@@ -988,7 +1251,7 @@ def _udp_from_data_to_target(data_sock: ssl.SSLSocket, udp_sock: socket.socket, 
     stop.set()
 
 
-def _udp_from_target_to_data(data_sock: ssl.SSLSocket, udp_sock: socket.socket, stop: threading.Event) -> None:
+def _udp_from_target_to_data(data_sock: Any, udp_sock: socket.socket, stop: threading.Event) -> None:
     try:
         while not stop.is_set():
             try:
@@ -1015,18 +1278,8 @@ def _split_hostport(addr: str) -> Tuple[str, int]:
     if addr.count(':') == 1:
         host, p = addr.split(':', 1)
         return (host.strip() or '0.0.0.0', int(p))
-    # last colon
     host, p = addr.rsplit(':', 1)
     return (host.strip() or '0.0.0.0', int(p))
-
-
-def _mask_token(token: str) -> str:
-    t = (token or '').strip()
-    if not t:
-        return ''
-    if len(t) <= 12:
-        return t
-    return f"{t[:4]}…{t[-4:]}"
 
 
 class IntranetManager:
@@ -1047,116 +1300,104 @@ class IntranetManager:
             self._apply_rules_locked(rules)
 
     def status(self) -> Dict[str, Any]:
-        """Lightweight runtime status for debugging."""
         with self._lock:
-            servers: List[Dict[str, Any]] = []
+            servers = []
             for p, s in self._servers.items():
                 tls_on = bool(getattr(s, '_ssl_ctx', None) is not None)
-                sess_map: Dict[str, Any] = getattr(s, '_sessions', {})  # token -> _ControlSession
                 sessions = []
-                try:
-                    for t, sess in list(sess_map.items()):
+                with getattr(s, '_sessions_lock'):
+                    for tok, sess in list(getattr(s, '_sessions', {}).items()):
                         sessions.append({
-                            'token': _mask_token(t),
-                            'node_id': int(getattr(sess, 'node_id', 0) or 0),
-                            'last_seen': int(getattr(sess, 'last_seen', 0) or 0),
+                            'token': _mask_token(tok),
+                            'node_id': sess.node_id,
+                            'dial_mode': sess.dial_mode,
+                            'legacy': bool(sess.legacy),
+                            'connected_at': int(sess.connected_at),
+                            'last_seen_at': int(sess.last_seen),
+                            'rtt_ms': sess.rtt_ms,
                         })
-                except Exception:
-                    sessions = [_mask_token(x) for x in list(sess_map.keys())]
-                servers.append({'port': p, 'tls': tls_on, 'sessions': sessions})
+                servers.append({'port': int(p), 'tls': tls_on, 'sessions': sessions})
 
             clients = []
-            for k, c in self._clients.items():
-                st = getattr(c, 'state', None)
-                if isinstance(st, ClientRuntimeState):
-                    clients.append({
-                        'key': k,
-                        'peer': f"{st.peer_host}:{st.peer_port}",
-                        'token': st.token,
-                        'tls_verify': bool(st.tls_verify),
-                        'connected': bool(st.connected),
-                        'dial_mode': st.last_dial_mode,
-                        'last_connect': int(st.last_connect_at),
-                        'last_hello': int(st.last_hello_at),
-                        'last_error': st.last_error,
-                    })
-                else:
-                    clients.append({'key': k})
+            for key, c in self._clients.items():
+                st = c.get_state()
+                st['key'] = key
+                clients.append(st)
 
-            # shrink rule snapshot: avoid sending large PEMs in frequent push reports
-            def rule_view(r: IntranetRule) -> Dict[str, Any]:
-                return {
-                    'sync_id': r.sync_id,
+            # per rule quick view
+            rules = []
+            for sync_id, r in self._last_rules.items():
+                rules.append({
+                    'sync_id': sync_id,
                     'role': r.role,
                     'listen': r.listen,
-                    'protocol': r.protocol,
-                    'balance': r.balance,
-                    'remotes': r.remotes,
-                    'peer_node_id': r.peer_node_id,
                     'peer_host': r.peer_host,
-                    'tunnel_port': r.tunnel_port,
+                    'port': r.tunnel_port,
                     'token': _mask_token(r.token),
-                    'tls_verify': bool(r.server_cert_pem),
-                }
+                    'handshake': self.handshake_health(r.sync_id, {
+                        'intranet_role': r.role,
+                        'intranet_token': r.token,
+                        'intranet_server_port': r.tunnel_port,
+                        'intranet_peer_host': r.peer_host,
+                    }),
+                })
 
             return {
                 'servers': servers,
                 'tcp_rules': list(self._tcp_listeners.keys()),
                 'udp_rules': list(self._udp_listeners.keys()),
                 'clients': clients,
-                'rules': {k: rule_view(v) for k, v in self._last_rules.items()},
+                'rules': rules,
             }
 
-    def diagnose(self) -> Dict[str, Any]:
-        """High-level diagnosis: highlights the most common misconfigurations."""
-        st = self.status()
-        warnings: List[str] = []
-        rules: Dict[str, Any] = st.get('rules') or {}
+    def handshake_health(self, sync_id: str, ex: Dict[str, Any]) -> Dict[str, Any]:
+        """Return health payload for panel handshake check.
 
-        # server rules should have matching client connected
+        Shape:
+          {ok:bool, latency_ms?:int, error?:str, message?:str}
+        """
+        role = str(ex.get('intranet_role') or '').strip()
+        token = str(ex.get('intranet_token') or '').strip()
         try:
-            for sync_id, r in rules.items():
-                role = str(r.get('role') or '')
-                token_mask = str(r.get('token') or '')
-                if role == 'server':
-                    port = int(r.get('tunnel_port') or DEFAULT_TUNNEL_PORT)
-                    found = False
-                    for srv in st.get('servers') or []:
-                        if int(srv.get('port') or 0) != port:
-                            continue
-                        for s in srv.get('sessions') or []:
-                            tok = s.get('token') if isinstance(s, dict) else str(s)
-                            if tok and (token_mask == tok):
-                                found = True
-                                break
-                        if found:
-                            break
-                    if not found:
-                        warnings.append(f"[server] 规则 {sync_id} 未检测到内网客户端连接（token={token_mask}，port={port}）。")
-                elif role == 'client':
-                    peer = str(r.get('peer_host') or '')
-                    port = int(r.get('tunnel_port') or DEFAULT_TUNNEL_PORT)
-                    found_client = False
-                    for c in st.get('clients') or []:
-                        if not isinstance(c, dict):
-                            continue
-                        k = str(c.get('key') or '')
-                        # key contains peer:port:token (raw or masked). We match loosely by peer/port.
-                        if (peer and peer in k and str(port) in k):
-                            found_client = True
-                            if not bool(c.get('connected')):
-                                warnings.append(f"[client] 规则 {sync_id} 客户端未连接到 {peer}:{port}（{c.get('last_error') or 'no_error'}）。")
-                            break
-                    if not found_client:
-                        warnings.append(f"[client] 规则 {sync_id} 未启动客户端（peer={peer}:{port}）。")
+            port = int(ex.get('intranet_server_port') or DEFAULT_TUNNEL_PORT)
         except Exception:
-            pass
+            port = DEFAULT_TUNNEL_PORT
 
-        return {
-            'ok': True,
-            'status': st,
-            'warnings': warnings,
-        }
+        # Server side: check control session presence
+        if role == 'server':
+            srv = self._servers.get(port)
+            if not srv:
+                return {'ok': False, 'error': 'server_not_running'}
+            sess = srv.get_session(token)
+            if not sess:
+                return {'ok': False, 'error': 'no_client_connected'}
+            latency = sess.rtt_ms
+            if latency is None:
+                latency = int(max(0.0, (_now() - sess.last_seen) * 1000.0))
+            payload: Dict[str, Any] = {'ok': True, 'latency_ms': int(latency)}
+            if sess.legacy:
+                payload['message'] = 'legacy_client'
+            return payload
+
+        # Client side: check client runtime
+        if role == 'client':
+            peer_host = str(ex.get('intranet_peer_host') or '').strip()
+            key = f"{peer_host}:{port}:{token}" if peer_host and token else ''
+            c = self._clients.get(key) if key else None
+            if not c:
+                return {'ok': False, 'error': 'client_not_running'}
+            st = c.get_state()
+            if st.get('connected'):
+                payload2: Dict[str, Any] = {'ok': True}
+                if st.get('rtt_ms') is not None:
+                    payload2['latency_ms'] = int(st.get('rtt_ms') or 0)
+                elif st.get('handshake_ms') is not None:
+                    payload2['latency_ms'] = int(st.get('handshake_ms') or 0)
+                return payload2
+            err = str(st.get('last_error') or 'not_connected')
+            return {'ok': False, 'error': err}
+
+        return {'ok': None, 'message': 'unknown_role'}
 
     def _parse_rules(self, pool: Dict[str, Any]) -> Dict[str, IntranetRule]:
         out: Dict[str, IntranetRule] = {}
@@ -1216,7 +1457,6 @@ class IntranetManager:
         return out
 
     def _apply_rules_locked(self, rules: Dict[str, IntranetRule]) -> None:
-        # servers: collect tokens per port
         tokens_by_port: Dict[int, set[str]] = {}
         for r in rules.values():
             if r.role == 'server':
@@ -1280,10 +1520,10 @@ class IntranetManager:
             key = f"{r.peer_host}:{r.tunnel_port}:{r.token}"
             c = self._clients.get(key)
             if not c:
-                c = _TunnelClient(key=key, peer_host=r.peer_host, peer_port=r.tunnel_port, token=r.token, node_id=self.node_id, server_cert_pem=r.server_cert_pem)
+                c = _TunnelClient(peer_host=r.peer_host, peer_port=r.tunnel_port, token=r.token, node_id=self.node_id, server_cert_pem=r.server_cert_pem)
                 c.start()
             desired_clients[key] = c
-        # stop removed
+
         for key in list(self._clients.keys()):
             if key not in desired_clients:
                 self._clients[key].stop()
