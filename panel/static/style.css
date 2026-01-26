@@ -128,8 +128,14 @@ a{color:inherit}
 }
 .nav-link:hover{border-color:var(--line);background:var(--surface-2);color:var(--text)}
 
-.container{max-width:var(--container);margin:0 auto;padding:14px 16px;position:relative;z-index:1}
-.footer{max-width:var(--container);margin:0 auto;padding:12px 16px;color:var(--muted);font-size:12px;position:relative;z-index:1}
+/*
+  NOTE
+  ----
+  Don't create a stacking context on the main container.
+  Otherwise, fixed modals rendered inside <main> can be trapped *under* the sticky topbar.
+*/
+.container{max-width:var(--container);margin:0 auto;padding:14px 16px;position:relative}
+.footer{max-width:var(--container);margin:0 auto;padding:12px 16px;color:var(--muted);font-size:12px;position:relative}
 
 /* Layout helpers */
 .row{display:flex;gap:12px;align-items:center}
@@ -1118,12 +1124,16 @@ body.modal-open{ overflow:hidden; }
 /* =========================
    Agent Update Modal — Dense / Premium
    ========================= */
-#agentUpdateModal.modal{ padding:12px; }
+/* Agent update should feel like a modal popup (not a full-page view) */
+#agentUpdateModal.modal{
+  padding:18px;
+  align-items:center;
+}
 
 .au-modal{
-  width: min(1480px, calc(100vw - 24px));
-  height: calc(100vh - 24px);
-  max-height: calc(100vh - 24px);
+  width: min(1200px, calc(100vw - 36px));
+  height: min(820px, calc(100vh - 120px));
+  max-height: calc(100vh - 120px);
 }
 .au-modal .modal-head{ padding:10px 14px; }
 .au-modal .modal-body.au-body{
@@ -1263,6 +1273,8 @@ body.modal-open{ overflow:hidden; }
 }
 
 @media (max-width: 720px){
+  #agentUpdateModal.modal{ padding:12px; align-items:stretch; }
+  .au-modal{ width: calc(100vw - 24px); height: calc(100vh - 24px); max-height: calc(100vh - 24px); }
   .au-modal{ height: calc(100vh - 24px); }
   .au-modal .modal-body.au-body{ overflow:auto; }
   .au-list-card{ flex:0 0 auto; min-height:auto; }
