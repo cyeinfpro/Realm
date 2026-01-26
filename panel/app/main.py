@@ -1079,17 +1079,22 @@ async def api_agents_update_progress(update_id: str = '', user: str = Depends(re
     """Return rollout progress."""
     uid = (update_id or '').strip()
     nodes = list_nodes()
-    items = []
+    orders = get_group_orders()
+
+    items: List[Dict[str, Any]] = []
     summary = {'total': 0, 'done': 0, 'failed': 0, 'installing': 0, 'sent': 0, 'queued': 0, 'offline': 0, 'other': 0}
+
     for n in nodes:
         nuid = str(n.get('desired_agent_update_id') or '').strip()
         if uid and nuid != uid:
             continue
+
         summary['total'] += 1
         online = _is_report_fresh(n)
         desired = str(n.get('desired_agent_version') or '').strip()
         cur = str(n.get('agent_reported_version') or '').strip()
         st = str(n.get('agent_update_state') or '').strip() or 'queued'
+
         if not online:
             st2 = 'offline'
         else:
@@ -1103,10 +1108,14 @@ async def api_agents_update_progress(update_id: str = '', user: str = Depends(re
         else:
             summary['other'] += 1
 
+        group_name = str(n.get('group_name') or '').strip() or '默认分组'
+        group_order = int(orders.get(group_name, 9999) or 9999)
+
         items.append({
             'id': n.get('id'),
             'name': n.get('name'),
-            'group_name': n.get('group_name'),
+            'group_name': group_name,
+            'group_order': group_order,
             'online': bool(online),
             'agent_version': cur,
             'desired_version': desired,
@@ -1114,6 +1123,17 @@ async def api_agents_update_progress(update_id: str = '', user: str = Depends(re
             'msg': str(n.get('agent_update_msg') or '').strip(),
             'last_seen_at': n.get('last_seen_at'),
         })
+
+    # Deterministic ordering (group order -> group -> name -> id)
+    try:
+        items.sort(key=lambda x: (
+            int(x.get('group_order') or 9999),
+            str(x.get('group_name') or ''),
+            str(x.get('name') or ''),
+            int(x.get('id') or 0),
+        ))
+    except Exception:
+        pass
 
     return {'ok': True, 'update_id': uid, 'summary': summary, 'nodes': items}
 

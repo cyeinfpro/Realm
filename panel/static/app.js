@@ -2284,30 +2284,68 @@ let __AGENT_UPDATE_TIMER__ = null;
 let __AGENT_UPDATE_ID__ = '';
 let __AGENT_UPDATE_TARGET__ = '';
 
+let __AU_FILTER_STATE__ = 'all';
+let __AU_SEARCH__ = '';
+let __AU_LAST_ROWS__ = [];
+let __AU_LAST_SUMMARY__ = null;
+let __AU_BOUND__ = false;
+
 function openAgentUpdateModal(){
   const m = document.getElementById('agentUpdateModal');
   if(!m) return;
   m.style.display = 'flex';
   document.body.classList.add('modal-open');
 
-  // reset UI
+  // reset state/UI
   __AGENT_UPDATE_ID__ = '';
   __AGENT_UPDATE_TARGET__ = '';
+  __AU_FILTER_STATE__ = 'all';
+  __AU_SEARCH__ = '';
+  __AU_LAST_ROWS__ = [];
+  __AU_LAST_SUMMARY__ = null;
+
   const t = document.getElementById('agentUpdateTarget');
   const id = document.getElementById('agentUpdateId');
   const sum = document.getElementById('agentUpdateSummary');
   const bar = document.getElementById('agentUpdateBar');
+  const seg = document.getElementById('agentUpdateSegBar');
   const list = document.getElementById('agentUpdateList');
   const pills = document.getElementById('agentUpdatePills');
   const btn = document.getElementById('agentUpdateStartBtn');
+  const search = document.getElementById('agentUpdateSearch');
 
   if(t) t.textContent = '—';
   if(id) id.textContent = '';
   if(sum) sum.textContent = '—';
   if(bar) bar.style.width = '0%';
+  if(seg) seg.innerHTML = '';
   if(list) list.innerHTML = '';
   if(pills) pills.innerHTML = '';
   if(btn){ btn.disabled = false; btn.textContent = '开始更新'; }
+  if(search){ search.value = ''; }
+
+  // Bind handlers once
+  if(!__AU_BOUND__){
+    __AU_BOUND__ = true;
+
+    if(pills){
+      pills.addEventListener('click', (e)=>{
+        const el = (e.target && e.target.closest) ? e.target.closest('.pill-stat') : null;
+        if(!el) return;
+        const st = String(el.getAttribute('data-state') || 'all').trim() || 'all';
+        __AU_FILTER_STATE__ = st;
+        _renderPills(__AU_LAST_SUMMARY__ || {});
+        _renderList(__AU_LAST_ROWS__ || []);
+      });
+    }
+
+    if(search){
+      search.addEventListener('input', ()=>{
+        __AU_SEARCH__ = String(search.value || '').trim().toLowerCase();
+        _renderList(__AU_LAST_ROWS__ || []);
+      });
+    }
+  }
 
   // fetch latest agent version bundled with panel
   fetch('/api/agents/latest', { credentials: 'include' })
@@ -2354,54 +2392,171 @@ function _badgeClass(st){
   return 'muted';
 }
 
+function _statusWeight(st){
+  const s = String(st || '').toLowerCase();
+  if(s === 'failed') return 1;
+  if(s === 'installing') return 2;
+  if(s === 'sent') return 3;
+  if(s === 'queued') return 4;
+  if(s === 'offline') return 5;
+  if(s === 'done') return 6;
+  return 7;
+}
+
+function _renderSegBar(summary){
+  const seg = document.getElementById('agentUpdateSegBar');
+  if(!seg) return;
+  const s = summary || {};
+  const total = Number(s.total || 0) || 0;
+  if(!total){
+    seg.innerHTML = '';
+    return;
+  }
+  const parts = [
+    {k:'done', cls:'done', label:'完成'},
+    {k:'installing', cls:'installing', label:'安装中'},
+    {k:'failed', cls:'failed', label:'失败'},
+    {k:'offline', cls:'offline', label:'离线'},
+    {k:'sent', cls:'sent', label:'已下发'},
+    {k:'queued', cls:'queued', label:'排队'},
+  ];
+  const html = parts.map(p=>{
+    const v = Number(s[p.k] || 0) || 0;
+    if(v <= 0) return '';
+    const w = Math.max(0, Math.min(100, (v * 100 / total)));
+    const title = `${p.label} ${v}/${total}`;
+    return `<div class="au-seg ${p.cls}" style="width:${w}%" title="${escapeHtml(title)}"></div>`;
+  }).join('');
+  seg.innerHTML = html || '';
+}
+
 function _renderPills(summary){
   const pills = document.getElementById('agentUpdatePills');
   if(!pills) return;
   const s = summary || {};
+  const total = Number(s.total || 0) || 0;
   const items = [
-    {k:'done', label:'完成', cls:'ok'},
-    {k:'failed', label:'失败', cls:'bad'},
-    {k:'installing', label:'安装中', cls:'warn'},
-    {k:'sent', label:'已下发', cls:'info'},
-    {k:'queued', label:'排队', cls:'muted'},
-    {k:'offline', label:'离线', cls:'muted'},
+    {state:'all', label:'全部', cls:'muted', val: total},
+    {state:'done', label:'完成', cls:'ok', val: Number(s.done || 0)},
+    {state:'failed', label:'失败', cls:'bad', val: Number(s.failed || 0)},
+    {state:'installing', label:'安装中', cls:'warn', val: Number(s.installing || 0)},
+    {state:'sent', label:'已下发', cls:'info', val: Number(s.sent || 0)},
+    {state:'queued', label:'排队', cls:'muted', val: Number(s.queued || 0)},
+    {state:'offline', label:'离线', cls:'muted', val: Number(s.offline || 0)},
   ];
   pills.innerHTML = items.map(it=>{
-    const v = Number(s[it.k] || 0);
-    return `<span class="pill-stat ${it.cls}">${escapeHtml(it.label)} <strong>${escapeHtml(String(v))}</strong></span>`;
+    const active = (__AU_FILTER_STATE__ === it.state) ? ' active' : '';
+    return `<span class="pill-stat ${it.cls}${active}" data-state="${escapeHtml(it.state)}">${escapeHtml(it.label)} <strong>${escapeHtml(String(it.val))}</strong></span>`;
   }).join('');
+}
+
+function _countStates(rows){
+  const out = {done:0, failed:0, installing:0, sent:0, queued:0, offline:0, other:0};
+  (rows || []).forEach(n=>{
+    const st = String((n && n.state) || '').toLowerCase();
+    if(out.hasOwnProperty(st)) out[st] += 1;
+    else out.other += 1;
+  });
+  return out;
+}
+
+function _renderRow(n){
+  const name = (n.name || ('节点-' + n.id));
+  const stRaw = (n.state || '');
+  const stTxt = _stateText(stRaw);
+  const badge = _badgeClass(stRaw);
+  const cur = (n.agent_version || '-');
+  const des = (n.desired_version || '-');
+  const msg = String(n.msg || '').trim();
+  const msgTitle = msg ? ` title="${escapeHtml(msg)}"` : '';
+  const online = !!n.online;
+  const dotCls = online ? 'on' : 'off';
+  const last = String(n.last_seen_at || '').trim();
+  const lastTxt = last ? ('心跳 ' + last) : '未上报';
+
+  return `<div class="au-row">
+    <div class="au-node">
+      <div class="au-node-name">${escapeHtml(String(name))}</div>
+      <div class="au-node-meta">
+        <span class="au-dot ${dotCls}" title="${online ? '在线' : '离线'}"></span>
+        <span class="kv-mini mono">${escapeHtml(lastTxt)}</span>
+      </div>
+    </div>
+    <div class="au-col-r"><span class="badge ${badge}">${escapeHtml(String(stTxt))}</span></div>
+    <div class="au-ver-cell mono">${escapeHtml(String(cur))} → ${escapeHtml(String(des))}</div>
+    <div class="au-msg-cell"${msgTitle}>${escapeHtml(msg || '—')}</div>
+  </div>`;
 }
 
 function _renderList(rows){
   const list = document.getElementById('agentUpdateList');
   if(!list) return;
   const arr = Array.isArray(rows) ? rows : [];
-  if(arr.length === 0){
-    list.innerHTML = `<div class="au-item"><div class="au-left"><div class="au-name">暂无数据</div><div class="au-sub"><span class="badge muted">等待下发或节点上报…</span></div></div></div>`;
+
+  let view = arr.slice();
+  const f = String(__AU_FILTER_STATE__ || 'all').toLowerCase();
+  if(f && f !== 'all'){
+    view = view.filter(n=> String((n && n.state) || '').toLowerCase() === f);
+  }
+
+  const q = String(__AU_SEARCH__ || '').trim().toLowerCase();
+  if(q){
+    view = view.filter(n=>{
+      const hay = [
+        n && n.name,
+        n && n.group_name,
+        n && n.msg,
+        n && n.agent_version,
+        n && n.desired_version,
+        n && n.last_seen_at,
+      ].map(x=>String(x || '')).join(' ').toLowerCase();
+      return hay.indexOf(q) !== -1;
+    });
+  }
+
+  if(view.length === 0){
+    list.innerHTML = `<div class="au-row"><div class="au-node"><div class="au-node-name">暂无匹配节点</div><div class="au-node-meta"><span class="kv-mini mono">调整筛选条件或搜索关键词</span></div></div></div>`;
     return;
   }
-  list.innerHTML = arr.map(n=>{
-    const name = (n.name || ('节点-' + n.id));
-    const stRaw = (n.state || '');
-    const stTxt = _stateText(stRaw);
-    const badge = _badgeClass(stRaw);
-    const cur = (n.agent_version || '-');
-    const des = (n.desired_version || '-');
-    const msg = (n.msg || '');
-    const msgText = msg ? String(msg) : '';
-    const msgTitle = msgText ? ` title="${escapeHtml(msgText)}"` : '';
-    const msgCell = msgText ? `<div class="au-msg"${msgTitle}>${escapeHtml(msgText)}</div>` : `<div class="au-msg">—</div>`;
-    return `<div class="au-item">
-      <div class="au-left">
-        <div class="au-name">${escapeHtml(String(name))}</div>
-        <div class="au-sub">
-          <span class="badge ${badge}">${escapeHtml(String(stTxt))}</span>
-          <span class="kv-mini mono">当前 ${escapeHtml(String(cur))}</span>
-          <span class="kv-mini mono">目标 ${escapeHtml(String(des))}</span>
-        </div>
+
+  // group by group_name
+  const gmap = new Map();
+  view.forEach(n=>{
+    const g = String((n && n.group_name) || '').trim() || '默认分组';
+    if(!gmap.has(g)) gmap.set(g, []);
+    gmap.get(g).push(n);
+  });
+
+  const groups = Array.from(gmap.entries()).map(([g, items])=>{
+    const ord = (items && items[0] && (items[0].group_order !== undefined)) ? Number(items[0].group_order) : 9999;
+    return {g, ord: (isNaN(ord) ? 9999 : ord), items};
+  });
+  groups.sort((a,b)=>{
+    if(a.ord !== b.ord) return a.ord - b.ord;
+    return String(a.g).localeCompare(String(b.g), 'zh-Hans-CN');
+  });
+
+  groups.forEach(gr=>{
+    gr.items.sort((a,b)=>{
+      const wa = _statusWeight(a && a.state);
+      const wb = _statusWeight(b && b.state);
+      if(wa !== wb) return wa - wb;
+      return String(a && a.name || '').localeCompare(String(b && b.name || ''), 'zh-Hans-CN');
+    });
+  });
+
+  list.innerHTML = groups.map(gr=>{
+    const c = _countStates(gr.items);
+    const head = `<summary>
+      <div class="au-group-title">${escapeHtml(gr.g)}</div>
+      <div class="au-group-meta">
+        <span class="kv-mini mono">${escapeHtml(String(gr.items.length))} 节点</span>
+        <span class="kv-mini mono">完成 ${escapeHtml(String(c.done))}</span>
+        <span class="kv-mini mono">失败 ${escapeHtml(String(c.failed))}</span>
       </div>
-      <div class="au-right">${msgCell}</div>
-    </div>`;
+    </summary>`;
+    const body = gr.items.map(_renderRow).join('');
+    return `<details class="au-group" open>${head}<div class="au-group-body">${body}</div></details>`;
   }).join('');
 }
 
@@ -2419,16 +2574,16 @@ async function _pollAgentUpdate(){
     if(!r.ok || !d.ok) return;
 
     const s = d.summary || {};
-    const total = Number(s.total || 0);
-    const done = Number(s.done || 0);
-    const failed = Number(s.failed || 0);
-    const offline = Number(s.offline || 0);
-    const installing = Number(s.installing || 0);
-    const sent = Number(s.sent || 0);
-    const queued = Number(s.queued || 0);
+    const total = Number(s.total || 0) || 0;
+    const done = Number(s.done || 0) || 0;
+    const failed = Number(s.failed || 0) || 0;
+    const offline = Number(s.offline || 0) || 0;
+    const installing = Number(s.installing || 0) || 0;
+    const sent = Number(s.sent || 0) || 0;
+    const queued = Number(s.queued || 0) || 0;
 
     if(sumEl){
-      sumEl.textContent = `进度：${done}/${total} · 安装中 ${installing} · 失败 ${failed} · 离线 ${offline} · 已下发 ${sent} · 排队 ${queued}`;
+      sumEl.textContent = `${done}/${total} 完成 · 安装中 ${installing} · 失败 ${failed} · 离线 ${offline} · 已下发 ${sent} · 排队 ${queued}`;
     }
 
     if(bar){
@@ -2436,8 +2591,12 @@ async function _pollAgentUpdate(){
       bar.style.width = pct + '%';
     }
 
+    __AU_LAST_SUMMARY__ = s;
+    __AU_LAST_ROWS__ = Array.isArray(d.nodes) ? d.nodes : [];
+
+    _renderSegBar(s);
     _renderPills(s);
-    _renderList(d.nodes);
+    _renderList(__AU_LAST_ROWS__);
 
   }catch(_e){}
 }
@@ -2489,7 +2648,6 @@ document.addEventListener('keydown', (e)=>{
   if(!m || m.style.display === 'none') return;
   if(e.key === 'Escape') closeAgentUpdateModal();
 });
-
 
 
 // ---------------- Dashboard: Full Restore Modal ----------------
