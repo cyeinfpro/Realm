@@ -2468,23 +2468,24 @@ function _renderRow(n){
   const cur = (n.agent_version || '-');
   const des = (n.desired_version || '-');
   const msg = String(n.msg || '').trim();
-  const msgTitle = msg ? ` title="${escapeHtml(msg)}"` : '';
   const online = !!n.online;
   const dotCls = online ? 'on' : 'off';
   const last = String(n.last_seen_at || '').trim();
-  const lastTxt = last ? ('心跳 ' + last) : '未上报';
+  const lastTxt = last ? (`心跳 ${last}`) : '未上报';
+  const tail = msg ? (` · ${msg}`) : '';
+  const cell = `${lastTxt}${tail}`;
+  const title = escapeHtml(cell);
 
   return `<div class="au-row">
     <div class="au-node">
       <div class="au-node-name">${escapeHtml(String(name))}</div>
-      <div class="au-node-meta">
-        <span class="au-dot ${dotCls}" title="${online ? '在线' : '离线'}"></span>
-        <span class="kv-mini mono">${escapeHtml(lastTxt)}</span>
-      </div>
     </div>
-    <div class="au-col-r"><span class="badge ${badge}">${escapeHtml(String(stTxt))}</span></div>
-    <div class="au-ver-cell mono">${escapeHtml(String(cur))} → ${escapeHtml(String(des))}</div>
-    <div class="au-msg-cell"${msgTitle}>${escapeHtml(msg || '—')}</div>
+    <div class="au-status-cell">
+      <span class="au-dot ${dotCls}" title="${online ? '在线' : '离线'}"></span>
+      <span class="badge ${badge}">${escapeHtml(String(stTxt))}</span>
+    </div>
+    <div class="au-ver-cell mono">${escapeHtml(String(cur))}→${escapeHtml(String(des))}</div>
+    <div class="au-msg-cell" title="${title}">${escapeHtml(cell)}</div>
   </div>`;
 }
 

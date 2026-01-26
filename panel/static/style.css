@@ -965,7 +965,8 @@ body.modal-open{ overflow:hidden; }
   overflow:hidden;
   display:flex;
   flex-direction:column;
-  max-height: calc(100vh - 56px);
+  /* keep within the overlay padding (default modal padding is 22px) */
+  max-height: calc(100vh - 44px);
   background: linear-gradient(180deg, rgba(15,23,42,0.88), rgba(15,23,42,0.72));
   border: 1px solid rgba(148,163,184,0.22);
   border-radius: 20px;
@@ -986,7 +987,7 @@ body.modal-open{ overflow:hidden; }
   align-items:center;
   justify-content:space-between;
   gap:10px;
-  padding:14px 16px;
+  padding:10px 14px;
   border-bottom:1px solid rgba(148,163,184,0.18);
   background: rgba(2,6,23,0.18);
   backdrop-filter: blur(18px);
@@ -996,7 +997,7 @@ body.modal-open{ overflow:hidden; }
 .modal-pro .modal-head .h2{ font-size:16px; font-weight:900; letter-spacing:0.3px; }
 
 .modal-pro .modal-body{
-  padding:14px 16px 16px;
+  padding:10px 14px 12px;
   overflow:auto;
 }
 
@@ -1034,12 +1035,12 @@ body.modal-open{ overflow:hidden; }
 .au-ver{ font-size:18px; font-weight:950; letter-spacing:0.3px; }
 
 .au-progress{
-  height:10px;
+  height:6px;
   border-radius:999px;
   background: rgba(0,0,0,0.22);
   border:1px solid rgba(255,255,255,0.07);
   overflow:hidden;
-  margin-top:10px;
+  margin-top:8px;
 }
 
 .au-progress-fill{
@@ -1117,17 +1118,20 @@ body.modal-open{ overflow:hidden; }
 /* =========================
    Agent Update Modal — Dense / Premium
    ========================= */
+#agentUpdateModal.modal{ padding:12px; }
+
 .au-modal{
-  width: min(1120px, calc(100vw - 44px));
-  height: min(860px, calc(100vh - 56px));
+  width: min(1480px, calc(100vw - 24px));
+  height: calc(100vh - 24px);
+  max-height: calc(100vh - 24px);
 }
-.au-modal .modal-head{ padding:12px 14px; }
+.au-modal .modal-head{ padding:10px 14px; }
 .au-modal .modal-body.au-body{
-  padding:12px 14px 14px;
+  padding:10px 14px 12px;
   overflow:hidden;
   display:flex;
   flex-direction:column;
-  gap:12px;
+  gap:10px;
 }
 
 .au-tip{
@@ -1154,14 +1158,14 @@ body.modal-open{ overflow:hidden; }
 }
 .au-tip-text{ font-size:12px; color:var(--muted); line-height:1.45; }
 
-.au-hero-grid{ display:grid; grid-template-columns: 1fr auto; gap:12px; align-items:start; }
-.au-hero-left{ display:flex; flex-direction:column; gap:6px; min-width:0; }
+.au-hero-grid{ display:grid; grid-template-columns: 1fr auto; gap:10px; align-items:start; }
+.au-hero-left{ display:flex; flex-direction:column; gap:4px; min-width:0; }
 .au-hero-right{ display:flex; flex-direction:column; align-items:flex-end; gap:8px; flex:0 0 auto; }
 .au-hero-right .btn{ min-width:96px; }
 
 .au-segbar{
-  margin-top:8px;
-  height:8px;
+  margin-top:6px;
+  height:6px;
   border-radius:999px;
   overflow:hidden;
   display:flex;
@@ -1180,7 +1184,10 @@ body.modal-open{ overflow:hidden; }
 
 .au-meta2{ justify-content:space-between; align-items:center; }
 .au-search{ flex:0 0 280px; max-width: 40%; }
-.au-search-input{ padding:8px 10px; border-radius:12px; min-height:34px; }
+.au-search-input{ padding:7px 9px; border-radius:12px; min-height:32px; }
+
+/* tighter chips in update modal */
+.au-modal .pill-stat{ padding:5px 9px; font-size:11px; }
 
 .pill-stat{ cursor:pointer; user-select:none; }
 .pill-stat:hover{ border-color: rgba(255,255,255,0.18); }
@@ -1190,10 +1197,10 @@ body.modal-open{ overflow:hidden; }
 .au-list-card{ padding:0; overflow:hidden; flex:1; display:flex; flex-direction:column; min-height:0; }
 .au-grid-head{
   display:grid;
-  grid-template-columns: 1.6fr 0.7fr 0.8fr 1.2fr;
+  grid-template-columns: 2.1fr 0.8fr 0.8fr 1.1fr;
   gap:10px;
   align-items:center;
-  padding:10px 12px;
+  padding:8px 12px;
   border-bottom:1px solid rgba(148,163,184,0.16);
   background: rgba(2,6,23,0.14);
   font-size:11px;
@@ -1214,7 +1221,7 @@ body.modal-open{ overflow:hidden; }
   align-items:center;
   justify-content:space-between;
   gap:10px;
-  padding:8px 12px;
+  padding:7px 12px;
   background: rgba(2,6,23,0.08);
   border-bottom:1px solid rgba(148,163,184,0.10);
 }
@@ -1224,12 +1231,14 @@ body.modal-open{ overflow:hidden; }
 
 .au-row{
   display:grid;
-  grid-template-columns: 1.6fr 0.7fr 0.8fr 1.2fr;
+  grid-template-columns: 2.1fr 0.8fr 0.8fr 1.1fr;
   gap:10px;
   align-items:center;
-  padding:8px 12px;
+  padding:7px 12px;
   border-bottom:1px solid rgba(148,163,184,0.10);
 }
+
+.au-status-cell{ display:flex; justify-content:flex-end; align-items:center; gap:8px; }
 .au-row:last-child{ border-bottom:none; }
 .au-row:hover{ background: rgba(148,163,184,0.04); }
 

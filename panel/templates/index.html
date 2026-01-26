@@ -174,10 +174,6 @@
     </div>
 
     <div class="modal-body au-body">
-      <div class="au-tip">
-        <span class="au-tip-ico" aria-hidden="true">⟲</span>
-        <div class="au-tip-text">节点在下一次心跳/上报时接收更新指令；安装完成后会在下一次上报回传状态，面板将自动标记完成。</div>
-      </div>
 
       <div class="card au-hero compact">
         <div class="au-hero-grid">
@@ -213,7 +209,7 @@
           <div>节点</div>
           <div class="au-col-r">状态</div>
           <div class="au-col-r">版本</div>
-          <div class="au-col-r">备注</div>
+          <div class="au-col-r">心跳 / 备注</div>
         </div>
         <div class="au-list" id="agentUpdateList"></div>
       </div>
@@ -252,5 +248,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=42.0"></script>
+<script src="/static/app.js?v=42.1"></script>
 {% endblock %}
