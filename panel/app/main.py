@@ -1984,10 +1984,70 @@ def _upsert_endpoint_by_sync_id(pool: Dict[str, Any], sync_id: str, endpoint: Di
     pool["endpoints"] = new_eps
 
 
-def _choose_receiver_port(receiver_pool: Dict[str, Any], preferred: Optional[int]) -> int:
+def _find_sync_listen_port(pool: Dict[str, Any], sync_id: str, role: Optional[str] = None) -> Optional[int]:
+    """Find listen port for an endpoint identified by extra_config.sync_id.
+
+    Used by WSS tunnel autosync to keep receiver port stable across enable/disable.
+
+    Args:
+        pool: realm pool dict
+        sync_id: sync id
+        role: optional extra_config role filter (e.g. "receiver" / "sender")
+    """
+    if not isinstance(pool, dict):
+        return None
+    for ep in pool.get("endpoints") or []:
+        if not isinstance(ep, dict):
+            continue
+        ex = ep.get("extra_config") or {}
+        if not isinstance(ex, dict):
+            continue
+        sid = ex.get("sync_id")
+        if not sid or str(sid) != str(sync_id):
+            continue
+        if role and str(ex.get("sync_role") or "") != str(role):
+            continue
+        _, p = _split_host_port(str(ep.get("listen") or ""))
+        if p:
+            try:
+                return int(p)
+            except Exception:
+                return None
+    return None
+
+
+def _port_used_by_other_sync(receiver_pool: Dict[str, Any], port: int, sync_id: str) -> bool:
+    """Return True if `port` is already used by another endpoint (different sync_id)."""
+    if not isinstance(receiver_pool, dict):
+        return False
+    for ep in receiver_pool.get("endpoints") or []:
+        if not isinstance(ep, dict):
+            continue
+        _, p = _split_host_port(str(ep.get("listen") or ""))
+        if not p:
+            continue
+        try:
+            if int(p) != int(port):
+                continue
+        except Exception:
+            continue
+        ex = ep.get("extra_config") or {}
+        sid = ex.get("sync_id") if isinstance(ex, dict) else None
+        if sid and str(sid) == str(sync_id):
+            continue
+        return True
+    return False
+
+
+def _choose_receiver_port(receiver_pool: Dict[str, Any], preferred: Optional[int], ignore_sync_id: Optional[str] = None) -> int:
     used = set()
     for ep in receiver_pool.get("endpoints") or []:
         if not isinstance(ep, dict):
+            continue
+        ex = ep.get("extra_config") or {}
+        sid = ex.get("sync_id") if isinstance(ex, dict) else None
+        if ignore_sync_id and sid and str(sid) == str(ignore_sync_id):
+            # allow reusing the same port for the same sync tunnel
             continue
         h, p = _split_host_port(str(ep.get("listen") or ""))
         if p:
@@ -2268,17 +2328,44 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
 
     sync_id = str(payload.get("sync_id") or "").strip() or uuid.uuid4().hex
 
-    receiver_port = payload.get("receiver_port")
-    try:
-        receiver_port = int(receiver_port) if receiver_port is not None and receiver_port != "" else None
-    except Exception:
-        receiver_port = None
+    # Receiver port policy:
+    #   - If receiver_port is explicitly provided (UI input / toggle), treat it as FIXED.
+    #   - If this sync_id already exists on receiver, keep its existing port (stable across enable/disable).
+    #   - Otherwise, default to sender listen port, and auto-pick a free one if conflicted.
+    receiver_pool = await _load_pool_for_node(receiver)
+    existing_receiver_port = _find_sync_listen_port(receiver_pool, sync_id, role="receiver")
+
+    raw_receiver_port = payload.get("receiver_port")
+    explicit_receiver_port = raw_receiver_port is not None and raw_receiver_port != ""
+    receiver_port: Optional[int] = None
+    if explicit_receiver_port:
+        try:
+            receiver_port = int(raw_receiver_port)
+        except Exception:
+            return JSONResponse({"ok": False, "error": "receiver_port 必须是数字"}, status_code=400)
 
     # preferred port = sender listen port
     _, sender_listen_port = _split_host_port(listen)
-    preferred_port = receiver_port or sender_listen_port
-    receiver_pool = await _load_pool_for_node(receiver)
-    receiver_port = _choose_receiver_port(receiver_pool, preferred_port)
+    if sender_listen_port is None:
+        return JSONResponse({"ok": False, "error": "listen 格式不正确，请使用 0.0.0.0:端口"}, status_code=400)
+
+    if receiver_port is None:
+        receiver_port = existing_receiver_port
+    if receiver_port is None:
+        receiver_port = sender_listen_port
+
+    if receiver_port <= 0 or receiver_port > 65535:
+        return JSONResponse({"ok": False, "error": "receiver_port 端口范围必须是 1-65535"}, status_code=400)
+
+    port_fixed = explicit_receiver_port or (existing_receiver_port is not None)
+    if port_fixed:
+        if _port_used_by_other_sync(receiver_pool, receiver_port, sync_id):
+            return JSONResponse(
+                {"ok": False, "error": f"接收机端口 {receiver_port} 已被其他规则占用，请换一个端口"},
+                status_code=400,
+            )
+    else:
+        receiver_port = _choose_receiver_port(receiver_pool, receiver_port, ignore_sync_id=sync_id)
 
     receiver_host = _node_host_for_realm(receiver)
     if not receiver_host:
