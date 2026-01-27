@@ -2144,7 +2144,7 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
     remotes = [str(x).strip() for x in remotes if str(x).strip()]
     disabled = bool(payload.get("disabled", False))
     balance = str(payload.get("balance") or "roundrobin").strip()
-    protocol = str(payload.get("protocol") or "tcp+udp").strip() or "tcp+udp"
+    protocol = 'tcp'
 
     wss = payload.get("wss") or {}
     if not isinstance(wss, dict):
@@ -2187,7 +2187,7 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         "listen": listen,
         "disabled": disabled,
         "balance": balance,
-        "protocol": protocol,
+        "protocol": 'tcp',
         "remotes": [sender_to_receiver],
         "extra_config": {
             "remote_transport": "ws",
@@ -2211,7 +2211,7 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         "listen": _format_addr("0.0.0.0", receiver_port),
         "disabled": disabled,
         "balance": balance,
-        "protocol": protocol,
+        "protocol": 'tcp',
         "remotes": remotes,
         "extra_config": {
             "listen_transport": "ws",
@@ -2348,7 +2348,7 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     remotes = [str(x).strip() for x in remotes if str(x).strip()]
     disabled = bool(payload.get("disabled", False))
     balance = str(payload.get("balance") or "roundrobin").strip() or "roundrobin"
-    protocol = str(payload.get("protocol") or "tcp+udp").strip() or "tcp+udp"
+    protocol = 'tcp'
 
     try:
         server_port = int(payload.get("server_port") or 18443)
@@ -2387,15 +2387,8 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     sender_host = override_host or _node_host_for_realm(sender)
     if not sender_host:
         return JSONResponse({"ok": False, "error": "公网入口地址为空。请检查节点 base_url 或在内网穿透中填写“公网入口地址(A)”。"}, status_code=400)
-
-    # Best-effort: fetch A-side tunnel server cert and embed into B config for TLS verification.
+    # TCP-only tunnel: no TLS cert required
     server_cert_pem = ""
-    try:
-        cert = await agent_get(sender.get("base_url", ""), sender.get("api_key", ""), "/api/v1/intranet/cert", _node_verify_tls(sender))
-        if isinstance(cert, dict) and cert.get("ok") is True:
-            server_cert_pem = str(cert.get("cert_pem") or "").strip()
-    except Exception:
-        server_cert_pem = ""
 
     now_iso = datetime.utcnow().isoformat() + "Z"
 
@@ -2403,7 +2396,7 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         "listen": listen,
         "disabled": disabled,
         "balance": balance,
-        "protocol": protocol,
+        "protocol": 'tcp',
         "remotes": remotes,
         "extra_config": {
             "intranet_role": "server",
@@ -2423,7 +2416,7 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         "listen": _format_addr("0.0.0.0", 0),
         "disabled": disabled,
         "balance": balance,
-        "protocol": protocol,
+        "protocol": 'tcp',
         "remotes": remotes,
         "extra_config": {
             "intranet_role": "client",
@@ -2433,8 +2426,6 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
             "intranet_peer_host": sender_host,
             "intranet_server_port": server_port,
             "intranet_token": token,
-            "intranet_server_cert_pem": server_cert_pem,
-            "intranet_tls_verify": bool(server_cert_pem),
             "intranet_sender_listen": listen,
             "intranet_original_remotes": remotes,
             "sync_id": sync_id,
