@@ -96,6 +96,15 @@ def _recv_line(sock: Any, max_len: int = 65536) -> str:
     while True:
         try:
             ch = sock.recv(1)
+        except socket.timeout:
+            # IMPORTANT: allow callers that use settimeout() to distinguish
+            # between "no data yet" (timeout) and a real disconnect.
+            #
+            # The tunnel client control loop relies on this behaviour:
+            # it sets a short timeout to periodically wake up and check
+            # ping/pong / stop flags, and expects a socket.timeout to be
+            # raised when there is no incoming data.
+            raise
         except Exception:
             break
         if not ch:
@@ -943,6 +952,20 @@ class _TunnelClient:
             _safe_close(raw)
             return None, '', f'dial_tls_failed: {exc}'
         except Exception as exc:
+            # Some plaintext servers will immediately close when they see a TLS ClientHello,
+            # which can surface as ConnectionResetError (instead of an ssl.SSLError).
+            # When we are allowed to fall back to plaintext (i.e. TLS verification is not
+            # required), treat this as a strong signal that the peer is running without TLS.
+            if (not self.server_cert_pem) and ALLOW_PLAINTEXT_FALLBACK and isinstance(exc, ConnectionResetError):
+                _safe_close(raw)
+                try:
+                    raw2 = socket.create_connection((self.peer_host, self.peer_port), timeout=6)
+                    raw2.settimeout(None)
+                    _set_keepalive(raw2)
+                    return raw2, 'plain', ''
+                except Exception as exc2:
+                    return None, '', f'dial_failed: {exc2}'
+
             _safe_close(raw)
             return None, '', f'dial_tls_failed: {exc}'
 

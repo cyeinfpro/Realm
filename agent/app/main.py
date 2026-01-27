@@ -1226,7 +1226,7 @@ def _apply_sync_pool_cmd(cmd: Dict[str, Any]) -> None:
 
             # Keep intranet tunnel supervisor in sync for LAN/NAT nodes.
             try:
-                _INTRANET.apply_from_pool(new_full)
+                _INTRANET.apply_from_pool(pool)
             except Exception:
                 pass
 
