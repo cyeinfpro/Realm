@@ -932,26 +932,10 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
         pass
 
     # Persist agent version + update status (best-effort)
-    # ⚠️ 注意：面板触发新一轮更新（desired_agent_update_id 改变）时，
-    # agent 可能还在上报「旧 update_id=...」的 done 状态。
-    # 这会把面板刚设置的 queued 覆盖掉，导致新更新任务被误判为“已完成”。
-    # 解决：仅当 agent 上报的 update_id 为空，或与 desired_update_id 一致时，才更新 state/msg。
     try:
-        desired_update_id_now = str(node.get('desired_agent_update_id') or '').strip()
-        rep_update_id = str(agent_update.get('update_id') or '').strip() if isinstance(agent_update, dict) else ''
         st = str(agent_update.get('state') or '').strip() if isinstance(agent_update, dict) else ''
         msg = str(agent_update.get('error') or agent_update.get('msg') or '').strip() if isinstance(agent_update, dict) else ''
-
-        if (not desired_update_id_now) or (not rep_update_id) or (rep_update_id == desired_update_id_now):
-            update_agent_status(
-                node_id=node_id,
-                agent_reported_version=agent_version or None,
-                state=st or None,
-                msg=msg or None,
-            )
-        else:
-            # 仅更新版本号，不覆盖面板当前批次的状态
-            update_agent_status(node_id=node_id, agent_reported_version=agent_version or None)
+        update_agent_status(node_id=node_id, agent_reported_version=agent_version or None, state=st or None, msg=msg or None)
     except Exception:
         pass
 
@@ -1017,15 +1001,9 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
         desired_update_id = str(node.get('desired_agent_update_id') or '').strip()
         cur_agent_ver = (agent_version or str(node.get('agent_reported_version') or '')).strip()
 
-        rep_update_id = str(agent_update.get('update_id') or '').strip() if isinstance(agent_update, dict) else ''
-        rep_state = str(agent_update.get('state') or '').strip().lower() if isinstance(agent_update, dict) else ''
-
         if desired_agent_ver and desired_update_id:
-            # ✅ “一键更新”=强制按面板/GitHub 文件重装：不再用版本号短路。
-            # 只有当 agent 明确回报「本批次 update_id 已 done」时才停止下发。
-            already_done = (rep_update_id == desired_update_id and rep_state == 'done')
-
-            if already_done:
+            if _ver_int(cur_agent_ver) >= _ver_int(desired_agent_ver) and _ver_int(desired_agent_ver) > 0:
+                # already on desired (or newer)
                 if str(node.get('agent_update_state') or '').strip() != 'done':
                     try:
                         update_agent_status(node_id=node_id, state='done', msg='')
@@ -1035,15 +1013,10 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
                 # 自更新能力从 v32 开始（更老版本会忽略 update_agent 命令）
                 if _ver_int(cur_agent_ver) and _ver_int(cur_agent_ver) < 32:
                     try:
-                        update_agent_status(
-                            node_id=node_id,
-                            state='failed',
-                            msg='Agent 版本过旧（<32），不支持一键自更新：请先在节点上手动运行 realm_agent.sh 更新一次',
-                        )
+                        update_agent_status(node_id=node_id, state='failed', msg='Agent 版本过旧（<32），不支持一键自更新：请先在节点上手动运行 realm_agent.sh 更新一次')
                     except Exception:
                         pass
                     return {"ok": True, "server_time": now, "desired_version": desired_ver, "commands": cmds}
-
                 panel_base = _panel_public_base_url(request)
                 sh_url, zip_url, github_only = _agent_asset_urls(panel_base)
                 zip_sha256 = '' if github_only else _file_sha256(STATIC_DIR / 'realm-agent.zip')
@@ -1059,7 +1032,6 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
                     'force': True,
                 }
                 cmds.append(_sign_cmd(str(node.get('api_key') or ''), ucmd))
-
                 # mark queued->sent (best-effort)
                 if str(node.get('agent_update_state') or '').strip() in ('', 'queued'):
                     try:
@@ -1130,12 +1102,13 @@ async def api_agents_update_progress(update_id: str = '', user: str = Depends(re
         cur = str(n.get('agent_reported_version') or '').strip()
         st = str(n.get('agent_update_state') or '').strip() or 'queued'
 
-        # ✅ 一键更新进度：以 agent_update_state 为准。
-        # 不再用“当前版本 >= 目标版本”来直接判定 done，避免强制重装场景下被提前标记完成。
         if not online:
             st2 = 'offline'
         else:
-            st2 = st
+            if desired and _ver_int(cur) >= _ver_int(desired) and _ver_int(desired) > 0:
+                st2 = 'done'
+            else:
+                st2 = st
 
         if st2 in summary:
             summary[st2] += 1

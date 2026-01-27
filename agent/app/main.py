@@ -1402,16 +1402,9 @@ def _apply_update_agent_cmd(cmd: Dict[str, Any]) -> None:
             _save_update_state(st)
             return
 
-        # ✅ 去重：同一个 update_id 开始安装后（installing/done）不重复触发，避免心跳期间反复 systemd-run。
-        st0 = _load_update_state()
-        if str(st0.get('update_id') or '').strip() == update_id and str(st0.get('state') or '').strip().lower() in ('installing', 'done'):
-            return
-
         # Already on desired (or newer)
-        # 默认行为：若当前版本已满足 desired_version，则直接标记 done，不再安装。
-        # 但当 force=true（面板“一键更新”点击触发）时，必须强制按面板/GitHub 文件重新安装，不做版本短路。
         try:
-            if (not force) and int(str(app.version)) >= int(desired_ver) and int(desired_ver) > 0:
+            if int(str(app.version)) >= int(desired_ver) and int(desired_ver) > 0:
                 st = _load_update_state()
                 st.update({
                     'update_id': update_id,
@@ -1425,6 +1418,10 @@ def _apply_update_agent_cmd(cmd: Dict[str, Any]) -> None:
                 return
         except Exception:
             pass
+
+        st0 = _load_update_state()
+        if (not force) and str(st0.get('update_id') or '').strip() == update_id and str(st0.get('state') or '').strip().lower() in ('installing', 'done'):
+            return
 
         host, port = _get_current_agent_bind()
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -1473,17 +1470,7 @@ PY
 trap 'export ERR_MSG=\"line $LINENO: $BASH_COMMAND\"; fail $?' ERR
 
 echo \"[update] download zip...\" | tee -a \"$LOG\"
-# cache-bust to avoid CDN/proxy caching when forcing a reinstall
-BUST=\"ts=$(date +%s)\"
-ZURL=\"{zip_url}\"
-if [[ \"$ZURL\" == http://* || \"$ZURL\" == https://* ]]; then
-  if [[ \"$ZURL\" == *\\?* ]]; then
-    ZURL=\"${ZURL}&${BUST}\"
-  else
-    ZURL=\"${ZURL}?${BUST}\"
-  fi
-fi
-curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \"$ZURL\" -o \"$TMP_ZIP\"
+curl -fsSL \"{zip_url}\" -o \"$TMP_ZIP\"
 if [[ -n \"{zip_sha256}\" ]]; then
   echo \"{zip_sha256}  $TMP_ZIP\" | sha256sum -c -
 fi
@@ -1496,15 +1483,7 @@ export REALM_AGENT_PORT=\"{port}\"
 export REALM_AGENT_REPO_ZIP_URL=\"file://$TMP_ZIP\"
 
 echo \"[update] run installer...\" | tee -a \"$LOG\"
-SURL=\"{sh_url}\"
-if [[ \"$SURL\" == http://* || \"$SURL\" == https://* ]]; then
-  if [[ \"$SURL\" == *\\?* ]]; then
-    SURL=\"${SURL}&${BUST}\"
-  else
-    SURL=\"${SURL}?${BUST}\"
-  fi
-fi
-curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \"$SURL\" | bash
+curl -fsSL \"{sh_url}\" | bash
 
 python3 - <<'PY'
 import json, pathlib, datetime
