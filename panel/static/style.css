@@ -546,6 +546,7 @@ details.menu summary::-webkit-details-marker{display:none}
 .form{display:flex;flex-direction:column;gap:10px;margin-top:10px}
 .label{font-size:12px;color:var(--muted)}
 .help{font-size:12px;color:var(--muted);margin-top:6px}
+.help.compact{margin-top:4px;font-size:11px;line-height:1.35}
 .input,.select,textarea,.textarea{
   width:100%;
   background:rgba(15,23,42,0.56);
@@ -571,6 +572,20 @@ textarea,.textarea{min-height:90px;resize:vertical}
   border:1px solid rgba(148,163,184,0.18);
   background: rgba(2,6,23,0.12);
 }
+
+/* Mode strip (mode cards shown inside rule modal) */
+.mode-strip{
+  padding: 10px 12px;
+  border-radius: 16px;
+  border:1px solid rgba(148,163,184,0.18);
+  background: rgba(2,6,23,0.12);
+}
+
+/* Rule modal: make the first row compact & focused */
+.base-top-row{align-items:flex-end}
+.listen-col{flex:1.15; min-width:260px}
+.status-col{flex:0 0 190px; max-width:190px}
+.peer-col{flex:1.55; min-width:240px}
 
 .section-head{
   display:flex;

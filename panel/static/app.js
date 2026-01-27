@@ -1468,7 +1468,7 @@ function syncTunnelModeUI(){
 
   const listenMain = document.getElementById('listenLabelMain');
   const listenExample = document.getElementById('listenLabelExample');
-  const listenHelp = document.getElementById('listenHelp');
+  const baseHelp = document.getElementById('baseHelp');
   const portEl = q('f_listen_port');
 
   // Ensure default listen host exists (advanced)
@@ -1489,7 +1489,7 @@ function syncTunnelModeUI(){
     if(remEl) remEl.placeholder = '例如：10.0.0.10:443\n10.0.0.11:443';
     if(portEl && !portEl.placeholder) portEl.placeholder = '443';
 
-    setText(listenHelp, '对外开放端口（默认绑定 0.0.0.0）。需要修改监听 IP 请展开高级参数。');
+    setText(baseHelp, '默认监听 0.0.0.0；保存/删除会同步到接收机。监听 IP / 隧道参数在高级参数。');
 
     let h = 'Remote 填最终目标（接收机可达）。多行可启用负载均衡。';
     const optCount = q('f_wss_receiver_node') ? q('f_wss_receiver_node').querySelectorAll('option').length : 0;
@@ -1508,7 +1508,7 @@ function syncTunnelModeUI(){
     if(remEl) remEl.placeholder = '例如：192.168.1.10:80\n192.168.1.11:80';
     if(portEl && !portEl.placeholder) portEl.placeholder = '443';
 
-    setText(listenHelp, '公网入口对外开放端口（默认绑定 0.0.0.0）。监听 IP/隧道端口等可在高级参数调整。');
+    setText(baseHelp, '默认监听 0.0.0.0；保存/删除会同步到内网出口。监听 IP / 隧道参数在高级参数。');
 
     let h = 'Remote 填内网目标（内网出口 B 可达）。多行可启用负载均衡。';
     const optCount = q('f_intranet_receiver_node') ? q('f_intranet_receiver_node').querySelectorAll('option').length : 0;
@@ -1527,7 +1527,7 @@ function syncTunnelModeUI(){
     if(remEl) remEl.placeholder = '203.0.113.10:443\n198.51.100.8:443';
     if(portEl && !portEl.placeholder) portEl.placeholder = '443';
 
-    setText(listenHelp, '默认绑定 0.0.0.0（监听所有网卡）。监听 IP / 协议 / 策略等在高级参数。');
+    setText(baseHelp, '默认监听 0.0.0.0；协议/策略/监听 IP 在高级参数。');
     setText(remoteHelp, '多目标时默认轮询；需要按来源 IP 固定落点可选 IP Hash。');
   }
 
@@ -1791,7 +1791,6 @@ function newRule(){
   fillWssFields({});
   fillIntranetFields({});
   showWssBox();
-  try{ setRuleScreen('intro'); }catch(_e){}
   openModal();
 }
 
@@ -1839,7 +1838,6 @@ function editRule(idx){
     fillIntranetFields({});
   }
   showWssBox();
-  try{ setRuleScreen('params'); }catch(_e){}
   // Close/open advanced panel based on non-default values
   const adv = document.getElementById('advancedDetails');
   if(adv){
