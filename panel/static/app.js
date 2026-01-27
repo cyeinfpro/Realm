@@ -1243,6 +1243,125 @@ function closeCommandModal(){
 
 function setField(id, v){ q(id).value = v==null?'':String(v); }
 
+
+// -------------------- Listen field helpers (port-only UI) --------------------
+
+function _trim(v){ return String(v||'').trim(); }
+
+// Parse a listen string into {host, port}. Supports:
+// - 0.0.0.0:443
+// - [::]:443
+// - ::1:443 (best-effort)
+// - 443
+function parseListenToHostPort(listen){
+  const s = _trim(listen);
+  let host = '0.0.0.0';
+  let port = '';
+  if(!s) return {host, port};
+
+  // [::]:443
+  if(s.startsWith('[')){
+    const r = s.indexOf(']');
+    if(r > 0){
+      host = s.slice(1, r) || host;
+      const rest = s.slice(r + 1);
+      const m = rest.match(/^:(\d+)$/);
+      if(m) port = m[1];
+      return {host, port};
+    }
+  }
+
+  // pure port
+  if(/^\d+$/.test(s)){
+    return {host, port: s};
+  }
+
+  // host:port (use last ':' as separator)
+  const m = s.match(/^(.*):(\d+)$/);
+  if(m){
+    host = m[1] || host;
+    port = m[2] || '';
+  }else{
+    host = s || host;
+  }
+
+  host = host.replace(/^\[(.*)\]$/, '$1') || '0.0.0.0';
+  return {host, port};
+}
+
+// Normalize host input (strip scheme / strip trailing :port for IPv4/domain)
+// NOTE: IPv6 is kept as-is (and will be wrapped with [] when formatting).
+function normalizeListenHostInput(raw){
+  let h = _trim(raw);
+  if(!h) return '';
+  // URL -> hostname
+  try{
+    if(h.includes('://')){
+      const u = new URL(h);
+      if(u && u.hostname) h = u.hostname;
+    }
+  }catch(_e){}
+  // [::]:443 -> ::
+  if(h.startsWith('[') && h.includes(']')){
+    return h.slice(1, h.indexOf(']')) || '';
+  }
+  // host:port -> host (only when host part doesn't look like IPv6)
+  const m = h.match(/^(.*):(\d+)$/);
+  if(m){
+    const left = m[1] || '';
+    if(left && !left.includes(':')){
+      h = left;
+    }
+  }
+  return h;
+}
+
+function _formatListenHost(host){
+  const clean = normalizeListenHostInput(host) || '0.0.0.0';
+  // IPv6 needs brackets
+  if(clean.includes(':') && !clean.startsWith('[') && !clean.endsWith(']')){
+    return `[${clean}]`;
+  }
+  return clean;
+}
+
+function getListenHost(){
+  const el = q('f_listen_host');
+  const raw = el ? el.value : '';
+  const h = normalizeListenHostInput(raw) || '0.0.0.0';
+  // keep the input tidy
+  if(el && _trim(el.value) !== h) el.value = h;
+  return h;
+}
+
+function getListenPort(){
+  const el = q('f_listen_port');
+  const raw = el ? _trim(el.value) : '';
+  if(!raw) return '';
+  return raw.replace(/[^0-9]/g, '');
+}
+
+function getListenString(){
+  const port = getListenPort();
+  if(!port) return '';
+  const host = _formatListenHost(getListenHost());
+  return `${host}:${port}`;
+}
+
+function syncListenComputed(){
+  try{
+    const full = getListenString();
+    const fullEl = q('f_listen');
+    if(fullEl) fullEl.value = full;
+
+    const prefix = document.getElementById('listenHostPrefix');
+    if(prefix){
+      prefix.textContent = `${getListenHost()}:`;
+    }
+  }catch(_e){}
+}
+
+
 // Read WSS params from the form.
 // IMPORTANT: This must match panel backend API expectations:
 // {host, path, sni, tls, insecure}
@@ -1290,11 +1409,11 @@ function showWssBox(){
   if(q('wssBox')) q('wssBox').style.display = (mode === 'wss') ? 'block' : 'none';
   if(q('intranetBox')) q('intranetBox').style.display = (mode === 'intranet') ? 'block' : 'none';
 
-  // WSS 隧道统一走“选择接收机自动同步”
-  const autoBox = document.getElementById('wssAutoSyncBox');
-  if(autoBox){
-    autoBox.style.display = (mode === 'wss') ? 'flex' : 'none';
-  }
+  // Advanced sections (collapsed area)
+  const wssAdv = document.getElementById('wssAdvancedBox');
+  if(wssAdv) wssAdv.style.display = (mode === 'wss') ? 'block' : 'none';
+  const intrAdv = document.getElementById('intranetAdvancedBox');
+  if(intrAdv) intrAdv.style.display = (mode === 'intranet') ? 'block' : 'none';
 
   // Update mode cards / guide / dynamic hints (new UI)
   try{ syncTunnelModeUI(); }catch(_e){}
@@ -1331,57 +1450,88 @@ function syncTunnelModeUI(){
   if(wrap){
     wrap.querySelectorAll('.mode-card').forEach((btn)=>{
       const m = btn.getAttribute('data-mode');
-      const on = (m === mode);
-      btn.classList.toggle('active', on);
-      btn.setAttribute('aria-selected', on ? 'true' : 'false');
+      btn.classList.toggle('active', m === mode);
     });
   }
 
-  const listenHelp = document.getElementById('listenHelp');
-  const remoteHelp = document.getElementById('remoteHelp');
-  const remoteMain = document.getElementById('remoteLabelMain');
-  const remoteExtra = document.getElementById('remoteLabelExtra');
-  const listenMain = document.getElementById('listenLabelMain');
-  const listenExample = document.getElementById('listenLabelExample');
-
-  const remEl = q('f_remotes');
-  const lisEl = q('f_listen');
+  // Re-render intro guide for selected mode
+  try{ renderModeGuide(mode); }catch(_e){}
 
   const setText = (el, t)=>{ if(el) el.textContent = t || ''; };
   const setHtml = (el, h)=>{ if(el) el.innerHTML = h || ''; };
 
-  if(mode === 'wss'){
-    if(remoteMain) remoteMain.textContent = '最终目标';
-    if(remoteExtra) remoteExtra.textContent = '（由接收机转发，每行一个 host:port）';
-    if(listenMain) listenMain.textContent = '监听';
-    if(listenExample) listenExample.textContent = '（发送机对外端口，例如 0.0.0.0:443）';
-    if(remEl) remEl.placeholder = '例如：10.0.0.10:443\n10.0.0.11:443';
-    if(lisEl && !lisEl.placeholder) lisEl.placeholder = '0.0.0.0:443';
-    setText(listenHelp, '这里填“发送机”（当前节点）对外开放的端口；客户端会连接到这里。');
+  // Common elements
+  const remoteMain = document.getElementById('remoteLabelMain');
+  const remoteExtra = document.getElementById('remoteLabelExtra');
+  const remoteHelp = document.getElementById('remoteHelp');
+  const remEl = q('f_remotes');
 
-    const optCount = q('f_wss_receiver_node') ? q('f_wss_receiver_node').querySelectorAll('option').length : 0;
-    const extraHint = optCount <= 1 ? '<div class="help">提示：接收机列表为空？先在左侧“节点列表”接入另一台节点，或检查节点是否在线。</div>' : '';
-    setHtml(remoteHelp, '这里填“最终目标”地址（接收机节点能够访问的地址）。多行会做负载均衡。' + extraHint);
-  } else if(mode === 'intranet'){
-    if(remoteMain) remoteMain.textContent = '内网目标';
-    if(remoteExtra) remoteExtra.textContent = '（内网出口节点可达，每行一个 host:port）';
-    if(listenExample) listenExample.textContent = '（公网入口对外端口，例如 0.0.0.0:443）';
-    if(remEl) remEl.placeholder = '例如：192.168.1.10:80\n10.0.0.5:443';
-    setText(listenHelp, '这里填“公网入口”（当前节点）对外开放的端口；外部用户会连接到这里。');
+  const listenMain = document.getElementById('listenLabelMain');
+  const listenExample = document.getElementById('listenLabelExample');
+  const listenHelp = document.getElementById('listenHelp');
+  const portEl = q('f_listen_port');
 
-    const optCount = q('f_intranet_receiver_node') ? q('f_intranet_receiver_node').querySelectorAll('option').length : 0;
-    const extraHint = optCount <= 1 ? '<div class="help">提示：下拉框为空？请先编辑内网节点，勾选“内网机器（用于内网穿透出口）”。</div>' : '';
-    setHtml(remoteHelp, '这里填“内网目标”地址（由内网出口节点转发到这些地址）。' + extraHint);
-  } else {
-    if(remoteMain) remoteMain.textContent = '目标地址';
-    if(remoteExtra) remoteExtra.textContent = '（Remote，每行一个 host:port）';
-    if(listenExample) listenExample.textContent = '（例如 0.0.0.0:443）';
-    if(remEl) remEl.placeholder = '203.0.113.10:443\n198.51.100.8:443';
-    setText(listenHelp, '这里填当前节点监听地址。常用：0.0.0.0:端口（监听所有网卡）。');
-    setText(remoteHelp, '每行一个目标地址；多行将启用负载均衡（轮询/IP Hash/权重）。');
+  // Ensure default listen host exists (advanced)
+  if(q('f_listen_host') && !q('f_listen_host').value.trim()){
+    q('f_listen_host').value = '0.0.0.0';
   }
 
-  renderModeGuide(mode);
+  // Keep prefix + hidden listen updated
+  syncListenComputed();
+
+  if(mode === 'wss'){
+    setText(remoteMain, '最终目标');
+    setText(remoteExtra, '（接收机转发，每行一个 host:port）');
+
+    setText(listenMain, '监听端口');
+    setText(listenExample, '（发送机对外端口，例如 443）');
+
+    if(remEl) remEl.placeholder = '例如：10.0.0.10:443\n10.0.0.11:443';
+    if(portEl && !portEl.placeholder) portEl.placeholder = '443';
+
+    setText(listenHelp, '对外开放端口（默认绑定 0.0.0.0）。需要修改监听 IP 请展开高级参数。');
+
+    let h = 'Remote 填最终目标（接收机可达）。多行可启用负载均衡。';
+    const optCount = q('f_wss_receiver_node') ? q('f_wss_receiver_node').querySelectorAll('option').length : 0;
+    if(optCount <= 1){
+      h += '<br><span class="muted sm">接收机列表为空？请先在面板接入另一台节点。</span>';
+    }
+    setHtml(remoteHelp, h);
+
+  }else if(mode === 'intranet'){
+    setText(remoteMain, '内网目标');
+    setText(remoteExtra, '（B 内网可达地址，每行一个 host:port）');
+
+    setText(listenMain, '监听端口');
+    setText(listenExample, '（公网入口对外端口，例如 443）');
+
+    if(remEl) remEl.placeholder = '例如：192.168.1.10:80\n192.168.1.11:80';
+    if(portEl && !portEl.placeholder) portEl.placeholder = '443';
+
+    setText(listenHelp, '公网入口对外开放端口（默认绑定 0.0.0.0）。监听 IP/隧道端口等可在高级参数调整。');
+
+    let h = 'Remote 填内网目标（内网出口 B 可达）。多行可启用负载均衡。';
+    const optCount = q('f_intranet_receiver_node') ? q('f_intranet_receiver_node').querySelectorAll('option').length : 0;
+    if(optCount <= 1){
+      h += '<br><span class="muted sm">内网节点列表为空？先把内网机器接入面板，并在节点设置里勾选“内网机器”。</span>';
+    }
+    setHtml(remoteHelp, h);
+
+  }else{
+    setText(remoteMain, '目标地址');
+    setText(remoteExtra, '（每行一个 host:port，多行启用负载均衡）');
+
+    setText(listenMain, '监听端口');
+    setText(listenExample, '（例如 443）');
+
+    if(remEl) remEl.placeholder = '203.0.113.10:443\n198.51.100.8:443';
+    if(portEl && !portEl.placeholder) portEl.placeholder = '443';
+
+    setText(listenHelp, '默认绑定 0.0.0.0（监听所有网卡）。监听 IP / 协议 / 策略等在高级参数。');
+    setText(remoteHelp, '多目标时默认轮询；需要按来源 IP 固定落点可选 IP Hash。');
+  }
+
+  try{ updateModePreview(); }catch(_e){}
 }
 
 function _findNodeNameById(id){
@@ -1400,7 +1550,9 @@ function renderModeGuide(mode){
   const box = document.getElementById('modeGuide');
   if(!box) return;
 
-  const nodeName = (window.__NODE_NAME__ && String(window.__NODE_NAME__).trim()) ? String(window.__NODE_NAME__).trim() : (window.__NODE_IP__ || '当前节点');
+  const nodeName = (window.__NODE_NAME__ && String(window.__NODE_NAME__).trim())
+    ? String(window.__NODE_NAME__).trim()
+    : (window.__NODE_IP__ || '当前节点');
 
   let title = '';
   let desc = '';
@@ -1411,50 +1563,47 @@ function renderModeGuide(mode){
   if(mode === 'wss'){
     ico = '🛡️';
     title = 'WSS 隧道（发送机 ↔ 接收机）';
-    desc = '适用于需要“伪装/隐藏传输”或跨网络环境转发。保存后会自动在接收机生成对应规则（只读锁定），后续暂停/删除会同步两端。';
-    diagram = `客户端 → 发送机 ${nodeName} 监听 Listen\n  ⇒ (WSS: Host/Path/TLS) ⇒ 接收机 监听端口\n    → 最终目标 Remotes`;
+    desc = '发送机对外监听；面板自动在接收机生成对应规则。Host/Path/SNI 可留空自动生成。';
+    diagram = `客户端 → 发送机 ${nodeName} Listen  ⇢  WSS  ⇢  接收机 Receiver → 最终目标 Remotes`;
     steps = [
-      '先选择 <b>接收机节点</b>（面板会自动同步配置到接收机）。',
-      '填写 WSS 参数：<b>Host/Path/SNI</b>（可点“随机生成参数”快速填充）。',
-      'Remote 填 <b>最终目标</b>（接收机能访问的地址）。多行可负载均衡。',
-      '如遇证书/兼容性问题，可勾选“跳过证书校验”（安全性会下降）。',
+      '选择 <b>接收机节点</b>（自动同步配置）。',
+      'Remote 填 <b>最终目标</b>（接收机可达地址）。',
+      '更多细节在「高级参数」：接收机端口 / Host / Path / TLS。',
     ];
   } else if(mode === 'intranet'){
     ico = '🏠';
     title = '内网穿透（公网入口A ↔ 内网出口B）';
-    desc = '适用于把内网服务暴露到公网：公网入口节点 A 对外监听，内网出口节点 B 主动连回 A，并将流量转发到内网目标。';
-    diagram = `公网用户 → 公网入口 A（当前节点）监听 Listen\n  ⇒ (加密隧道: B 主动连回 A 的端口) ⇒ 内网出口 B\n    → 内网目标 Remotes`;
+    desc = '公网入口监听；内网出口主动连回并把流量转发到内网目标。';
+    diagram = `公网用户 → 公网入口A ${nodeName} Listen  ⇢  隧道(默认 18443)  ⇢  内网出口B → 内网目标 Remotes`;
     steps = [
-      '先在内网节点 B 的“编辑节点”里勾选 <b>内网机器</b>，这样它才会出现在下拉框。',
-      '在本节点（公网入口 A）选择对应的 <b>内网出口节点</b>。',
-      '在 A 放行“隧道服务端端口”（默认 18443），确保 B 能连上 A。',
-      'Remote 填 <b>内网目标</b>（B 内网可达地址，如 192.168.x.x:80）。',
+      '先在内网节点 B 的节点设置里勾选 <b>内网机器</b>，再回来选择它。',
+      'Remote 填 <b>内网目标</b>（B 可达地址，如 192.168.x.x:80）。',
+      '隧道端口/公网地址可在「高级参数」调整。',
     ];
   } else {
     ico = '⚡';
     title = '普通转发（单机）';
-    desc = '最常用：当前节点监听一个端口，并直接转发到一个或多个目标地址。';
-    diagram = `客户端 → 当前节点 ${nodeName} 监听 Listen → 目标 Remotes`;
+    desc = '当前节点监听端口，转发到一个或多个目标地址（多行=负载均衡）。';
+    diagram = `客户端 → 当前节点 ${nodeName} Listen → 目标 Remotes`;
     steps = [
-      'Listen 填本机要开放的端口（例如 0.0.0.0:443）。',
-      'Remote 每行一个目标地址（host:port）。多行将启用负载均衡。',
-      '需要按来源 IP 固定落点时用“IP Hash”；否则建议轮询。',
-      '不需要 UDP 时，协议选 TCP 更省资源（可选）。',
+      '填 <b>监听端口</b>（默认 0.0.0.0 监听所有网卡）。',
+      'Remote 每行一个目标地址（host:port）。',
+      '协议/策略/权重 在「高级参数」调整（可选）。',
     ];
   }
 
-  const stepsHtml = steps.map((s, i)=>`<div class=\"mode-step\"><span class=\"num\">${i+1}</span><div class=\"txt\">${s}</div></div>`).join('');
+  const stepsHtml = steps.map((s, i)=>`<div class="mode-step"><span class="num">${i+1}</span><div class="txt">${s}</div></div>`).join('');
   box.innerHTML = `
-    <div class=\"mode-guide-head\">
-      <div class=\"mode-ico\">${ico}</div>
-      <div style=\"min-width:0;\">
-        <div class=\"mode-guide-title\">${title}</div>
-        <div class=\"mode-guide-desc\">${desc}</div>
+    <div class="mode-guide-head">
+      <div class="mode-ico">${ico}</div>
+      <div style="min-width:0;">
+        <div class="mode-guide-title">${title}</div>
+        <div class="mode-guide-desc">${desc}</div>
       </div>
     </div>
-    <div class=\"mode-diagram\">${escapeHtml(diagram)}</div>
-    <div class=\"mode-steps\">${stepsHtml}</div>
-    <div class=\"mode-preview\" id=\"modeGuidePreview\"></div>
+    <div class="mode-diagram">${escapeHtml(diagram)}</div>
+    <div class="mode-steps">${stepsHtml}</div>
+    <div class="mode-preview" id="modeGuidePreview"></div>
   `;
 
   updateModePreview();
@@ -1468,18 +1617,23 @@ function updateModePreview(){
   const el = document.getElementById('modeGuidePreview');
   if(!el) return;
 
+  // keep listen fields synced (host prefix + hidden full listen)
+  syncListenComputed();
+
   const mode = q('f_type') ? String(q('f_type').value || 'tcp').trim() : 'tcp';
-  const listen = q('f_listen') ? q('f_listen').value.trim() : '';
+  const listen = getListenString();
   const remotes = _splitLines(q('f_remotes') ? q('f_remotes').value : '');
   const n = remotes.length;
-  const nodeName = (window.__NODE_NAME__ && String(window.__NODE_NAME__).trim()) ? String(window.__NODE_NAME__).trim() : (window.__NODE_IP__ || '当前节点');
+  const nodeName = (window.__NODE_NAME__ && String(window.__NODE_NAME__).trim())
+    ? String(window.__NODE_NAME__).trim()
+    : (window.__NODE_IP__ || '当前节点');
 
   if(mode === 'wss'){
     const rid = q('f_wss_receiver_node') ? q('f_wss_receiver_node').value.trim() : '';
     const recvName = _findNodeNameById(rid) || (rid ? ('节点-' + rid) : '未选择');
     const rport = q('f_wss_receiver_port') ? q('f_wss_receiver_port').value.trim() : '';
-    const portText = rport ? rport : '（与 Listen 一致）';
-    el.innerHTML = `预览：发送机 <b>${escapeHtml(nodeName)}</b> 监听 <span class=\"mono\">${escapeHtml(listen||'—')}</span> ⇒ WSS ⇒ 接收机 <b>${escapeHtml(recvName)}</b> 端口 <span class=\"mono\">${escapeHtml(portText)}</span> → 目标 <b>${n}</b> 个`;
+    const portText = rport ? rport : '（同发送机端口）';
+    el.innerHTML = `预览：发送机 <b>${escapeHtml(nodeName)}</b> 监听 <span class="mono">${escapeHtml(listen||'—')}</span> ⇒ WSS ⇒ 接收机 <b>${escapeHtml(recvName)}</b> 端口 <span class="mono">${escapeHtml(portText)}</span> → 目标 <b>${n}</b> 个`;
     return;
   }
 
@@ -1488,11 +1642,11 @@ function updateModePreview(){
     const recvName = _findNodeNameById(rid) || (rid ? ('节点-' + rid) : '未选择');
     const sport = q('f_intranet_server_port') ? q('f_intranet_server_port').value.trim() : '';
     const shost = q('f_intranet_server_host') ? q('f_intranet_server_host').value.trim() : '';
-    el.innerHTML = `预览：公网入口 <b>${escapeHtml(nodeName)}</b> 监听 <span class=\"mono\">${escapeHtml(listen||'—')}</span> ⇒ 隧道端口 <span class=\"mono\">${escapeHtml(sport||'18443')}</span>${shost ? (' · 公网地址 <span class=\"mono\">' + escapeHtml(shost) + '</span>') : ''} ⇒ 内网出口 <b>${escapeHtml(recvName)}</b> → 内网目标 <b>${n}</b> 个`;
+    el.innerHTML = `预览：公网入口 <b>${escapeHtml(nodeName)}</b> 监听 <span class="mono">${escapeHtml(listen||'—')}</span> ⇒ 隧道端口 <span class="mono">${escapeHtml(sport||'18443')}</span>${shost ? (' · 公网地址 <span class="mono">' + escapeHtml(shost) + '</span>') : ''} ⇒ 内网出口 <b>${escapeHtml(recvName)}</b> → 内网目标 <b>${n}</b> 个`;
     return;
   }
 
-  el.innerHTML = `预览：当前节点 <b>${escapeHtml(nodeName)}</b> 监听 <span class=\"mono\">${escapeHtml(listen||'—')}</span> → 目标 <b>${n}</b> 个`;
+  el.innerHTML = `预览：当前节点 <b>${escapeHtml(nodeName)}</b> 监听 <span class="mono">${escapeHtml(listen||'—')}</span> → 目标 <b>${n}</b> 个`;
 }
 
 window.setTunnelMode = setTunnelMode;
@@ -1605,18 +1759,33 @@ function formatWeights(weights){
 function newRule(){
   CURRENT_EDIT_INDEX = -1;
   q('modalTitle').textContent = '新增规则';
-  setField('f_listen','0.0.0.0:443');
+
+  // Listen: port-only UI (default 0.0.0.0:443)
+  if(q('f_listen_host')) setField('f_listen_host', '0.0.0.0');
+  if(q('f_listen_port')) setField('f_listen_port', '443');
+  syncListenComputed();
+
   setField('f_remotes','');
   q('f_disabled').value = '0';
+
+  // Advanced defaults
   q('f_balance').value = 'roundrobin';
   setField('f_weights','');
   q('f_protocol').value = 'tcp+udp';
+
+  // Mode default
   q('f_type').value = 'tcp';
+
   // reset autosync receiver fields
   if(q('f_wss_receiver_node')) setField('f_wss_receiver_node','');
   if(q('f_wss_receiver_port')) setField('f_wss_receiver_port','');
   if(q('f_intranet_receiver_node')) setField('f_intranet_receiver_node','');
   if(q('f_intranet_server_port')) setField('f_intranet_server_port','18443');
+
+  // Close advanced by default
+  const adv = document.getElementById('advancedDetails');
+  if(adv) adv.open = false;
+
   populateReceiverSelect();
   populateIntranetReceiverSelect();
   fillWssFields({});
@@ -1632,7 +1801,11 @@ function editRule(idx){
   const ex = (e && e.extra_config) ? e.extra_config : {};
 
   q('modalTitle').textContent = `编辑规则 #${idx+1}`;
-  setField('f_listen', e.listen || '');
+  // Listen: port-only UI
+  const lp = parseListenToHostPort(e.listen || '');
+  if(q('f_listen_host')) setField('f_listen_host', lp.host || '0.0.0.0');
+  if(q('f_listen_port')) setField('f_listen_port', lp.port || '');
+  syncListenComputed();
   // synced sender rule should show original targets (not the peer receiver ip:port)
   setField('f_remotes', formatRemoteForInput(e));
 
@@ -1667,6 +1840,30 @@ function editRule(idx){
   }
   showWssBox();
   try{ setRuleScreen('params'); }catch(_e){}
+  // Close/open advanced panel based on non-default values
+  const adv = document.getElementById('advancedDetails');
+  if(adv){
+    let openAdv = false;
+    try{
+      const host = getListenHost();
+      if(host && host !== '0.0.0.0') openAdv = true;
+      if(q('f_protocol') && String(q('f_protocol').value || '') !== 'tcp+udp') openAdv = true;
+      if(q('f_balance') && String(q('f_balance').value || '') !== 'roundrobin') openAdv = true;
+      if(q('f_weights') && String(q('f_weights').value || '').trim()) openAdv = true;
+
+      const mode = q('f_type') ? String(q('f_type').value || 'tcp') : 'tcp';
+      if(mode === 'intranet'){
+        if(q('f_intranet_server_port') && String(q('f_intranet_server_port').value || '').trim() && String(q('f_intranet_server_port').value).trim() !== '18443') openAdv = true;
+        if(q('f_intranet_server_host') && String(q('f_intranet_server_host').value || '').trim()) openAdv = true;
+      }else if(mode === 'wss'){
+        if(q('f_wss_receiver_port') && String(q('f_wss_receiver_port').value || '').trim()) openAdv = true;
+        if(q('f_wss_tls') && String(q('f_wss_tls').value || '1') !== '1') openAdv = true;
+        if(q('f_wss_insecure') && q('f_wss_insecure').checked === false) openAdv = true;
+      }
+    }catch(_e){}
+    adv.open = openAdv;
+  }
+
   openModal();
 }
 
@@ -1827,7 +2024,10 @@ async function deleteRule(idx){
 
 async function saveRule(){
   const typeSel = q('f_type').value;
-  const listen = q('f_listen').value.trim();
+  // Listen: port-only UI
+  syncListenComputed();
+  const listen = getListenString();
+  const listenPortNum = parseInt(getListenPort() || '0', 10);
   const remotesRaw = q('f_remotes').value || '';
   const remotes = remotesRaw.split('\n').map(x=>x.trim()).filter(Boolean).map(x=>x.replace('\\r',''));
   const disabled = (q('f_disabled').value === '1');
@@ -2213,7 +2413,7 @@ function initNodePage(){
   });
 
   // Update mode preview as you type/select
-  ['f_listen','f_remotes','f_wss_receiver_node','f_wss_receiver_port','f_intranet_receiver_node','f_intranet_server_port','f_intranet_server_host'].forEach((id)=>{
+  ['f_listen_port','f_listen_host','f_remotes','f_wss_receiver_node','f_wss_receiver_port','f_intranet_receiver_node','f_intranet_server_port','f_intranet_server_host'].forEach((id)=>{
     const el = document.getElementById(id);
     if(!el) return;
     const fn = ()=>{ try{ updateModePreview(); }catch(_e){} };

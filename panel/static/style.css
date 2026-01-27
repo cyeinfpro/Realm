@@ -557,6 +557,143 @@ details.menu summary::-webkit-details-marker{display:none}
 }
 textarea,.textarea{min-height:90px;resize:vertical}
 
+
+/* =========================
+   Form sections + advanced params
+   ========================= */
+
+.form-section{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  padding:12px 12px;
+  border-radius:16px;
+  border:1px solid rgba(148,163,184,0.18);
+  background: rgba(2,6,23,0.12);
+}
+
+.section-head{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:10px;
+}
+
+.section-title{
+  font-weight: 900;
+  font-size: 13px;
+  letter-spacing:0.2px;
+}
+
+.section-sub{
+  margin-top:3px;
+  font-size:12px;
+  color: var(--muted);
+  line-height:1.45;
+}
+
+.input-group{
+  display:flex;
+  align-items:stretch;
+  width:100%;
+  border:1px solid var(--line);
+  border-radius:12px;
+  background:rgba(15,23,42,0.56);
+  overflow:hidden;
+}
+
+.input-prefix{
+  display:flex;
+  align-items:center;
+  padding:10px 10px;
+  border-right:1px solid var(--line);
+  background:rgba(2,6,23,0.10);
+  color: rgba(226,232,240,0.82);
+  white-space:nowrap;
+}
+
+.input-group .input{
+  border:0;
+  border-radius:0;
+  background:transparent;
+}
+
+.input-group .input:focus{
+  outline:none;
+}
+
+/* Advanced parameters (collapsible) */
+.advanced-details{
+  margin-top: 10px;
+  border-radius: 16px;
+  border:1px solid rgba(148,163,184,0.18);
+  background: rgba(2,6,23,0.10);
+  overflow:hidden;
+}
+
+.advanced-details > summary{
+  cursor:pointer;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  padding:10px 12px;
+  user-select:none;
+  list-style:none;
+}
+
+.advanced-details > summary::-webkit-details-marker{ display:none; }
+
+.advanced-details > summary::after{
+  content: '▾';
+  font-size: 12px;
+  color: rgba(226,232,240,0.72);
+  transform: translateY(-1px);
+  transition: transform .14s ease;
+}
+
+.advanced-details[open] > summary::after{
+  transform: rotate(-180deg) translateY(1px);
+}
+
+.advanced-details[open] > summary{
+  background: rgba(99,102,241,0.10);
+  border-bottom:1px solid rgba(148,163,184,0.18);
+}
+
+.adv-title{
+  font-weight: 900;
+  font-size: 12px;
+  letter-spacing:0.2px;
+}
+
+.adv-hint{
+  margin-top:2px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.adv-body{
+  padding: 12px 12px;
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+}
+
+.adv-grid{
+  display:grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.adv-subtitle{
+  font-weight: 900;
+  font-size: 12px;
+  letter-spacing:0.2px;
+  margin: 0;
+  padding-top: 4px;
+}
+
 /* =========================
    Rule modal: tunnel mode switcher
    ========================= */
