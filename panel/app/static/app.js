@@ -1015,7 +1015,12 @@ function showHealthDetail(idx){
     const statsLookup = buildStatsLookup();
     const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
     const lis = (eps[idx] && eps[idx].listen != null) ? String(eps[idx].listen).trim() : '';
-    const stats = (statsLookup.byIdx[idx] || (lis ? statsLookup.byListen[lis] : null) || {});
+    // Prefer matching by listen (stable) when idx mapping may be stale due to async apply/report.
+    const byIdx = statsLookup.byIdx[idx];
+    const byLis = lis ? statsLookup.byListen[lis] : null;
+    const stats = (byIdx && lis && String(byIdx.listen || '').trim() === lis)
+      ? byIdx
+      : (byLis || byIdx || {});
     const list = Array.isArray(stats.health) ? stats.health : [];
     const lines = list.map((it)=>{
       const ok = it && it.ok === true;
@@ -1121,7 +1126,12 @@ ${endpointType(e)}`.toLowerCase();
     const idx = it.idx;
     const rowNo = i + 1;
     const lis = (e && e.listen != null) ? String(e.listen).trim() : '';
-    const stats = statsLookup.byIdx[idx] || (lis ? statsLookup.byListen[lis] : null) || {};
+    // Prefer matching by listen (stable) when idx mapping may be stale due to async apply/report.
+    const byIdx = statsLookup.byIdx[idx];
+    const byLis = lis ? statsLookup.byListen[lis] : null;
+    const stats = (byIdx && lis && String(byIdx.listen || '').trim() === lis)
+      ? byIdx
+      : (byLis || byIdx || {});
     const statsError = statsLookup.error;
 
     if(isMobile && mobileWrap){

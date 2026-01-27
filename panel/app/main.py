@@ -1941,6 +1941,49 @@ def _remove_endpoints_by_sync_id(pool: Dict[str, Any], sync_id: str) -> None:
     pool["endpoints"] = new_eps
 
 
+def _upsert_endpoint_by_sync_id(pool: Dict[str, Any], sync_id: str, endpoint: Dict[str, Any]) -> None:
+    """Upsert an endpoint by extra_config.sync_id while preserving original ordering.
+
+    Background:
+      For WSS/内网穿透这类“同步规则”，面板后端过去采取
+      `remove(sync_id) + append(new)` 的策略。
+      这会导致：每次启停/编辑同步规则时，该规则会被移动到列表末尾。
+      前端又会用规则数组下标去关联 stats（连接数/流量/健康探测），在 Agent
+      尚未完成应用/上报前，会出现“暂停一个规则，其他规则统计也跟着错位”的视觉错乱。
+
+    This helper keeps the endpoint at its original index (if it already exists),
+    and also deduplicates any stale duplicates with the same sync_id.
+    """
+    if not isinstance(pool, dict):
+        return
+    eps = pool.get("endpoints")
+    if not isinstance(eps, list):
+        pool["endpoints"] = [endpoint]
+        return
+
+    keep_index: Optional[int] = None
+    new_eps: list[Any] = []
+    for ep in eps:
+        if not isinstance(ep, dict):
+            new_eps.append(ep)
+            continue
+        ex = ep.get("extra_config") or {}
+        sid = ex.get("sync_id") if isinstance(ex, dict) else None
+        if sid and str(sid) == str(sync_id):
+            if keep_index is None:
+                keep_index = len(new_eps)
+            # drop duplicates
+            continue
+        new_eps.append(ep)
+
+    if keep_index is None or keep_index < 0 or keep_index > len(new_eps):
+        new_eps.append(endpoint)
+    else:
+        new_eps.insert(keep_index, endpoint)
+
+    pool["endpoints"] = new_eps
+
+
 def _choose_receiver_port(receiver_pool: Dict[str, Any], preferred: Optional[int]) -> int:
     used = set()
     for ep in receiver_pool.get("endpoints") or []:
@@ -2295,11 +2338,9 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
 
     sender_pool = await _load_pool_for_node(sender)
 
-    # upsert by sync_id
-    _remove_endpoints_by_sync_id(sender_pool, sync_id)
-    _remove_endpoints_by_sync_id(receiver_pool, sync_id)
-    sender_pool["endpoints"].append(sender_ep)
-    receiver_pool["endpoints"].append(receiver_ep)
+    # upsert by sync_id (preserve original ordering to avoid UI/stat mismatch)
+    _upsert_endpoint_by_sync_id(sender_pool, sync_id, sender_ep)
+    _upsert_endpoint_by_sync_id(receiver_pool, sync_id, receiver_ep)
 
     # persist desired pools on panel
     s_ver, _ = set_desired_pool(sender_id, sender_pool)
@@ -2506,11 +2547,9 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     sender_pool = await _load_pool_for_node(sender)
     receiver_pool = await _load_pool_for_node(receiver)
 
-    # upsert by sync_id
-    _remove_endpoints_by_sync_id(sender_pool, sync_id)
-    _remove_endpoints_by_sync_id(receiver_pool, sync_id)
-    sender_pool["endpoints"].append(sender_ep)
-    receiver_pool["endpoints"].append(receiver_ep)
+    # upsert by sync_id (preserve original ordering to avoid UI/stat mismatch)
+    _upsert_endpoint_by_sync_id(sender_pool, sync_id, sender_ep)
+    _upsert_endpoint_by_sync_id(receiver_pool, sync_id, receiver_ep)
 
     s_ver, _ = set_desired_pool(sender_id, sender_pool)
     r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
