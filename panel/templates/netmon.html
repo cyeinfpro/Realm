@@ -6,7 +6,7 @@
   <div class="page-title">
     <h1 class="h1">网络波动监控</h1>
     <div class="meta">
-      <span class="meta-item">后台持续采集 · 打开页面可直接查看历史曲线（时间-延迟坐标图）。每个目标一张图，多节点同图对比。</span>
+      <span class="meta-item">后台持续采集 · 打开页面可直接查看历史曲线（时间-延迟坐标图）。每个目标一张图，多节点同图对比。支持：滚轮缩放、拖拽平移、悬浮显示具体数值；点击图例节点名可隐藏/显示曲线；双击图表可重置视图。</span>
     </div>
   </div>
   <div class="right" style="display:flex; gap:10px;">
@@ -99,7 +99,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=51.0"></script>
+<script src="/static/app.js?v=52.0"></script>
 <script>
 window.__NETMON_NODE_GROUPS__ = {{ (node_groups or [])|tojson }};
 window.addEventListener('DOMContentLoaded', ()=>{

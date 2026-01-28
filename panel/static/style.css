@@ -1824,6 +1824,8 @@ body.modal-open{ overflow:hidden; }
 
 .netmon-chart-card .netmon-canvas-wrap{
   padding: 0 12px 12px;
+
+  position: relative;
 }
 
 .netmon-canvas{
@@ -1833,6 +1835,13 @@ body.modal-open{ overflow:hidden; }
   border-radius: 12px;
   background: rgba(2,6,23,0.38);
   border: 1px solid rgba(148,163,184,0.12);
+
+  cursor: grab;
+  touch-action: none;
+}
+
+.netmon-canvas.is-dragging{
+  cursor: grabbing;
 }
 
 .netmon-legend{ margin-top: 10px; }
@@ -1844,11 +1853,27 @@ body.modal-open{ overflow:hidden; }
 }
 
 .netmon-legend-item{
+  appearance:none;
+  border: 1px solid rgba(148,163,184,0.18);
+  background: rgba(2,6,23,0.18);
+  padding: 4px 10px;
+  border-radius: 999px;
   display:flex;
   align-items:center;
   gap:6px;
   font-size:12px;
   color: rgba(226,232,240,0.92);
+  cursor:pointer;
+  user-select:none;
+  white-space:nowrap;
+}
+
+.netmon-legend-item:hover{
+  background: rgba(148,163,184,0.10);
+}
+
+.netmon-legend-item.off{
+  opacity: 0.45;
 }
 
 .netmon-dot{
@@ -1856,4 +1881,30 @@ body.modal-open{ overflow:hidden; }
   height: 10px;
   border-radius: 999px;
   box-shadow: 0 0 0 2px rgba(11,15,20,0.65);
+}
+
+.netmon-tooltip{
+  position:absolute;
+  z-index: 5;
+  min-width: 160px;
+  max-width: 280px;
+  background: rgba(2,6,23,0.92);
+  border: 1px solid rgba(148,163,184,0.18);
+  border-radius: 10px;
+  padding: 8px 10px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+  pointer-events:none;
+}
+
+.netmon-tt-head{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  margin-bottom:6px;
+}
+
+.netmon-tt-line{
+  font-size: 12px;
+  line-height: 1.2;
+  margin-top: 2px;
 }
