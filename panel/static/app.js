@@ -3749,6 +3749,15 @@ function initNetMonPage(){
 
   // Chart card actions (event delegation)
   chartsBox.addEventListener('click', async (e)=>{
+    const fullBtn = e.target.closest && e.target.closest('button.netmon-full');
+    if(fullBtn){
+      e.preventDefault();
+      const mid = fullBtn.getAttribute('data-mid');
+      const st = NETMON_STATE;
+      const ch = (st && st.charts && mid) ? st.charts[String(mid)] : null;
+      if(ch && ch.toggleFullscreen) ch.toggleFullscreen();
+      return;
+    }
     const editBtn = e.target.closest && e.target.closest('button.netmon-edit');
     if(editBtn){
       e.preventDefault();
@@ -3769,6 +3778,13 @@ function initNetMonPage(){
       const mid = delBtn.getAttribute('data-mid');
       if(mid) await netmonDeleteMonitor(mid);
       return;
+    }
+  });
+
+  // Esc exits full screen
+  window.addEventListener('keydown', (e)=>{
+    if(e && (e.key === 'Escape' || e.key === 'Esc')){
+      try{ _netmonExitFullscreenAll(); }catch(_e){}
     }
   });
 
@@ -4182,13 +4198,15 @@ function _netmonCreateMonitorCard(m){
   card.setAttribute('data-mid', String(m.id));
 
   card.innerHTML = `
-    <div class="card-header" style="padding:12px 12px 8px;">
+    <div class="card-header netmon-card-head" style="padding:12px 12px 8px;">
       <div style="min-width:0;">
         <div class="card-title mono netmon-title"></div>
         <div class="card-sub netmon-sub"></div>
+        <div class="netmon-stats" aria-label="metrics"></div>
         <div class="netmon-legend"></div>
       </div>
       <div class="right netmon-actions" style="flex:0 0 auto;">
+        <button class="btn xs ghost netmon-full" type="button" data-mid="${escapeHtml(String(m.id))}" title="全屏查看该图表">全屏</button>
         <button class="btn xs ghost netmon-edit" type="button" data-mid="${escapeHtml(String(m.id))}">编辑</button>
         <button class="btn xs ghost netmon-toggle" type="button" data-mid="${escapeHtml(String(m.id))}">停用</button>
         <button class="btn xs danger netmon-delete" type="button" data-mid="${escapeHtml(String(m.id))}">删除</button>
@@ -4196,6 +4214,7 @@ function _netmonCreateMonitorCard(m){
     </div>
     <div class="netmon-canvas-wrap">
       <canvas class="netmon-canvas" height="220"></canvas>
+      <button class="btn xs primary netmon-realtime-btn" type="button" style="display:none;" title="回到实时窗口">回到实时</button>
       <div class="netmon-tooltip" style="display:none;"></div>
     </div>
   `;
@@ -4299,6 +4318,39 @@ function _netmonSaveHidden(mid, setObj){
   }catch(_e){}
 }
 
+// Fullscreen helpers (single-card fullscreen with backdrop)
+let NETMON_FS_BACKDROP = null;
+
+function _netmonEnsureFsBackdrop(){
+  if(NETMON_FS_BACKDROP) return;
+  const d = document.createElement('div');
+  d.className = 'netmon-backdrop';
+  d.addEventListener('click', ()=>{
+    try{ _netmonExitFullscreenAll(); }catch(_e){}
+  });
+  document.body.appendChild(d);
+  NETMON_FS_BACKDROP = d;
+}
+
+function _netmonRemoveFsBackdrop(){
+  if(NETMON_FS_BACKDROP && NETMON_FS_BACKDROP.parentNode){
+    NETMON_FS_BACKDROP.parentNode.removeChild(NETMON_FS_BACKDROP);
+  }
+  NETMON_FS_BACKDROP = null;
+}
+
+function _netmonExitFullscreenAll(){
+  const st = NETMON_STATE;
+  if(st && st.charts){
+    Object.keys(st.charts).forEach((mid)=>{
+      const ch = st.charts[mid];
+      if(ch && ch.setFullscreen) ch.setFullscreen(false, {skipGlobal:true});
+    });
+  }
+  _netmonRemoveFsBackdrop();
+  try{ document.body.classList.remove('netmon-noscroll'); }catch(_e){}
+}
+
 function _netmonClamp(v, a, b){
   const x = Number(v);
   if(!Number.isFinite(x)) return a;
@@ -4325,7 +4377,10 @@ class NetMonChart{
     this.canvas = card.querySelector('canvas');
     this.ctx = this.canvas ? this.canvas.getContext('2d') : null;
     this.legendEl = card.querySelector('.netmon-legend');
+    this.statsEl = card.querySelector('.netmon-stats');
     this.tooltipEl = card.querySelector('.netmon-tooltip');
+    this.realtimeBtn = card.querySelector('.netmon-realtime-btn');
+    this.fullBtn = card.querySelector('button.netmon-full');
 
     this.hiddenNodes = _netmonLoadHidden(this.monitorId);
 
@@ -4337,8 +4392,12 @@ class NetMonChart{
     // interaction state
     this.layout = null;
     this.hover = null;
-    this.drag = { active:false, pointerId:null, startX:0, startY:0, startRange:null, moved:false };
+    this.drag = { active:false, pointerId:null, startX:0, startY:0, startRange:null, moved:false, mode:'pan', prevView:null };
     this._raf = null;
+
+    // cached UI fragments
+    this._statsKey = '';
+    this._legendClickTimer = null;
 
     this._bindEvents();
   }
@@ -4348,10 +4407,51 @@ class NetMonChart{
       this.legendEl.addEventListener('click', (e)=>{
         const item = e.target && e.target.closest ? e.target.closest('.netmon-legend-item') : null;
         if(!item) return;
+
+        const action = item.getAttribute('data-action');
+        if(action === 'showall'){
+          e.preventDefault();
+          this.showAllNodes();
+          return;
+        }
+
         const nid = item.getAttribute('data-nid');
         if(!nid) return;
         e.preventDefault();
-        this.toggleNode(nid);
+
+        // Power-user: Shift+click = solo (only show this node)
+        if(e.shiftKey){
+          this.soloNode(nid);
+          return;
+        }
+
+        // Single click toggles hide/show, double click solos.
+        // Use a short delay so dblclick won't flicker.
+        const clickCount = Number(e.detail || 1);
+        if(clickCount >= 2){
+          if(this._legendClickTimer){
+            clearTimeout(this._legendClickTimer);
+            this._legendClickTimer = null;
+          }
+          this.soloNode(nid);
+          return;
+        }
+
+        if(this._legendClickTimer){
+          clearTimeout(this._legendClickTimer);
+          this._legendClickTimer = null;
+        }
+        this._legendClickTimer = setTimeout(()=>{
+          this._legendClickTimer = null;
+          this.toggleNode(nid);
+        }, 220);
+      });
+    }
+
+    if(this.realtimeBtn){
+      this.realtimeBtn.addEventListener('click', (e)=>{
+        e.preventDefault();
+        this.resetView();
       });
     }
 
@@ -4373,6 +4473,72 @@ class NetMonChart{
     _netmonSaveHidden(this.monitorId, this.hiddenNodes);
     this.hover = null;
     this._hideTooltip();
+    this._syncHistoryUI();
+    this._scheduleRender(true);
+  }
+
+  showAllNodes(){
+    if(!this.hiddenNodes || this.hiddenNodes.size === 0) return;
+    this.hiddenNodes.clear();
+    _netmonSaveHidden(this.monitorId, this.hiddenNodes);
+    this.hover = null;
+    this._hideTooltip();
+    this._scheduleRender(true);
+  }
+
+  soloNode(nid){
+    const id = String(nid);
+    const st = NETMON_STATE;
+    const mon = st && st.monitorsMap ? st.monitorsMap[this.monitorId] : null;
+    const nodeIds = Array.isArray(mon && mon.node_ids) ? mon.node_ids.map(x=>String(x)) : [];
+    if(!nodeIds.length) return;
+    if(!nodeIds.includes(id)) return;
+
+    const visible = nodeIds.filter(x=>!this.hiddenNodes.has(String(x)));
+    const alreadySolo = (visible.length === 1 && String(visible[0]) === id);
+
+    if(alreadySolo){
+      this.hiddenNodes.clear();
+    }else{
+      const next = new Set();
+      nodeIds.forEach((x)=>{ if(String(x) !== id) next.add(String(x)); });
+      this.hiddenNodes = next;
+    }
+
+    _netmonSaveHidden(this.monitorId, this.hiddenNodes);
+    this.hover = null;
+    this._hideTooltip();
+    this._scheduleRender(true);
+  }
+
+  toggleFullscreen(){
+    if(!this.card) return;
+    const on = !this.card.classList.contains('netmon-fullscreen');
+    if(on){
+      // ensure only one fullscreen chart
+      try{ _netmonExitFullscreenAll(); }catch(_e){}
+      _netmonEnsureFsBackdrop();
+      try{ document.body.classList.add('netmon-noscroll'); }catch(_e){}
+    }
+    this.setFullscreen(on);
+  }
+
+  setFullscreen(on, opts){
+    if(!this.card) return;
+    const enable = !!on;
+    this.card.classList.toggle('netmon-fullscreen', enable);
+    if(this.fullBtn) this.fullBtn.textContent = enable ? '退出全屏' : '全屏';
+
+    if(!enable && !(opts && opts.skipGlobal)){
+      // if no more fullscreen charts, remove backdrop
+      const any = document.querySelector('.netmon-chart-card.netmon-fullscreen');
+      if(!any){
+        _netmonRemoveFsBackdrop();
+        try{ document.body.classList.remove('netmon-noscroll'); }catch(_e){}
+      }
+    }
+
+    // force re-layout
     this._scheduleRender(true);
   }
 
@@ -4390,7 +4556,31 @@ class NetMonChart{
     }
     this.hover = null;
     this._hideTooltip();
+    this._syncHistoryUI();
     this._scheduleRender(true);
+  }
+
+  _syncHistoryUI(){
+    if(this.realtimeBtn){
+      const show = (this.viewMode === 'fixed');
+      this.realtimeBtn.style.display = show ? '' : 'none';
+    }
+    if(this.card){
+      this.card.classList.toggle('netmon-history', this.viewMode === 'fixed');
+    }
+  }
+
+  _applyViewState(v){
+    if(!v) return;
+    this.viewMode = (v.viewMode === 'fixed') ? 'fixed' : 'follow';
+    if(v.spanMs != null) this.spanMs = v.spanMs;
+    if(v.fixed && v.fixed.xMin != null && v.fixed.xMax != null){
+      this.fixed.xMin = v.fixed.xMin;
+      this.fixed.xMax = v.fixed.xMax;
+    }else{
+      this.fixed.xMin = null;
+      this.fixed.xMax = null;
+    }
   }
 
   _scheduleRender(force){
@@ -4518,27 +4708,58 @@ class NetMonChart{
 
     this.hover = null;
     this._hideTooltip();
+    this._syncHistoryUI();
     this._scheduleRender(true);
   }
 
   _onPointerDown(e){
     if(!this.layout) return;
     if(e.pointerType === 'mouse' && e.button !== 0) return;
+
     const pos = this._getPos(e);
     if(!pos) return;
     if(!this._inPlot(pos.x, pos.y)) return;
 
     try{ this.canvas.setPointerCapture(e.pointerId); }catch(_e){}
 
+    const wantBox = !!(e.shiftKey);
+
     this.drag.active = true;
     this.drag.pointerId = e.pointerId;
     this.drag.startX = pos.x;
     this.drag.startY = pos.y;
     this.drag.moved = false;
-    this.drag.startRange = this._currentRange();
+    this.drag.mode = wantBox ? 'box' : 'pan';
+    this.drag.prevView = null;
 
     this.hover = null;
     this._hideTooltip();
+
+    if(wantBox){
+      // Freeze current view so selection doesn't drift while data auto-refreshes
+      const r = this._currentRange();
+      this.drag.startRange = {xMin:r.xMin, xMax:r.xMax};
+      this.drag.prevView = {
+        viewMode: this.viewMode,
+        spanMs: this.spanMs,
+        fixed: {xMin: this.fixed.xMin, xMax: this.fixed.xMax},
+      };
+
+      this.viewMode = 'fixed';
+      this.fixed.xMin = r.xMin;
+      this.fixed.xMax = r.xMax;
+
+      const x0 = _netmonClamp(pos.x, this.layout.padL, this.layout.padL + this.layout.plotW);
+      const y0 = _netmonClamp(pos.y, this.layout.padT, this.layout.padT + this.layout.plotH);
+      this.boxSel = {active:true, x0, y0, x1:x0, y1:y0};
+
+      if(this.canvas) this.canvas.classList.add('is-boxing');
+      this._syncHistoryUI();
+      this._scheduleRender(false);
+      return;
+    }
+
+    this.drag.startRange = this._currentRange();
     if(this.canvas) this.canvas.classList.add('is-dragging');
   }
 
@@ -4547,7 +4768,27 @@ class NetMonChart{
     if(!pos) return;
 
     if(this.drag.active && this.drag.pointerId === e.pointerId){
-      if(!this.layout || !this.drag.startRange) return;
+      if(!this.layout) return;
+
+      if(this.drag.mode === 'box'){
+        if(!this.boxSel || !this.boxSel.active) return;
+
+        const x = _netmonClamp(pos.x, this.layout.padL, this.layout.padL + this.layout.plotW);
+        const y = _netmonClamp(pos.y, this.layout.padT, this.layout.padT + this.layout.plotH);
+
+        this.boxSel.x1 = x;
+        this.boxSel.y1 = y;
+
+        const dx = x - this.boxSel.x0;
+        const dy = y - this.boxSel.y0;
+        if(Math.abs(dx) > 2 || Math.abs(dy) > 2) this.drag.moved = true;
+
+        this._scheduleRender(false);
+        return;
+      }
+
+      // pan
+      if(!this.drag.startRange) return;
 
       const dx = pos.x - this.drag.startX;
       const dy = pos.y - this.drag.startY;
@@ -4567,6 +4808,7 @@ class NetMonChart{
       this.viewMode = 'fixed';
       this.fixed.xMin = clamped.xMin;
       this.fixed.xMax = clamped.xMax;
+      this._syncHistoryUI();
 
       this._scheduleRender(false);
       return;
@@ -4579,9 +4821,64 @@ class NetMonChart{
     if(!this.drag.active) return;
     if(this.drag.pointerId !== e.pointerId) return;
 
+    if(this.drag.mode === 'box'){
+      const sel = (this.boxSel && this.boxSel.active) ? { ...this.boxSel } : null;
+      const startRange = this.drag.startRange;
+      const prevView = this.drag.prevView;
+
+      if(this.canvas) this.canvas.classList.remove('is-boxing');
+      if(this.boxSel) this.boxSel.active = false;
+
+      let didZoom = false;
+
+      if(this.drag.moved && sel && this.layout && startRange){
+        const minX = Math.min(sel.x0, sel.x1);
+        const maxX = Math.max(sel.x0, sel.x1);
+        const w = maxX - minX;
+
+        if(w >= 14){
+          const span = Math.max(1, startRange.xMax - startRange.xMin);
+          const r0 = _netmonClamp((minX - this.layout.padL) / this.layout.plotW, 0, 1);
+          const r1 = _netmonClamp((maxX - this.layout.padL) / this.layout.plotW, 0, 1);
+
+          let newMin = startRange.xMin + r0 * span;
+          let newMax = startRange.xMin + r1 * span;
+
+          const MIN_SPAN = 10000; // 10s
+          if(newMax - newMin < MIN_SPAN){
+            const c = (newMin + newMax) / 2;
+            newMin = c - MIN_SPAN / 2;
+            newMax = c + MIN_SPAN / 2;
+          }
+
+          const st = NETMON_STATE;
+          const loaded = this._loadedRange(st);
+          const clamped = this._clampRange(newMin, newMax, loaded.minMs, loaded.maxMs);
+
+          this.viewMode = 'fixed';
+          this.fixed.xMin = clamped.xMin;
+          this.fixed.xMax = clamped.xMax;
+          didZoom = true;
+        }
+      }
+
+      if(!didZoom && prevView){
+        this._applyViewState(prevView);
+      }
+
+      this.hover = null;
+      this._hideTooltip();
+      this._syncHistoryUI();
+      this._scheduleRender(true);
+    }
+
+    // end drag (pan or box)
     this.drag.active = false;
     this.drag.pointerId = null;
     this.drag.startRange = null;
+    this.drag.prevView = null;
+    this.drag.mode = 'pan';
+
     if(this.canvas) this.canvas.classList.remove('is-dragging');
   }
 
@@ -4621,11 +4918,15 @@ class NetMonChart{
     }
 
     const span = Math.max(1, this.layout.xMax - this.layout.xMin);
-    const tCursor = this.layout.xMin + ((mouseX - this.layout.padL) / this.layout.plotW) * span;
+    const mx = _netmonClamp(mouseX, this.layout.padL, this.layout.padL + this.layout.plotW);
+    const my = _netmonClamp(mouseY, this.layout.padT, this.layout.padT + this.layout.plotH);
+    const tCursor = this.layout.xMin + ((mx - this.layout.padL) / this.layout.plotW) * span;
 
-    let best = null;
-    let bestD2 = Infinity;
-    const radius = 6;
+    // --- snap-to-point (so hovering *on* a point feels precise)
+    let snap = null;
+    let snapD2 = Infinity;
+    const SNAP_RADIUS = 10; // px
+    const probe = 4;
 
     for(const nid of nodeIds){
       if(this.hiddenNodes.has(nid)) continue;
@@ -4633,62 +4934,162 @@ class NetMonChart{
       if(!arr.length) continue;
 
       const idx = _netmonBinarySearchByT(arr, tCursor);
-      for(let k=-radius;k<=radius;k++){
+      for(let k=-probe;k<=probe;k++){
         const i = idx + k;
         if(i < 0 || i >= arr.length) continue;
         const p = arr[i];
-        if(!p || p.v == null) continue;
+        if(!p) continue;
 
         const t = Number(p.t);
-        const v = Number(p.v);
-        if(!Number.isFinite(t) || !Number.isFinite(v)) continue;
+        if(!Number.isFinite(t)) continue;
         if(t < this.layout.xMin || t > this.layout.xMax) continue;
+
+        // Prefer snapping to points with numeric latency.
+        if(p.v == null) continue;
+        const v = Number(p.v);
+        if(!Number.isFinite(v)) continue;
 
         const x = this.layout.padL + ((t - this.layout.xMin) / span) * this.layout.plotW;
         const y = this.layout.padT + this.layout.plotH - (Math.max(0, Math.min(this.layout.yMax, v)) / this.layout.yMax) * this.layout.plotH;
-
-        const dx = x - mouseX;
-        const dy = y - mouseY;
+        const dx = x - mx;
+        const dy = y - my;
         const d2 = dx*dx + dy*dy;
-        if(d2 < bestD2){
-          bestD2 = d2;
-          best = {nid, t, v, x, y};
+        if(d2 < snapD2){
+          snapD2 = d2;
+          snap = {nid, t, v};
         }
       }
     }
 
-    const THRESH = 20 * 20;
-    if(best && bestD2 <= THRESH){
-      this.hover = { ...best, mouseX, mouseY };
-      this._showTooltip(best);
-      this._scheduleRender(false);
-    }else{
+    const SNAP_THR2 = SNAP_RADIUS * SNAP_RADIUS;
+    const anchorT = (snap && snapD2 <= SNAP_THR2) ? Number(snap.t) : tCursor;
+
+    const intervalMs = Math.max(1, (Number(mon.interval_sec) || 5)) * 1000;
+    const tolMs = Math.max(900, intervalMs * 1.25);
+
+    const rows = [];
+    for(const nid of nodeIds){
+      if(this.hiddenNodes.has(nid)) continue;
+      const arr = per[nid] || [];
+      let best = null;
+      let bestDt = Infinity;
+
+      if(arr.length){
+        const idx = _netmonBinarySearchByT(arr, anchorT);
+        for(const i of [idx-2, idx-1, idx, idx+1, idx+2]){
+          if(i < 0 || i >= arr.length) continue;
+          const p = arr[i];
+          if(!p) continue;
+          const t = Number(p.t);
+          if(!Number.isFinite(t)) continue;
+          if(t < this.layout.xMin || t > this.layout.xMax) continue;
+          const dt = Math.abs(t - anchorT);
+          if(dt < bestDt){
+            bestDt = dt;
+            best = p;
+          }
+        }
+      }
+
+      const row = { nid, t:null, v:null, ok:null, e:'', dt:null };
+      if(best && bestDt <= tolMs){
+        const bt = Number(best.t);
+        row.t = Number.isFinite(bt) ? bt : null;
+        row.v = (best.v == null) ? null : Number(best.v);
+        if(typeof best.ok === 'boolean') row.ok = !!best.ok;
+        else row.ok = (best.v != null);
+        if(best.e != null) row.e = String(best.e);
+        row.dt = (row.t != null) ? (row.t - anchorT) : null;
+      }
+      rows.push(row);
+    }
+
+    if(!rows.length){
       if(this.hover){
         this.hover = null;
         this._hideTooltip();
         this._scheduleRender(false);
       }
+      return;
     }
+
+    const hv = {
+      t: anchorT,
+      cursorT: tCursor,
+      snapNid: (snap && snapD2 <= SNAP_THR2) ? String(snap.nid) : null,
+      mouseX: mx,
+      mouseY: my,
+      intervalMs,
+      tolMs,
+      rows,
+    };
+
+    this.hover = hv;
+    this._showTooltip(hv);
+    this._scheduleRender(false);
   }
 
-  _showTooltip(best){
-    if(!this.tooltipEl || !best || !this.canvas) return;
+  _showTooltip(hv){
+    if(!this.tooltipEl || !hv || !this.canvas) return;
     const st = NETMON_STATE;
-    const meta = (st && st.nodesMeta && st.nodesMeta[best.nid]) ? st.nodesMeta[best.nid] : null;
-    const name = meta ? (meta.name || ('节点-' + best.nid)) : ('节点-' + best.nid);
-    const color = _netmonColorForNode(best.nid);
 
-    const tTxt = _netmonFormatTs(best.t);
-    const vTxt = `${Number(best.v).toFixed(1)} ms`;
+    const rows = Array.isArray(hv.rows) ? hv.rows : [];
+    const tTxt = _netmonFormatTs(hv.t);
 
-    this.tooltipEl.innerHTML = `
-      <div class="netmon-tt-head">
-        <span class="netmon-dot" style="background:${escapeHtml(color)}"></span>
-        <span class="mono">${escapeHtml(name)}</span>
+    const out = [];
+    out.push(`
+      <div class="netmon-tt-top">
+        <div class="netmon-tt-title mono">${escapeHtml(tTxt)}</div>
+        <div class="netmon-tt-sub muted sm">提示：单击图例隐藏，双击独显 · Shift+单击也可独显</div>
       </div>
-      <div class="netmon-tt-line"><span class="muted mono">${escapeHtml(tTxt)}</span></div>
-      <div class="netmon-tt-line"><span class="muted">延迟</span> <strong class="mono">${escapeHtml(vTxt)}</strong></div>
-    `;
+      <div class="netmon-tt-table">
+    `);
+
+    const dtBadge = (dtMs, intervalMs)=>{
+      if(dtMs == null || !Number.isFinite(Number(dtMs))) return '<span class="netmon-tt-delta muted mono"></span>';
+      const abs = Math.abs(Number(dtMs));
+      // Only show when the nearest sample is meaningfully off from the crosshair time
+      if(abs < Math.max(250, intervalMs * 0.35)) return '<span class="netmon-tt-delta muted mono"></span>';
+      const s = (Number(dtMs) >= 0) ? '+' : '-';
+      const sec = (abs / 1000);
+      const txt = sec >= 10 ? `${s}${sec.toFixed(0)}s` : `${s}${sec.toFixed(1)}s`;
+      return `<span class="netmon-tt-delta muted mono">${escapeHtml(txt)}</span>`;
+    };
+
+    for(const r of rows){
+      if(!r || !r.nid) continue;
+      const nid = String(r.nid);
+      const meta = (st && st.nodesMeta && st.nodesMeta[nid]) ? st.nodesMeta[nid] : null;
+      const name = meta ? (meta.name || ('节点-' + nid)) : ('节点-' + nid);
+      const color = _netmonColorForNode(nid);
+
+      let vTxt = '—';
+      let isBad = false;
+      let errTxt = '';
+      if(r.v != null && Number.isFinite(Number(r.v))){
+        vTxt = `${Number(r.v).toFixed(1)} ms`;
+      }else if(r.ok === false){
+        vTxt = '失败';
+        isBad = true;
+        if(r.e) errTxt = String(r.e);
+      }
+
+      out.push(`
+        <div class="netmon-tt-row">
+          <span class="netmon-dot" style="background:${escapeHtml(color)}"></span>
+          <span class="mono netmon-tt-name">${escapeHtml(name)}</span>
+          ${dtBadge(r.dt, hv.intervalMs || 1000)}
+          <span class="mono netmon-tt-val ${isBad ? 'bad' : ''}">${escapeHtml(vTxt)}</span>
+        </div>
+      `);
+      if(errTxt){
+        out.push(`<div class="netmon-tt-err muted mono">${escapeHtml(errTxt)}</div>`);
+      }
+    }
+
+    out.push(`</div>`);
+
+    this.tooltipEl.innerHTML = out.join('');
 
     // show first to measure
     this.tooltipEl.style.display = '';
@@ -4712,14 +5113,14 @@ class NetMonChart{
     const tipRect = this.tooltipEl.getBoundingClientRect();
     const offset = 12;
 
-    let left = offX + (best.mouseX || 0) + offset;
-    let top = offY + (best.mouseY || 0) + offset;
+    let left = offX + (hv.mouseX || 0) + offset;
+    let top = offY + (hv.mouseY || 0) + offset;
 
     const maxLeft = Math.max(8, wrapW - tipRect.width - 8);
     const maxTop = Math.max(8, wrapH - tipRect.height - 8);
 
-    if(left > maxLeft) left = offX + (best.mouseX || 0) - tipRect.width - offset;
-    if(top > maxTop) top = offY + (best.mouseY || 0) - tipRect.height - offset;
+    if(left > maxLeft) left = offX + (hv.mouseX || 0) - tipRect.width - offset;
+    if(top > maxTop) top = offY + (hv.mouseY || 0) - tipRect.height - offset;
 
     left = _netmonClamp(left, 8, maxLeft);
     top = _netmonClamp(top, 8, maxTop);
@@ -4739,6 +5140,8 @@ class NetMonChart{
 
     const mon = st.monitorsMap ? st.monitorsMap[this.monitorId] : null;
     if(!mon) return;
+
+    this._syncHistoryUI();
 
     const w = Math.max(200, this.canvas.clientWidth || 0);
     const h = Math.max(140, this.canvas.clientHeight || 0);
@@ -4888,35 +5291,193 @@ class NetMonChart{
       if(started) this.ctx.stroke();
     }
 
-    // hover highlight
-    if(this.hover && this.hover.nid && !this.hiddenNodes.has(this.hover.nid)){
+    // box zoom selection
+    if(this.boxSel && this.boxSel.active){
+      const x0 = Number(this.boxSel.x0);
+      const y0 = Number(this.boxSel.y0);
+      const x1 = Number(this.boxSel.x1);
+      const y1 = Number(this.boxSel.y1);
+      const x = Math.min(x0, x1);
+      const y = Math.min(y0, y1);
+      const rw = Math.abs(x1 - x0);
+      const rh = Math.abs(y1 - y0);
+      if(rw > 1 && rh > 1){
+        this.ctx.save();
+        this.ctx.fillStyle = 'rgba(255,255,255,0.06)';
+        this.ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+        this.ctx.lineWidth = 1;
+        try{ this.ctx.setLineDash([6,4]); }catch(_e){}
+        this.ctx.fillRect(x, y, rw, rh);
+        this.ctx.strokeRect(x + 0.5, y + 0.5, rw, rh);
+        try{ this.ctx.setLineDash([]); }catch(_e){}
+        this.ctx.restore();
+      }
+    }
+
+    // hover highlight (crosshair + multi-series point markers)
+    if(this.hover && Array.isArray(this.hover.rows)){
       const t = Number(this.hover.t);
-      const v = Number(this.hover.v);
-      if(Number.isFinite(t) && Number.isFinite(v) && t >= xMin && t <= xMax){
+      if(Number.isFinite(t) && t >= xMin && t <= xMax){
         const x = padL + ((t - xMin) / xSpan) * plotW;
-        const y = padT + plotH - (Math.max(0, Math.min(yMax, v)) / yMax) * plotH;
 
         // crosshair
-        this.ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+        this.ctx.save();
+        this.ctx.strokeStyle = 'rgba(255,255,255,0.14)';
         this.ctx.lineWidth = 1;
+        try{ this.ctx.setLineDash([4,4]); }catch(_e){}
         this.ctx.beginPath();
         this.ctx.moveTo(x, padT);
         this.ctx.lineTo(x, padT + plotH);
         this.ctx.stroke();
+        try{ this.ctx.setLineDash([]); }catch(_e){}
+        this.ctx.restore();
 
-        // point
-        const c = _netmonColorForNode(this.hover.nid);
-        this.ctx.beginPath();
-        this.ctx.arc(x, y, 4.5, 0, Math.PI * 2);
-        this.ctx.fillStyle = c;
-        this.ctx.fill();
-        this.ctx.lineWidth = 2;
-        this.ctx.strokeStyle = 'rgba(11,15,20,0.85)';
-        this.ctx.stroke();
+        const rows = this.hover.rows;
+        for(const r of rows){
+          if(!r || !r.nid) continue;
+          const nid = String(r.nid);
+          if(this.hiddenNodes.has(nid)) continue;
+          if(r.v == null || !Number.isFinite(Number(r.v))) continue;
+          if(r.t == null || !Number.isFinite(Number(r.t))) continue;
+          const ptT = Number(r.t);
+          if(ptT < xMin || ptT > xMax) continue;
+          const ptV = Number(r.v);
+
+          const px = padL + ((ptT - xMin) / xSpan) * plotW;
+          const py = padT + plotH - (Math.max(0, Math.min(yMax, ptV)) / yMax) * plotH;
+
+          const c = _netmonColorForNode(nid);
+          const isSnap = (this.hover.snapNid && String(this.hover.snapNid) === nid);
+          const radius = isSnap ? 5.2 : 4.2;
+
+          this.ctx.beginPath();
+          this.ctx.arc(px, py, radius, 0, Math.PI * 2);
+          this.ctx.fillStyle = c;
+          this.ctx.fill();
+          this.ctx.lineWidth = 2;
+          this.ctx.strokeStyle = 'rgba(11,15,20,0.85)';
+          this.ctx.stroke();
+        }
       }
     }
 
+    this._renderStats(mon, per, xMin, xMax);
     this._renderLegend(mon, per, xMin, xMax);
+  }
+
+  _renderStats(mon, per, xMin, xMax){
+    const st = NETMON_STATE;
+    if(!st || !this.statsEl) return;
+    const nodeIds = Array.isArray(mon && mon.node_ids) ? mon.node_ids.map(x=>String(x)) : [];
+
+    // Cache by range + hidden set + latest snapshot timestamp
+    const hiddenKey = Array.from(this.hiddenNodes || []).sort().join(',');
+    const key = `${Math.round(Number(xMin)||0)}|${Math.round(Number(xMax)||0)}|${hiddenKey}|${Math.round(Number(st.lastTs)||0)}`;
+    if(key === this._statsKey) return;
+    this._statsKey = key;
+
+    const visibleNodes = nodeIds.filter(nid=>!this.hiddenNodes.has(String(nid)));
+
+    // Online count
+    let online = 0;
+    for(const nid of visibleNodes){
+      const meta = (st.nodesMeta && st.nodesMeta[String(nid)]) ? st.nodesMeta[String(nid)] : null;
+      if(meta && meta.online) online += 1;
+    }
+
+    // Collect values in range
+    let total = 0;
+    let fail = 0;
+    let values = [];
+
+    // Last per node (within range) for max-last
+    let lastMax = null;
+
+    const xMinN = Number(xMin) || 0;
+    const xMaxN = Number(xMax) || 0;
+
+    for(const nid of visibleNodes){
+      const arr = (per && per[String(nid)]) ? per[String(nid)] : [];
+      if(!arr.length) continue;
+
+      // last within range
+      let lastV = null;
+      for(let i=arr.length-1;i>=0;i--){
+        const p = arr[i];
+        if(!p) continue;
+        const t = Number(p.t);
+        if(!Number.isFinite(t)) continue;
+        if(t < xMinN) break;
+        if(t > xMaxN) continue;
+        if(p.v != null && Number.isFinite(Number(p.v))){ lastV = Number(p.v); break; }
+      }
+      if(lastV != null){
+        if(lastMax == null) lastMax = lastV;
+        else lastMax = Math.max(Number(lastMax), Number(lastV));
+      }
+
+      const start = _netmonBinarySearchByT(arr, xMinN);
+      for(let i=start;i<arr.length;i++){
+        const p = arr[i];
+        if(!p) continue;
+        const t = Number(p.t);
+        if(!Number.isFinite(t)) continue;
+        if(t > xMaxN) break;
+        total += 1;
+        if(p.v == null){
+          fail += 1;
+          continue;
+        }
+        const v = Number(p.v);
+        if(Number.isFinite(v)) values.push(v);
+      }
+    }
+
+    // Downsample if too many points (keep UI snappy even with long windows)
+    const MAX_N = 20000;
+    if(values.length > MAX_N){
+      const step = Math.ceil(values.length / MAX_N);
+      const sampled = [];
+      for(let i=0;i<values.length;i+=step) sampled.push(values[i]);
+      values = sampled;
+    }
+
+    let avg = null;
+    let p50 = null;
+    let p95 = null;
+    if(values.length){
+      let sum = 0;
+      for(const v of values) sum += Number(v) || 0;
+      avg = sum / values.length;
+
+      const sorted = values.slice().sort((a,b)=>a-b);
+      const q = (p)=>{
+        if(!sorted.length) return null;
+        const idx = Math.max(0, Math.min(sorted.length-1, Math.floor(p * (sorted.length-1))));
+        return sorted[idx];
+      };
+      p50 = q(0.50);
+      p95 = q(0.95);
+    }
+
+    const jitter = (p95 != null && p50 != null) ? (Number(p95) - Number(p50)) : null;
+    const loss = (total > 0) ? (fail / total) : null;
+
+    const pill = (k, v, cls, title)=>{
+      const c = cls ? ` ${cls}` : '';
+      const t = title ? ` title="${escapeHtml(title)}"` : '';
+      return `<div class="netmon-pill${c}"${t}><span class="k">${escapeHtml(k)}</span><span class="v mono">${escapeHtml(v)}</span></div>`;
+    };
+
+    const pills = [];
+    pills.push(pill('在线', `${online}/${visibleNodes.length}`, '', '当前可见节点在线数 / 可见节点数'));
+    pills.push(pill('当前', (lastMax != null) ? `${Number(lastMax).toFixed(1)}ms` : '—', '', '可见节点在当前窗口内的“最新延迟”的最大值'));
+    pills.push(pill('均值', (avg != null) ? `${Number(avg).toFixed(1)}ms` : '—', '', '窗口内全部成功采样点的均值'));
+    pills.push(pill('P95', (p95 != null) ? `${Number(p95).toFixed(1)}ms` : '—', '', '窗口内全部成功采样点的 95 分位'));
+    pills.push(pill('抖动', (jitter != null) ? `${Number(jitter).toFixed(1)}ms` : '—', '', 'P95 - P50（越大说明波动越明显）'));
+    pills.push(pill('失败', (loss != null) ? `${(loss*100).toFixed(1)}%` : '—', (loss != null && loss > 0.02) ? 'warn' : '', '失败采样占比（v 为空/探测失败）'));
+
+    this.statsEl.innerHTML = `<div class="netmon-stats-wrap">${pills.join('')}</div>`;
   }
 
   _renderLegend(mon, per, xMin, xMax){
@@ -4954,10 +5515,19 @@ class NetMonChart{
       const valTxt = (last != null && !Number.isNaN(Number(last))) ? `${Number(last).toFixed(1)} ms` : '—';
 
       parts.push(`
-        <button class="netmon-legend-item ${hidden ? 'off' : ''}" type="button" data-nid="${escapeHtml(nidStr)}" title="点击隐藏/显示该节点曲线">
+        <button class="netmon-legend-item ${hidden ? 'off' : ''}" type="button" data-nid="${escapeHtml(nidStr)}" title="单击隐藏/显示 · 双击仅看该节点 · Shift+单击也可独显">
           <span class="netmon-dot" style="background:${escapeHtml(color)}"></span>
           <span class="mono">${escapeHtml(showName)}</span>
           <span class="muted mono">${escapeHtml(valTxt)}</span>
+        </button>
+      `);
+    }
+
+    // Show-all shortcut when some series are hidden
+    if(this.hiddenNodes && this.hiddenNodes.size > 0 && nodeIds.length > 0){
+      parts.push(`
+        <button class="netmon-legend-item aux" type="button" data-action="showall" title="显示全部曲线">
+          <span class="muted">显示全部</span>
         </button>
       `);
     }

@@ -2793,7 +2793,19 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
                 v = float(r.get("latency_ms"))
             except Exception:
                 v = None
-        series[mid_s][nid_s].append({"t": ts, "v": v})
+
+        # For richer chart UX (tooltip shows error cause), include ok/error in point.
+        # Keep the payload compact: only attach error message for failed samples.
+        pt: Dict[str, Any] = {"t": ts, "v": v, "ok": ok}
+        if not ok:
+            err = r.get("error")
+            if err is not None:
+                em = str(err)
+                if len(em) > 120:
+                    em = em[:120] + "…"
+                pt["e"] = em
+
+        series[mid_s][nid_s].append(pt)
 
     monitors_out: List[Dict[str, Any]] = []
     for m in monitors:
