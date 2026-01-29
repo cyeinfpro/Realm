@@ -3683,8 +3683,17 @@ function initNetMonPage(){
     lastTs: Date.now(),
     cutoffMs: null,
     windowSec: null,
+
+    // UI view config
     windowMin: 10,
     autoRefresh: true,
+    searchQuery: '',
+    filterMode: 'all',
+
+    // URL shared view (apply once after first snapshot)
+    urlState: _netmonParseUrlState(),
+    urlApplied: false,
+
     nodesMeta: nodesMeta,       // from template (fallback). will be replaced by snapshot.nodes
     monitors: [],
     monitorsMap: {},
@@ -3699,6 +3708,16 @@ function initNetMonPage(){
     if(saved && typeof saved === 'object'){
       if(saved.windowMin) NETMON_STATE.windowMin = Math.max(1, Number(saved.windowMin) || 10);
       if(saved.autoRefresh === false) NETMON_STATE.autoRefresh = false;
+      if(typeof saved.searchQuery === 'string') NETMON_STATE.searchQuery = saved.searchQuery;
+      if(saved.filterMode) NETMON_STATE.filterMode = String(saved.filterMode);
+    }
+  }catch(_e){}
+
+  // Apply shared-view window override from URL (if any)
+  try{
+    const u = NETMON_STATE.urlState;
+    if(u && u.winMin){
+      NETMON_STATE.windowMin = Math.max(Number(NETMON_STATE.windowMin)||10, Number(u.winMin)||0);
     }
   }catch(_e){}
 
@@ -3707,6 +3726,11 @@ function initNetMonPage(){
   if(winEl) winEl.value = String(Math.max(1, Math.min(1440, NETMON_STATE.windowMin)));
   const autoEl = document.getElementById('netmonAutoRefresh');
   if(autoEl) autoEl.value = NETMON_STATE.autoRefresh ? 'on' : 'off';
+
+  const searchEl = document.getElementById('netmonSearch');
+  if(searchEl) searchEl.value = String(NETMON_STATE.searchQuery || '');
+  const filterEl = document.getElementById('netmonFilter');
+  if(filterEl) filterEl.value = String(NETMON_STATE.filterMode || 'all');
 
   if(winEl){
     winEl.addEventListener('change', ()=>{
@@ -3722,6 +3746,28 @@ function initNetMonPage(){
       NETMON_STATE.autoRefresh = (autoEl.value !== 'off');
       _netmonSaveView();
       _netmonSyncAutoTimer();
+    });
+  }
+
+  // Search & filter
+  let _netmonSearchTimer = null;
+  if(searchEl){
+    searchEl.addEventListener('input', ()=>{
+      if(_netmonSearchTimer) clearTimeout(_netmonSearchTimer);
+      _netmonSearchTimer = setTimeout(()=>{
+        _netmonSearchTimer = null;
+        NETMON_STATE.searchQuery = String(searchEl.value || '');
+        _netmonSaveView();
+        _netmonApplyCardFilters();
+      }, 140);
+    });
+  }
+
+  if(filterEl){
+    filterEl.addEventListener('change', ()=>{
+      NETMON_STATE.filterMode = String(filterEl.value || 'all');
+      _netmonSaveView();
+      _netmonApplyCardFilters();
     });
   }
 
@@ -3756,6 +3802,24 @@ function initNetMonPage(){
       const st = NETMON_STATE;
       const ch = (st && st.charts && mid) ? st.charts[String(mid)] : null;
       if(ch && ch.toggleFullscreen) ch.toggleFullscreen();
+      return;
+    }
+    const shareBtn = e.target.closest && e.target.closest('button.netmon-share');
+    if(shareBtn){
+      e.preventDefault();
+      const mid = shareBtn.getAttribute('data-mid');
+      const st = NETMON_STATE;
+      const ch = (st && st.charts && mid) ? st.charts[String(mid)] : null;
+      if(ch && ch.copyShareLink) await ch.copyShareLink();
+      return;
+    }
+    const exportBtn = e.target.closest && e.target.closest('button.netmon-export');
+    if(exportBtn){
+      e.preventDefault();
+      const mid = exportBtn.getAttribute('data-mid');
+      const st = NETMON_STATE;
+      const ch = (st && st.charts && mid) ? st.charts[String(mid)] : null;
+      if(ch && ch.exportPNG) ch.exportPNG();
       return;
     }
     const editBtn = e.target.closest && e.target.closest('button.netmon-edit');
@@ -3809,6 +3873,8 @@ function _netmonSaveView(){
     localStorage.setItem('netmon_view', JSON.stringify({
       windowMin: NETMON_STATE ? NETMON_STATE.windowMin : 10,
       autoRefresh: NETMON_STATE ? NETMON_STATE.autoRefresh : true,
+      searchQuery: NETMON_STATE ? NETMON_STATE.searchQuery : '',
+      filterMode: NETMON_STATE ? NETMON_STATE.filterMode : 'all',
     }));
   }catch(_e){}
 }
@@ -4145,15 +4211,12 @@ async function netmonRefresh(force){
     st.series = (res && res.series && typeof res.series === 'object') ? res.series : {};
 
     _netmonEnsureCards();
+    _netmonApplyUrlStateIfNeeded();
     netmonRenderAll(force);
+    _netmonApplyCardFilters();
 
     const empty = document.getElementById('netmonEmpty');
     if(empty) empty.style.display = monitors.length ? 'none' : '';
-
-    if(statusEl){
-      const tsTxt = _netmonFormatClock(st.lastTs);
-      statusEl.textContent = `已加载 ${monitors.length} 条监控 · 最近更新：${tsTxt}`;
-    }
   }catch(e){
     const msg = (e && e.message) ? e.message : String(e);
     if(statusEl) statusEl.textContent = `加载失败：${msg}`;
@@ -4216,6 +4279,55 @@ function netmonRenderAll(force){
   });
 }
 
+function _netmonApplyCardFilters(){
+  const st = NETMON_STATE;
+  if(!st || !st.charts) return;
+
+  const q = String(st.searchQuery || '').trim().toLowerCase();
+  const mode = String(st.filterMode || 'all');
+
+  let shown = 0;
+  let total = 0;
+
+  Object.keys(st.charts).forEach((mid)=>{
+    const ch = st.charts[mid];
+    if(!ch || !ch.card) return;
+    total += 1;
+
+    const mon = st.monitorsMap ? st.monitorsMap[String(mid)] : null;
+    const target = mon ? String(mon.target || '') : '';
+
+    let match = true;
+    if(q){
+      match = target.toLowerCase().includes(q) || String(mid).includes(q);
+    }
+
+    if(match){
+      if(mode === 'enabled' && mon && !mon.enabled) match = false;
+      if(mode === 'disabled' && mon && mon.enabled) match = false;
+      if(mode === 'abnormal'){
+        const lv = String(ch.level || 'none');
+        match = (lv === 'warn' || lv === 'crit');
+      }
+      if(mode === 'crit'){
+        match = String(ch.level || '') === 'crit';
+      }
+    }
+
+    ch.card.style.display = match ? '' : 'none';
+    if(match) shown += 1;
+  });
+
+  // Update status text with shown count (based on last snapshot)
+  try{
+    const statusEl = document.getElementById('netmonStatus');
+    if(statusEl && Array.isArray(st.monitors)){
+      const tsTxt = _netmonFormatClock(st.lastTs);
+      statusEl.textContent = `已加载 ${st.monitors.length} 条监控 · 显示 ${shown}/${total} · 最近更新：${tsTxt}`;
+    }
+  }catch(_e){}
+}
+
 function _netmonCreateMonitorCard(m){
   const card = document.createElement('div');
   card.className = 'card netmon-chart-card';
@@ -4231,6 +4343,8 @@ function _netmonCreateMonitorCard(m){
       </div>
       <div class="right netmon-actions" style="flex:0 0 auto;">
         <button class="btn xs ghost netmon-full" type="button" data-mid="${escapeHtml(String(m.id))}" title="全屏查看该图表">全屏</button>
+        <button class="btn xs ghost netmon-share" type="button" data-mid="${escapeHtml(String(m.id))}" title="复制分享链接（包含当前视图/隐藏曲线）">分享</button>
+        <button class="btn xs ghost netmon-export" type="button" data-mid="${escapeHtml(String(m.id))}" title="导出当前图表为 PNG">PNG</button>
         <button class="btn xs ghost netmon-edit" type="button" data-mid="${escapeHtml(String(m.id))}">编辑</button>
         <button class="btn xs ghost netmon-toggle" type="button" data-mid="${escapeHtml(String(m.id))}">停用</button>
         <button class="btn xs danger netmon-delete" type="button" data-mid="${escapeHtml(String(m.id))}">删除</button>
@@ -4351,6 +4465,116 @@ function _netmonSaveHidden(mid, setObj){
   }catch(_e){}
 }
 
+function _netmonSanitizeFilename(name){
+  const s = String(name || 'export')
+    .replace(/[:\/\\?%*|"<>]/g, '_')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return s ? s.slice(0, 60) : 'export';
+}
+
+function _netmonParseUrlState(){
+  try{
+    const params = new URLSearchParams(window.location.search || '');
+    const mid = params.get('mid');
+    if(!mid) return null;
+
+    const modeRaw = String(params.get('mode') || '').toLowerCase();
+    const mode = (modeRaw === 'fixed') ? 'fixed' : 'follow';
+
+    const num = (x)=>{
+      const v = Number(x);
+      return Number.isFinite(v) ? v : null;
+    };
+
+    const from = num(params.get('from'));
+    const to = num(params.get('to'));
+    const span = num(params.get('span'));
+    const win = num(params.get('win'));
+
+    const hiddenRaw = params.get('hidden');
+    const hidden = hiddenRaw ? String(hiddenRaw).split(',').map(s=>String(s).trim()).filter(Boolean) : [];
+
+    return {
+      mid: String(mid),
+      mode,
+      from,
+      to,
+      span,
+      hidden,
+      winMin: (win != null) ? Math.max(1, Math.min(1440, win)) : null,
+    };
+  }catch(_e){
+    return null;
+  }
+}
+
+function _netmonApplyUrlStateIfNeeded(){
+  const st = NETMON_STATE;
+  if(!st || st.urlApplied) return;
+
+  const u = st.urlState;
+  if(!u || !u.mid){
+    st.urlApplied = true;
+    return;
+  }
+
+  const mid = String(u.mid);
+  const ch = (st.charts && st.charts[mid]) ? st.charts[mid] : null;
+  const mon = (st.monitorsMap && st.monitorsMap[mid]) ? st.monitorsMap[mid] : null;
+
+  // If monitor doesn't exist, mark applied and notify once.
+  if(!mon){
+    st.urlApplied = true;
+    try{ toast('分享链接的监控不存在或已删除', true); }catch(_e){}
+    return;
+  }
+
+  // Wait until card is created.
+  if(!ch) return;
+
+  // Apply hidden nodes (list means "hidden")
+  if(Array.isArray(u.hidden)){
+    const next = new Set(u.hidden.map(x=>String(x)));
+    const allow = new Set((Array.isArray(mon.node_ids) ? mon.node_ids : []).map(x=>String(x)));
+    for(const x of Array.from(next)){
+      if(!allow.has(String(x))) next.delete(String(x));
+    }
+    ch.hiddenNodes = next;
+    _netmonSaveHidden(mid, next);
+  }
+
+  // Apply range
+  if(u.mode === 'fixed' && u.from != null && u.to != null && Number(u.to) > Number(u.from)){
+    ch.viewMode = 'fixed';
+    ch.fixed.xMin = Number(u.from);
+    ch.fixed.xMax = Number(u.to);
+  }else{
+    ch.viewMode = 'follow';
+    ch.fixed.xMin = null;
+    ch.fixed.xMax = null;
+    if(u.span != null && Number.isFinite(Number(u.span))){
+      ch.spanMs = Number(u.span);
+    }
+  }
+
+  try{ ch._syncHistoryUI(); }catch(_e){}
+  ch.hover = null;
+  try{ ch._hideTooltip(); }catch(_e){}
+
+  // Focus the card briefly
+  try{
+    if(ch.card){
+      ch.card.classList.add('netmon-focus');
+      setTimeout(()=>{ try{ ch.card.classList.remove('netmon-focus'); }catch(_e){} }, 2200);
+      ch.card.scrollIntoView({behavior:'smooth', block:'start'});
+    }
+  }catch(_e){}
+
+  st.urlApplied = true;
+}
+
 // Fullscreen helpers (single-card fullscreen with backdrop)
 let NETMON_FS_BACKDROP = null;
 
@@ -4403,6 +4627,64 @@ function _netmonBinarySearchByT(arr, t){
   return lo;
 }
 
+function _netmonLTTB(data, threshold){
+  // Largest-Triangle-Three-Buckets downsampling
+  // data: array of {t, v} sorted by t
+  const n = Array.isArray(data) ? data.length : 0;
+  const th = Math.max(3, Math.floor(Number(threshold) || 0));
+  if(!n || th >= n) return data;
+
+  const sampled = [];
+  const every = (n - 2) / (th - 2);
+  let a = 0;
+  sampled.push(data[a]);
+
+  for(let i=0;i<th-2;i++){
+    const avgRangeStart = Math.floor((i + 1) * every) + 1;
+    let avgRangeEnd = Math.floor((i + 2) * every) + 1;
+    if(avgRangeEnd > n) avgRangeEnd = n;
+
+    // average of next bucket
+    let avgX = 0;
+    let avgY = 0;
+    let avgLen = avgRangeEnd - avgRangeStart;
+    if(avgLen <= 0) avgLen = 1;
+
+    for(let j=avgRangeStart;j<avgRangeEnd;j++){
+      avgX += Number(data[j].t);
+      avgY += Number(data[j].v);
+    }
+    avgX /= avgLen;
+    avgY /= avgLen;
+
+    const rangeOffs = Math.floor(i * every) + 1;
+    let rangeTo = Math.floor((i + 1) * every) + 1;
+    if(rangeTo > n - 1) rangeTo = n - 1;
+
+    const ax = Number(data[a].t);
+    const ay = Number(data[a].v);
+
+    let maxArea = -1;
+    let maxIdx = rangeOffs;
+
+    for(let j=rangeOffs;j<rangeTo;j++){
+      const bx = Number(data[j].t);
+      const by = Number(data[j].v);
+      const area = Math.abs((ax - avgX) * (by - ay) - (ax - bx) * (avgY - ay));
+      if(area > maxArea){
+        maxArea = area;
+        maxIdx = j;
+      }
+    }
+
+    sampled.push(data[maxIdx]);
+    a = maxIdx;
+  }
+
+  sampled.push(data[n - 1]);
+  return sampled;
+}
+
 class NetMonChart{
   constructor(card, monitorId){
     this.card = card;
@@ -4418,6 +4700,9 @@ class NetMonChart{
     this.fullBtn = card.querySelector('button.netmon-full');
 
     this.hiddenNodes = _netmonLoadHidden(this.monitorId);
+
+    // current computed status level (for filters)
+    this.level = 'none';
 
     // view state
     this.viewMode = 'follow'; // 'follow' | 'fixed'
@@ -4587,6 +4872,146 @@ class NetMonChart{
 
     // force re-layout
     this._scheduleRender(true);
+  }
+
+  getShareUrl(){
+    const st = NETMON_STATE;
+    const url = new URL(window.location.origin + window.location.pathname);
+
+    // Keep path, replace query with shared view state
+    url.searchParams.set('mid', String(this.monitorId));
+    if(st && st.windowMin) url.searchParams.set('win', String(st.windowMin));
+
+    // series visibility
+    if(this.hiddenNodes && this.hiddenNodes.size > 0){
+      url.searchParams.set('hidden', Array.from(this.hiddenNodes).map(x=>String(x)).join(','));
+    }else{
+      url.searchParams.delete('hidden');
+    }
+
+    if(this.viewMode === 'fixed' && this.fixed.xMin != null && this.fixed.xMax != null){
+      url.searchParams.set('mode', 'fixed');
+      url.searchParams.set('from', String(Math.round(Number(this.fixed.xMin))));
+      url.searchParams.set('to', String(Math.round(Number(this.fixed.xMax))));
+      url.searchParams.delete('span');
+    }else{
+      url.searchParams.set('mode', 'follow');
+      const span = (this.spanMs != null) ? Number(this.spanMs) : ((st && st.windowSec) ? (Number(st.windowSec) * 1000) : (10*60*1000));
+      url.searchParams.set('span', String(Math.round(span)));
+      url.searchParams.delete('from');
+      url.searchParams.delete('to');
+    }
+
+    url.searchParams.set('v', '1');
+    return url.toString();
+  }
+
+  async copyShareLink(){
+    const link = this.getShareUrl();
+    try{
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        await navigator.clipboard.writeText(link);
+      }else{
+        throw new Error('clipboard unavailable');
+      }
+      toast('已复制分享链接');
+    }catch(_e){
+      // fallback
+      try{
+        const ta = document.createElement('textarea');
+        ta.value = link;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        toast('已复制分享链接');
+      }catch(e2){
+        prompt('复制分享链接：', link);
+      }
+    }
+  }
+
+  exportPNG(){
+    try{
+      const st = NETMON_STATE;
+      const mon = (st && st.monitorsMap) ? st.monitorsMap[String(this.monitorId)] : null;
+      const target = mon ? String(mon.target || ('monitor-' + this.monitorId)) : ('monitor-' + this.monitorId);
+
+      if(!this.canvas) return;
+
+      const w = Math.max(200, this.canvas.clientWidth || 0);
+      const hMain = Math.max(140, this.canvas.clientHeight || 0);
+      const hNav = (this.navCanvas ? Math.max(28, this.navCanvas.clientHeight || 0) : 0);
+      const topPad = 44;
+      const gap = hNav ? 10 : 0;
+      const botPad = 14;
+
+      const srcDpr = (this.canvas.width && w) ? (this.canvas.width / w) : (window.devicePixelRatio || 1);
+      const outH = topPad + hMain + gap + hNav + botPad;
+
+      const out = document.createElement('canvas');
+      out.width = Math.floor(w * srcDpr);
+      out.height = Math.floor(outH * srcDpr);
+      const ctx = out.getContext('2d');
+      if(!ctx) return;
+
+      ctx.setTransform(srcDpr, 0, 0, srcDpr, 0, 0);
+
+      // background (match card background as much as possible)
+      let bg = 'rgba(2,6,23,0.96)';
+      try{
+        const cs = getComputedStyle(this.card);
+        if(cs && cs.backgroundColor) bg = cs.backgroundColor;
+      }catch(_e){}
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, w, outH);
+
+      // title
+      ctx.fillStyle = 'rgba(226,232,240,0.95)';
+      ctx.font = '700 14px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.fillText(target, 12, 10);
+
+      // subtitle: time range / mode
+      const range = this._currentRange();
+      const left = _netmonFormatTs(range.xMin);
+      const right = _netmonFormatTs(range.xMax);
+      const modeTxt = (this.viewMode === 'fixed') ? '历史' : '实时';
+      ctx.fillStyle = 'rgba(148,163,184,0.95)';
+      ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.fillText(`${modeTxt} · ${left} ~ ${right}`, 12, 26);
+
+      // draw canvases
+      ctx.drawImage(this.canvas, 0, topPad, w, hMain);
+      if(this.navCanvas && hNav){
+        ctx.drawImage(this.navCanvas, 0, topPad + hMain + gap, w, hNav);
+      }
+
+      // watermark
+      ctx.fillStyle = 'rgba(148,163,184,0.55)';
+      ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'bottom';
+      const stamp = new Date().toLocaleString();
+      ctx.fillText(stamp, w - 10, outH - 6);
+
+      const dataUrl = out.toDataURL('image/png');
+      const name = `netmon_${_netmonSanitizeFilename(target)}_${Date.now()}.png`;
+
+      const a = document.createElement('a');
+      a.href = dataUrl;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+
+      toast('已导出 PNG');
+    }catch(e){
+      toast('导出失败：' + ((e && e.message) ? e.message : String(e)), true);
+    }
   }
 
   resetView(){
@@ -5662,7 +6087,8 @@ class NetMonChart{
       this.ctx.restore();
     }
 
-    // lines
+    // lines (downsample in long windows to keep rendering snappy)
+    const maxPts = Math.max(220, Math.floor(plotW * 1.6));
     for(const nid of nodeIds){
       if(this.hiddenNodes.has(nid)) continue;
       const arr = per[nid] || [];
@@ -5670,31 +6096,43 @@ class NetMonChart{
       this.ctx.strokeStyle = color;
       this.ctx.lineWidth = 2;
       this.ctx.beginPath();
-      let started = false;
+
+      // Build continuous segments within current x-range
+      const segments = [];
+      let seg = [];
       for(const p of arr){
         if(!p) continue;
         const t = Number(p.t);
         if(t < xMin) continue;
         if(t > xMax) break;
+
         if(p.v == null){
-          started = false;
+          if(seg.length){ segments.push(seg); seg = []; }
           continue;
         }
         const v = Number(p.v);
         if(Number.isNaN(v)){
-          started = false;
+          if(seg.length){ segments.push(seg); seg = []; }
           continue;
         }
-        const x = padL + ((t - xMin) / xSpan) * plotW;
-        const y = padT + plotH - (Math.max(0, Math.min(yMax, v)) / yMax) * plotH;
-        if(!started){
-          this.ctx.moveTo(x, y);
-          started = true;
-        }else{
-          this.ctx.lineTo(x, y);
-        }
+        seg.push({t, v});
       }
-      if(started) this.ctx.stroke();
+      if(seg.length) segments.push(seg);
+
+      let any = false;
+      for(const s of segments){
+        const pts = (s.length > maxPts) ? _netmonLTTB(s, maxPts) : s;
+        for(let i=0;i<pts.length;i++){
+          const pt = pts[i];
+          const x = padL + ((pt.t - xMin) / xSpan) * plotW;
+          const y = padT + plotH - (Math.max(0, Math.min(yMax, pt.v)) / yMax) * plotH;
+          if(i === 0) this.ctx.moveTo(x, y);
+          else this.ctx.lineTo(x, y);
+        }
+        if(pts.length) any = true;
+      }
+
+      if(any) this.ctx.stroke();
     }
 
     // box zoom selection
@@ -5914,6 +6352,9 @@ class NetMonChart{
       else if(level === 'warn') this.card.classList.add('netmon-level-warn');
       else if(level === 'ok') this.card.classList.add('netmon-level-ok');
     }
+
+    // Expose for toolbar filters
+    this.level = level;
 
     pills.push(pill('在线', `${online}/${visibleNodes.length}`, '', '当前可见节点在线数 / 可见节点数'));
     pills.push(pill('当前', (lastMax != null) ? `${Number(lastMax).toFixed(1)}ms` : '—', '', '可见节点在当前窗口内的“最新延迟”的最大值'));

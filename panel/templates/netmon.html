@@ -6,7 +6,7 @@
   <div class="page-title">
     <h1 class="h1">网络波动监控</h1>
     <div class="meta">
-      <span class="meta-item">后台持续采集 · 打开页面可直接查看历史曲线（时间-延迟坐标图）。每个目标一张图，多节点同图对比。支持：滚轮缩放、拖拽平移、十字线对齐多节点数值、点击/双击图例控制曲线、Shift+拖拽框选缩放、底部时间导航条（mini-map）快速选窗；历史模式会出现“回到实时”按钮；双击图表可重置视图。</span>
+      <span class="meta-item">后台持续采集 · 打开页面可直接查看历史曲线（时间-延迟坐标图）。每个目标一张图，多节点同图对比。支持：滚轮缩放、拖拽平移、十字线对齐多节点数值、点击/双击图例控制曲线、Shift+拖拽框选缩放、底部时间导航条（mini-map）快速选窗；历史模式会出现“回到实时”按钮；双击图表可重置视图；一键导出 PNG、复制分享链接。</span>
     </div>
   </div>
   <div class="right" style="display:flex; gap:10px;">
@@ -27,6 +27,21 @@
       <select class="select" id="netmonAutoRefresh">
         <option value="on">开启（2s）</option>
         <option value="off">关闭</option>
+      </select>
+    </div>
+    <div class="col" style="max-width:240px;">
+      <label class="label">快速搜索</label>
+      <input class="input" id="netmonSearch" placeholder="按目标/ID 搜索…">
+      <div class="help">支持模糊匹配</div>
+    </div>
+    <div class="col" style="max-width:220px;">
+      <label class="label">筛选</label>
+      <select class="select" id="netmonFilter">
+        <option value="all">全部</option>
+        <option value="abnormal">仅异常（WARN/CRIT）</option>
+        <option value="crit">仅严重（CRIT）</option>
+        <option value="enabled">仅启用</option>
+        <option value="disabled">仅停用</option>
       </select>
     </div>
     <div class="col" style="max-width:200px;">
@@ -115,7 +130,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=55.0"></script>
+<script src="/static/app.js?v=56.0"></script>
 <script>
 window.__NETMON_NODE_GROUPS__ = {{ (node_groups or [])|tojson }};
 window.addEventListener('DOMContentLoaded', ()=>{
