@@ -3707,6 +3707,23 @@ function initNetMonPage(){
     shareToken = null;
   }
 
+  // Kiosk/minimal UI (for share links / clean mobile view)
+  let kiosk = false;
+  try{
+    const params = new URLSearchParams(window.location.search || '');
+    const ui = String(params.get('ui') || '').toLowerCase();
+    kiosk = kiosk
+      || params.get('kiosk') === '1'
+      || params.get('minimal') === '1'
+      || params.get('min') === '1'
+      || ui === 'kiosk'
+      || ui === 'minimal'
+      || ui === 'min';
+  }catch(_e){
+    kiosk = false;
+  }
+  if(wallboard) kiosk = true;
+
   // Build node checkbox list for modal
   const nodesMeta = {};
   _netmonBuildNodes(groups, document.getElementById('netmonMNodes'), nodesMeta);
@@ -3739,6 +3756,7 @@ function initNetMonPage(){
 
     nodesMeta: nodesMeta,       // from template (fallback). will be replaced by snapshot.nodes
     readOnly: readOnly,
+    kiosk: kiosk,
     shareToken: (shareToken || null),
     monitors: [],
     monitorsMap: {},
@@ -3746,6 +3764,9 @@ function initNetMonPage(){
     charts: {},
     editingId: null,
   };
+
+  // Apply body UI class flags early
+  try{ if(kiosk) document.body.classList.add('netmon-kiosk'); }catch(_e){}
 
   // Restore view config
   try{
@@ -4485,7 +4506,7 @@ function _netmonApplyCardFilters(){
         }
       }catch(_e){}
 
-      statusEl.textContent = `已加载 ${st.monitors.length} 条监控 · 显示 ${shown}/${total}${rollTxt} · 最近更新：${tsTxt}`;
+      statusEl.textContent = `${shown}/${total}${rollTxt} · 更新 ${tsTxt}`;
     }
   }catch(_e){}
 
@@ -4709,8 +4730,8 @@ function _netmonCreateMonitorCard(m){
     </div>
     <div class="netmon-events">
       <div class="netmon-events-row">
-        <div class="muted sm">异常时间轴</div>
-        <div class="muted sm">点击区间跳转</div>
+        <div class="muted sm">异常</div>
+        <div class="muted sm"></div>
       </div>
       <div class="netmon-events-bar" aria-label="abnormal events timeline"></div>
       <div class="netmon-events-list"></div>
@@ -5170,6 +5191,8 @@ class NetMonChart{
     this._statsKey = '';
     this._eventsKey = '';
     this._legendClickTimer = null;
+    // Prevent double-trigger on mobile (pointerup + click)
+    this._evtTapTs = 0;
 
     this._bindEvents();
   }
@@ -5227,15 +5250,41 @@ class NetMonChart{
       });
     }
 
-    // Abnormal events timeline: click to jump into that segment
+    const _evtMarkTap = ()=>{
+      try{ this._evtTapTs = Date.now(); }catch(_e){}
+    };
+    const _evtRecentlyTapped = ()=>{
+      try{ return (Date.now() - (this._evtTapTs || 0)) < 380; }catch(_e){ return false; }
+    };
+
+    // Abnormal events timeline: click/tap to jump into that segment
     if(this.eventsBar){
-      this.eventsBar.addEventListener('click', (e)=>{
+      // Mobile: pointerup is more responsive than click. We still keep click as fallback.
+      this.eventsBar.addEventListener('pointerup', (e)=>{
         const seg = e.target && e.target.closest ? e.target.closest('.netmon-event') : null;
         if(!seg) return;
         const from = Number(seg.getAttribute('data-from'));
         const to = Number(seg.getAttribute('data-to'));
         if(Number.isFinite(from) && Number.isFinite(to) && to > from){
           e.preventDefault();
+          _evtMarkTap();
+          if(e.shiftKey || e.altKey || e.metaKey){
+            this.openEventDetail(from, to);
+          }else{
+            this.jumpToRange(from, to);
+          }
+        }
+      });
+
+      this.eventsBar.addEventListener('click', (e)=>{
+        if(_evtRecentlyTapped()) return;
+        const seg = e.target && e.target.closest ? e.target.closest('.netmon-event') : null;
+        if(!seg) return;
+        const from = Number(seg.getAttribute('data-from'));
+        const to = Number(seg.getAttribute('data-to'));
+        if(Number.isFinite(from) && Number.isFinite(to) && to > from){
+          e.preventDefault();
+          _evtMarkTap();
           // Shift/Alt/Meta: open diagnosis detail modal
           if(e.shiftKey || e.altKey || e.metaKey){
             this.openEventDetail(from, to);
@@ -5247,13 +5296,14 @@ class NetMonChart{
     }
 
     if(this.eventsList){
-      this.eventsList.addEventListener('click', (e)=>{
+      this.eventsList.addEventListener('pointerup', (e)=>{
         const dBtn = e.target && e.target.closest ? e.target.closest('[data-action="detail"]') : null;
         if(dBtn){
           const from = Number(dBtn.getAttribute('data-from'));
           const to = Number(dBtn.getAttribute('data-to'));
           if(Number.isFinite(from) && Number.isFinite(to) && to > from){
             e.preventDefault();
+            _evtMarkTap();
             this.openEventDetail(from, to);
           }
           return;
@@ -5264,6 +5314,43 @@ class NetMonChart{
           const to = Number(btn.getAttribute('data-to'));
           if(Number.isFinite(from) && Number.isFinite(to) && to > from){
             e.preventDefault();
+            _evtMarkTap();
+            this.jumpToRange(from, to);
+          }
+          return;
+        }
+        const row = e.target && e.target.closest ? e.target.closest('.netmon-evt-row') : null;
+        if(row){
+          const from = Number(row.getAttribute('data-from'));
+          const to = Number(row.getAttribute('data-to'));
+          if(Number.isFinite(from) && Number.isFinite(to) && to > from){
+            e.preventDefault();
+            _evtMarkTap();
+            this.jumpToRange(from, to);
+          }
+        }
+      });
+
+      this.eventsList.addEventListener('click', (e)=>{
+        if(_evtRecentlyTapped()) return;
+        const dBtn = e.target && e.target.closest ? e.target.closest('[data-action="detail"]') : null;
+        if(dBtn){
+          const from = Number(dBtn.getAttribute('data-from'));
+          const to = Number(dBtn.getAttribute('data-to'));
+          if(Number.isFinite(from) && Number.isFinite(to) && to > from){
+            e.preventDefault();
+            _evtMarkTap();
+            this.openEventDetail(from, to);
+          }
+          return;
+        }
+        const btn = e.target && e.target.closest ? e.target.closest('[data-action="jump"]') : null;
+        if(btn){
+          const from = Number(btn.getAttribute('data-from'));
+          const to = Number(btn.getAttribute('data-to'));
+          if(Number.isFinite(from) && Number.isFinite(to) && to > from){
+            e.preventDefault();
+            _evtMarkTap();
             this.jumpToRange(from, to);
           }
         }
@@ -5275,6 +5362,7 @@ class NetMonChart{
           const to = Number(row.getAttribute('data-to'));
           if(Number.isFinite(from) && Number.isFinite(to) && to > from){
             e.preventDefault();
+            _evtMarkTap();
             this.jumpToRange(from, to);
           }
         }
@@ -5383,6 +5471,8 @@ class NetMonChart{
     const url = new URL(window.location.origin + '/netmon/view');
 
     url.searchParams.set('ro', '1');
+    // Minimal/kiosk UI for external viewers by default
+    url.searchParams.set('kiosk', '1');
 
     // Keep query with shared view state
     url.searchParams.set('mid', String(this.monitorId));
@@ -5431,6 +5521,7 @@ class NetMonChart{
     const st = NETMON_STATE;
     const url = new URL(window.location.origin + '/netmon/view');
     url.searchParams.set('ro', '1');
+    url.searchParams.set('kiosk', '1');
     url.searchParams.set('mid', String(this.monitorId));
     if(st && st.windowMin) url.searchParams.set('win', String(st.windowMin));
     if(this.hiddenNodes && this.hiddenNodes.size > 0){
@@ -5473,6 +5564,7 @@ class NetMonChart{
         mode: 'fixed',
         from: Math.round(Number(from) || 0),
         to: Math.round(Number(to) || 0),
+        kiosk: 1,
       };
 
       try{
@@ -5486,9 +5578,12 @@ class NetMonChart{
       try{
         const res = await fetchJSON('/api/netmon/share', {method:'POST', body: JSON.stringify(payload)});
         link = (res && res.url) ? String(res.url) : null;
-      }catch(_e){
-        // Fallback (will still require login)
-        link = this.getShareUrlForRange(from, to);
+        try{ if(res && res.token && st){ st.shareToken = String(res.token); } }catch(_e){}
+        if(!link) throw new Error((res && res.error) ? String(res.error) : 'share_failed');
+      }catch(e){
+        const msg = (e && e.message) ? e.message : String(e);
+        toast(`生成分享链接失败：${msg}（请刷新/重新登录）`, true);
+        return;
       }
     }
 
@@ -5526,7 +5621,7 @@ class NetMonChart{
       link = window.location.href;
     }else{
       // Request a signed share URL from backend (requires login)
-      const payload = { page: 'view', mid: Number(this.monitorId) };
+      const payload = { page: 'view', mid: Number(this.monitorId), kiosk: 1 };
 
       try{
         if(st && st.windowMin) payload.win = Number(st.windowMin) || 10;
@@ -5551,9 +5646,12 @@ class NetMonChart{
       try{
         const res = await fetchJSON('/api/netmon/share', {method:'POST', body: JSON.stringify(payload)});
         link = (res && res.url) ? String(res.url) : null;
-      }catch(_e){
-        // Fallback (will still require login)
-        link = this.getShareUrl();
+        try{ if(res && res.token && st){ st.shareToken = String(res.token); } }catch(_e){}
+        if(!link) throw new Error((res && res.error) ? String(res.error) : 'share_failed');
+      }catch(e){
+        const msg = (e && e.message) ? e.message : String(e);
+        toast(`生成分享链接失败：${msg}（请刷新/重新登录）`, true);
+        return;
       }
     }
 
@@ -5928,7 +6026,7 @@ class NetMonChart{
       }
       table += `</tbody></table></div>`;
 
-      const hintHtml = `<div class="netmon-evt-hint"><strong>${escapeHtml(hint)}</strong><div class="muted sm" style="margin-top:6px;">提示：点击异常时间轴区间可定位；按住 Shift/Alt 再点可直接打开详情。</div></div>`;
+      const hintHtml = `<div class="netmon-evt-hint"><strong>${escapeHtml(hint)}</strong></div>`;
       const html = `${hintHtml}<div class="netmon-evt-kpis">${kpi.join('')}</div><div style="margin-top:10px;">${table}</div>`;
 
       if(bodyEl) bodyEl.innerHTML = html;
@@ -7550,7 +7648,7 @@ class NetMonChart{
     const MAX_LIST = 6;
     const list = events.slice().sort((a,b)=>Number(b.end)-Number(a.end)).slice(0, MAX_LIST);
     const rows = [];
-    rows.push(`<div class="netmon-events-summary muted sm">共 <strong>${events.length}</strong> 个异常区间 · 点击可跳转定位</div>`);
+    rows.push(`<div class="netmon-events-summary muted sm">异常区间 <strong>${events.length}</strong></div>`);
 
     for(const ev of list){
       if(!ev) continue;

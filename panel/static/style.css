@@ -94,7 +94,7 @@ body{
   :root{ --sticky-top:58px; }
 
   .netmon-toolbar .help{ display:none; }
-  .netmon-meta .muted{ display:none; }
+  .netmon-meta{ display:none; }
   .netmon-events-bar{ height:16px; }
   .netmon-event{ min-width:12px; }
   .netmon-event, .netmon-evt-row{ touch-action: manipulation; }
@@ -2270,6 +2270,17 @@ body.netmon-noscroll{ overflow:hidden; }
   .netmon-chart-card.netmon-fullscreen{ inset: 62px 10px 10px 10px; }
   .netmon-chart-card.netmon-fullscreen .netmon-canvas{ height: calc(100vh - 460px); }
 }
+
+/* =========================
+   NetMon Kiosk (share minimal)
+   ========================= */
+body.netmon-kiosk .topbar,
+body.netmon-kiosk .footer{ display:none; }
+body.netmon-kiosk .container{ max-width:none; padding: 10px; }
+body.netmon-kiosk .page-head,
+body.netmon-kiosk .netmon-toolbar{ display:none !important; }
+body.netmon-kiosk .netmon-charts{ margin-top: 0; }
+body.netmon-kiosk .netmon-events-row{ display:none; }
 
 /* =========================
    NetMon Wallboard (NOC / TV screen)

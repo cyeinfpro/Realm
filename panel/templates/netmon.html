@@ -6,7 +6,7 @@
   <div class="page-title">
     <h1 class="h1">网络波动监控</h1>
     <div class="meta netmon-meta">
-      <span class="meta-item netmon-meta-short">实时 / 历史 · 框选缩放 · 悬浮读数 · 分享只读页</span>
+      <span class="meta-item netmon-meta-short">实时 · 历史</span>
     </div>
   </div>
   <div class="right netmon-head-actions">
@@ -52,7 +52,6 @@
         <option value="900000">15m</option>
         <option value="3600000">1h</option>
       </select>
-      <div class="help">窗口越大越建议使用自动/聚合，性能更稳。</div>
     </div>
     <div class="col nm-search">
       <label class="label">快速搜索</label>
@@ -81,7 +80,7 @@
 
 <div class="card netmon-empty" id="netmonEmpty" style="display:none;">
   <div class="card-title">暂无监控</div>
-  <div class="card-sub">点击右上角「新建监控」，为某个目标配置监控节点与探测方式。</div>
+  <div class="card-sub">点击「新建监控」开始配置。</div>
 </div>
 
 <!-- Create/Edit Monitor Modal -->
@@ -149,7 +148,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=62.0"></script>
+<script src="/static/app.js?v=63.0"></script>
 <script>
 window.__NETMON_NODE_GROUPS__ = {{ (node_groups or [])|tojson }};
 window.addEventListener('DOMContentLoaded', ()=>{
