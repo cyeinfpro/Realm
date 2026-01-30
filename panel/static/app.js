@@ -4731,10 +4731,13 @@ function _netmonCreateMonitorCard(m){
     <div class="netmon-events">
       <div class="netmon-events-row">
         <div class="muted sm">异常</div>
-        <div class="muted sm"></div>
+        <div class="right" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
+          <div class="netmon-events-badges" aria-label="abnormal summary"></div>
+          <button class="btn xs ghost netmon-events-open" type="button" title="查看全部异常">查看</button>
+        </div>
       </div>
       <div class="netmon-events-bar" aria-label="abnormal events timeline"></div>
-      <div class="netmon-events-list"></div>
+      <div class="netmon-events-foot"></div>
     </div>
   `;
 
@@ -5164,7 +5167,9 @@ class NetMonChart{
     this.statsEl = card.querySelector('.netmon-stats');
     this.tooltipEl = card.querySelector('.netmon-tooltip');
     this.eventsBar = card.querySelector('.netmon-events-bar');
-    this.eventsList = card.querySelector('.netmon-events-list');
+    this.eventsBadges = card.querySelector('.netmon-events-badges');
+    this.eventsOpenBtn = card.querySelector('button.netmon-events-open');
+    this.eventsFoot = card.querySelector('.netmon-events-foot');
     this.realtimeBtn = card.querySelector('.netmon-realtime-btn');
     this.fullBtn = card.querySelector('button.netmon-full');
 
@@ -5268,10 +5273,12 @@ class NetMonChart{
         if(Number.isFinite(from) && Number.isFinite(to) && to > from){
           e.preventDefault();
           _evtMarkTap();
+          // Default: open the abnormal center modal (show all events, focus this segment)
+          // Power-user: hold Shift/Alt/Meta to directly jump the chart to this range.
           if(e.shiftKey || e.altKey || e.metaKey){
-            this.openEventDetail(from, to);
-          }else{
             this.jumpToRange(from, to);
+          }else{
+            this.openAbModal(from, to);
           }
         }
       });
@@ -5286,86 +5293,41 @@ class NetMonChart{
           e.preventDefault();
           _evtMarkTap();
           // Shift/Alt/Meta: open diagnosis detail modal
+          // Default: open the abnormal center modal (show all events, focus this segment)
+          // Power-user: hold Shift/Alt/Meta to directly jump the chart to this range.
           if(e.shiftKey || e.altKey || e.metaKey){
-            this.openEventDetail(from, to);
-          }else{
             this.jumpToRange(from, to);
+          }else{
+            this.openAbModal(from, to);
           }
         }
       });
     }
 
-    if(this.eventsList){
-      this.eventsList.addEventListener('pointerup', (e)=>{
-        const dBtn = e.target && e.target.closest ? e.target.closest('[data-action="detail"]') : null;
-        if(dBtn){
-          const from = Number(dBtn.getAttribute('data-from'));
-          const to = Number(dBtn.getAttribute('data-to'));
-          if(Number.isFinite(from) && Number.isFinite(to) && to > from){
-            e.preventDefault();
-            _evtMarkTap();
-            this.openEventDetail(from, to);
-          }
-          return;
-        }
-        const btn = e.target && e.target.closest ? e.target.closest('[data-action="jump"]') : null;
-        if(btn){
-          const from = Number(btn.getAttribute('data-from'));
-          const to = Number(btn.getAttribute('data-to'));
-          if(Number.isFinite(from) && Number.isFinite(to) && to > from){
-            e.preventDefault();
-            _evtMarkTap();
-            this.jumpToRange(from, to);
-          }
-          return;
-        }
-        const row = e.target && e.target.closest ? e.target.closest('.netmon-evt-row') : null;
-        if(row){
-          const from = Number(row.getAttribute('data-from'));
-          const to = Number(row.getAttribute('data-to'));
-          if(Number.isFinite(from) && Number.isFinite(to) && to > from){
-            e.preventDefault();
-            _evtMarkTap();
-            this.jumpToRange(from, to);
-          }
-        }
+
+    // Abnormal center: open a single modal that lists ALL abnormal segments in current window
+    const _openAbCenter = (e)=>{
+      try{ if(e) e.preventDefault(); }catch(_e){}
+      _evtMarkTap();
+      try{ this.openAbModal(null, null); }catch(_e){}
+    };
+
+    if(this.eventsOpenBtn){
+      this.eventsOpenBtn.addEventListener('pointerup', (e)=>{ _openAbCenter(e); });
+      this.eventsOpenBtn.addEventListener('click', (e)=>{ if(_evtRecentlyTapped()) return; _openAbCenter(e); });
+    }
+
+    if(this.eventsFoot){
+      this.eventsFoot.addEventListener('pointerup', (e)=>{ 
+        const el = e.target && e.target.closest ? e.target.closest('[data-action="openab"]') : null;
+        if(!el) return;
+        _openAbCenter(e);
       });
-
-      this.eventsList.addEventListener('click', (e)=>{
+      this.eventsFoot.addEventListener('click', (e)=>{ 
         if(_evtRecentlyTapped()) return;
-        const dBtn = e.target && e.target.closest ? e.target.closest('[data-action="detail"]') : null;
-        if(dBtn){
-          const from = Number(dBtn.getAttribute('data-from'));
-          const to = Number(dBtn.getAttribute('data-to'));
-          if(Number.isFinite(from) && Number.isFinite(to) && to > from){
-            e.preventDefault();
-            _evtMarkTap();
-            this.openEventDetail(from, to);
-          }
-          return;
-        }
-        const btn = e.target && e.target.closest ? e.target.closest('[data-action="jump"]') : null;
-        if(btn){
-          const from = Number(btn.getAttribute('data-from'));
-          const to = Number(btn.getAttribute('data-to'));
-          if(Number.isFinite(from) && Number.isFinite(to) && to > from){
-            e.preventDefault();
-            _evtMarkTap();
-            this.jumpToRange(from, to);
-          }
-        }
-
-        // Mobile-friendly: tap the whole row to jump
-        const row = e.target && e.target.closest ? e.target.closest('.netmon-evt-row') : null;
-        if(row){
-          const from = Number(row.getAttribute('data-from'));
-          const to = Number(row.getAttribute('data-to'));
-          if(Number.isFinite(from) && Number.isFinite(to) && to > from){
-            e.preventDefault();
-            _evtMarkTap();
-            this.jumpToRange(from, to);
-          }
-        }
+        const el = e.target && e.target.closest ? e.target.closest('[data-action="openab"]') : null;
+        if(!el) return;
+        _openAbCenter(e);
       });
     }
 
@@ -5823,10 +5785,47 @@ class NetMonChart{
     this._scheduleRender(true);
   }
 
+  openAbModal(focusFromTs, focusToTs){
+    const st = NETMON_STATE;
+    const mon = (st && st.monitorsMap) ? st.monitorsMap[String(this.monitorId)] : null;
+    const target = mon ? String(mon.target || ('monitor-' + this.monitorId)) : ('monitor-' + this.monitorId);
+
+    // Prefer the last events-scan range; fallback to current visible range
+    let xMin = (this._eventsXMin != null) ? Number(this._eventsXMin) : null;
+    let xMax = (this._eventsXMax != null) ? Number(this._eventsXMax) : null;
+    if(!Number.isFinite(xMin) || !Number.isFinite(xMax)){
+      try{
+        const r = this._currentRange();
+        xMin = (r && r.xMin != null) ? Number(r.xMin) : null;
+        xMax = (r && r.xMax != null) ? Number(r.xMax) : null;
+      }catch(_e){}
+    }
+
+    const events = Array.isArray(this._eventsAll) ? this._eventsAll : [];
+    try{
+      _netmonOpenAbModal({
+        mid: this.monitorId,
+        target,
+        events,
+        xMin,
+        xMax,
+        focusFrom: focusFromTs,
+        focusTo: focusToTs,
+      });
+    }catch(e){
+      toast('打开异常窗口失败：' + ((e && e.message) ? e.message : String(e)), true);
+    }
+  }
+
+
   async openEventDetail(fromTs, toTs){
     const from = Number(fromTs);
     const to = Number(toTs);
     if(!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return;
+
+    // New UX: route to the Abnormal Center modal (one window shows all abnormal segments)
+    try{ this.openAbModal(from, to); }catch(_e){}
+    return;
 
     const modal = _netmonEnsureEventModal();
     if(!modal) return;
@@ -7465,13 +7464,13 @@ class NetMonChart{
 
   _renderEvents(mon, per, xMin, xMax){
     const st = NETMON_STATE;
-    if(!st || !this.eventsBar || !this.eventsList) return;
+    if(!st || !this.eventsBar || !this.eventsFoot) return;
 
-    const hiddenKey = Array.from(this.hiddenNodes || []).sort().join(',');
     const warn0 = Number(mon && mon.warn_ms) || 0;
     const crit0 = Number(mon && mon.crit_ms) || 0;
     const rm = Number(st.rollupMs) || 0;
-    const key = `${Math.round(Number(xMin)||0)}|${Math.round(Number(xMax)||0)}|${hiddenKey}|${Math.round(Number(st.lastTs)||0)}|${Math.round(warn0)}|${Math.round(crit0)}|${Math.round(rm)}`;
+    // Note: abnormal scan is based on ALL configured nodes, independent of curve visibility.
+    const key = `${Math.round(Number(xMin)||0)}|${Math.round(Number(xMax)||0)}|${Math.round(Number(st.lastTs)||0)}|${Math.round(warn0)}|${Math.round(crit0)}|${Math.round(rm)}`;
     if(key === this._eventsKey) return;
     this._eventsKey = key;
 
@@ -7517,7 +7516,6 @@ class NetMonChart{
     const nodeIds = Array.isArray(mon && mon.node_ids) ? mon.node_ids.map(x=>String(x)) : Object.keys(per || {});
     for(const nid of nodeIds){
       const nidStr = String(nid);
-      if(this.hiddenNodes && this.hiddenNodes.has(nidStr)) continue;
       const arr = (per && per[nidStr]) ? per[nidStr] : [];
       if(!arr.length) continue;
       const start = _netmonBinarySearchByT(arr, xMinN);
@@ -7616,6 +7614,45 @@ class NetMonChart{
     }
     closeCur();
 
+    // Merge same-level events separated by tiny gaps (reduce noisy fragmentation)
+    try{
+      const merged = [];
+      const gapAllow = bucketMs * 1.10;
+      for(const ev of events){
+        if(!ev) continue;
+        if(ev.parts == null) ev.parts = 1;
+        if(!merged.length){
+          merged.push(ev);
+          continue;
+        }
+        const last = merged[merged.length-1];
+        const gap = Number(ev.start) - Number(last.end);
+        if(last && ev.lvl === last.lvl && gap >= 0 && gap <= gapAllow){
+          last.end = Math.max(Number(last.end), Number(ev.end));
+          last.fail = (Number(last.fail) || 0) + (Number(ev.fail) || 0);
+          last.total = (Number(last.total) || 0) + (Number(ev.total) || 0);
+          last.parts = (Number(last.parts) || 1) + (Number(ev.parts) || 1);
+          if(ev.maxV != null && Number.isFinite(Number(ev.maxV))){
+            const vv = Number(ev.maxV);
+            if(last.maxV == null || vv > Number(last.maxV)){
+              last.maxV = vv;
+              last.maxNid = ev.maxNid;
+            }
+          }
+        }else{
+          merged.push(ev);
+        }
+      }
+      events.splice(0, events.length, ...merged);
+    }catch(_e){}
+
+    // Cache for abnormal center modal
+    try{
+      this._eventsAll = events.slice();
+      this._eventsXMin = xMinN;
+      this._eventsXMax = xMaxN;
+    }catch(_e){}
+
     // --- render timeline bar
     const segHtml = [];
     for(const ev of events){
@@ -7653,50 +7690,38 @@ class NetMonChart{
     }
     this.eventsBar.innerHTML = segHtml.join('');
 
-    // --- render list
-    if(!events.length){
-      this.eventsList.innerHTML = `<div class="muted sm">当前窗口内无异常事件</div>`;
-      return;
+
+    // --- render compact summary (no long list on the card)
+    const critCnt = events.filter(ev=>ev && ev.lvl >= 2).length;
+    const warnCnt = events.filter(ev=>ev && ev.lvl === 1).length;
+    const failCnt = events.filter(ev=>ev && (Number(ev.total)||0) > 0 && (Number(ev.fail)||0) > 0).length;
+
+    if(this.eventsBadges){
+      const bs = [];
+      if(critCnt) bs.push(`<span class="nm-badge crit">CRIT ${critCnt}</span>`);
+      if(warnCnt) bs.push(`<span class="nm-badge warn">WARN ${warnCnt}</span>`);
+      if(failCnt) bs.push(`<span class="nm-badge">FAIL ${failCnt}</span>`);
+      if(!bs.length) bs.push(`<span class="nm-badge ok">OK</span>`);
+      this.eventsBadges.innerHTML = bs.join('');
     }
 
-    const MAX_LIST = 6;
-    const list = events.slice().sort((a,b)=>Number(b.end)-Number(a.end)).slice(0, MAX_LIST);
-    const rows = [];
-    rows.push(`<div class="netmon-events-summary muted sm">异常区间 <strong>${events.length}</strong></div>`);
-
-    for(const ev of list){
-      if(!ev) continue;
-      const cls = (ev.lvl >= 2) ? 'crit' : 'warn';
-      const stTxt = (ev.lvl >= 2) ? 'CRIT' : 'WARN';
-      const timeTxt = `${_netmonFormatTs(ev.start)} ~ ${_netmonFormatTs(ev.end)}`;
-      const durTxt = _netmonFormatDur(ev.end - ev.start);
-
-      const maxTxt = (ev.maxV != null && Number.isFinite(Number(ev.maxV))) ? `${Number(ev.maxV).toFixed(1)}ms` : '—';
-      let nodeTxt = '';
-      try{
-        if(ev.maxNid && st.nodesMeta && st.nodesMeta[String(ev.maxNid)]){
-          nodeTxt = String(st.nodesMeta[String(ev.maxNid)].name || ('节点-' + ev.maxNid));
-        }
-      }catch(_e){}
-
-      let extra = `${durTxt} · max ${maxTxt}`;
-      if(ev.total > 0 && ev.fail > 0){
-        extra += ` · fail ${Math.round(ev.fail)}/${Math.round(ev.total)}`;
+    if(this.eventsOpenBtn){
+      if(!events.length){
+        this.eventsOpenBtn.style.display = 'none';
+      }else{
+        this.eventsOpenBtn.style.display = '';
+        this.eventsOpenBtn.textContent = `查看 ${events.length}`;
       }
-      if(nodeTxt) extra += ` · ${nodeTxt}`;
-
-      rows.push(`
-        <div class="netmon-evt-row ${cls}" data-from="${Math.round(ev.start)}" data-to="${Math.round(ev.end)}" role="button" tabindex="0">
-          <span class="netmon-evt-dot ${cls}" aria-hidden="true"></span>
-          <span class="netmon-evt-lv mono">${escapeHtml(stTxt)}</span>
-          <span class="netmon-evt-time mono">${escapeHtml(timeTxt)}</span>
-          <span class="netmon-evt-meta muted mono">${escapeHtml(extra)}</span>
-          <button class="btn xs ghost" type="button" data-action="jump" data-from="${Math.round(ev.start)}" data-to="${Math.round(ev.end)}">查看</button>
-          <button class="btn xs" type="button" data-action="detail" data-lvl="${cls}" data-from="${Math.round(ev.start)}" data-to="${Math.round(ev.end)}">详情</button>
-        </div>
-      `);
     }
-    this.eventsList.innerHTML = rows.join('');
+
+    if(this.eventsFoot){
+      if(!events.length){
+        this.eventsFoot.innerHTML = `<div class="muted sm">当前窗口内无异常</div>`;
+      }else{
+        // keep it minimal
+        this.eventsFoot.innerHTML = ``;
+      }
+    }
   }
 }
 
