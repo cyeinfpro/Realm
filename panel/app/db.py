@@ -811,6 +811,80 @@ def list_netmon_samples(
     return [dict(r) for r in rows]
 
 
+def list_netmon_samples_rollup(
+    monitor_ids: List[int],
+    since_ts_ms: int,
+    bucket_ms: int,
+    db_path: str = DEFAULT_DB_PATH,
+) -> List[Dict[str, Any]]:
+    """Return rolled-up samples aggregated by time buckets.
+
+    This is used for large time windows to reduce payload size and
+    improve chart performance.
+
+    Returns rows:
+      - monitor_id
+      - node_id
+      - bucket_ts_ms (integer, bucket start)
+      - cnt (total samples in bucket)
+      - ok_cnt
+      - fail_cnt
+      - avg_latency_ms (avg of ok samples)
+      - max_latency_ms (max of ok samples)
+      - error (an arbitrary error string from failed samples)
+    """
+    mids: List[int] = []
+    for x in monitor_ids or []:
+        try:
+            mid = int(x)
+        except Exception:
+            continue
+        if mid > 0 and mid not in mids:
+            mids.append(mid)
+    if not mids:
+        return []
+
+    try:
+        since = int(since_ts_ms)
+    except Exception:
+        since = 0
+
+    try:
+        bms = int(bucket_ms)
+    except Exception:
+        bms = 0
+    if bms <= 0:
+        # fallback to raw listing
+        return list_netmon_samples(mids, since, db_path=db_path)
+    if bms < 1000:
+        bms = 1000
+    if bms > 24 * 3600 * 1000:
+        bms = 24 * 3600 * 1000
+
+    placeholders = ",".join(["?"] * len(mids))
+    # Use integer modulo to avoid float precision issues.
+    sql = f"""
+        SELECT
+            monitor_id,
+            node_id,
+            (ts_ms - (ts_ms % ?)) AS bucket_ts_ms,
+            COUNT(*) AS cnt,
+            SUM(ok) AS ok_cnt,
+            SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END) AS fail_cnt,
+            AVG(CASE WHEN ok=1 THEN latency_ms END) AS avg_latency_ms,
+            MAX(CASE WHEN ok=1 THEN latency_ms END) AS max_latency_ms,
+            MAX(CASE WHEN ok=0 THEN error END) AS error
+        FROM netmon_samples
+        WHERE monitor_id IN ({placeholders}) AND ts_ms >= ?
+        GROUP BY monitor_id, node_id, bucket_ts_ms
+        ORDER BY bucket_ts_ms ASC
+    """
+
+    with connect(db_path) as conn:
+        rows = conn.execute(sql, tuple([bms] + mids + [since])).fetchall()
+    return [dict(r) for r in rows]
+
+
 def prune_netmon_samples(before_ts_ms: int, db_path: str = DEFAULT_DB_PATH) -> int:
     try:
         cutoff = int(before_ts_ms)

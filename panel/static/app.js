@@ -3673,6 +3673,18 @@ function initNetMonPage(){
 
   const groups = window.__NETMON_NODE_GROUPS__ || [];
 
+  // Read-only display mode (share / wallboard)
+  let readOnly = false;
+  try{
+    const params = new URLSearchParams(window.location.search || '');
+    readOnly = !!window.__NETMON_READONLY__
+      || params.get('ro') === '1'
+      || params.get('readonly') === '1'
+      || (String(window.location.pathname || '').includes('/netmon/view'));
+  }catch(_e){
+    readOnly = !!window.__NETMON_READONLY__;
+  }
+
   // Build node checkbox list for modal
   const nodesMeta = {};
   _netmonBuildNodes(groups, document.getElementById('netmonMNodes'), nodesMeta);
@@ -3683,6 +3695,7 @@ function initNetMonPage(){
     lastTs: Date.now(),
     cutoffMs: null,
     windowSec: null,
+    rollupMs: 0,
 
     // UI view config
     windowMin: 10,
@@ -3695,6 +3708,7 @@ function initNetMonPage(){
     urlApplied: false,
 
     nodesMeta: nodesMeta,       // from template (fallback). will be replaced by snapshot.nodes
+    readOnly: readOnly,
     monitors: [],
     monitorsMap: {},
     series: {},
@@ -3775,7 +3789,13 @@ function initNetMonPage(){
   if(refreshBtn) refreshBtn.addEventListener('click', ()=>netmonRefresh(true));
 
   const newBtn = document.getElementById('netmonNewBtn');
-  if(newBtn) newBtn.addEventListener('click', ()=>openNetMonMonitorModal(null));
+  if(newBtn){
+    if(readOnly){
+      newBtn.style.display = 'none';
+    }else{
+      newBtn.addEventListener('click', ()=>openNetMonMonitorModal(null));
+    }
+  }
 
   // Modal UX
   const cancelBtn = document.getElementById('netmonModalCancel');
@@ -4188,12 +4208,22 @@ async function netmonRefresh(force){
   const statusEl = document.getElementById('netmonStatus');
   try{
     const winMin = Math.max(1, Math.min(1440, Number(st.windowMin) || 10));
-    const res = await fetchJSON(`/api/netmon/snapshot?window_min=${encodeURIComponent(winMin)}`);
+    let url = `/api/netmon/snapshot?window_min=${encodeURIComponent(winMin)}`;
+    // Read-only share page usually focuses a single monitor. Fetch only what we need.
+    try{
+      const u = st.urlState;
+      if(st.readOnly && u && u.mid){
+        url += `&mid=${encodeURIComponent(String(u.mid))}`;
+      }
+    }catch(_e){}
+
+    const res = await fetchJSON(url);
     st.lastTs = (res && res.ts) ? Number(res.ts) : Date.now();
 
     // Loaded window bounds (for zoom/pan clamping)
     st.cutoffMs = (res && res.cutoff_ms) ? Number(res.cutoff_ms) : null;
     st.windowSec = (res && res.window_sec) ? Number(res.window_sec) : (winMin * 60);
+    st.rollupMs = (res && res.rollup_ms != null) ? Number(res.rollup_ms) : 0;
 
     // Update node meta from server (better names/online state)
     if(res && res.nodes && typeof res.nodes === 'object'){
@@ -4323,7 +4353,18 @@ function _netmonApplyCardFilters(){
     const statusEl = document.getElementById('netmonStatus');
     if(statusEl && Array.isArray(st.monitors)){
       const tsTxt = _netmonFormatClock(st.lastTs);
-      statusEl.textContent = `已加载 ${st.monitors.length} 条监控 · 显示 ${shown}/${total} · 最近更新：${tsTxt}`;
+      let rollTxt = '';
+      try{
+        const rm = Number(st.rollupMs) || 0;
+        if(rm > 0){
+          if(rm >= 3600000) rollTxt = ` · 分辨率 ${Math.round(rm/3600000)}h`;
+          else if(rm >= 60000) rollTxt = ` · 分辨率 ${Math.round(rm/60000)}m`;
+          else if(rm >= 1000) rollTxt = ` · 分辨率 ${Math.round(rm/1000)}s`;
+          else rollTxt = ` · 分辨率 ${rm}ms`;
+        }
+      }catch(_e){}
+
+      statusEl.textContent = `已加载 ${st.monitors.length} 条监控 · 显示 ${shown}/${total}${rollTxt} · 最近更新：${tsTxt}`;
     }
   }catch(_e){}
 }
@@ -4332,6 +4373,20 @@ function _netmonCreateMonitorCard(m){
   const card = document.createElement('div');
   card.className = 'card netmon-chart-card';
   card.setAttribute('data-mid', String(m.id));
+
+  const ro = !!(NETMON_STATE && NETMON_STATE.readOnly);
+  const actions = ro ? `
+        <button class="btn xs ghost netmon-full" type="button" data-mid="${escapeHtml(String(m.id))}" title="全屏查看该图表">全屏</button>
+        <button class="btn xs ghost netmon-share" type="button" data-mid="${escapeHtml(String(m.id))}" title="复制只读展示链接（包含当前视图/隐藏曲线）">分享</button>
+        <button class="btn xs ghost netmon-export" type="button" data-mid="${escapeHtml(String(m.id))}" title="导出当前图表为 PNG">PNG</button>
+  ` : `
+        <button class="btn xs ghost netmon-full" type="button" data-mid="${escapeHtml(String(m.id))}" title="全屏查看该图表">全屏</button>
+        <button class="btn xs ghost netmon-share" type="button" data-mid="${escapeHtml(String(m.id))}" title="复制分享链接（包含当前视图/隐藏曲线）">分享</button>
+        <button class="btn xs ghost netmon-export" type="button" data-mid="${escapeHtml(String(m.id))}" title="导出当前图表为 PNG">PNG</button>
+        <button class="btn xs ghost netmon-edit" type="button" data-mid="${escapeHtml(String(m.id))}">编辑</button>
+        <button class="btn xs ghost netmon-toggle" type="button" data-mid="${escapeHtml(String(m.id))}">停用</button>
+        <button class="btn xs danger netmon-delete" type="button" data-mid="${escapeHtml(String(m.id))}">删除</button>
+  `;
 
   card.innerHTML = `
     <div class="card-header netmon-card-head" style="padding:12px 12px 8px;">
@@ -4342,12 +4397,7 @@ function _netmonCreateMonitorCard(m){
         <div class="netmon-legend"></div>
       </div>
       <div class="right netmon-actions" style="flex:0 0 auto;">
-        <button class="btn xs ghost netmon-full" type="button" data-mid="${escapeHtml(String(m.id))}" title="全屏查看该图表">全屏</button>
-        <button class="btn xs ghost netmon-share" type="button" data-mid="${escapeHtml(String(m.id))}" title="复制分享链接（包含当前视图/隐藏曲线）">分享</button>
-        <button class="btn xs ghost netmon-export" type="button" data-mid="${escapeHtml(String(m.id))}" title="导出当前图表为 PNG">PNG</button>
-        <button class="btn xs ghost netmon-edit" type="button" data-mid="${escapeHtml(String(m.id))}">编辑</button>
-        <button class="btn xs ghost netmon-toggle" type="button" data-mid="${escapeHtml(String(m.id))}">停用</button>
-        <button class="btn xs danger netmon-delete" type="button" data-mid="${escapeHtml(String(m.id))}">删除</button>
+        ${actions}
       </div>
     </div>
     <div class="netmon-canvas-wrap">
@@ -4355,6 +4405,14 @@ function _netmonCreateMonitorCard(m){
       <canvas class="netmon-nav-canvas" height="44"></canvas>
       <button class="btn xs primary netmon-realtime-btn" type="button" style="display:none;" title="回到实时窗口">回到实时</button>
       <div class="netmon-tooltip" style="display:none;"></div>
+    </div>
+    <div class="netmon-events">
+      <div class="netmon-events-row">
+        <div class="muted sm">异常时间轴</div>
+        <div class="muted sm">点击区间跳转</div>
+      </div>
+      <div class="netmon-events-bar" aria-label="abnormal events timeline"></div>
+      <div class="netmon-events-list"></div>
     </div>
   `;
 
@@ -4442,6 +4500,19 @@ function _netmonFormatTs(ts){
   const MM = String(d.getMonth()+1).padStart(2,'0');
   const DD = String(d.getDate()).padStart(2,'0');
   return `${MM}-${DD} ${time}`;
+}
+
+function _netmonFormatDur(ms){
+  const m = Math.max(0, Number(ms) || 0);
+  if(m < 1000) return `${Math.round(m)}ms`;
+  const s = m / 1000;
+  if(s < 60) return `${s.toFixed(s < 10 ? 1 : 0)}s`;
+  const mm = Math.floor(s / 60);
+  const ss = Math.floor(s % 60);
+  if(mm < 60) return `${mm}m ${String(ss).padStart(2,'0')}s`;
+  const hh = Math.floor(mm / 60);
+  const rem = mm % 60;
+  return `${hh}h ${String(rem).padStart(2,'0')}m`;
 }
 
 function _netmonLSHiddenKey(mid){
@@ -4696,6 +4767,8 @@ class NetMonChart{
     this.legendEl = card.querySelector('.netmon-legend');
     this.statsEl = card.querySelector('.netmon-stats');
     this.tooltipEl = card.querySelector('.netmon-tooltip');
+    this.eventsBar = card.querySelector('.netmon-events-bar');
+    this.eventsList = card.querySelector('.netmon-events-list');
     this.realtimeBtn = card.querySelector('.netmon-realtime-btn');
     this.fullBtn = card.querySelector('button.netmon-full');
 
@@ -4720,6 +4793,7 @@ class NetMonChart{
 
     // cached UI fragments
     this._statsKey = '';
+    this._eventsKey = '';
     this._legendClickTimer = null;
 
     this._bindEvents();
@@ -4775,6 +4849,33 @@ class NetMonChart{
       this.realtimeBtn.addEventListener('click', (e)=>{
         e.preventDefault();
         this.resetView();
+      });
+    }
+
+    // Abnormal events timeline: click to jump into that segment
+    if(this.eventsBar){
+      this.eventsBar.addEventListener('click', (e)=>{
+        const seg = e.target && e.target.closest ? e.target.closest('.netmon-event') : null;
+        if(!seg) return;
+        const from = Number(seg.getAttribute('data-from'));
+        const to = Number(seg.getAttribute('data-to'));
+        if(Number.isFinite(from) && Number.isFinite(to) && to > from){
+          e.preventDefault();
+          this.jumpToRange(from, to);
+        }
+      });
+    }
+
+    if(this.eventsList){
+      this.eventsList.addEventListener('click', (e)=>{
+        const btn = e.target && e.target.closest ? e.target.closest('[data-action="jump"]') : null;
+        if(!btn) return;
+        const from = Number(btn.getAttribute('data-from'));
+        const to = Number(btn.getAttribute('data-to'));
+        if(Number.isFinite(from) && Number.isFinite(to) && to > from){
+          e.preventDefault();
+          this.jumpToRange(from, to);
+        }
       });
     }
 
@@ -4876,9 +4977,12 @@ class NetMonChart{
 
   getShareUrl(){
     const st = NETMON_STATE;
-    const url = new URL(window.location.origin + window.location.pathname);
+    // Share as a dedicated read-only display page
+    const url = new URL(window.location.origin + '/netmon/view');
 
-    // Keep path, replace query with shared view state
+    url.searchParams.set('ro', '1');
+
+    // Keep query with shared view state
     url.searchParams.set('mid', String(this.monitorId));
     if(st && st.windowMin) url.searchParams.set('win', String(st.windowMin));
 
@@ -5026,6 +5130,36 @@ class NetMonChart{
     }else{
       this.spanMs = null;
     }
+    this.hover = null;
+    this._hideTooltip();
+    this._syncHistoryUI();
+    this._scheduleRender(true);
+  }
+
+  jumpToRange(fromTs, toTs){
+    const st = NETMON_STATE;
+    let a = Number(fromTs);
+    let b = Number(toTs);
+    if(!Number.isFinite(a) || !Number.isFinite(b) || b <= a) return;
+
+    const span = Math.max(1000, b - a);
+    // Add a little context on both sides (capped)
+    const pad = Math.min(span * 0.22, 8 * 60 * 1000);
+    a = a - pad;
+    b = b + pad;
+
+    const loadedMin = (st && st.cutoffMs != null) ? Number(st.cutoffMs) : null;
+    const loadedMax = (st && st.lastTs != null) ? Number(st.lastTs) : Date.now();
+
+    if(loadedMin != null && Number.isFinite(loadedMin)) a = Math.max(a, loadedMin);
+    if(loadedMax != null && Number.isFinite(loadedMax)) b = Math.min(b, loadedMax);
+    if(b <= a) return;
+
+    const clamped = this._clampRange(a, b, (loadedMin != null ? loadedMin : a), (loadedMax != null ? loadedMax : b));
+
+    this.viewMode = 'fixed';
+    this.fixed.xMin = clamped.xMin;
+    this.fixed.xMax = clamped.xMax;
     this.hover = null;
     this._hideTooltip();
     this._syncHistoryUI();
@@ -5463,7 +5597,7 @@ class NetMonChart{
         }
       }
 
-      const row = { nid, t:null, v:null, ok:null, e:'', dt:null };
+      const row = { nid, t:null, v:null, ok:null, e:'', dt:null, n:null, f:null };
       if(best && bestDt <= tolMs){
         const bt = Number(best.t);
         row.t = Number.isFinite(bt) ? bt : null;
@@ -5471,6 +5605,8 @@ class NetMonChart{
         if(typeof best.ok === 'boolean') row.ok = !!best.ok;
         else row.ok = (best.v != null);
         if(best.e != null) row.e = String(best.e);
+        if(best.n != null) row.n = Number(best.n);
+        if(best.f != null) row.f = Number(best.f);
         row.dt = (row.t != null) ? (row.t - anchorT) : null;
       }
       rows.push(row);
@@ -5538,6 +5674,7 @@ class NetMonChart{
       let vTxt = '—';
       let isBad = false;
       let errTxt = '';
+      let metaTxt = '';
       if(r.v != null && Number.isFinite(Number(r.v))){
         vTxt = `${Number(r.v).toFixed(1)} ms`;
       }else if(r.ok === false){
@@ -5545,6 +5682,21 @@ class NetMonChart{
         isBad = true;
         if(r.e) errTxt = String(r.e);
       }
+
+      // Rollup extra: show failed/total when available
+      try{
+        const n = (r.n != null) ? Number(r.n) : null;
+        const f = (r.f != null) ? Number(r.f) : null;
+        if(Number.isFinite(n) && n > 0){
+          const nn = Math.max(1, Math.round(n));
+          const ff = (Number.isFinite(f) ? Math.max(0, Math.round(f)) : 0);
+          if(ff > 0){
+            const pct = Math.min(100, Math.max(0, (ff / nn) * 100));
+            metaTxt = `失败 ${ff}/${nn} (${pct.toFixed(0)}%)`;
+            if(pct >= 50) isBad = true;
+          }
+        }
+      }catch(_e){}
 
       out.push(`
         <div class="netmon-tt-row">
@@ -5556,6 +5708,9 @@ class NetMonChart{
       `);
       if(errTxt){
         out.push(`<div class="netmon-tt-err muted mono">${escapeHtml(errTxt)}</div>`);
+      }
+      if(metaTxt){
+        out.push(`<div class="netmon-tt-meta muted mono">${escapeHtml(metaTxt)}</div>`);
       }
     }
 
@@ -6209,6 +6364,7 @@ class NetMonChart{
 
     this._renderStats(mon, per, xMin, xMax);
     this._renderLegend(mon, per, xMin, xMax);
+    this._renderEvents(mon, per, xMin, xMax);
   }
 
   _renderStats(mon, per, xMin, xMax){
@@ -6420,6 +6576,241 @@ class NetMonChart{
     }
 
     this.legendEl.innerHTML = `<div class="netmon-legend-wrap">${parts.join('')}</div>`;
+  }
+
+  _renderEvents(mon, per, xMin, xMax){
+    const st = NETMON_STATE;
+    if(!st || !this.eventsBar || !this.eventsList) return;
+
+    const hiddenKey = Array.from(this.hiddenNodes || []).sort().join(',');
+    const warn0 = Number(mon && mon.warn_ms) || 0;
+    const crit0 = Number(mon && mon.crit_ms) || 0;
+    const rm = Number(st.rollupMs) || 0;
+    const key = `${Math.round(Number(xMin)||0)}|${Math.round(Number(xMax)||0)}|${hiddenKey}|${Math.round(Number(st.lastTs)||0)}|${Math.round(warn0)}|${Math.round(crit0)}|${Math.round(rm)}`;
+    if(key === this._eventsKey) return;
+    this._eventsKey = key;
+
+    let warnThr = warn0;
+    let critThr = crit0;
+    if(warnThr > 0 && critThr > 0 && warnThr > critThr){
+      const tmp = warnThr; warnThr = critThr; critThr = tmp;
+    }
+
+    // Choose bucketing resolution for event scan.
+    let bucketMs = (rm > 0) ? rm : (Math.max(1, (Number(mon.interval_sec) || 5)) * 1000);
+    if(!Number.isFinite(bucketMs) || bucketMs <= 0) bucketMs = 5000;
+    bucketMs = Math.max(1000, Math.min(bucketMs, 60 * 60 * 1000));
+
+    const xMinN = Number(xMin) || 0;
+    const xMaxN = Number(xMax) || 0;
+    const span = Math.max(1, xMaxN - xMinN);
+
+    // Build bucket map (worst severity across visible nodes).
+    const buckets = new Map(); // t -> {lvl, maxV, maxNid, fail, total}
+    const updBucket = (bt, lvl, v, nid, failAdd, totalAdd)=>{
+      let b = buckets.get(bt);
+      if(!b){
+        b = {lvl:0, maxV:null, maxNid:null, fail:0, total:0};
+        buckets.set(bt, b);
+      }
+      if(lvl > b.lvl) b.lvl = lvl;
+      if(v != null && Number.isFinite(Number(v))){
+        const vv = Number(v);
+        if(b.maxV == null || vv > Number(b.maxV)){
+          b.maxV = vv;
+          b.maxNid = nid;
+        }
+      }
+      if(totalAdd){
+        b.total += Math.max(0, Number(totalAdd) || 0);
+      }
+      if(failAdd){
+        b.fail += Math.max(0, Number(failAdd) || 0);
+      }
+    };
+
+    const nodeIds = Array.isArray(mon && mon.node_ids) ? mon.node_ids.map(x=>String(x)) : Object.keys(per || {});
+    for(const nid of nodeIds){
+      const nidStr = String(nid);
+      if(this.hiddenNodes && this.hiddenNodes.has(nidStr)) continue;
+      const arr = (per && per[nidStr]) ? per[nidStr] : [];
+      if(!arr.length) continue;
+      const start = _netmonBinarySearchByT(arr, xMinN);
+      for(let i=start;i<arr.length;i++){
+        const p = arr[i];
+        if(!p) continue;
+        const t = Number(p.t);
+        if(!Number.isFinite(t)) continue;
+        if(t > xMaxN) break;
+        if(t < xMinN) continue;
+
+        const bt = t - (t % bucketMs);
+
+        let lvl = 0;
+        let v = null;
+        if(p.v != null && Number.isFinite(Number(p.v))){
+          v = Number(p.v);
+          if(critThr > 0 && v >= critThr) lvl = 2;
+          else if(warnThr > 0 && v >= warnThr) lvl = 1;
+        }else{
+          // failed sample
+          if(p.ok === false || p.v == null) lvl = 2;
+        }
+
+        let totalAdd = 0;
+        let failAdd = 0;
+        if(p.n != null){
+          totalAdd = Number(p.n) || 0;
+          failAdd = Number(p.f) || 0;
+        }else{
+          totalAdd = 1;
+          if(p.v == null) failAdd = 1;
+        }
+
+        updBucket(bt, lvl, v, nidStr, failAdd, totalAdd);
+      }
+    }
+
+    const times = Array.from(buckets.keys()).sort((a,b)=>a-b);
+    const events = [];
+    let cur = null;
+    let prevT = null;
+
+    const closeCur = ()=>{
+      if(cur) events.push(cur);
+      cur = null;
+    };
+
+    for(const t of times){
+      const b = buckets.get(t);
+      if(!b) continue;
+      let lvl = Number(b.lvl) || 0;
+
+      // Failure ratio overrides (rollup-aware)
+      try{
+        if(b.total > 0 && b.fail > 0){
+          const pct = b.fail / b.total;
+          if(pct >= 0.5) lvl = Math.max(lvl, 2);
+          else lvl = Math.max(lvl, 1);
+        }
+      }catch(_e){}
+
+      const gapBreak = (prevT != null) ? (Number(t) - Number(prevT) > bucketMs * 2.2) : false;
+
+      if(lvl <= 0){
+        closeCur();
+        prevT = t;
+        continue;
+      }
+
+      if(!cur || cur.lvl !== lvl || gapBreak){
+        closeCur();
+        cur = {
+          lvl,
+          start: Number(t),
+          end: Number(t) + bucketMs,
+          maxV: (b.maxV != null ? Number(b.maxV) : null),
+          maxNid: (b.maxNid != null ? String(b.maxNid) : null),
+          fail: Number(b.fail) || 0,
+          total: Number(b.total) || 0,
+        };
+      }else{
+        cur.end = Number(t) + bucketMs;
+        cur.fail += Number(b.fail) || 0;
+        cur.total += Number(b.total) || 0;
+        if(b.maxV != null && Number.isFinite(Number(b.maxV))){
+          const vv = Number(b.maxV);
+          if(cur.maxV == null || vv > Number(cur.maxV)){
+            cur.maxV = vv;
+            cur.maxNid = (b.maxNid != null ? String(b.maxNid) : null);
+          }
+        }
+      }
+
+      prevT = t;
+    }
+    closeCur();
+
+    // --- render timeline bar
+    const segHtml = [];
+    for(const ev of events){
+      if(!ev) continue;
+      const left = ((ev.start - xMinN) / span) * 100;
+      const width = ((ev.end - ev.start) / span) * 100;
+      const l = _netmonClamp(left, -2, 102);
+      const w = _netmonClamp(width, 0, 102);
+      if(w <= 0.05) continue;
+
+      const cls = (ev.lvl >= 2) ? 'crit' : 'warn';
+      const stTxt = (ev.lvl >= 2) ? 'CRIT' : 'WARN';
+      const durTxt = _netmonFormatDur(ev.end - ev.start);
+      const maxTxt = (ev.maxV != null && Number.isFinite(Number(ev.maxV))) ? `${Number(ev.maxV).toFixed(1)}ms` : '—';
+
+      let nodeTxt = '';
+      try{
+        if(ev.maxNid && st.nodesMeta && st.nodesMeta[String(ev.maxNid)]){
+          nodeTxt = String(st.nodesMeta[String(ev.maxNid)].name || ('节点-' + ev.maxNid));
+        }
+      }catch(_e){}
+
+      let failTxt = '';
+      try{
+        if(ev.total > 0 && ev.fail > 0){
+          failTxt = ` fail=${Math.round(ev.fail)}/${Math.round(ev.total)}`;
+        }
+      }catch(_e){}
+
+      const title = `${stTxt} ${_netmonFormatTs(ev.start)} ~ ${_netmonFormatTs(ev.end)} (${durTxt}) max=${maxTxt}${nodeTxt ? (' node=' + nodeTxt) : ''}${failTxt}`;
+
+      segHtml.push(
+        `<button type="button" class="netmon-event ${cls}" style="left:${l.toFixed(3)}%;width:${w.toFixed(3)}%;" data-from="${Math.round(ev.start)}" data-to="${Math.round(ev.end)}" title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}"></button>`
+      );
+    }
+    this.eventsBar.innerHTML = segHtml.join('');
+
+    // --- render list
+    if(!events.length){
+      this.eventsList.innerHTML = `<div class="muted sm">当前窗口内无异常事件</div>`;
+      return;
+    }
+
+    const MAX_LIST = 6;
+    const list = events.slice().sort((a,b)=>Number(b.end)-Number(a.end)).slice(0, MAX_LIST);
+    const rows = [];
+    rows.push(`<div class="netmon-events-summary muted sm">共 <strong>${events.length}</strong> 个异常区间 · 点击可跳转定位</div>`);
+
+    for(const ev of list){
+      if(!ev) continue;
+      const cls = (ev.lvl >= 2) ? 'crit' : 'warn';
+      const stTxt = (ev.lvl >= 2) ? 'CRIT' : 'WARN';
+      const timeTxt = `${_netmonFormatTs(ev.start)} ~ ${_netmonFormatTs(ev.end)}`;
+      const durTxt = _netmonFormatDur(ev.end - ev.start);
+
+      const maxTxt = (ev.maxV != null && Number.isFinite(Number(ev.maxV))) ? `${Number(ev.maxV).toFixed(1)}ms` : '—';
+      let nodeTxt = '';
+      try{
+        if(ev.maxNid && st.nodesMeta && st.nodesMeta[String(ev.maxNid)]){
+          nodeTxt = String(st.nodesMeta[String(ev.maxNid)].name || ('节点-' + ev.maxNid));
+        }
+      }catch(_e){}
+
+      let extra = `${durTxt} · max ${maxTxt}`;
+      if(ev.total > 0 && ev.fail > 0){
+        extra += ` · fail ${Math.round(ev.fail)}/${Math.round(ev.total)}`;
+      }
+      if(nodeTxt) extra += ` · ${nodeTxt}`;
+
+      rows.push(`
+        <div class="netmon-evt-row ${cls}">
+          <span class="netmon-evt-dot ${cls}" aria-hidden="true"></span>
+          <span class="netmon-evt-lv mono">${escapeHtml(stTxt)}</span>
+          <span class="netmon-evt-time mono">${escapeHtml(timeTxt)}</span>
+          <span class="netmon-evt-meta muted mono">${escapeHtml(extra)}</span>
+          <button class="btn xs ghost" type="button" data-action="jump" data-from="${Math.round(ev.start)}" data-to="${Math.round(ev.end)}">查看</button>
+        </div>
+      `);
+    }
+    this.eventsList.innerHTML = rows.join('');
   }
 }
 

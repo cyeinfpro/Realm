@@ -49,6 +49,7 @@ from .db import (
     update_netmon_monitor,
     delete_netmon_monitor,
     list_netmon_samples,
+    list_netmon_samples_rollup,
     insert_netmon_samples,
     prune_netmon_samples,
 )
@@ -888,6 +889,26 @@ async def netmon_page(request: Request, user: str = Depends(require_login_page))
             "node_groups": node_groups,
             "flash": _flash(request),
             "title": "网络波动监控",
+        },
+    )
+
+
+@app.get("/netmon/view", response_class=HTMLResponse)
+async def netmon_view_page(request: Request, user: str = Depends(require_login_page)):
+    """Read-only NetMon display page (for sharing / wallboard).
+
+    Notes:
+      - Still requires login session (same as other pages).
+      - The UI hides create/edit/delete/toggle controls.
+      - Frontend will request /api/netmon/snapshot?mid=... when URL contains mid.
+    """
+    return templates.TemplateResponse(
+        "netmon_view.html",
+        {
+            "request": request,
+            "user": user,
+            "flash": _flash(request),
+            "title": "网络波动 · 只读展示",
         },
     )
 
@@ -2709,6 +2730,8 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
     qp = request.query_params
     raw_min = qp.get("window_min")
     raw_sec = qp.get("window_sec")
+    raw_mid = qp.get("mid") or qp.get("monitor_id")
+    raw_rollup = qp.get("rollup_ms") or qp.get("resolution_ms")
 
     window_sec = None
     if raw_sec is not None and str(raw_sec).strip() != "":
@@ -2732,10 +2755,54 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
     if window_sec > 24 * 3600:
         window_sec = 24 * 3600
 
+    # Optional: limit response to one monitor (share/read-only view).
+    only_mid: Optional[int] = None
+    if raw_mid is not None and str(raw_mid).strip() != "":
+        try:
+            only_mid = int(str(raw_mid).strip())
+        except Exception:
+            only_mid = None
+        if only_mid is not None and only_mid <= 0:
+            only_mid = None
+
+    # Backend resolution tiering (rollup) for large windows.
+    # The chart also has client-side LTTB downsampling, but server rollup reduces DB/io payload.
+    rollup_ms = 0
+    if raw_rollup is not None and str(raw_rollup).strip() != "":
+        try:
+            rollup_ms = int(str(raw_rollup).strip())
+        except Exception:
+            rollup_ms = 0
+        if rollup_ms < 0:
+            rollup_ms = 0
+
+    if rollup_ms <= 0:
+        # Default tiers (feel free to tune):
+        #  - <= 1h  : raw
+        #  - <= 6h  : 10s
+        #  - <= 24h : 30s
+        #  - <= 7d  : 5m
+        #  - <= 30d : 15m
+        #  - > 30d  : 1h
+        if window_sec <= 3600:
+            rollup_ms = 0
+        elif window_sec <= 6 * 3600:
+            rollup_ms = 10_000
+        elif window_sec <= 24 * 3600:
+            rollup_ms = 30_000
+        elif window_sec <= 7 * 86400:
+            rollup_ms = 300_000
+        elif window_sec <= 30 * 86400:
+            rollup_ms = 900_000
+        else:
+            rollup_ms = 3_600_000
+
     now_ms = int(time.time() * 1000)
     cutoff_ms = now_ms - int(window_sec * 1000)
 
     monitors = list_netmon_monitors()
+    if only_mid is not None:
+        monitors = [m for m in monitors if int(m.get("id") or 0) == int(only_mid)]
     monitor_ids = [int(m.get("id") or 0) for m in monitors if int(m.get("id") or 0) > 0]
 
     # Node metadata (for legend)
@@ -2754,7 +2821,13 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
         }
 
     # Samples
-    samples = list_netmon_samples(monitor_ids, cutoff_ms) if monitor_ids else []
+    if monitor_ids:
+        if rollup_ms and rollup_ms > 0:
+            samples = list_netmon_samples_rollup(monitor_ids, cutoff_ms, rollup_ms)
+        else:
+            samples = list_netmon_samples(monitor_ids, cutoff_ms)
+    else:
+        samples = []
 
     series: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     for m in monitors:
@@ -2775,7 +2848,8 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
         try:
             mid = int(r.get("monitor_id") or 0)
             nid = int(r.get("node_id") or 0)
-            ts = int(r.get("ts_ms") or 0)
+            # raw rows use ts_ms; rollup rows use bucket_ts_ms
+            ts = int(r.get("bucket_ts_ms") or r.get("ts_ms") or 0)
         except Exception:
             continue
         if mid <= 0 or nid <= 0 or ts <= 0:
@@ -2786,25 +2860,62 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
             series[mid_s] = {}
         if nid_s not in series[mid_s]:
             series[mid_s][nid_s] = []
-        ok = bool(r.get("ok") or 0)
-        v = None
-        if ok and r.get("latency_ms") is not None:
+        # raw schema
+        if "ts_ms" in r and "ok" in r:
+            ok = bool(r.get("ok") or 0)
+            v = None
+            if ok and r.get("latency_ms") is not None:
+                try:
+                    v = float(r.get("latency_ms"))
+                except Exception:
+                    v = None
+
+            pt: Dict[str, Any] = {"t": ts, "v": v, "ok": ok}
+            if not ok:
+                err = r.get("error")
+                if err is not None:
+                    em = str(err)
+                    if len(em) > 120:
+                        em = em[:120] + "…"
+                    pt["e"] = em
+
+        else:
+            # rollup schema
             try:
-                v = float(r.get("latency_ms"))
+                ok_cnt = int(r.get("ok_cnt") or 0)
             except Exception:
-                v = None
+                ok_cnt = 0
+            try:
+                cnt = int(r.get("cnt") or 0)
+            except Exception:
+                cnt = 0
+            try:
+                fail_cnt = int(r.get("fail_cnt") or 0)
+            except Exception:
+                fail_cnt = 0
 
-        # For richer chart UX (tooltip shows error cause), include ok/error in point.
-        # Keep the payload compact: only attach error message for failed samples.
-        pt: Dict[str, Any] = {"t": ts, "v": v, "ok": ok}
-        if not ok:
-            err = r.get("error")
-            if err is not None:
-                em = str(err)
-                if len(em) > 120:
-                    em = em[:120] + "…"
-                pt["e"] = em
+            ok = ok_cnt > 0
+            v = None
+            if ok and r.get("max_latency_ms") is not None:
+                try:
+                    v = float(r.get("max_latency_ms"))
+                except Exception:
+                    v = None
 
+            pt = {"t": ts, "v": v, "ok": ok}
+            if cnt:
+                pt["n"] = cnt
+            if fail_cnt:
+                pt["f"] = fail_cnt
+            if not ok:
+                err = r.get("error")
+                if err is not None:
+                    em = str(err)
+                    if len(em) > 120:
+                        em = em[:120] + "…"
+                    pt["e"] = em
+
+        # Attach point
         series[mid_s][nid_s].append(pt)
 
     monitors_out: List[Dict[str, Any]] = []
@@ -2836,6 +2947,7 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
         "ts": now_ms,
         "cutoff_ms": cutoff_ms,
         "window_sec": int(window_sec),
+        "rollup_ms": int(rollup_ms or 0),
         "monitors": monitors_out,
         "nodes": nodes_meta,
         "series": series,
