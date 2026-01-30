@@ -11,6 +11,7 @@
   </div>
   <div class="right" style="display:flex; gap:10px;">
     <button class="btn sm" type="button" id="netmonNewBtn">新建监控</button>
+    <a class="btn sm ghost" href="/netmon/wall" target="_blank">大屏展示</a>
     <a class="btn sm secondary" href="/">返回控制台</a>
   </div>
 </div>
@@ -28,6 +29,20 @@
         <option value="on">开启（2s）</option>
         <option value="off">关闭</option>
       </select>
+    </div>
+    <div class="col" style="max-width:220px;">
+      <label class="label">显示精度</label>
+      <select class="select" id="netmonResolution">
+        <option value="auto">自动（后端分层聚合）</option>
+        <option value="0">原始（不聚合）</option>
+        <option value="10000">10s</option>
+        <option value="30000">30s</option>
+        <option value="60000">1m</option>
+        <option value="300000">5m</option>
+        <option value="900000">15m</option>
+        <option value="3600000">1h</option>
+      </select>
+      <div class="help">窗口越大越建议使用自动/聚合，性能更稳。</div>
     </div>
     <div class="col" style="max-width:240px;">
       <label class="label">快速搜索</label>
@@ -130,7 +145,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=58.0"></script>
+<script src="/static/app.js?v=60.0"></script>
 <script>
 window.__NETMON_NODE_GROUPS__ = {{ (node_groups or [])|tojson }};
 window.addEventListener('DOMContentLoaded', ()=>{

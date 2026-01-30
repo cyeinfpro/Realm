@@ -49,6 +49,7 @@ from .db import (
     update_netmon_monitor,
     delete_netmon_monitor,
     list_netmon_samples,
+    list_netmon_samples_range,
     list_netmon_samples_rollup,
     insert_netmon_samples,
     prune_netmon_samples,
@@ -909,6 +910,26 @@ async def netmon_view_page(request: Request, user: str = Depends(require_login_p
             "user": user,
             "flash": _flash(request),
             "title": "网络波动 · 只读展示",
+        },
+    )
+
+
+@app.get("/netmon/wall", response_class=HTMLResponse)
+async def netmon_wall_page(request: Request, user: str = Depends(require_login_page)):
+    """NetMon wallboard (read-only).
+
+    Designed for NOC / TV screens:
+      - hides management controls
+      - grid layout
+      - optional auto rotation highlight
+    """
+    return templates.TemplateResponse(
+        "netmon_wall.html",
+        {
+            "request": request,
+            "user": user,
+            "flash": _flash(request),
+            "title": "网络波动 · 大屏展示",
         },
     )
 
@@ -2767,8 +2788,16 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
 
     # Backend resolution tiering (rollup) for large windows.
     # The chart also has client-side LTTB downsampling, but server rollup reduces DB/io payload.
+    #
+    # Behavior:
+    #  - If rollup_ms is omitted: backend chooses a tier automatically.
+    #  - If rollup_ms is present:
+    #      * 0  => raw (no rollup)
+    #      * >0 => force that bucket size
+    rollup_param_present = False
     rollup_ms = 0
     if raw_rollup is not None and str(raw_rollup).strip() != "":
+        rollup_param_present = True
         try:
             rollup_ms = int(str(raw_rollup).strip())
         except Exception:
@@ -2776,7 +2805,7 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
         if rollup_ms < 0:
             rollup_ms = 0
 
-    if rollup_ms <= 0:
+    if not rollup_param_present:
         # Default tiers (feel free to tune):
         #  - <= 1h  : raw
         #  - <= 6h  : 10s
@@ -2949,6 +2978,131 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
         "window_sec": int(window_sec),
         "rollup_ms": int(rollup_ms or 0),
         "monitors": monitors_out,
+        "nodes": nodes_meta,
+        "series": series,
+    }
+
+
+@app.get("/api/netmon/range")
+async def api_netmon_range(request: Request, user: str = Depends(require_login)):
+    """Return raw samples for one monitor within a time range.
+
+    This is used for the "abnormal event detail" diagnosis modal.
+
+    Query:
+      - mid (or monitor_id): monitor id
+      - from / to (ms timestamp)
+
+    Notes:
+      - Always returns raw points (no rollup) to preserve details.
+      - Range and row count are capped for safety.
+    """
+    qp = request.query_params
+    raw_mid = qp.get("mid") or qp.get("monitor_id")
+    raw_from = qp.get("from") or qp.get("from_ts_ms")
+    raw_to = qp.get("to") or qp.get("to_ts_ms")
+
+    try:
+        mid = int(str(raw_mid).strip()) if raw_mid is not None else 0
+    except Exception:
+        mid = 0
+    if mid <= 0:
+        return JSONResponse({"ok": False, "error": "mid 无效"}, status_code=400)
+
+    try:
+        from_ms = int(str(raw_from).strip()) if raw_from is not None else 0
+    except Exception:
+        from_ms = 0
+    try:
+        to_ms = int(str(raw_to).strip()) if raw_to is not None else 0
+    except Exception:
+        to_ms = 0
+    if from_ms <= 0 or to_ms <= 0 or to_ms <= from_ms:
+        return JSONResponse({"ok": False, "error": "from/to 无效"}, status_code=400)
+
+    # Safety: cap maximum range (default 6h)
+    max_span_ms = 6 * 3600 * 1000
+    if (to_ms - from_ms) > max_span_ms:
+        # Keep it safe: shrink to the last max_span_ms ending at to_ms
+        from_ms = to_ms - max_span_ms
+
+    mon = get_netmon_monitor(mid)
+    if not mon:
+        return JSONResponse({"ok": False, "error": "monitor 不存在"}, status_code=404)
+
+    # Node metadata (for legend/table)
+    nodes = list_nodes()
+    nodes_meta: Dict[str, Any] = {}
+    for n in nodes:
+        nid = int(n.get("id") or 0)
+        if nid <= 0:
+            continue
+        nodes_meta[str(nid)] = {
+            "id": nid,
+            "name": n.get("name") or _extract_ip_for_display(n.get("base_url", "")),
+            "group_name": str(n.get("group_name") or "").strip() or "默认分组",
+            "display_ip": _extract_ip_for_display(n.get("base_url", "")),
+            "online": _is_report_fresh(n, max_age_sec=90),
+        }
+
+    # Raw samples
+    rows = list_netmon_samples_range(mid, from_ms, to_ms, limit=80000)
+    series: Dict[str, List[Dict[str, Any]]] = {}
+
+    # Pre-create node arrays for configured nodes
+    for nid in (mon.get("node_ids") or []):
+        try:
+            nid_i = int(nid)
+        except Exception:
+            continue
+        series[str(nid_i)] = []
+
+    for r in rows:
+        try:
+            nid = int(r.get("node_id") or 0)
+            ts = int(r.get("ts_ms") or 0)
+        except Exception:
+            continue
+        if nid <= 0 or ts <= 0:
+            continue
+        nid_s = str(nid)
+        if nid_s not in series:
+            series[nid_s] = []
+
+        ok = bool(r.get("ok") or 0)
+        v = None
+        if ok and r.get("latency_ms") is not None:
+            try:
+                v = float(r.get("latency_ms"))
+            except Exception:
+                v = None
+        pt: Dict[str, Any] = {"t": ts, "v": v, "ok": ok}
+        if not ok:
+            err = r.get("error")
+            if err is not None:
+                em = str(err)
+                if len(em) > 160:
+                    em = em[:160] + "…"
+                pt["e"] = em
+        series[nid_s].append(pt)
+
+    now_ms = int(time.time() * 1000)
+    return {
+        "ok": True,
+        "ts": now_ms,
+        "monitor": {
+            "id": int(mon.get("id") or 0),
+            "target": str(mon.get("target") or ""),
+            "mode": str(mon.get("mode") or "ping"),
+            "tcp_port": int(mon.get("tcp_port") or 443),
+            "interval_sec": int(mon.get("interval_sec") or 5),
+            "warn_ms": int(mon.get("warn_ms") or 0),
+            "crit_ms": int(mon.get("crit_ms") or 0),
+            "enabled": bool(mon.get("enabled") or 0),
+            "node_ids": [int(x) for x in (mon.get("node_ids") or []) if isinstance(x, int) or str(x).isdigit()],
+        },
+        "from": int(from_ms),
+        "to": int(to_ms),
         "nodes": nodes_meta,
         "series": series,
     }

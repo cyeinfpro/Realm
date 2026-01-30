@@ -2148,3 +2148,84 @@ body.netmon-noscroll{ overflow:hidden; }
   .netmon-chart-card.netmon-fullscreen{ inset: 62px 10px 10px 10px; }
   .netmon-chart-card.netmon-fullscreen .netmon-canvas{ height: calc(100vh - 460px); }
 }
+
+/* =========================
+   NetMon Wallboard (NOC / TV screen)
+   ========================= */
+body.netmon-wall .topbar,
+body.netmon-wall .footer{ display:none; }
+body.netmon-wall .container{ max-width:none; padding: 12px; }
+
+.badge.crit{ border-color: rgba(248,113,113,0.32); background: rgba(248,113,113,0.10); }
+
+.netmon-wallbar{
+  position: sticky;
+  top: 10px;
+  z-index: 60;
+  display:flex;
+  align-items:flex-end;
+  justify-content:space-between;
+  gap: 14px;
+  padding: 12px 12px 10px;
+  border: 1px solid rgba(148,163,184,0.16);
+  border-radius: 14px;
+  background: rgba(2,6,23,0.72);
+  backdrop-filter: blur(10px);
+  box-shadow: 0 18px 60px rgba(0,0,0,0.40);
+}
+.netmon-wall-left{ display:flex; flex-direction:column; gap:2px; }
+.netmon-wall-clock{
+  font-size: 26px;
+  font-weight: 950;
+  letter-spacing: 0.06em;
+  line-height: 1.0;
+}
+.netmon-wall-mid{ flex:1; display:flex; justify-content:center; }
+.netmon-wall-badges{ display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
+.netmon-wall-right{ display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; justify-content:flex-end; }
+.netmon-wall-ctrl{ display:flex; flex-direction:column; gap:4px; }
+
+body.netmon-wall .netmon-charts{ display:grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 12px; }
+body.netmon-wall .netmon-chart-card .netmon-canvas{ height: 180px; }
+body.netmon-wall .netmon-nav-canvas{ height: 32px; }
+body.netmon-wall .netmon-actions{ display:none; }
+body.netmon-wall .netmon-events-list{ display:none; }
+body.netmon-wall .netmon-events{ padding-bottom: 10px; }
+body.netmon-wall .netmon-realtime-btn{ display:none !important; }
+
+.netmon-wall-focus{
+  outline: 1px solid rgba(56,189,248,0.40);
+  box-shadow: 0 0 0 1px rgba(56,189,248,0.14) inset, 0 42px 140px rgba(56,189,248,0.18);
+  transform: translateY(-1px);
+}
+
+@media (max-width: 720px){
+  body.netmon-wall .netmon-charts{ grid-template-columns: 1fr; }
+  .netmon-wallbar{ top: 0; border-radius: 12px; }
+}
+
+/* =========================
+   NetMon Event Detail Modal
+   ========================= */
+.netmon-evt-hint{
+  border: 1px solid rgba(148,163,184,0.18);
+  background: rgba(2,6,23,0.28);
+  border-radius: 12px;
+  padding: 10px 12px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+}
+.netmon-evt-hint strong{ font-weight: 950; }
+
+.netmon-evt-kpis{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+
+.netmon-evt-table td{ font-size: 13px; }
+.netmon-evt-table tr.crit td{ background: rgba(248,113,113,0.06); }
+.netmon-evt-table tr.warn td{ background: rgba(245,158,11,0.05); }
+.netmon-evt-table .n-dot{
+  width:8px; height:8px; border-radius:999px; display:inline-block; margin-right:8px;
+  box-shadow: 0 0 0 2px rgba(11,15,20,0.65);
+}
+.netmon-evt-table .n-dot.online{ background: rgba(34,197,94,0.92); }
+.netmon-evt-table .n-dot.offline{ background: rgba(100,116,139,0.92); }
+.netmon-evt-table .bad{ color: rgba(248,113,113,0.95); font-weight: 900; }
+.netmon-evt-table .warnc{ color: rgba(245,158,11,0.95); font-weight: 900; }

@@ -811,6 +811,58 @@ def list_netmon_samples(
     return [dict(r) for r in rows]
 
 
+def list_netmon_samples_range(
+    monitor_id: int,
+    from_ts_ms: int,
+    to_ts_ms: int,
+    limit: int = 60000,
+    db_path: str = DEFAULT_DB_PATH,
+) -> List[Dict[str, Any]]:
+    """Return raw samples for a single monitor within [from, to].
+
+    Used for "event detail" diagnosis modal.
+
+    Notes:
+      - We keep it raw (no rollup) to preserve details.
+      - A hard LIMIT is applied as a safety net.
+    """
+    try:
+        mid = int(monitor_id)
+    except Exception:
+        mid = 0
+    if mid <= 0:
+        return []
+    try:
+        f = int(from_ts_ms)
+    except Exception:
+        f = 0
+    try:
+        t = int(to_ts_ms)
+    except Exception:
+        t = 0
+    if f <= 0 or t <= 0 or t <= f:
+        return []
+    try:
+        lim = int(limit)
+    except Exception:
+        lim = 60000
+    if lim < 1000:
+        lim = 1000
+    if lim > 200000:
+        lim = 200000
+
+    sql = """
+        SELECT monitor_id, node_id, ts_ms, ok, latency_ms, error
+        FROM netmon_samples
+        WHERE monitor_id=? AND ts_ms>=? AND ts_ms<=?
+        ORDER BY ts_ms ASC
+        LIMIT ?
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute(sql, (mid, f, t, lim)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def list_netmon_samples_rollup(
     monitor_ids: List[int],
     since_ts_ms: int,
