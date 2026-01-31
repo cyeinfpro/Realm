@@ -1292,6 +1292,32 @@ textarea,.textarea{min-height:90px;resize:vertical}
   font-size:12px;
 }
 
+/* Rule metadata (remark / tags / favorite) */
+.tag-wrap{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px}
+.tag-chip{
+  display:inline-flex;
+  align-items:center;
+  padding:4px 8px;
+  border-radius:999px;
+  border:1px solid rgba(148,163,184,0.16);
+  background: rgba(11,15,20,0.18);
+  color: var(--text);
+  font-size:11px;
+  max-width: 220px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.tag-chip.muted{color:var(--muted)}
+
+/* Favorite star button (small icon) */
+.btn.fav-btn{font-weight:900;}
+.btn.fav-btn.active{
+  color: var(--warn);
+  border-color: rgba(245,158,11,0.35);
+  background: rgba(245,158,11,0.10);
+}
+
 /* Inline expand area (+N -> multi-line) */
 .remote-extra{flex-basis:100%;display:flex;flex-direction:column;gap:6px;margin-top:6px;padding-left:2px}
 .remote-line{display:flex;flex-wrap:wrap;gap:6px}
@@ -2579,173 +2605,3 @@ body.netmon-wall .netmon-realtime-btn{ display:none !important; }
 .netmon-evt-table .n-dot.offline{ background: rgba(100,116,139,0.92); }
 .netmon-evt-table .bad{ color: rgba(248,113,113,0.95); font-weight: 900; }
 .netmon-evt-table .warnc{ color: rgba(245,158,11,0.95); font-weight: 900; }
-
-/* =========================
-   Enhanced Features Styles
-   ========================= */
-
-/* Batch Operations */
-#batch_toolbar {
-  animation: slideDown 0.2s ease-out;
-}
-@keyframes slideDown {
-  from { opacity: 0; transform: translateY(-10px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-.rule-checkbox {
-  cursor: pointer;
-  width: 16px;
-  height: 16px;
-}
-
-.rule-row.selected {
-  background: rgba(59, 130, 246, 0.08) !important;
-}
-
-/* Favorite button */
-.fav-btn {
-  background: none;
-  border: none;
-  cursor: pointer;
-  font-size: 16px;
-  padding: 2px 6px;
-  border-radius: 4px;
-  transition: all 0.15s ease;
-  opacity: 0.5;
-}
-.fav-btn:hover {
-  opacity: 1;
-  background: rgba(255,255,255,0.05);
-}
-.fav-btn.active {
-  opacity: 1;
-  text-shadow: 0 0 8px rgba(250,204,21,0.5);
-}
-
-/* Tag badges */
-.tag-badge {
-  display: inline-block;
-  padding: 2px 8px;
-  font-size: 11px;
-  border-radius: 999px;
-  background: rgba(59,130,246,0.15);
-  color: rgba(147,197,253,0.95);
-  margin: 2px 2px;
-  white-space: nowrap;
-}
-.tag-badge.clickable {
-  cursor: pointer;
-  transition: background 0.15s ease;
-}
-.tag-badge.clickable:hover {
-  background: rgba(59,130,246,0.25);
-}
-
-/* Rule note preview */
-.rule-note {
-  font-size: 12px;
-  color: var(--muted);
-  max-width: 200px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* Metadata cell */
-.meta-cell {
-  max-width: 220px;
-}
-.meta-cell .rule-note {
-  margin-bottom: 4px;
-}
-
-/* Traffic chart modal */
-#traffic_modal .modal-inner {
-  width: 90vw;
-}
-#traffic_chart {
-  width: 100%;
-  max-height: 300px;
-}
-
-/* Toast notifications */
-.toast-container {
-  position: fixed;
-  bottom: 24px;
-  right: 24px;
-  z-index: 10000;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.toast {
-  padding: 12px 20px;
-  border-radius: var(--radius-sm);
-  background: var(--surface-strong);
-  box-shadow: var(--shadow);
-  animation: toastIn 0.3s ease-out;
-  max-width: 360px;
-}
-.toast.success { border-left: 3px solid var(--ok); }
-.toast.error { border-left: 3px solid var(--bad); }
-.toast.warning { border-left: 3px solid var(--warn); }
-.toast.info { border-left: 3px solid var(--accent); }
-
-@keyframes toastIn {
-  from { opacity: 0; transform: translateX(20px); }
-  to { opacity: 1; transform: translateX(0); }
-}
-@keyframes toastOut {
-  from { opacity: 1; transform: translateX(0); }
-  to { opacity: 0; transform: translateX(20px); }
-}
-.toast.fade-out {
-  animation: toastOut 0.3s ease-out forwards;
-}
-
-/* Action buttons in rule row */
-.rule-actions {
-  display: flex;
-  gap: 4px;
-  flex-wrap: nowrap;
-}
-.rule-actions .btn {
-  padding: 4px 8px;
-  font-size: 12px;
-}
-
-/* Mini sparkline chart */
-.mini-chart {
-  width: 80px;
-  height: 24px;
-  display: inline-block;
-  vertical-align: middle;
-}
-
-/* Modal enhancements */
-#meta_modal .modal-inner,
-#traffic_modal .modal-inner {
-  background: var(--surface-strong);
-  border: 1px solid var(--line);
-}
-
-/* Surface alt for batch toolbar */
-.surface-alt, [style*="surface-alt"] {
-  background: rgba(17,24,39,0.85) !important;
-}
-
-/* Responsive adjustments */
-@media (max-width: 768px) {
-  #batch_toolbar .row {
-    flex-direction: column;
-    gap: 12px;
-  }
-  .meta-cell {
-    max-width: 150px;
-  }
-  #traffic_modal .modal-inner {
-    width: 95vw;
-    padding: 12px;
-  }
-}

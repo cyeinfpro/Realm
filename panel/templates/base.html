@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0B0F14">
   <title>{% if title %}{{ title }} · Nexus Network Control Plane{% else %}Nexus Network Control Plane{% endif %}</title>
   <link rel="icon" type="image/svg+xml" href="/static/nexus.svg">
-  <link rel="stylesheet" href="/static/style.css?v=60.0">
+  <link rel="stylesheet" href="/static/style.css?v=61.0">
 </head>
 <body>
   <!-- Flowing background (fixed, no seams on scroll) -->
@@ -81,10 +81,6 @@
     </div>
   </div>
 
-  <!-- Chart.js for traffic history charts -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   {% block scripts %}{% endblock %}
-  <!-- Enhanced features: batch ops, notes/tags, filtering, charts (must load after app.js) -->
-  <script src="/static/enhanced.js?v=1.0"></script>
 </body>
 </html>

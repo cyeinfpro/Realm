@@ -66,8 +66,56 @@
           <div class="right node-tools node-head-right" style="gap:10px; flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end;">
             <div class="search-pill">
               <span class="muted">🔎</span>
-              <input class="input sm" id="ruleSearch" placeholder="搜索监听/目标…" oninput="setRuleFilter(this.value)">
+              <input class="input sm" id="ruleSearch" placeholder="搜索监听/目标/备注/标签…" oninput="setRuleFilter(this.value)">
             </div>
+
+            <details class="menu" id="ruleFilterMenu">
+              <summary class="btn sm ghost">筛选 ▾</summary>
+              <div class="menu-pop" style="min-width:260px;">
+                <div style="display:flex;flex-direction:column;gap:10px;padding:4px 2px;">
+                  <div>
+                    <div class="label">状态</div>
+                    <select class="select" id="ruleFilterStatus" onchange="setRuleStatusFilter(this.value)">
+                      <option value="all">全部</option>
+                      <option value="running">运行</option>
+                      <option value="disabled">已暂停</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <div class="label">类型</div>
+                    <select class="select" id="ruleFilterType" onchange="setRuleTypeFilter(this.value)">
+                      <option value="all">全部</option>
+                      <option value="tcp">普通转发</option>
+                      <option value="wss">WSS 隧道</option>
+                      <option value="intranet">内网穿透</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <div class="label">收藏</div>
+                    <select class="select" id="ruleFilterFav" onchange="setRuleFavFilter(this.value)">
+                      <option value="all">全部</option>
+                      <option value="fav">仅收藏</option>
+                      <option value="nofav">未收藏</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <div class="label">标签</div>
+                    <select class="select" id="ruleFilterTag" onchange="setRuleTagFilter(this.value)">
+                      <option value="all">全部</option>
+                      <option value="__none__">无标签</option>
+                    </select>
+                    <div class="help compact">下拉列表会自动收集当前节点已有标签。</div>
+                  </div>
+
+                  <div class="row" style="gap:10px;justify-content:flex-end;">
+                    <button class="btn xs ghost" type="button" onclick="resetRuleFilters()">清空筛选</button>
+                  </div>
+                </div>
+              </div>
+            </details>
             <button class="btn sm" type="button" onclick="newRule()">+ 创建转发</button>
             <button class="btn sm ghost" type="button" id="autoRefreshBtn" onclick="toggleAutoRefresh()">⟳ 自动刷新：开</button>
 
@@ -106,44 +154,6 @@
 
         <!-- Node system info removed (shown only in 控制台 cards) -->
 
-        <!-- Search/Filter toolbar -->
-        <div class="row between" style="gap:8px;flex-wrap:wrap;margin-top:12px;">
-          <div class="row" style="gap:8px;flex-wrap:wrap;">
-            <input class="input" id="ruleSearchInput" placeholder="搜索 listen/remote/备注/标签..." oninput="setRuleFilter(this.value)" style="width:200px;" />
-            <select class="select" id="ruleFilterSelect" onchange="applyRuleTypeFilter(this.value)">
-              <option value="all">全部</option>
-              <option value="running">运行中</option>
-              <option value="disabled">已暂停</option>
-              <option value="wss">WSS</option>
-              <option value="lb">负载均衡</option>
-              <option value="favorite">⭐ 收藏</option>
-            </select>
-            <select class="select" id="tagFilterSelect" onchange="applyTagFilter(this.value)" style="min-width:120px;">
-              <option value="">全部标签</option>
-            </select>
-          </div>
-        </div>
-
-        <!-- Batch operation toolbar -->
-        <div id="batchToolbar" class="card" style="display:none;padding:10px 16px;margin-top:8px;background:rgba(17,24,39,0.85);">
-          <div class="row between" style="flex-wrap:wrap;gap:8px;">
-            <div class="row" style="gap:12px;">
-              <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-                <input type="checkbox" id="batchSelectAll" onchange="BatchOps.toggleAll(this.checked)" />
-                <span class="muted">全选</span>
-              </label>
-              <span class="muted" id="batchCount">已选 0 项</span>
-            </div>
-            <div class="row" style="gap:8px;">
-              <button class="btn xs" onclick="BatchOps.execute('enable')" title="启用选中规则">▶ 启用</button>
-              <button class="btn xs" onclick="BatchOps.execute('disable')" title="暂停选中规则">⏸ 暂停</button>
-              <button class="btn xs" onclick="BatchOps.execute('copy')" title="复制选中规则">📋 复制</button>
-              <button class="btn xs danger" onclick="BatchOps.execute('delete')" title="删除选中规则">🗑 删除</button>
-              <button class="btn xs ghost" onclick="BatchOps.clear()">取消</button>
-            </div>
-          </div>
-        </div>
-
         <div id="rulesLoading" class="muted">正在加载规则…</div>
 
         <!-- Mobile: card list (table is desktop only) -->
@@ -153,14 +163,12 @@
           <table id="rulesTable" class="table rules-table" style="display:none;">
             <thead>
               <tr>
-                <th style="width:32px;"><input type="checkbox" id="headerSelectAll" onchange="BatchOps.toggleAll(this.checked)" title="全选" /></th>
                 <th>#</th>
                 <th>状态</th>
                 <th class="listen">监听</th>
                 <th class="health">连通</th>
                 <th class="stat">活跃</th>
                 <th class="stat">流量</th>
-                <th class="meta-col">备注/标签</th>
                 <th class="actions">操作</th>
               </tr>
             </thead>
@@ -391,6 +399,25 @@
 	        </label>
 	        <textarea class="textarea" id="f_remotes" rows="4" placeholder="203.0.113.10:443\n198.51.100.8:443"></textarea>
 	        <div class="help" id="remoteHelp"></div>
+
+	        <div class="row" style="gap:12px;margin-top:10px;align-items:flex-end;flex-wrap:wrap;">
+	          <div class="col" style="min-width:220px;">
+	            <label class="label">备注</label>
+	            <input class="input" id="f_remark" placeholder="例如：客户A · Web入口 · hk01">
+	          </div>
+	          <div class="col" style="min-width:220px;">
+	            <label class="label">标签 <span class="muted sm">（逗号/空格分隔）</span></label>
+	            <input class="input" id="f_tags" placeholder="客户A hk web">
+	            <div class="help compact">仅用于搜索/筛选；建议用简短关键词。</div>
+	          </div>
+	          <div class="col" style="max-width:200px;">
+	            <label class="label" style="display:flex;align-items:center;gap:8px;">
+	              <input type="checkbox" id="f_favorite" style="width:auto;margin:0;">
+	              收藏（★）
+	            </label>
+	            <div class="help compact">收藏后可在「筛选」中一键查看。</div>
+	          </div>
+	        </div>
 	      </div>
 
 	      <details class="advanced-details" id="advancedDetails">
@@ -503,55 +530,6 @@
 
                     <div class="help" style="margin-top:6px;">提示：Remote 写 B 内网可达地址（如 192.168.x.x:port）。</div>
                   </div>
-
-                  <!-- Additional Advanced Parameters (JQ Filter supported) -->
-                  <div class="adv-subtitle" style="margin-top:16px;">更多高级参数</div>
-                  
-                  <div class="adv-grid">
-                    <div class="col">
-                      <label class="label">SOCKS5 代理（through）</label>
-                      <input class="input" id="f_through" placeholder="例如: socks5://127.0.0.1:1080">
-                      <div class="help">流量经此 SOCKS5 代理转发到目标。</div>
-                    </div>
-                    
-                    <div class="col">
-                      <label class="label">绑定网卡（interface）</label>
-                      <input class="input" id="f_interface" placeholder="例如: eth0 或 192.168.1.100">
-                      <div class="help">出站流量绑定到指定网卡或 IP。</div>
-                    </div>
-                  </div>
-
-                  <div class="adv-grid" style="margin-top:10px;">
-                    <div class="col" style="max-width:200px;">
-                      <label class="label">接收 PROXY Protocol</label>
-                      <select class="select" id="f_accept_proxy">
-                        <option value="">关闭</option>
-                        <option value="1">v1</option>
-                        <option value="2">v2</option>
-                      </select>
-                      <div class="help">从客户端接收真实 IP。</div>
-                    </div>
-                    
-                    <div class="col" style="max-width:200px;">
-                      <label class="label">发送 PROXY Protocol</label>
-                      <select class="select" id="f_send_proxy">
-                        <option value="">关闭</option>
-                        <option value="1">v1</option>
-                        <option value="2">v2</option>
-                      </select>
-                      <div class="help">向后端发送真实 IP。</div>
-                    </div>
-                    
-                    <div class="col" style="max-width:200px;">
-                      <label class="label">MPTCP（多路径TCP）</label>
-                      <select class="select" id="f_mptcp">
-                        <option value="">关闭</option>
-                        <option value="accept">接收端启用</option>
-                        <option value="send">发送端启用</option>
-                        <option value="both">双向启用</option>
-                      </select>
-                    </div>
-                  </div>
                 </div>
               </details>
 
@@ -600,75 +578,10 @@
     </div>
   </div>
 </div>
-
-<!-- Metadata Editor Modal -->
-<div id="metaModal" class="modal" style="display:none;">
-  <div class="modal-inner" style="max-width:480px;">
-    <div class="row" style="justify-content:space-between;align-items:center;">
-      <div class="h2">规则备注/标签</div>
-      <button class="btn xs ghost" type="button" onclick="RuleMeta.closeEditor()">×</button>
-    </div>
-    <div class="form" style="margin-top:12px;">
-      <label class="label">备注</label>
-      <textarea class="input" id="metaNote" rows="3" placeholder="输入备注信息..." maxlength="500"></textarea>
-      <div class="muted sm" style="text-align:right;"><span id="metaNoteCount">0</span>/500</div>
-
-      <label class="label" style="margin-top:12px;">标签 <span class="muted sm">(逗号分隔，最多10个)</span></label>
-      <input class="input" id="metaTags" placeholder="例如: production, critical, http" />
-
-      <label class="label" style="margin-top:12px;display:flex;align-items:center;gap:8px;">
-        <input type="checkbox" id="metaFavorite" />
-        <span>⭐ 收藏此规则</span>
-      </label>
-
-      <input type="hidden" id="metaRuleIndex" />
-      <div class="row" style="justify-content:flex-end;gap:8px;margin-top:16px;">
-        <button class="btn xs ghost" type="button" onclick="RuleMeta.closeEditor()">取消</button>
-        <button class="btn xs" type="button" onclick="RuleMeta.save()">保存</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Traffic Chart Modal -->
-<div id="trafficModal" class="modal" style="display:none;">
-  <div class="modal-inner" style="max-width:800px;">
-    <div class="row" style="justify-content:space-between;align-items:center;">
-      <div class="h2">流量/连接历史</div>
-      <button class="btn xs ghost" type="button" onclick="TrafficChart.closeModal()">×</button>
-    </div>
-    <div class="row" style="gap:8px;margin-top:12px;flex-wrap:wrap;">
-      <select class="select" id="trafficRange" onchange="TrafficChart.loadData()">
-        <option value="3600000">最近1小时</option>
-        <option value="21600000">最近6小时</option>
-        <option value="86400000" selected>最近24小时</option>
-        <option value="604800000">最近7天</option>
-      </select>
-      <button class="btn xs" onclick="TrafficChart.loadData()">刷新</button>
-      <button class="btn xs ghost" onclick="TrafficChart.collectNow()" title="立即从节点采集当前数据点">📥 采集数据</button>
-    </div>
-    <div class="muted sm" style="margin-top:8px;">
-      💡 数据在节点每次上报时自动采集（约30秒/次），也可点击"采集数据"手动触发
-    </div>
-    <div class="card" style="padding:16px;margin-top:12px;">
-      <canvas id="trafficChart" height="300"></canvas>
-    </div>
-    <div class="row" style="gap:12px;margin-top:12px;">
-      <div class="card" style="flex:1;padding:12px;">
-        <div class="muted sm">总接收流量</div>
-        <div class="h2" id="trafficRxTotal">-</div>
-      </div>
-      <div class="card" style="flex:1;padding:12px;">
-        <div class="muted sm">总发送流量</div>
-        <div class="h2" id="trafficTxTotal">-</div>
-      </div>
-    </div>
-  </div>
-</div>
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=66.0"></script>
+<script src="/static/app.js?v=67.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};

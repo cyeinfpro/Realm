@@ -54,11 +54,6 @@ from .db import (
     list_netmon_samples_rollup,
     insert_netmon_samples,
     prune_netmon_samples,
-    
-    # Traffic history
-    insert_traffic_history,
-    list_traffic_history_rollup,
-    prune_traffic_history,
 )
 from .agents import agent_get, agent_post, agent_ping
 
@@ -741,35 +736,6 @@ async def _start_netmon_bg() -> None:
     app.state.netmon_bg_started = True
     try:
         asyncio.create_task(_netmon_bg_loop())
-    except Exception:
-        pass
-
-
-# Traffic history pruning background task
-_TRAFFIC_PRUNE_INTERVAL = 3600  # 1 hour
-_TRAFFIC_MAX_AGE_MS = 7 * 24 * 3600 * 1000  # 7 days
-
-
-async def _traffic_history_prune_loop() -> None:
-    """Background task to prune old traffic history records."""
-    while True:
-        try:
-            await asyncio.sleep(_TRAFFIC_PRUNE_INTERVAL)
-            cutoff = int(time.time() * 1000) - _TRAFFIC_MAX_AGE_MS
-            deleted = prune_traffic_history(cutoff)
-            if deleted > 0:
-                print(f"[traffic_prune] Deleted {deleted} old traffic history records")
-        except Exception as e:
-            print(f"[traffic_prune] Error: {e}")
-
-
-@app.on_event("startup")
-async def _start_traffic_prune_bg() -> None:
-    if getattr(app.state, "traffic_prune_started", False):
-        return
-    app.state.traffic_prune_started = True
-    try:
-        asyncio.create_task(_traffic_history_prune_loop())
     except Exception:
         pass
 
@@ -1767,46 +1733,6 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
         # 不要让写库失败影响 agent
         pass
 
-    # ===== 保存流量历史数据 =====
-    # 从report中提取stats并保存到traffic_history表
-    try:
-        stats = report.get("stats") if isinstance(report, dict) else None
-        if isinstance(stats, dict):
-            ts_ms = int(time.time() * 1000)
-            # stats格式: {"rule_listen": {"rx_bytes": ..., "tx_bytes": ..., "connections": ...}, ...}
-            # 或者 {"0": {...}, "1": {...}} (按索引)
-            pool_data = report.get("pool") if isinstance(report, dict) else None
-            endpoints = pool_data.get("endpoints", []) if isinstance(pool_data, dict) else []
-            
-            for key, stat in stats.items():
-                if not isinstance(stat, dict):
-                    continue
-                # 确定rule_index
-                rule_idx = -1
-                try:
-                    rule_idx = int(key)
-                except ValueError:
-                    # key可能是listen地址，需要找到对应的索引
-                    for i, ep in enumerate(endpoints):
-                        if isinstance(ep, dict) and ep.get("listen") == key:
-                            rule_idx = i
-                            break
-                
-                if rule_idx >= 0:
-                    insert_traffic_history(
-                        node_id=node_id,
-                        rule_index=rule_idx,
-                        ts_ms=ts_ms,
-                        connections=int(stat.get("connections", 0) or 0),
-                        connections_active=int(stat.get("connections_active", 0) or 0),
-                        connections_total=int(stat.get("connections_total", stat.get("connections_established", 0)) or 0),
-                        rx_bytes=int(stat.get("rx_bytes", 0) or 0),
-                        tx_bytes=int(stat.get("tx_bytes", 0) or 0),
-                    )
-    except Exception:
-        # 不要让写库失败影响 agent
-        pass
-
     # Persist agent version + update status (best-effort)
     # ⚠️ 关键：面板触发新一轮更新（desired_agent_update_id 改变）时，
     # Agent 可能还在上报「上一轮」的状态（甚至旧版本 Agent 的状态里没有 update_id）。
@@ -2605,14 +2531,33 @@ async def api_restore(
                     continue
                 if e.get("listen") is not None:
                     e["listen"] = str(e.get("listen") or "").strip()
+                    # Legacy compatibility: allow listen as port-only ("443")
+                    if e["listen"].isdigit():
+                        e["listen"] = _format_addr("0.0.0.0", int(e["listen"]))
                 if e.get("remote") is not None:
                     e["remote"] = str(e.get("remote") or "").strip()
                 if isinstance(e.get("remotes"), list):
                     e["remotes"] = [str(x).strip() for x in e.get("remotes") if str(x).strip()]
                 if isinstance(e.get("extra_remotes"), list):
                     e["extra_remotes"] = [str(x).strip() for x in e.get("extra_remotes") if str(x).strip()]
+
+                # UI metadata
+                if e.get("remark") is not None:
+                    e["remark"] = str(e.get("remark") or "").strip()
+                if "tags" in e:
+                    e["tags"] = _parse_tags_value(e.get("tags"))
+                if "favorite" in e:
+                    e["favorite"] = _to_bool(e.get("favorite"))
     except Exception:
         pass
+
+    # Validate before restore
+    errs = _pool_validation_errors(pool)
+    if errs:
+        msg = "；".join(errs[:3])
+        if len(errs) > 3:
+            msg = f"{msg}（共{len(errs)}项）"
+        return JSONResponse({"ok": False, "error": msg, "errors": errs}, status_code=400)
     # Store on panel; apply will be done asynchronously (avoid blocking / proxy timeouts).
     desired_ver, _ = set_desired_pool(node_id, pool)
     _schedule_apply_pool(node, pool)
@@ -2631,20 +2576,6 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     if not isinstance(pool, dict):
         return JSONResponse({"ok": False, "error": "请求缺少 pool 字段"}, status_code=400)
 
-    # --- Pre-save validation ---
-    from .services.validators import validate_and_normalize
-    validation = validate_and_normalize(pool)
-    if not validation.valid:
-        return JSONResponse({
-            "ok": False,
-            "error": "规则校验失败",
-            "validation": validation.to_dict(),
-        }, status_code=400)
-    
-    # Use normalized pool if available
-    if validation.normalized_pool:
-        pool = validation.normalized_pool
-
     # --- Sanitize pool fields (trim spaces) ---
     # 说明：Agent 侧会对 listen 做 strip()，如果面板保存了带空格/不可见字符的 listen，
     # 前端按 listen 精确匹配 stats 时会出现“暂无检测数据”。
@@ -2656,12 +2587,22 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
                     continue
                 if e.get("listen") is not None:
                     e["listen"] = str(e.get("listen") or "").strip()
+                    # Legacy compatibility: allow listen as port-only ("443")
+                    if e["listen"].isdigit():
+                        e["listen"] = _format_addr("0.0.0.0", int(e["listen"]))
                 if e.get("remote") is not None:
                     e["remote"] = str(e.get("remote") or "").strip()
                 if isinstance(e.get("remotes"), list):
                     e["remotes"] = [str(x).strip() for x in e.get("remotes") if str(x).strip()]
                 if isinstance(e.get("extra_remotes"), list):
                     e["extra_remotes"] = [str(x).strip() for x in e.get("extra_remotes") if str(x).strip()]
+                # Rule metadata (remark / tags / favorite)
+                if e.get("remark") is not None:
+                    e["remark"] = str(e.get("remark") or "").strip()
+                if "tags" in e:
+                    e["tags"] = _parse_tags_value(e.get("tags"))
+                if "favorite" in e:
+                    e["favorite"] = _to_bool(e.get("favorite"))
                 # common optional string fields
                 for k in ("through", "interface", "listen_interface", "listen_transport", "remote_transport", "protocol", "balance"):
                     if e.get(k) is not None and isinstance(e.get(k), str):
@@ -2730,6 +2671,14 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
                     )
     except Exception:
         pass
+
+    # Validate before save (port conflicts / remote format / weights)
+    errs = _pool_validation_errors(pool)
+    if errs:
+        msg = "；".join(errs[:3])
+        if len(errs) > 3:
+            msg = f"{msg}（共{len(errs)}项）"
+        return JSONResponse({"ok": False, "error": msg, "errors": errs}, status_code=400)
 
     # Store desired pool on panel. Agent will pull it on next report.
     desired_ver, _ = set_desired_pool(node_id, pool)
@@ -2878,6 +2827,196 @@ def _format_addr(host: str, port: int) -> str:
     return f"{host}:{int(port)}"
 
 
+def _parse_tags_value(v: Any) -> List[str]:
+    """Parse tags from either list[str] or a comma/whitespace separated string.
+
+    UI metadata only; keep it tolerant and stable.
+    """
+    if v is None:
+        return []
+    if isinstance(v, list):
+        s = ",".join([str(x) for x in v])
+    elif isinstance(v, str):
+        s = v
+    else:
+        return []
+
+    s = s.replace("，", ",").replace("\n", ",")
+    raw: List[str] = []
+    for seg in s.split(","):
+        seg = (seg or "").strip()
+        if not seg:
+            continue
+        for t in seg.split():
+            t = (t or "").strip()
+            if t:
+                raw.append(t)
+
+    seen: set = set()
+    out: List[str] = []
+    for t in raw:
+        k = t.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+        if len(out) >= 50:
+            break
+    return out
+
+
+def _to_bool(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int):
+        return v != 0
+    if isinstance(v, float):
+        return v != 0.0
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "y", "on")
+    return False
+
+
+def _validate_host_port_string(addr: Any, *, allow_port0: bool = False) -> Optional[str]:
+    """Validate `host:port` strings used for listen/remote.
+
+    Returns an error string if invalid; otherwise None.
+    """
+    if not isinstance(addr, str):
+        return "必须为字符串"
+    s = addr.strip()
+    if not s:
+        return "不能为空"
+    if "://" in s:
+        return "不要包含协议（://）"
+    host, port = _split_host_port(s)
+    if port is None:
+        return "格式必须为 host:port"
+    if not host:
+        return "缺少主机名"
+    if port == 0 and allow_port0:
+        return None
+    if port < 1 or port > 65535:
+        return "端口范围必须为 1-65535"
+    return None
+
+
+def _extract_roundrobin_weights(balance: Any) -> Tuple[List[int], Optional[str]]:
+    """Extract weights from `balance` string like: roundrobin: 1,2,3
+
+    Returns: (weights, error). If no weights are present, returns ([], None).
+    """
+    if not isinstance(balance, str):
+        return [], None
+    s = balance.strip()
+    if ":" not in s:
+        return [], None
+    head, rest = s.split(":", 1)
+    head = head.strip().lower().replace("_", "")
+    if head not in ("roundrobin",):
+        return [], None
+
+    weights: List[int] = []
+    for part in rest.split(","):
+        p = (part or "").strip()
+        if not p:
+            continue
+        if not p.isdigit():
+            return [], f"非法权重：{p}"
+        w = int(p)
+        if w <= 0:
+            return [], f"非法权重：{p}"
+        weights.append(w)
+    return weights, None
+
+
+def _pool_validation_errors(pool: Dict[str, Any]) -> List[str]:
+    """Validate a pool before persisting it.
+
+    We keep the rules minimal and match common user errors:
+    - listen port conflicts (enabled rules only)
+    - remote format must be host:port
+    - roundrobin weights count must match remote count
+    """
+    errs: List[str] = []
+    eps = pool.get("endpoints")
+    if eps is None:
+        return errs
+    if not isinstance(eps, list):
+        return ["endpoints 必须是列表"]
+
+    # Collect enabled listen ports for conflict detection
+    enabled_ports: Dict[int, List[int]] = {}
+
+    for i, ep in enumerate(eps):
+        if not isinstance(ep, dict):
+            continue
+
+        listen = str(ep.get("listen") or "").strip()
+        if not listen:
+            errs.append(f"规则 #{i+1}: 本地监听不能为空")
+            continue
+
+        ex = ep.get("extra_config") if isinstance(ep.get("extra_config"), dict) else {}
+        allow_listen0 = (ex.get("intranet_role") == "client")
+
+        l_err = _validate_host_port_string(listen, allow_port0=allow_listen0)
+        if l_err is not None:
+            errs.append(f"规则 #{i+1}: 本地监听格式错误（应为 host:port）：{listen}")
+        else:
+            _, lp = _split_host_port(listen)
+            if lp is not None and lp != 0 and not bool(ep.get("disabled")):
+                enabled_ports.setdefault(int(lp), []).append(i)
+
+        # Remotes
+        base_remotes: List[str] = []
+        if isinstance(ep.get("remotes"), list):
+            base_remotes = [str(x).strip() for x in ep.get("remotes") if str(x).strip()]
+        elif isinstance(ep.get("remote"), str) and str(ep.get("remote")).strip():
+            base_remotes = [str(ep.get("remote")).strip()]
+        extra_remotes: List[str] = []
+        if isinstance(ep.get("extra_remotes"), list):
+            extra_remotes = [str(x).strip() for x in ep.get("extra_remotes") if str(x).strip()]
+        remotes = base_remotes + extra_remotes
+
+        if not remotes:
+            errs.append(f"规则 #{i+1}: Remote 不能为空")
+        else:
+            for j, r in enumerate(remotes):
+                r_err = _validate_host_port_string(r, allow_port0=False)
+                if r_err is not None:
+                    errs.append(f"规则 #{i+1}: Remote 第{j+1}行格式错误（应为 host:port）：{r}")
+
+        # Weights / balance
+        if len(remotes) > 1:
+            weights: List[int] = []
+            w_err: Optional[str] = None
+            if isinstance(ep.get("weights"), list):
+                try:
+                    weights = [int(x) for x in ep.get("weights")]
+                    if any(w <= 0 for w in weights):
+                        w_err = "非法权重"
+                except Exception:
+                    w_err = "非法权重"
+            else:
+                weights, w_err = _extract_roundrobin_weights(ep.get("balance"))
+
+            if w_err is not None:
+                errs.append(f"规则 #{i+1}: 权重格式错误（应为逗号分隔的正整数）")
+            elif weights:
+                if len(weights) != len(remotes):
+                    errs.append(
+                        f"规则 #{i+1}: 权重数量必须与 Remote 行数一致（Remote: {len(remotes)} 行，权重: {len(weights)} 个）"
+                    )
+
+    for port, idxs in enabled_ports.items():
+        if len(idxs) > 1:
+            refs = ", ".join([f"#{x+1}" for x in idxs])
+            errs.append(f"端口冲突：{port} 同时被规则 {refs} 使用")
+
+    return errs
+
+
 def _node_host_for_realm(node: Dict[str, Any]) -> str:
     base = (node.get("base_url") or "").strip()
     if not base:
@@ -2972,6 +3111,22 @@ def _upsert_endpoint_by_sync_id(pool: Dict[str, Any], sync_id: str, endpoint: Di
     pool["endpoints"] = new_eps
 
 
+def _get_endpoint_by_sync_id(pool: Dict[str, Any], sync_id: str) -> Optional[Dict[str, Any]]:
+    """Best-effort lookup: find the first endpoint whose extra_config.sync_id matches."""
+    if not isinstance(pool, dict) or not sync_id:
+        return None
+    for ep in pool.get("endpoints") or []:
+        if not isinstance(ep, dict):
+            continue
+        ex = ep.get("extra_config") or {}
+        if not isinstance(ex, dict):
+            continue
+        sid = ex.get("sync_id")
+        if sid and str(sid) == str(sync_id):
+            return ep
+    return None
+
+
 def _find_sync_listen_port(pool: Dict[str, Any], sync_id: str, role: Optional[str] = None) -> Optional[int]:
     """Find listen port for an endpoint identified by extra_config.sync_id.
 
@@ -3023,6 +3178,34 @@ def _port_used_by_other_sync(receiver_pool: Dict[str, Any], port: int, sync_id: 
         sid = ex.get("sync_id") if isinstance(ex, dict) else None
         if sid and str(sid) == str(sync_id):
             continue
+        return True
+    return False
+
+
+def _port_used_by_other_enabled_listen(pool: Dict[str, Any], port: int, ignore_sync_id: Optional[str] = None) -> bool:
+    """Return True if `port` is already used by another *enabled* endpoint on this node.
+
+    Used for "save before" validation on sender nodes."""
+    if not isinstance(pool, dict):
+        return False
+    for ep in (pool.get("endpoints") or []):
+        if not isinstance(ep, dict):
+            continue
+        if ep.get("disabled") is True:
+            continue
+        _, p = _split_host_port(str(ep.get("listen") or ""))
+        if not p:
+            continue
+        try:
+            if int(p) != int(port):
+                continue
+        except Exception:
+            continue
+        if ignore_sync_id:
+            ex = ep.get("extra_config") or {}
+            sid = ex.get("sync_id") if isinstance(ex, dict) else None
+            if sid and str(sid) == str(ignore_sync_id):
+                continue
         return True
     return False
 
@@ -4317,15 +4500,39 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
 
     listen = str(payload.get("listen") or "").strip()
+    # Legacy compatibility: allow listen as port-only ("443")
+    if listen.isdigit():
+        listen = _format_addr("0.0.0.0", int(listen))
+    l_err = _validate_host_port_string(listen, allow_port0=False)
+    if l_err:
+        return JSONResponse({"ok": False, "error": f"本地监听格式错误（应为 host:port）：{listen}"}, status_code=400)
     remotes = payload.get("remotes") or []
     if isinstance(remotes, str):
         remotes = [x.strip() for x in remotes.splitlines() if x.strip()]
     if not isinstance(remotes, list):
         remotes = []
     remotes = [str(x).strip() for x in remotes if str(x).strip()]
-    disabled = bool(payload.get("disabled", False))
+    for i, r in enumerate(remotes):
+        r_err = _validate_host_port_string(r, allow_port0=False)
+        if r_err:
+            return JSONResponse({"ok": False, "error": f"Remote 第{i+1}行格式错误（应为 host:port）：{r}"}, status_code=400)
+
+    disabled = _to_bool(payload.get("disabled", False))
     balance = str(payload.get("balance") or "roundrobin").strip()
     protocol = str(payload.get("protocol") or "tcp+udp").strip() or "tcp+udp"
+
+    # Validate weights count if provided
+    weights, w_err = _extract_roundrobin_weights(balance)
+    if w_err:
+        return JSONResponse({"ok": False, "error": f"权重格式错误（应为逗号分隔的正整数）：{balance}"}, status_code=400)
+    if weights and len(remotes) > 1 and len(weights) != len(remotes):
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": f"权重数量必须与 Remote 行数一致（Remote: {len(remotes)} 行，权重: {len(weights)} 个）",
+            },
+            status_code=400,
+        )
 
     wss = payload.get("wss") or {}
     if not isinstance(wss, dict):
@@ -4421,6 +4628,10 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
     if sender_listen_port is None:
         return JSONResponse({"ok": False, "error": "listen 格式不正确，请使用 0.0.0.0:端口"}, status_code=400)
 
+    # Sender-side port conflict: only block when enabled
+    if (not disabled) and _port_used_by_other_enabled_listen(sender_pool, sender_listen_port, ignore_sync_id=sync_id):
+        return JSONResponse({"ok": False, "error": f"端口冲突：本地监听端口 {sender_listen_port} 已被其他运行规则占用"}, status_code=400)
+
     if receiver_port is None:
         receiver_port = existing_receiver_port
     if receiver_port is None:
@@ -4444,6 +4655,12 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         return JSONResponse({"ok": False, "error": "接收机 base_url 无法解析主机名，请检查节点地址"}, status_code=400)
     sender_to_receiver = _format_addr(receiver_host, receiver_port)
 
+    # Metadata (remark / tags / favorite). Keep in sync across both sides.
+    old_sender_ep = _get_endpoint_by_sync_id(sender_pool, sync_id) or {}
+    remark = str(payload.get("remark") or "").strip() if ("remark" in payload) else str(old_sender_ep.get("remark") or "").strip()
+    tags = _parse_tags_value(payload.get("tags")) if ("tags" in payload) else _parse_tags_value(old_sender_ep.get("tags"))
+    favorite = _to_bool(payload.get("favorite")) if ("favorite" in payload) else _to_bool(old_sender_ep.get("favorite"))
+
     now_iso = datetime.utcnow().isoformat() + "Z"
 
     sender_ep = {
@@ -4451,6 +4668,9 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         "disabled": disabled,
         "balance": balance,
         "protocol": protocol,
+        "remark": remark,
+        "tags": tags,
+        "favorite": favorite,
         "remotes": [sender_to_receiver],
         "extra_config": {
             "remote_transport": "ws",
@@ -4475,6 +4695,9 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         "disabled": disabled,
         "balance": balance,
         "protocol": protocol,
+        "remark": remark,
+        "tags": tags,
+        "favorite": favorite,
         "remotes": remotes,
         "extra_config": {
             "listen_transport": "ws",
@@ -4603,15 +4826,33 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         return JSONResponse({"ok": False, "error": "所选节点未标记为内网机器，请在节点设置中勾选“内网机器”"}, status_code=400)
 
     listen = str(payload.get("listen") or "").strip()
+    # Legacy compatibility: allow listen as port-only ("443")
+    if listen.isdigit():
+        listen = _format_addr("0.0.0.0", int(listen))
+    l_err = _validate_host_port_string(listen, allow_port0=False)
+    if l_err:
+        return JSONResponse({"ok": False, "error": f"本地监听格式错误（应为 host:port）：{listen}"}, status_code=400)
     remotes = payload.get("remotes") or []
     if isinstance(remotes, str):
         remotes = [x.strip() for x in remotes.splitlines() if x.strip()]
     if not isinstance(remotes, list):
         remotes = []
     remotes = [str(x).strip() for x in remotes if str(x).strip()]
-    disabled = bool(payload.get("disabled", False))
+    for i, r in enumerate(remotes):
+        r_err = _validate_host_port_string(r, allow_port0=False)
+        if r_err:
+            return JSONResponse({"ok": False, "error": f"Remote 第{i+1}行格式错误（应为 host:port）：{r}"}, status_code=400)
+
+    disabled = _to_bool(payload.get("disabled", False))
     balance = str(payload.get("balance") or "roundrobin").strip() or "roundrobin"
     protocol = str(payload.get("protocol") or "tcp+udp").strip() or "tcp+udp"
+
+    # Validate weights count if provided
+    weights, w_err = _extract_roundrobin_weights(balance)
+    if w_err:
+        return JSONResponse({"ok": False, "error": f"权重格式错误（应为逗号分隔的正整数）：{balance}"}, status_code=400)
+    if weights and len(remotes) > 1 and len(weights) != len(remotes):
+        return JSONResponse({"ok": False, "error": f"权重数量必须与 Remote 行数一致（Remote: {len(remotes)} 行，权重: {len(weights)} 个）"}, status_code=400)
 
     try:
         server_port = int(payload.get("server_port") or 18443)
@@ -4631,6 +4872,19 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     # If editing an existing intranet tunnel and switching the peer node,
     # proactively remove the old peer-side rule to avoid leaving stale synced rules behind.
     sender_pool = await _load_pool_for_node(sender)
+
+    # Sender-side port conflict (enabled rules only)
+    _, listen_port = _split_host_port(listen)
+    if listen_port is None:
+        return JSONResponse({"ok": False, "error": "本地监听格式错误（应为 host:port）"}, status_code=400)
+    if (not disabled) and _port_used_by_other_enabled_listen(sender_pool, listen_port, ignore_sync_id=sync_id):
+        return JSONResponse({"ok": False, "error": f"端口冲突：本地监听端口 {listen_port} 已被其他运行规则占用"}, status_code=400)
+
+    # Metadata (remark / tags / favorite) - keep across both sides
+    old_sender_ep = _get_endpoint_by_sync_id(sender_pool, sync_id) or {}
+    remark = str(payload.get("remark") or "").strip() if ("remark" in payload) else str(old_sender_ep.get("remark") or "").strip()
+    tags = _parse_tags_value(payload.get("tags")) if ("tags" in payload) else _parse_tags_value(old_sender_ep.get("tags"))
+    favorite = _to_bool(payload.get("favorite")) if ("favorite" in payload) else _to_bool(old_sender_ep.get("favorite"))
     old_receiver_id: int = 0
     try:
         for ep in sender_pool.get("endpoints") or []:
@@ -4700,6 +4954,9 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         "disabled": disabled,
         "balance": balance,
         "protocol": protocol,
+        "remark": remark,
+        "tags": tags,
+        "favorite": favorite,
         "remotes": remotes,
         "extra_config": {
             "intranet_role": "server",
@@ -4720,6 +4977,9 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         "disabled": disabled,
         "balance": balance,
         "protocol": protocol,
+        "remark": remark,
+        "tags": tags,
+        "favorite": favorite,
         "remotes": remotes,
         "extra_config": {
             "intranet_role": "client",
@@ -4979,324 +5239,3 @@ async def api_graph(request: Request, node_id: int, user: str = Depends(require_
                 }
             )
     return {"ok": True, "elements": elements}
-
-
-# ==================== Batch Operations API ====================
-
-@app.post("/api/nodes/{node_id}/rules/batch")
-async def api_batch_rules(node_id: int, request: Request, user=Depends(require_login)):
-    """批量操作规则"""
-    node = get_node(node_id)
-    if not node:
-        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
-    
-    try:
-        payload = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "Invalid JSON"}, status_code=400)
-    
-    action = payload.get("action")  # enable, disable, delete, copy
-    indices = payload.get("indices", [])  # 规则索引列表
-    
-    if not isinstance(indices, list) or not indices:
-        return JSONResponse({"ok": False, "error": "indices 必须是非空数组"}, status_code=400)
-    
-    # 获取当前规则池
-    desired_ver, pool = get_desired_pool(node_id)
-    if not isinstance(pool, dict):
-        rep = get_last_report(node_id)
-        pool = rep.get("pool") if isinstance(rep, dict) else None
-    
-    if not isinstance(pool, dict):
-        return JSONResponse({"ok": False, "error": "无法获取当前规则池"}, status_code=400)
-    
-    endpoints = pool.get("endpoints", [])
-    if not isinstance(endpoints, list):
-        endpoints = []
-    
-    # 检查锁定规则 - 与编辑规则相同的约束
-    def is_rule_locked(ep):
-        if not isinstance(ep, dict):
-            return False, ""
-        ex = ep.get("extra_config") or {}
-        if not isinstance(ex, dict):
-            ex = {}
-        # WSS 隧道接收端锁定
-        if ex.get("sync_lock") is True or ex.get("sync_role") == "receiver":
-            return True, "WSS隧道接收端规则已锁定，请在发送机节点操作"
-        # 内网穿透客户端锁定
-        if ex.get("intranet_lock") is True or ex.get("intranet_role") == "client":
-            return True, "内网穿透客户端规则已锁定，请在公网入口节点操作"
-        return False, ""
-    
-    # 检查所有选中的规则是否有锁定
-    locked_indices = []
-    for idx in indices:
-        if 0 <= idx < len(endpoints):
-            locked, reason = is_rule_locked(endpoints[idx])
-            if locked:
-                locked_indices.append((idx, reason))
-    
-    if locked_indices and action in ("enable", "disable", "delete"):
-        # 对于修改/删除操作，不允许操作锁定规则
-        first_locked = locked_indices[0]
-        return JSONResponse({
-            "ok": False, 
-            "error": f"规则 #{first_locked[0]+1} 已锁定: {first_locked[1]}",
-            "locked_indices": [i for i, _ in locked_indices]
-        }, status_code=403)
-    
-    import copy as copy_module
-    modified = False
-    skipped = 0
-    
-    if action == "enable":
-        for idx in indices:
-            if 0 <= idx < len(endpoints):
-                locked, _ = is_rule_locked(endpoints[idx])
-                if locked:
-                    skipped += 1
-                    continue
-                endpoints[idx]["disabled"] = False
-                modified = True
-    
-    elif action == "disable":
-        for idx in indices:
-            if 0 <= idx < len(endpoints):
-                locked, _ = is_rule_locked(endpoints[idx])
-                if locked:
-                    skipped += 1
-                    continue
-                endpoints[idx]["disabled"] = True
-                modified = True
-    
-    elif action == "delete":
-        # 删除时要从后往前，避免索引错位
-        for idx in sorted(indices, reverse=True):
-            if 0 <= idx < len(endpoints):
-                locked, _ = is_rule_locked(endpoints[idx])
-                if locked:
-                    skipped += 1
-                    continue
-                endpoints.pop(idx)
-                modified = True
-    
-    elif action == "copy":
-        # 复制不受锁定限制，但复制出来的规则不应继承锁定状态
-        for idx in indices:
-            if 0 <= idx < len(endpoints):
-                new_ep = copy_module.deepcopy(endpoints[idx])
-                new_ep["disabled"] = True
-                # 清除锁定相关字段
-                if new_ep.get("extra_config"):
-                    new_ep["extra_config"].pop("sync_lock", None)
-                    new_ep["extra_config"].pop("sync_role", None)
-                    new_ep["extra_config"].pop("sync_id", None)
-                    new_ep["extra_config"].pop("sync_peer_node_id", None)
-                    new_ep["extra_config"].pop("intranet_lock", None)
-                    new_ep["extra_config"].pop("intranet_role", None)
-                    new_ep["extra_config"].pop("intranet_tunnel_id", None)
-                if new_ep.get("note"):
-                    new_ep["note"] = f"[复制] {new_ep.get('note', '')}"
-                else:
-                    new_ep["note"] = "[复制]"
-                endpoints.append(new_ep)
-                modified = True
-    
-    else:
-        return JSONResponse({"ok": False, "error": f"未知操作: {action}"}, status_code=400)
-    
-    if not modified:
-        if skipped > 0:
-            return {"ok": True, "modified": False, "skipped": skipped, "message": f"跳过了 {skipped} 条锁定规则"}
-        return {"ok": True, "modified": False}
-    
-    pool["endpoints"] = endpoints
-    new_ver, _ = set_desired_pool(node_id, pool)
-    
-    applied = False
-    try:
-        data = await agent_post(node["base_url"], node["api_key"], "/api/v1/pool", {"pool": pool}, _node_verify_tls(node))
-        if isinstance(data, dict) and data.get("ok", True):
-            await agent_post(node["base_url"], node["api_key"], "/api/v1/apply", {}, _node_verify_tls(node))
-            applied = True
-    except Exception:
-        pass
-    
-    return {
-        "ok": True,
-        "modified": True,
-        "desired_version": new_ver,
-        "applied": applied,
-        "rule_count": len(endpoints),
-    }
-
-
-@app.post("/api/nodes/{node_id}/rules/{rule_index}/metadata")
-async def api_update_rule_metadata(node_id: int, rule_index: int, request: Request, user=Depends(require_login)):
-    """更新规则元数据（备注、标签、收藏）"""
-    node = get_node(node_id)
-    if not node:
-        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
-    
-    try:
-        payload = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "Invalid JSON"}, status_code=400)
-    
-    desired_ver, pool = get_desired_pool(node_id)
-    if not isinstance(pool, dict):
-        rep = get_last_report(node_id)
-        pool = rep.get("pool") if isinstance(rep, dict) else None
-    
-    if not isinstance(pool, dict):
-        return JSONResponse({"ok": False, "error": "无法获取当前规则池"}, status_code=400)
-    
-    endpoints = pool.get("endpoints", [])
-    if not isinstance(endpoints, list):
-        return JSONResponse({"ok": False, "error": "规则列表无效"}, status_code=400)
-    
-    if rule_index < 0 or rule_index >= len(endpoints):
-        return JSONResponse({"ok": False, "error": "规则索引无效"}, status_code=400)
-    
-    ep = endpoints[rule_index]
-    
-    if "note" in payload:
-        ep["note"] = str(payload["note"])[:500]
-    
-    if "tags" in payload:
-        tags = payload["tags"]
-        if isinstance(tags, list):
-            ep["tags"] = [str(t)[:50] for t in tags[:10]]
-        elif isinstance(tags, str):
-            ep["tags"] = [t.strip()[:50] for t in tags.split(",") if t.strip()][:10]
-    
-    if "favorite" in payload:
-        ep["favorite"] = bool(payload["favorite"])
-    
-    pool["endpoints"] = endpoints
-    new_ver, _ = set_desired_pool(node_id, pool)
-    
-    return {
-        "ok": True,
-        "desired_version": new_ver,
-        "rule": ep,
-    }
-
-
-@app.get("/api/nodes/{node_id}/traffic/rollup")
-async def api_get_traffic_rollup(
-    node_id: int,
-    rule_idx: int = None,
-    since: int = None,
-    bucket: int = 60000,
-    user=Depends(require_login),
-):
-    """获取聚合的流量历史数据"""
-    node = get_node(node_id)
-    if not node:
-        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
-    
-    # Default: last 24 hours
-    now_ms = int(time.time() * 1000)
-    if since is None:
-        since = now_ms - 24 * 3600 * 1000
-    
-    # Query from database
-    try:
-        data = list_traffic_history_rollup(
-            node_id=node_id,
-            since_ts_ms=since,
-            bucket_ms=bucket,
-            rule_index=rule_idx,
-        )
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": f"查询失败: {str(e)}"}, status_code=500)
-    
-    return {
-        "ok": True,
-        "node_id": node_id,
-        "rule_idx": rule_idx,
-        "data": data,
-        "ts": now_ms,
-    }
-
-
-@app.post("/api/nodes/{node_id}/traffic/collect")
-async def api_collect_traffic(node_id: int, user=Depends(require_login)):
-    """手动从节点收集流量数据"""
-    node = get_node(node_id)
-    if not node:
-        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
-    
-    # Get stats from agent
-    try:
-        data = await agent_get(
-            node.get("base_url", ""),
-            node.get("api_key", ""),
-            "/api/v1/stats",
-            _node_verify_tls(node),
-        )
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": f"获取stats失败: {str(e)}"}, status_code=500)
-    
-    if not isinstance(data, dict):
-        return JSONResponse({"ok": False, "error": "无效的stats响应"}, status_code=500)
-    
-    # Get pool to map listen addresses to indices
-    pool_data = None
-    try:
-        pool_resp = await agent_get(
-            node.get("base_url", ""),
-            node.get("api_key", ""),
-            "/api/v1/pool",
-            _node_verify_tls(node),
-        )
-        if isinstance(pool_resp, dict):
-            pool_data = pool_resp.get("pool")
-    except Exception:
-        pass
-    
-    endpoints = pool_data.get("endpoints", []) if isinstance(pool_data, dict) else []
-    
-    # Save stats to traffic history
-    ts_ms = int(time.time() * 1000)
-    saved = 0
-    stats = data.get("stats", data)  # stats may be in "stats" key or at root
-    
-    for key, stat in stats.items():
-        if not isinstance(stat, dict):
-            continue
-        
-        # Determine rule_index
-        rule_idx = -1
-        try:
-            rule_idx = int(key)
-        except ValueError:
-            # key may be listen address
-            for i, ep in enumerate(endpoints):
-                if isinstance(ep, dict) and ep.get("listen") == key:
-                    rule_idx = i
-                    break
-        
-        if rule_idx >= 0:
-            try:
-                insert_traffic_history(
-                    node_id=node_id,
-                    rule_index=rule_idx,
-                    ts_ms=ts_ms,
-                    connections=int(stat.get("connections", 0) or 0),
-                    connections_active=int(stat.get("connections_active", 0) or 0),
-                    connections_total=int(stat.get("connections_total", stat.get("connections_established", 0)) or 0),
-                    rx_bytes=int(stat.get("rx_bytes", 0) or 0),
-                    tx_bytes=int(stat.get("tx_bytes", 0) or 0),
-                )
-                saved += 1
-            except Exception:
-                pass
-    
-    return {
-        "ok": True,
-        "saved": saved,
-        "ts": ts_ms,
-    }

@@ -20,43 +20,19 @@
 
   <div id="tab_rules" class="tab-panel">
     <div class="row between mt">
-      <div class="row" style="gap:8px;flex-wrap:wrap;">
-        <input class="input" id="rule_search" placeholder="搜索 listen/remote/备注/标签..." oninput="UI.renderRules()" style="width:200px;" />
+      <div class="row">
+        <input class="input" id="rule_search" placeholder="搜索 listen/remote/wss..." oninput="UI.renderRules()" />
         <select class="select" id="rule_filter" onchange="UI.renderRules()">
           <option value="all">全部</option>
           <option value="running">运行中</option>
           <option value="disabled">已暂停</option>
           <option value="wss">WSS</option>
           <option value="lb">负载均衡</option>
-          <option value="favorite">⭐ 收藏</option>
-        </select>
-        <select class="select" id="tag_filter" onchange="UI.renderRules()" style="min-width:120px;">
-          <option value="">全部标签</option>
         </select>
       </div>
-      <div class="row" style="gap:8px;">
+      <div class="row">
         <button class="btn" onclick="UI.applyNode()">应用配置</button>
         <button class="btn primary" onclick="UI.openRuleEditor(null)">+ 新增规则</button>
-      </div>
-    </div>
-
-    <!-- Batch operation toolbar -->
-    <div id="batch_toolbar" class="card mt" style="display:none;padding:10px 16px;background:var(--surface-alt);">
-      <div class="row between">
-        <div class="row" style="gap:12px;">
-          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-            <input type="checkbox" id="batch_select_all" onchange="BatchOps.toggleAll(this.checked)" />
-            <span class="muted">全选</span>
-          </label>
-          <span class="muted" id="batch_count">已选 0 项</span>
-        </div>
-        <div class="row" style="gap:8px;">
-          <button class="btn xs" onclick="BatchOps.execute('enable')" title="启用选中规则">▶ 启用</button>
-          <button class="btn xs" onclick="BatchOps.execute('disable')" title="暂停选中规则">⏸ 暂停</button>
-          <button class="btn xs" onclick="BatchOps.execute('copy')" title="复制选中规则">📋 复制</button>
-          <button class="btn xs danger" onclick="BatchOps.execute('delete')" title="删除选中规则">🗑 删除</button>
-          <button class="btn xs ghost" onclick="BatchOps.clear()">取消</button>
-        </div>
       </div>
     </div>
 
@@ -65,13 +41,11 @@
         <table class="table" id="rules_table">
           <thead>
             <tr>
-              <th style="width:32px;"><input type="checkbox" id="header_select_all" onchange="BatchOps.toggleAll(this.checked)" title="全选" /></th>
               <th>状态</th>
               <th>Listen</th>
               <th>目标</th>
               <th>类型</th>
               <th>连接</th>
-              <th>备注/标签</th>
               <th>操作</th>
             </tr>
           </thead>
@@ -127,68 +101,6 @@
 
   <div id="modal_backdrop" class="modal-backdrop hidden"></div>
   <div id="modal" class="modal hidden"></div>
-
-  <!-- Metadata Editor Modal -->
-  <div id="meta_modal" class="modal hidden">
-    <div class="modal-inner" style="max-width:480px;">
-      <div class="row between">
-        <div class="h2">规则备注/标签</div>
-        <button class="btn xs ghost" onclick="RuleMeta.closeEditor()">×</button>
-      </div>
-      <div class="form mt">
-        <label class="label">备注</label>
-        <textarea class="input" id="meta_note" rows="3" placeholder="输入备注信息..." maxlength="500"></textarea>
-        <div class="muted sm" style="text-align:right;"><span id="meta_note_count">0</span>/500</div>
-
-        <label class="label mt">标签 <span class="muted sm">(逗号分隔，最多10个)</span></label>
-        <input class="input" id="meta_tags" placeholder="例如: production, critical, http" />
-
-        <label class="label mt" style="display:flex;align-items:center;gap:8px;">
-          <input type="checkbox" id="meta_favorite" />
-          <span>⭐ 收藏此规则</span>
-        </label>
-
-        <input type="hidden" id="meta_rule_index" />
-        <div class="row mt" style="justify-content:flex-end;gap:8px;">
-          <button class="btn ghost" onclick="RuleMeta.closeEditor()">取消</button>
-          <button class="btn primary" onclick="RuleMeta.save()">保存</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Traffic Chart Modal -->
-  <div id="traffic_modal" class="modal hidden">
-    <div class="modal-inner" style="max-width:800px;">
-      <div class="row between">
-        <div class="h2">流量/连接历史</div>
-        <button class="btn xs ghost" onclick="TrafficChart.closeModal()">×</button>
-      </div>
-      <div class="row mt" style="gap:8px;">
-        <select class="select" id="traffic_range" onchange="TrafficChart.loadData()">
-          <option value="3600000">最近1小时</option>
-          <option value="21600000">最近6小时</option>
-          <option value="86400000" selected>最近24小时</option>
-          <option value="604800000">最近7天</option>
-        </select>
-        <button class="btn xs" onclick="TrafficChart.loadData()">刷新</button>
-      </div>
-      <div class="card mt" style="padding:16px;">
-        <canvas id="traffic_chart" height="300"></canvas>
-      </div>
-      <div class="grid2 mt">
-        <div class="card" style="padding:12px;">
-          <div class="muted sm">总接收流量</div>
-          <div class="h2" id="traffic_rx_total">-</div>
-        </div>
-        <div class="card" style="padding:12px;">
-          <div class="muted sm">总发送流量</div>
-          <div class="h2" id="traffic_tx_total">-</div>
-        </div>
-      </div>
-    </div>
-  </div>
-
   <script>
     window.PAGE = { name: "node", nodeId: "{{ node.id }}" };
   </script>
