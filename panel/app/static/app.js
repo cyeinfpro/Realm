@@ -1876,6 +1876,13 @@ function newRule(){
   q('f_balance').value = 'roundrobin';
   setField('f_weights','');
   q('f_protocol').value = 'tcp+udp';
+  
+  // Clear new advanced parameters
+  if(q('f_through')) setField('f_through', '');
+  if(q('f_interface')) setField('f_interface', '');
+  if(q('f_accept_proxy')) q('f_accept_proxy').value = '';
+  if(q('f_send_proxy')) q('f_send_proxy').value = '';
+  if(q('f_mptcp')) q('f_mptcp').value = '';
 
   // Mode default
   q('f_type').value = 'tcp';
@@ -1930,6 +1937,24 @@ function editRule(idx){
   const weights = balance.startsWith('roundrobin:') ? balance.split(':').slice(1).join(':').trim().split(',').map(x=>x.trim()).filter(Boolean) : [];
   setField('f_weights', weights.join(','));
   q('f_protocol').value = e.protocol || 'tcp+udp';
+
+  // Fill new advanced parameters
+  if(q('f_through')) setField('f_through', e.through || '');
+  if(q('f_interface')) setField('f_interface', e.interface || '');
+  if(q('f_accept_proxy')){
+    if(e.accept_proxy) q('f_accept_proxy').value = e.accept_proxy_version === 2 ? '2' : '1';
+    else q('f_accept_proxy').value = '';
+  }
+  if(q('f_send_proxy')){
+    if(e.send_proxy) q('f_send_proxy').value = e.send_proxy_version === 2 ? '2' : '1';
+    else q('f_send_proxy').value = '';
+  }
+  if(q('f_mptcp')){
+    if(e.accept_mptcp && e.send_mptcp) q('f_mptcp').value = 'both';
+    else if(e.accept_mptcp) q('f_mptcp').value = 'accept';
+    else if(e.send_mptcp) q('f_mptcp').value = 'send';
+    else q('f_mptcp').value = '';
+  }
 
   // infer tunnel mode from endpoint
   q('f_type').value = wssMode(e);
@@ -2269,6 +2294,30 @@ async function saveRule(){
 
   // 普通转发（单机）
   const endpoint = { listen, remotes, disabled, balance: balanceStr, protocol };
+  
+  // Additional advanced parameters
+  const throughVal = q('f_through') ? q('f_through').value.trim() : '';
+  const interfaceVal = q('f_interface') ? q('f_interface').value.trim() : '';
+  const acceptProxyVal = q('f_accept_proxy') ? q('f_accept_proxy').value : '';
+  const sendProxyVal = q('f_send_proxy') ? q('f_send_proxy').value : '';
+  const mptcpVal = q('f_mptcp') ? q('f_mptcp').value : '';
+  
+  if(throughVal) endpoint.through = throughVal;
+  if(interfaceVal) endpoint.interface = interfaceVal;
+  if(acceptProxyVal) endpoint.accept_proxy = true;
+  if(acceptProxyVal === '2') endpoint.accept_proxy_version = 2;
+  if(sendProxyVal) endpoint.send_proxy = true;
+  if(sendProxyVal === '2') endpoint.send_proxy_version = 2;
+  if(mptcpVal === 'accept' || mptcpVal === 'both') endpoint.accept_mptcp = true;
+  if(mptcpVal === 'send' || mptcpVal === 'both') endpoint.send_mptcp = true;
+  
+  // Preserve existing metadata (note, tags, favorite)
+  if(CURRENT_EDIT_INDEX >= 0 && CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX]){
+    const old = CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX];
+    if(old.note) endpoint.note = old.note;
+    if(old.tags) endpoint.tags = old.tags;
+    if(old.favorite) endpoint.favorite = old.favorite;
+  }
 
     try{
       setLoading(true);
@@ -2307,7 +2356,15 @@ async function savePool(msg){
       if(msg) toast(msg);
       return true;
     }
-    const err = (res && res.error) ? res.error : '保存失败';
+    // Handle validation errors
+    let err = (res && res.error) ? res.error : '保存失败';
+    if(res && res.validation && res.validation.errors && res.validation.errors.length > 0){
+      const errList = res.validation.errors.map(e => {
+        if(e.rule_index >= 0) return `规则#${e.rule_index + 1}: ${e.message}`;
+        return e.message;
+      }).join('\n');
+      err = `校验失败:\n${errList}`;
+    }
     q('modalMsg') && (q('modalMsg').textContent = err);
     throw new Error(err);
   }catch(e){

@@ -2557,6 +2557,20 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     if not isinstance(pool, dict):
         return JSONResponse({"ok": False, "error": "请求缺少 pool 字段"}, status_code=400)
 
+    # --- Pre-save validation ---
+    from .services.validators import validate_and_normalize
+    validation = validate_and_normalize(pool)
+    if not validation.valid:
+        return JSONResponse({
+            "ok": False,
+            "error": "规则校验失败",
+            "validation": validation.to_dict(),
+        }, status_code=400)
+    
+    # Use normalized pool if available
+    if validation.normalized_pool:
+        pool = validation.normalized_pool
+
     # --- Sanitize pool fields (trim spaces) ---
     # 说明：Agent 侧会对 listen 做 strip()，如果面板保存了带空格/不可见字符的 listen，
     # 前端按 listen 精确匹配 stats 时会出现“暂无检测数据”。

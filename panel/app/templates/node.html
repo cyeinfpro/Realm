@@ -503,6 +503,55 @@
 
                     <div class="help" style="margin-top:6px;">提示：Remote 写 B 内网可达地址（如 192.168.x.x:port）。</div>
                   </div>
+
+                  <!-- Additional Advanced Parameters (JQ Filter supported) -->
+                  <div class="adv-subtitle" style="margin-top:16px;">更多高级参数</div>
+                  
+                  <div class="adv-grid">
+                    <div class="col">
+                      <label class="label">SOCKS5 代理（through）</label>
+                      <input class="input" id="f_through" placeholder="例如: socks5://127.0.0.1:1080">
+                      <div class="help">流量经此 SOCKS5 代理转发到目标。</div>
+                    </div>
+                    
+                    <div class="col">
+                      <label class="label">绑定网卡（interface）</label>
+                      <input class="input" id="f_interface" placeholder="例如: eth0 或 192.168.1.100">
+                      <div class="help">出站流量绑定到指定网卡或 IP。</div>
+                    </div>
+                  </div>
+
+                  <div class="adv-grid" style="margin-top:10px;">
+                    <div class="col" style="max-width:200px;">
+                      <label class="label">接收 PROXY Protocol</label>
+                      <select class="select" id="f_accept_proxy">
+                        <option value="">关闭</option>
+                        <option value="1">v1</option>
+                        <option value="2">v2</option>
+                      </select>
+                      <div class="help">从客户端接收真实 IP。</div>
+                    </div>
+                    
+                    <div class="col" style="max-width:200px;">
+                      <label class="label">发送 PROXY Protocol</label>
+                      <select class="select" id="f_send_proxy">
+                        <option value="">关闭</option>
+                        <option value="1">v1</option>
+                        <option value="2">v2</option>
+                      </select>
+                      <div class="help">向后端发送真实 IP。</div>
+                    </div>
+                    
+                    <div class="col" style="max-width:200px;">
+                      <label class="label">MPTCP（多路径TCP）</label>
+                      <select class="select" id="f_mptcp">
+                        <option value="">关闭</option>
+                        <option value="accept">接收端启用</option>
+                        <option value="send">发送端启用</option>
+                        <option value="both">双向启用</option>
+                      </select>
+                    </div>
+                  </div>
                 </div>
               </details>
 
