@@ -17,6 +17,14 @@
         <button class="menu-item" type="button" onclick="openRestoreFullModal()">全量恢复</button>
       </div>
     </details>
+
+    <details class="menu" id="themeMenu">
+      <summary class="btn sm secondary" aria-label="主题切换">主题：<span id="themeMenuLabel">classic</span> ▾</summary>
+      <div class="menu-pop">
+        <button class="menu-item" type="button" data-theme-option="classic" onclick="setTheme('classic')">经典（旧版）<span class="muted sm">dark</span></button>
+        <button class="menu-item" type="button" data-theme-option="aurora" onclick="setTheme('aurora')">Aurora（新版）<span class="muted sm">light</span></button>
+      </div>
+    </details>
     <button class="btn sm secondary" type="button" onclick="openAgentUpdateModal()">一键更新 Agent</button>
     <button class="btn sm" type="button" onclick="openAddNodeModal()">接入节点</button>
   </div>

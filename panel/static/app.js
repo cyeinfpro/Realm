@@ -104,48 +104,6 @@ function setRuleFilter(v){
 }
 window.setRuleFilter = setRuleFilter;
 
-// Rules advanced filters
-let RULE_FILTER_STATUS = 'all';  // all | running | disabled
-let RULE_FILTER_TYPE = 'all';    // all | tcp | wss | intranet
-let RULE_FILTER_FAV = 'all';     // all | fav | nofav
-let RULE_FILTER_TAG = 'all';     // all | __none__ | <tag>
-
-function setRuleStatusFilter(v){
-  RULE_FILTER_STATUS = String(v || 'all');
-  renderRules();
-}
-function setRuleTypeFilter(v){
-  RULE_FILTER_TYPE = String(v || 'all');
-  renderRules();
-}
-function setRuleFavFilter(v){
-  RULE_FILTER_FAV = String(v || 'all');
-  renderRules();
-}
-function setRuleTagFilter(v){
-  RULE_FILTER_TAG = String(v || 'all');
-  renderRules();
-}
-function resetRuleFilters(){
-  RULE_FILTER = '';
-  RULE_FILTER_STATUS = 'all';
-  RULE_FILTER_TYPE = 'all';
-  RULE_FILTER_FAV = 'all';
-  RULE_FILTER_TAG = 'all';
-  try{ if(q('ruleSearch')) q('ruleSearch').value = ''; }catch(_e){}
-  try{ if(q('ruleFilterStatus')) q('ruleFilterStatus').value = 'all'; }catch(_e){}
-  try{ if(q('ruleFilterType')) q('ruleFilterType').value = 'all'; }catch(_e){}
-  try{ if(q('ruleFilterFav')) q('ruleFilterFav').value = 'all'; }catch(_e){}
-  try{ if(q('ruleFilterTag')) q('ruleFilterTag').value = 'all'; }catch(_e){}
-  renderRules();
-}
-
-window.setRuleStatusFilter = setRuleStatusFilter;
-window.setRuleTypeFilter = setRuleTypeFilter;
-window.setRuleFavFilter = setRuleFavFilter;
-window.setRuleTagFilter = setRuleTagFilter;
-window.resetRuleFilters = resetRuleFilters;
-
 function showTab(name){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
   document.querySelectorAll('.tabpane').forEach(p=>p.classList.remove('show'));
@@ -222,33 +180,17 @@ function formatRemoteForInput(e){
   if(ex && ex.sync_role === 'sender' && Array.isArray(ex.sync_original_remotes)){
     return ex.sync_original_remotes.join('\n');
   }
-  const rs = getRemotesForDisplay(e);
+  const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
   return rs.join('\n');
 }
 
 function formatRemote(e){
-  const rs = getRemotesForDisplay(e);
+  const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
   return rs.join('\n');
 }
 
-// Preferred remote list for UI/search:
-// - WSS sender uses sync_original_remotes (what user typed)
-// - Intranet tunnel uses intranet_original_remotes if provided
-// - otherwise use remotes/remote
-function getRemotesForDisplay(e){
-  const ex = (e && e.extra_config) ? e.extra_config : {};
-  if(ex && ex.sync_role === 'sender' && Array.isArray(ex.sync_original_remotes) && ex.sync_original_remotes.length){
-    return ex.sync_original_remotes.map(x=>String(x||'').trim()).filter(Boolean);
-  }
-  if(ex && Array.isArray(ex.intranet_original_remotes) && ex.intranet_original_remotes.length){
-    return ex.intranet_original_remotes.map(x=>String(x||'').trim()).filter(Boolean);
-  }
-  const rs = Array.isArray(e?.remotes) ? e.remotes : (e?.remote ? [e.remote] : []);
-  return rs.map(x=>String(x||'').trim()).filter(Boolean);
-}
-
 function renderRemoteTargets(e, idx){
-  const rs = getRemotesForDisplay(e);
+  const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
   if(!rs.length) return '<span class="muted">—</span>';
   const MAX = 2;
   const shown = rs.slice(0, MAX);
@@ -263,112 +205,10 @@ function renderRemoteTargets(e, idx){
 
 // 表格视图：直接展开成多行（不再使用 +N）
 function renderRemoteTargetsExpanded(e){
-  const rs = getRemotesForDisplay(e);
+  const rs = Array.isArray(e.remotes) ? e.remotes : (e.remote ? [e.remote] : []);
   if(!rs.length) return '<span class="muted">—</span>';
   const lines = rs.map(r=>`<div class="remote-line"><span class="remote-chip mono" title="${escapeHtml(r)}">${escapeHtml(r)}</span></div>`).join('');
   return `<div class="remote-wrap expanded">${lines}</div>`;
-}
-
-// -------------------- Rule metadata (remark / tags / favorite) --------------------
-
-function _parseTagsText(text){
-  const s = String(text || '').trim();
-  if(!s) return [];
-  // 支持中文逗号/换行/空格
-  const tmp = s.replace(/，/g, ',').replace(/\n/g, ',');
-  const parts = tmp.split(',');
-  const out = [];
-  parts.forEach((p)=>{
-    const seg = String(p || '').trim();
-    if(!seg) return;
-    seg.split(/\s+/).forEach((t)=>{
-      const tag = String(t || '').trim();
-      if(tag) out.push(tag);
-    });
-  });
-  // uniq (case-insensitive), preserve order
-  const seen = new Set();
-  const uniq = [];
-  out.forEach((t)=>{
-    const k = t.toLowerCase();
-    if(seen.has(k)) return;
-    seen.add(k);
-    uniq.push(t);
-  });
-  return uniq;
-}
-
-function getRuleTags(e){
-  if(!e) return [];
-  if(e.tags != null){
-    if(Array.isArray(e.tags)){
-      return _parseTagsText(e.tags.map(x=>String(x||'').trim()).filter(Boolean).join(','));
-    }
-    return _parseTagsText(e.tags);
-  }
-  if(e.tag != null) return _parseTagsText(e.tag);
-  if(e.labels != null) return _parseTagsText(e.labels);
-  return [];
-}
-
-function formatTagsForInput(tags){
-  const arr = Array.isArray(tags) ? tags : _parseTagsText(tags);
-  return (arr || []).join(', ');
-}
-
-function isFavoriteRule(e){
-  return !!(e && e.favorite === true);
-}
-
-function renderTagChips(e){
-  const tags = getRuleTags(e);
-  if(!tags.length) return '';
-  const MAX = 3;
-  const shown = tags.slice(0, MAX);
-  const more = Math.max(0, tags.length - MAX);
-  const chips = shown.map(t=>`<span class="tag-chip" title="${escapeHtml(t)}">${escapeHtml(t)}</span>`).join('');
-  const moreHtml = more>0 ? `<span class="tag-chip muted" title="还有 ${more} 个标签">+${more}</span>` : '';
-  return `<div class="tag-wrap">${chips}${moreHtml}</div>`;
-}
-
-let _TAG_OPTIONS_CACHE = '';
-function updateRuleTagFilterOptions(){
-  const sel = q('ruleFilterTag');
-  if(!sel) return;
-  const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
-  const tags = [];
-  const seen = new Set();
-  eps.forEach((e)=>{
-    getRuleTags(e).forEach((t)=>{
-      const k = String(t||'').toLowerCase();
-      if(!k) return;
-      if(seen.has(k)) return;
-      seen.add(k);
-      tags.push(String(t));
-    });
-  });
-  tags.sort((a,b)=>a.localeCompare(b, 'zh-Hans-CN', {sensitivity:'base'}));
-
-  let html = '';
-  html += '<option value="all">全部</option>';
-  html += '<option value="__none__">无标签</option>';
-  tags.forEach((t)=>{
-    const v = escapeHtml(t);
-    html += `<option value="${v}">${v}</option>`;
-  });
-
-  if(html === _TAG_OPTIONS_CACHE) return;
-  _TAG_OPTIONS_CACHE = html;
-  const keep = String(sel.value || RULE_FILTER_TAG || 'all');
-  sel.innerHTML = html;
-
-  // restore selection
-  let ok = false;
-  for(const opt of Array.from(sel.options)){
-    if(opt.value === keep){ ok = true; break; }
-  }
-  sel.value = ok ? keep : 'all';
-  RULE_FILTER_TAG = sel.value;
 }
 
 // 表格视图：连通检测直接多行展示（不使用 +N）
@@ -1224,14 +1064,6 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
   const activeTitle = statsError ? '' : `title="当前已建立连接：${est}"`;
   const lockInfo = getRuleLockInfo(e);
 
-  const fav = isFavoriteRule(e);
-  const favBtn = (lockInfo && lockInfo.locked)
-    ? `<span class="btn xs icon ghost fav-btn ${fav?'active':''}" title="收藏（锁定规则请在发送机侧修改）">${fav ? '★' : '☆'}</span>`
-    : `<button class="btn xs icon ghost fav-btn ${fav?'active':''}" type="button" title="${fav ? '取消收藏' : '收藏'}" onclick="toggleFavorite(${idx})">${fav ? '★' : '☆'}</button>`;
-  const remark = String(e.remark || '').trim();
-  const subText = remark ? `${endpointType(e)} · ${remark}` : endpointType(e);
-  const tagsHtml = renderTagChips(e);
-
   const actionsHtml = (lockInfo && lockInfo.locked) ? `
     <div class="rule-actions">
       <span class="pill ghost" title="${escapeHtml(lockInfo.reason || '该规则已锁定（只读）')}">🔒 已锁定</span>
@@ -1250,11 +1082,9 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
         <div class="rule-topline">
           <span class="rule-idx">#${rowNo}</span>
           ${statusPill(e)}
-          ${favBtn}
         </div>
         <div class="rule-listen mono">${escapeHtml(e.listen)}</div>
-        <div class="rule-sub muted sm" ${remark ? `title="${escapeHtml(remark)}"` : ''}>${escapeHtml(subText)}</div>
-        ${tagsHtml}
+        <div class="rule-sub muted sm">${endpointType(e)}</div>
       </div>
       <div class="rule-right">
         <span class="pill ghost" ${activeTitle}>活跃 ${escapeHtml(connActive)}</span>
@@ -1282,60 +1112,23 @@ function renderRules(){
   // 小屏用卡片，大屏用表格
   const isMobile = window.matchMedia('(max-width: 1024px)').matches;
 
-  // Keep tag filter dropdown in sync with current rules
-  try{ updateRuleTagFilterOptions(); }catch(_e){}
-
-  // Filters (text / status / type / favorite / tag)
-  const fText = (RULE_FILTER || '').trim().toLowerCase();
-  const fStatus = String(RULE_FILTER_STATUS || 'all');
-  const fType = String(RULE_FILTER_TYPE || 'all');
-  const fFav = String(RULE_FILTER_FAV || 'all');
-  const fTag = String(RULE_FILTER_TAG || 'all');
-  const tagNeedle = (fTag && fTag !== 'all' && fTag !== '__none__') ? fTag.toLowerCase() : '';
-
+  // Filter (listen / remote / remark)
+  const f = (RULE_FILTER || '').trim().toLowerCase();
   const items = [];
   eps.forEach((e, idx)=>{
-    if(!e) return;
-
-    // status
-    if(fStatus === 'running' && e.disabled) return;
-    if(fStatus === 'disabled' && !e.disabled) return;
-
-    // type
-    const mode = tunnelMode(e); // tcp | wss | intranet
-    if(fType !== 'all' && mode !== fType) return;
-
-    // favorite
-    const fav = isFavoriteRule(e);
-    if(fFav === 'fav' && !fav) return;
-    if(fFav === 'nofav' && fav) return;
-
-    // tags
-    const tags = getRuleTags(e);
-    if(fTag === '__none__' && tags.length) return;
-    if(tagNeedle){
-      const has = tags.some(t=>String(t||'').toLowerCase() === tagNeedle);
-      if(!has) return;
-    }
-
-    // text search: listen / remote / remark / tags / type
-    if(fText){
+    if(f){
       const hay = `${e.listen||''}
 ${formatRemote(e)}
 ${(e.remark||'')}
-${tags.join(' ')}
-${endpointType(e)}
-${fav ? 'favorite 收藏 star' : ''}`.toLowerCase();
-      if(!hay.includes(fText)) return;
+${endpointType(e)}`.toLowerCase();
+      if(!hay.includes(f)) return;
     }
-
     items.push({e, idx});
   });
 
   if(!items.length){
     q('rulesLoading').style.display = '';
-    const anyFilter = !!(fText || (fStatus !== 'all') || (fType !== 'all') || (fFav !== 'all') || (fTag !== 'all'));
-    q('rulesLoading').textContent = anyFilter ? '未找到匹配规则' : '暂无规则';
+    q('rulesLoading').textContent = f ? '未找到匹配规则' : '暂无规则';
     table.style.display = 'none';
     if(mobileWrap) mobileWrap.style.display = 'none';
     if(statsLoading){
@@ -1373,27 +1166,14 @@ ${fav ? 'favorite 收藏 star' : ''}`.toLowerCase();
       const connActive = statsError ? 0 : (stats.connections_active ?? 0);
       const est = statsError ? 0 : (stats.connections_established ?? stats.connections ?? 0);
       const lockInfo = getRuleLockInfo(e);
-      const fav = isFavoriteRule(e);
-      const favBtn = (lockInfo && lockInfo.locked)
-        ? `<span class="btn xs icon ghost fav-btn ${fav?'active':''}" title="收藏（锁定规则请在发送机侧修改）">${fav ? '★' : '☆'}</span>`
-        : `<button class="btn xs icon ghost fav-btn ${fav?'active':''}" type="button" title="${fav ? '取消收藏' : '收藏'}" onclick="toggleFavorite(${idx})">${fav ? '★' : '☆'}</button>`;
-      const remark = String(e.remark || '').trim();
-      const remarkHtml = remark ? `<div class="muted sm" title="${escapeHtml(remark)}">备注：${escapeHtml(remark)}</div>` : '';
-      const tagsHtml = renderTagChips(e);
-      const typeText = endpointType(e);
 
       const tr = document.createElement('tr');
       tr.innerHTML = `
         <td>${rowNo}</td>
         <td>${statusPill(e)}</td>
         <td class="listen">
-          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-            ${favBtn}
-            <div class="mono">${escapeHtml(e.listen)}</div>
-          </div>
-          <div class="muted sm">${escapeHtml(typeText)}</div>
-          ${remarkHtml}
-          ${tagsHtml}
+          <div class="mono">${escapeHtml(e.listen)}</div>
+          <div class="muted sm">${endpointType(e)}</div>
         </td>
         <td class="health">${healthHtml}</td>
         <td class="stat" title="当前已建立连接：${escapeHtml(est)}">${statsError ? '—' : escapeHtml(connActive)}</td>
@@ -1541,53 +1321,6 @@ function parseListenToHostPort(listen){
 
   host = host.replace(/^\[(.*)\]$/, '$1') || '0.0.0.0';
   return {host, port};
-}
-
-// Parse host:port for remote validation (strict)
-function parseHostPortStrict(addr){
-  const s = _trim(addr);
-  if(!s) return null;
-  if(s.includes('://')) return null;
-
-  // [::]:443
-  if(s.startsWith('[')){
-    const r = s.indexOf(']');
-    if(r > 0){
-      const host = (s.slice(1, r) || '').trim();
-      const rest = s.slice(r + 1);
-      const m = rest.match(/^:(\d+)$/);
-      if(!m) return null;
-      const port = parseInt(m[1], 10);
-      if(!host) return null;
-      if(!(port >= 1 && port <= 65535)) return null;
-      return {host, port};
-    }
-  }
-
-  // host:port (use last ':' as separator)
-  const m = s.match(/^(.*):(\d+)$/);
-  if(!m) return null;
-  const host = String(m[1] || '').replace(/^\[(.*)\]$/, '$1').trim();
-  const port = parseInt(m[2], 10);
-  if(!host) return null;
-  if(!(port >= 1 && port <= 65535)) return null;
-  return {host, port};
-}
-
-function findListenPortConflicts(portNum, ignoreIdx){
-  const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
-  const out = [];
-  eps.forEach((ep, idx)=>{
-    if(idx === ignoreIdx) return;
-    if(!ep || ep.listen == null) return;
-    const p = parseListenToHostPort(ep.listen).port;
-    const pn = parseInt(String(p || '0'), 10);
-    if(!pn || pn <= 0) return;
-    if(pn === portNum){
-      out.push({ idx, disabled: !!ep.disabled, listen: String(ep.listen || '') });
-    }
-  });
-  return out;
 }
 
 // Normalize host input (strip scheme / strip trailing :port for IPv4/domain)
@@ -2067,10 +1800,6 @@ function newRule(){
   syncListenComputed();
 
   setField('f_remotes','');
-  // metadata
-  if(q('f_remark')) setField('f_remark','');
-  if(q('f_tags')) setField('f_tags','');
-  if(q('f_favorite')) q('f_favorite').checked = false;
   q('f_disabled').value = '0';
 
   // 新建规则：默认启用，不显示“状态”字段（更聚焦）
@@ -2127,10 +1856,6 @@ function editRule(idx){
   syncListenComputed();
   // synced sender rule should show original targets (not the peer receiver ip:port)
   setField('f_remotes', formatRemoteForInput(e));
-  // metadata
-  if(q('f_remark')) setField('f_remark', String(e.remark || ''));
-  if(q('f_tags')) setField('f_tags', formatTagsForInput(getRuleTags(e)));
-  if(q('f_favorite')) q('f_favorite').checked = isFavoriteRule(e);
 
   q('f_disabled').value = e.disabled ? '1':'0';
   const balance = e.balance || 'roundrobin';
@@ -2189,103 +1914,6 @@ function editRule(idx){
   openModal();
 }
 
-// Favorite / bookmark a rule (metadata only)
-async function toggleFavorite(idx){
-  const e = CURRENT_POOL.endpoints[idx];
-  if(!e) return;
-  const lockInfo = getRuleLockInfo(e);
-  if(lockInfo && lockInfo.locked){
-    toast(lockInfo.reason || '该规则已锁定，请在可编辑端修改。', true);
-    return;
-  }
-
-  const ex = (e && e.extra_config) ? e.extra_config : {};
-  const newFav = !isFavoriteRule(e);
-  const tags = getRuleTags(e);
-  const remark = String(e.remark || '').trim();
-
-  // Synced WSS sender: update both sides via panel API
-  if(ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
-    try{
-      setLoading(true);
-      const payload = {
-        sender_node_id: window.__NODE_ID__,
-        receiver_node_id: ex.sync_peer_node_id,
-        listen: e.listen,
-        remotes: ex.sync_original_remotes || [],
-        disabled: !!e.disabled,
-        balance: e.balance || 'roundrobin',
-        protocol: e.protocol || 'tcp+udp',
-        receiver_port: ex.sync_receiver_port,
-        sync_id: ex.sync_id,
-        remark: remark,
-        tags: tags,
-        favorite: newFav,
-        wss: {
-          psk: ex.sync_wss_psk || ex.wss_psk || '',
-          host: ex.sync_wss_host || ex.wss_host || '',
-          path: ex.sync_wss_path || ex.wss_path || '',
-          tls_enabled: ex.sync_wss_tls === true,
-          insecure_skip_verify: ex.sync_wss_insecure === true
-        }
-      };
-      const res = await fetchJSON('/api/wss_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
-      if(res && res.ok){
-        CURRENT_POOL = res.sender_pool;
-        renderRules();
-        toast(newFav ? '已收藏（已同步到接收端）' : '已取消收藏（已同步到接收端）');
-      }else{
-        toast(res && res.error ? res.error : '同步更新失败，请稍后重试', true);
-      }
-    }catch(err){
-      toast(String(err), true);
-    }finally{
-      setLoading(false);
-    }
-    return;
-  }
-
-  // Intranet tunnel sender: update both sides via panel API
-  if(ex && ex.sync_id && ex.intranet_role === 'server' && ex.intranet_peer_node_id){
-    try{
-      setLoading(true);
-      const payload = {
-        sender_node_id: window.__NODE_ID__,
-        receiver_node_id: ex.intranet_peer_node_id,
-        listen: e.listen,
-        remotes: ex.intranet_original_remotes || e.remotes || [],
-        disabled: !!e.disabled,
-        balance: e.balance || 'roundrobin',
-        protocol: e.protocol || 'tcp+udp',
-        server_port: ex.intranet_server_port || 18443,
-        sync_id: ex.sync_id,
-        remark: remark,
-        tags: tags,
-        favorite: newFav
-      };
-      const res = await fetchJSON('/api/intranet_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
-      if(res && res.ok){
-        CURRENT_POOL = res.sender_pool;
-        renderRules();
-        toast(newFav ? '已收藏（已同步到内网出口）' : '已取消收藏（已同步到内网出口）');
-      }else{
-        toast(res && res.error ? res.error : '同步更新失败，请稍后重试', true);
-      }
-    }catch(err){
-      toast(String(err), true);
-    }finally{
-      setLoading(false);
-    }
-    return;
-  }
-
-  // Normal rule (metadata lives on this node only)
-  e.favorite = newFav;
-  await savePool(newFav ? '已收藏' : '已取消收藏');
-  renderRules();
-}
-window.toggleFavorite = toggleFavorite;
-
 async function toggleRule(idx){
   const e = CURRENT_POOL.endpoints[idx];
   const ex = (e && e.extra_config) ? e.extra_config : {};
@@ -2312,19 +1940,16 @@ async function toggleRule(idx){
         listen: e.listen,
         remotes: ex.sync_original_remotes || [],
         disabled: newDisabled,
-        remark: String(e.remark || '').trim(),
-        tags: getRuleTags(e),
-        favorite: isFavoriteRule(e),
         balance: e.balance || 'roundrobin',
         protocol: e.protocol || 'tcp+udp',
         receiver_port: ex.sync_receiver_port,
         sync_id: ex.sync_id,
         wss: {
-          psk: ex.sync_wss_psk || ex.wss_psk || '',
-          host: ex.sync_wss_host || ex.wss_host || '',
-          path: ex.sync_wss_path || ex.wss_path || '',
-          tls_enabled: ex.sync_wss_tls === true,
-          insecure_skip_verify: ex.sync_wss_insecure === true
+          host: ex.remote_ws_host || '',
+          path: ex.remote_ws_path || '',
+          sni: ex.remote_tls_sni || '',
+          tls: ex.remote_tls_enabled !== false,
+          insecure: ex.remote_tls_insecure === true
         }
       };
       const res = await fetchJSON('/api/wss_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
@@ -2353,9 +1978,6 @@ async function toggleRule(idx){
         listen: e.listen,
         remotes: ex.intranet_original_remotes || e.remotes || [],
         disabled: newDisabled,
-        remark: String(e.remark || '').trim(),
-        tags: getRuleTags(e),
-        favorite: isFavoriteRule(e),
         balance: e.balance || 'roundrobin',
         protocol: e.protocol || 'tcp+udp',
         server_port: ex.intranet_server_port || 18443,
@@ -2454,17 +2076,12 @@ async function saveRule(){
   const listen = getListenString();
   const listenPortNum = parseInt(getListenPort() || '0', 10);
   const remotesRaw = q('f_remotes').value || '';
-  const remotes = remotesRaw.split('\n').map(x=>String(x||'').replace(/\r/g,'').trim()).filter(Boolean);
+  const remotes = remotesRaw.split('\n').map(x=>x.trim()).filter(Boolean).map(x=>x.replace('\\r',''));
   const disabled = (q('f_disabled').value === '1');
 
-  // metadata
-  const remark = q('f_remark') ? String(q('f_remark').value || '').trim() : '';
-  const tags = q('f_tags') ? _parseTagsText(q('f_tags').value) : [];
-  const favorite = q('f_favorite') ? !!q('f_favorite').checked : false;
-
   // optional weights for roundrobin (comma separated)
-  const weightsRaw = q('f_weights') ? String(q('f_weights').value || '').trim() : '';
-  const weights = weightsRaw ? weightsRaw.split(/[,，]/).map(x=>x.trim()).filter(Boolean) : [];
+  const weightsRaw = q('f_weights') ? (q('f_weights').value || '').trim() : '';
+  const weights = weightsRaw ? weightsRaw.split(',').map(x=>x.trim()).filter(Boolean) : [];
 
   let balTxt = (q('f_balance').value || '').trim();
   let balance = balTxt ? balTxt.split(':')[0].trim() : 'roundrobin';
@@ -2478,44 +2095,7 @@ async function saveRule(){
   const protocol = q('f_protocol').value || 'tcp+udp';
 
   if(!listen){ toast('本地监听不能为空', true); return; }
-  if(!listenPortNum || listenPortNum < 1 || listenPortNum > 65535){ toast('监听端口必须是 1-65535 的整数', true); return; }
   if(remotes.length === 0){ toast('目标地址不能为空', true); return; }
-
-  // remote format validation (host:port)
-  for(let i=0;i<remotes.length;i++){
-    const r = remotes[i];
-    if(!parseHostPortStrict(r)){
-      toast(`Remote 第${i+1}行格式错误（应为 host:port）：${r}`, true);
-      return;
-    }
-  }
-
-  // weights validation (only matters for roundrobin)
-  if(balance === 'roundrobin' && weights.length > 0){
-    for(const w of weights){
-      if(!/^\d+$/.test(w) || parseInt(w,10) <= 0){
-        toast(`权重必须是正整数：${w}`, true);
-        return;
-      }
-    }
-    if(weights.length !== remotes.length){
-      toast(`权重数量必须与 Remote 行数一致（Remote: ${remotes.length} 行，权重: ${weights.length} 个）`, true);
-      return;
-    }
-  }
-
-  // local listen port conflict validation
-  const conflicts = findListenPortConflicts(listenPortNum, CURRENT_EDIT_INDEX);
-  if(conflicts && conflicts.length){
-    const active = conflicts.filter(c=>!c.disabled);
-    if(!disabled && active.length){
-      const c = active[0];
-      toast(`端口冲突：${listenPortNum} 已被规则 #${c.idx+1} 监听（${c.listen}）。请修改端口或先暂停/删除冲突规则。`, true);
-      return;
-    }
-    const c = conflicts[0];
-    toast(`提示：端口 ${listenPortNum} 已被规则 #${c.idx+1} 使用（${c.listen}）。若同时启用会冲突。`);
-  }
 
   // WSS 隧道：必须选择接收机，自动同步生成接收端规则
   if(typeSel === 'wss'){
@@ -2525,15 +2105,6 @@ async function saveRule(){
       return;
     }
     const receiverPortTxt = q('f_wss_receiver_port') ? q('f_wss_receiver_port').value.trim() : '';
-
-    let receiverPort = null;
-    if(receiverPortTxt){
-      receiverPort = parseInt(receiverPortTxt,10);
-      if(!receiverPort || receiverPort < 1 || receiverPort > 65535){
-        toast('接收端端口必须为 1-65535', true);
-        return;
-      }
-    }
     const autoFilled = autoFillWssIfBlank();
     const wss = readWssFields();
     if(!wss.host || !wss.path){
@@ -2555,12 +2126,9 @@ async function saveRule(){
       listen,
       remotes,
       disabled,
-      remark,
-      tags,
-      favorite,
       balance: balanceStr,
       protocol,
-      receiver_port: receiverPort,
+      receiver_port: receiverPortTxt ? parseInt(receiverPortTxt,10) : null,
       sync_id: syncId || undefined,
       wss
     };
@@ -2593,12 +2161,6 @@ async function saveRule(){
     }
     const portTxt = q('f_intranet_server_port') ? q('f_intranet_server_port').value.trim() : '';
     const server_port = portTxt ? parseInt(portTxt,10) : 18443;
-    if(portTxt){
-      if(!server_port || server_port < 1 || server_port > 65535){
-        toast('服务端端口必须为 1-65535', true);
-        return;
-      }
-    }
     const server_host = q('f_intranet_server_host') ? q('f_intranet_server_host').value.trim() : '';
     let syncId = '';
     if(CURRENT_EDIT_INDEX >= 0){
@@ -2612,9 +2174,6 @@ async function saveRule(){
       listen,
       remotes,
       disabled,
-      remark,
-      tags,
-      favorite,
       balance: balanceStr,
       protocol,
       server_port,
@@ -2642,7 +2201,7 @@ async function saveRule(){
   }
 
   // 普通转发（单机）
-  const endpoint = { listen, remotes, disabled, remark, tags, favorite, balance: balanceStr, protocol };
+  const endpoint = { listen, remotes, disabled, balance: balanceStr, protocol };
 
     try{
       setLoading(true);
@@ -8758,3 +8317,52 @@ async function _netmonAbRenderDetail(){
 }
 // Expose for template inline init
 window.initNetMonPage = initNetMonPage;
+
+/* ======================================================================
+   Theme Switcher (Control Page)
+   - Stores selection in localStorage key: realm_theme
+   - Applies by setting <html data-theme="...">
+   ====================================================================== */
+(function(){
+  const THEMES = {
+    classic: { label: '经典' },
+    aurora:  { label: 'Aurora' }
+  };
+
+  function getTheme(){
+    try{ return localStorage.getItem('realm_theme') || document.documentElement.dataset.theme || 'classic'; }
+    catch(e){ return document.documentElement.dataset.theme || 'classic'; }
+  }
+
+  function setThemeSafe(t){
+    if(!THEMES[t]) t = 'classic';
+    try{ localStorage.setItem('realm_theme', t); }catch(e){}
+    document.documentElement.dataset.theme = t;
+    try{ window.dispatchEvent(new CustomEvent('realm_theme_change', { detail: { theme: t } })); }catch(e){}
+  }
+
+  // If base.html already defines setTheme/getTheme, reuse them.
+  if(typeof window.getTheme !== 'function') window.getTheme = getTheme;
+  if(typeof window.setTheme !== 'function') window.setTheme = setThemeSafe;
+
+  function syncThemeMenu(){
+    const t = (typeof window.getTheme === 'function') ? window.getTheme() : getTheme();
+    const label = (THEMES[t] && THEMES[t].label) ? THEMES[t].label : t;
+
+    const labelEl = document.getElementById('themeMenuLabel');
+    if(labelEl) labelEl.textContent = label;
+
+    // Active state on menu options
+    document.querySelectorAll('[data-theme-option]').forEach(btn=>{
+      const opt = btn.getAttribute('data-theme-option');
+      btn.classList.toggle('is-active', opt === t);
+    });
+
+    // If there is an aria summary, update it as well
+    const summary = document.querySelector('#themeMenu > summary');
+    if(summary) summary.setAttribute('aria-label', '主题切换：' + label);
+  }
+
+  window.addEventListener('realm_theme_change', syncThemeMenu);
+  document.addEventListener('DOMContentLoaded', syncThemeMenu);
+})();
