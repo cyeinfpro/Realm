@@ -10,19 +10,18 @@
     </div>
   </div>
   <div class="right">
+    <details class="menu theme-switch">
+      <summary class="btn sm ghost" aria-label="主题切换">主题 ▾</summary>
+      <div class="menu-pop">
+        <button class="menu-item" type="button" data-theme-set="aurora">Aurora（新版）</button>
+        <button class="menu-item" type="button" data-theme-set="classic">Classic（旧版）</button>
+      </div>
+    </details>
     <details class="menu">
       <summary class="btn sm secondary" aria-label="备份与恢复">备份与恢复 ▾</summary>
       <div class="menu-pop">
         <a class="menu-item" href="/api/backup/full">全量备份</a>
         <button class="menu-item" type="button" onclick="openRestoreFullModal()">全量恢复</button>
-      </div>
-    </details>
-
-    <details class="menu" id="themeMenu">
-      <summary class="btn sm secondary" aria-label="主题切换">主题：<span id="themeMenuLabel">classic</span> ▾</summary>
-      <div class="menu-pop">
-        <button class="menu-item" type="button" data-theme-option="classic" onclick="setTheme('classic')">经典（旧版）<span class="muted sm">dark</span></button>
-        <button class="menu-item" type="button" data-theme-option="aurora" onclick="setTheme('aurora')">Aurora（新版）<span class="muted sm">light</span></button>
       </div>
     </details>
     <button class="btn sm secondary" type="button" onclick="openAgentUpdateModal()">一键更新 Agent</button>
@@ -33,6 +32,29 @@
 {% set total_count = nodes|length %}
 {% set online_count = nodes|selectattr('online')|list|length %}
 {% set offline_count = total_count - online_count %}
+{% set group_count = (dashboard_groups or [])|length %}
+<div class="kpi-grid" id="dashboardKpis">
+  <div class="kpi-card">
+    <div class="kpi-label">节点总数</div>
+    <div class="kpi-value mono">{{ total_count }}</div>
+    <div class="kpi-sub muted sm">已接入面板的机器数量</div>
+  </div>
+  <div class="kpi-card ok">
+    <div class="kpi-label">在线</div>
+    <div class="kpi-value mono">{{ online_count }}</div>
+    <div class="kpi-sub muted sm">心跳 90s 内上报</div>
+  </div>
+  <div class="kpi-card warn">
+    <div class="kpi-label">离线</div>
+    <div class="kpi-value mono">{{ offline_count }}</div>
+    <div class="kpi-sub muted sm">建议检查 Agent 与网络</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">分组</div>
+    <div class="kpi-value mono">{{ group_count }}</div>
+    <div class="kpi-sub muted sm">用于面板分类与排序</div>
+  </div>
+</div>
 <div class="dashboard-toolbar" id="dashboardToolbar">
   <div class="dash-filters" role="tablist" aria-label="节点筛选">
     <button class="chip" type="button" data-filter="all" aria-selected="true">全部 <strong>{{ total_count }}</strong></button>
@@ -310,5 +332,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=67.0"></script>
+<script src="/static/app.js?v=66.0"></script>
 {% endblock %}

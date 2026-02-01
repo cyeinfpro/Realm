@@ -1,135 +1,127 @@
 <!doctype html>
-<html lang="zh" data-theme="classic">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <meta name="color-scheme" content="light dark" />
   <meta name="theme-color" content="#0B0F14" />
-  <title>Realm Pro Control Plane</title>
-  <link rel="icon" href="/static/nexus.svg" type="image/svg+xml">
+  <title>{{ title or "Realm Pro" }}</title>
 
-  <!-- Theme boot: set theme BEFORE CSS loads to avoid flash -->
+  <!-- Apply theme ASAP (before CSS) -->
   <script>
     (function(){
       try{
-        var t = localStorage.getItem('realm_theme') || 'classic';
-        document.documentElement.dataset.theme = t;
-      }catch(e){}
+        var t = localStorage.getItem('realm_theme') || 'aurora';
+        document.documentElement.setAttribute('data-theme', t);
+      }catch(_e){}
     })();
   </script>
 
-  <link rel="stylesheet" href="/static/style.css?v=70.0">
+  <link rel="stylesheet" href="/static/style.css?v=70.0" />
 </head>
 <body>
-  <!-- Ambient background -->
+  {% set path = request.url.path %}
+
   <div class="bg-flow" aria-hidden="true"></div>
   <div class="bg-noise" aria-hidden="true"></div>
 
-  <header class="topbar">
-    <a class="brand" href="/" aria-label="Realm Pro 控制台">
-      <span class="logo" aria-hidden="true"><img class="logo-img" src="/static/nexus.svg" alt=""></span>
-      <span class="brand-text">
-        <span class="brand-name">Realm Pro</span>
-        <span class="brand-sub">Control Plane</span>
-      </span>
+  <!-- Classic topbar: old design as a theme -->
+  <div class="topbar">
+    <a class="brand" href="/">
+      <span class="logo"></span>
+      <div class="brand-text">
+        <div class="brand-title">Realm Pro</div>
+        <div class="brand-sub">Control Plane</div>
+      </div>
     </a>
 
-    <nav class="nav" aria-label="主导航">
-      <div class="nav-desktop">
-        <a class="nav-link" href="/">控制台</a>
-        <a class="nav-link" href="/netmon">网络监控</a>
-        <a class="nav-link" href="/topology">拓扑</a>
-        <a class="nav-link" href="/logout">退出</a>
-      </div>
+    <div class="top-actions">
+      <a class="btn sm ghost" href="/">控制台</a>
+      <a class="btn sm ghost" href="/netmon">网络波动</a>
+      <a class="btn sm ghost" href="/nodes/new">接入节点</a>
 
-      <div class="nav-mobile">
-        <details class="menu">
-          <summary class="btn secondary sm">菜单 ▾</summary>
-          <div class="menu-pop">
-            <a class="menu-item" href="/">控制台</a>
-            <a class="menu-item" href="/netmon">网络监控</a>
-            <a class="menu-item" href="/topology">拓扑</a>
-            <div class="menu-sep"></div>
-            <a class="menu-item" href="/logout">退出</a>
-          </div>
-        </details>
-      </div>
-    </nav>
-  </header>
-
-  <main class="container">
-    {# NOTE: This project uses FastAPI + Jinja2Templates.
-       The original templates pass a simple `flash` string.
-       Avoid Flask-specific get_flashed_messages() to prevent 500 errors. #}
-    {% if flash %}
-      <div class="flash">{{ flash }}</div>
-    {% endif %}
-
-    {% block content %}{% endblock %}
-  </main>
-
-  <footer class="footer">
-    <span class="mono">Realm Pro</span> · {% if ver %}v{{ ver }}{% else %}v?{% endif %} · <span class="muted">theme:</span> <span class="mono" id="themeFooterLabel">classic</span>
-  </footer>
-
-  <!-- Group order modal (shared; kept for compatibility with original JS) -->
-  <div id="groupOrderModal" class="modal" style="display:none;">
-    <div class="modal-inner" style="max-width:520px;">
-      <div class="row" style="align-items:center;">
-        <div class="col"><div class="h2">分组排序</div></div>
-        <div class="col right"><button class="btn xs ghost" type="button" onclick="closeGroupOrderModal()">关闭</button></div>
-      </div>
-
-      <div class="form" style="margin-top:10px;">
-        <label class="label">分组名称</label>
-        <input class="input" id="groupOrderName" readonly>
-
-        <label class="label" style="margin-top:10px;">排序序号 <span class="muted sm">（数字越小越靠前）</span></label>
-        <input class="input" id="groupOrderValue" type="number" step="1" placeholder="例如：10">
-        <div class="help">仅影响面板显示顺序，不影响规则与转发。</div>
-
-        <div id="groupOrderError" class="muted" style="margin-top:8px;color:var(--bad);"></div>
-        <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
-          <button class="btn xs ghost" type="button" onclick="closeGroupOrderModal()">取消</button>
-          <button class="btn xs" id="groupOrderSubmit" type="button" onclick="saveGroupOrder()">保存</button>
+      <details class="menu theme-switch">
+        <summary class="btn sm secondary">主题 ▾</summary>
+        <div class="menu-pop">
+          <button class="menu-item" type="button" data-theme-set="aurora">Aurora（新版）</button>
+          <button class="menu-item" type="button" data-theme-set="classic">Classic（旧版）</button>
         </div>
-      </div>
+      </details>
+
+      <div class="pill xs ghost" title="登录账号">{{ user or '' }}</div>
+      <a class="btn sm secondary" href="/logout">退出</a>
     </div>
   </div>
 
-  <!-- Theme helpers (available on every page; control page adds the switcher UI) -->
-  <script>
-    (function(){
-      var THEMES = {
-        classic: { label: '经典', themeColor: '#0B0F14' },
-        aurora:  { label: 'Aurora', themeColor: '#F5F5F7' }
-      };
+  <!-- Aurora shell: new design as a theme -->
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="s-brand" href="/">
+        <span class="s-logo"></span>
+        <div class="s-brand-text">
+          <div class="s-title">Realm Pro</div>
+          <div class="s-sub">Aurora UI</div>
+        </div>
+      </a>
 
-      function applyTheme(t){
-        if(!THEMES[t]) t = 'classic';
-        document.documentElement.dataset.theme = t;
-        // update theme-color for mobile browsers
-        var meta = document.querySelector('meta[name="theme-color"]');
-        if(meta) meta.setAttribute('content', THEMES[t].themeColor || '#0B0F14');
-        var foot = document.getElementById('themeFooterLabel');
-        if(foot) foot.textContent = (THEMES[t] && THEMES[t].label) ? THEMES[t].label : t;
-      }
+      <nav class="s-nav">
+        <a class="s-item{% if path == '/' %} active{% endif %}" href="/">
+          <span class="s-ico">⌘</span>
+          <span>控制台</span>
+        </a>
+        <a class="s-item{% if path.startswith('/nodes') %} active{% endif %}" href="/nodes/new">
+          <span class="s-ico">⛓</span>
+          <span>节点</span>
+        </a>
+        <a class="s-item{% if path.startswith('/netmon') %} active{% endif %}" href="/netmon">
+          <span class="s-ico">◷</span>
+          <span>网络波动</span>
+        </a>
+      </nav>
 
-      window.getTheme = window.getTheme || function(){
-        try{ return localStorage.getItem('realm_theme') || document.documentElement.dataset.theme || 'classic'; }catch(e){ return document.documentElement.dataset.theme || 'classic'; }
-      };
+      <div class="s-foot">
+        <details class="menu theme-switch">
+          <summary class="btn sm ghost w100">主题切换 ▾</summary>
+          <div class="menu-pop">
+            <button class="menu-item" type="button" data-theme-set="aurora">Aurora（新版）</button>
+            <button class="menu-item" type="button" data-theme-set="classic">Classic（旧版）</button>
+          </div>
+        </details>
+        <div class="s-user">
+          <span class="pill xs ghost mono">{{ user or '' }}</span>
+          <a class="btn xs secondary" href="/logout">退出</a>
+        </div>
+      </div>
+    </aside>
 
-      window.setTheme = window.setTheme || function(t){
-        try{ localStorage.setItem('realm_theme', t); }catch(e){}
-        applyTheme(t);
-        try{ window.dispatchEvent(new CustomEvent('realm_theme_change', { detail: { theme: t } })); }catch(e){}
-      };
+    <div class="app-main">
+      <header class="appbar">
+        <div class="appbar-left">
+          <div class="appbar-title">{{ title or '控制台' }}</div>
+          <div class="appbar-sub muted">{{ request.url.path }}</div>
+        </div>
+        <div class="appbar-right">
+          <a class="btn sm ghost" href="/">控制台</a>
+          <a class="btn sm ghost" href="/netmon">网络波动</a>
+          <a class="btn sm ghost" href="/nodes/new">接入节点</a>
+          <details class="menu theme-switch">
+            <summary class="btn sm secondary">主题 ▾</summary>
+            <div class="menu-pop">
+              <button class="menu-item" type="button" data-theme-set="aurora">Aurora（新版）</button>
+              <button class="menu-item" type="button" data-theme-set="classic">Classic（旧版）</button>
+            </div>
+          </details>
+        </div>
+      </header>
 
-      // keep footer label correct
-      applyTheme(window.getTheme());
-    })();
-  </script>
+      <main class="container">
+        {% if flash %}
+          <div class="flash">{{ flash }}</div>
+        {% endif %}
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </div>
 
-  {% block scripts %}{% endblock %}
+  <script src="/static/theme.js?v=2.0"></script>
 </body>
 </html>
