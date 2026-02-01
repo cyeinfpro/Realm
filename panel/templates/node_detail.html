@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="row between">
+    <div>
+      <div class="h1">节点：{{ node.name }}</div>
+      <div class="muted">{{ node.base_url }}</div>
+    </div>
+    <div class="row">
+      <button class="btn" onclick="UI.refreshNode()">刷新</button>
+      <button class="btn danger" onclick="UI.deleteNode('{{ node.id }}')">删除节点</button>
+    </div>
+  </div>
+
+  <div class="tabs mt">
+    <button class="tab active" data-tab="rules" onclick="UI.switchTab('rules')">规则</button>
+    <button class="tab" data-tab="topology" onclick="UI.switchTab('topology')">连接图</button>
+    <button class="tab" data-tab="lb" onclick="UI.switchTab('lb')">负载均衡</button>
+    <button class="tab" data-tab="status" onclick="UI.switchTab('status')">系统状态</button>
+  </div>
+
+  <div id="tab_rules" class="tab-panel">
+    <div class="row between mt">
+      <div class="row">
+        <input class="input" id="rule_search" placeholder="搜索 listen/remote/wss..." oninput="UI.renderRules()" />
+        <select class="select" id="rule_filter" onchange="UI.renderRules()">
+          <option value="all">全部</option>
+          <option value="running">运行中</option>
+          <option value="disabled">已暂停</option>
+          <option value="wss">WSS</option>
+          <option value="lb">负载均衡</option>
+        </select>
+      </div>
+      <div class="row">
+        <button class="btn" onclick="UI.applyNode()">应用配置</button>
+        <button class="btn primary" onclick="UI.openRuleEditor(null)">+ 新增规则</button>
+      </div>
+    </div>
+
+    <div class="card mt">
+      <div class="table-wrap">
+        <table class="table" id="rules_table">
+          <thead>
+            <tr>
+              <th>状态</th>
+              <th>Listen</th>
+              <th>目标</th>
+              <th>类型</th>
+              <th>连接</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div id="tab_topology" class="tab-panel hidden">
+    <div class="row between mt">
+      <div>
+        <div class="h2">规则连接图</div>
+        <div class="muted">可视化展示 listen → remote 的关系（支持多目标 / WSS 参数）</div>
+      </div>
+      <button class="btn" onclick="UI.renderTopology()">重绘</button>
+    </div>
+    <div class="card mt">
+      <div id="topology_canvas" class="topology"></div>
+    </div>
+  </div>
+
+  <div id="tab_lb" class="tab-panel hidden">
+    <div class="row between mt">
+      <div>
+        <div class="h2">负载均衡策略</div>
+        <div class="muted">仅展示多目标规则（Round-Robin / IP-Hash / 权重）</div>
+      </div>
+      <button class="btn" onclick="UI.renderLB()">刷新</button>
+    </div>
+    <div class="card mt" id="lb_cards"></div>
+  </div>
+
+  <div id="tab_status" class="tab-panel hidden">
+    <div class="row between mt">
+      <div>
+        <div class="h2">系统状态</div>
+        <div class="muted">来自 Agent 的实时信息</div>
+      </div>
+      <button class="btn" onclick="UI.refreshStatus()">刷新</button>
+    </div>
+    <div class="grid2 mt">
+      <div class="card">
+        <div class="card-title">realm.service</div>
+        <pre class="pre" id="svc_realm">-</pre>
+      </div>
+      <div class="card">
+        <div class="card-title">realm-agent.service</div>
+        <pre class="pre" id="svc_agent">-</pre>
+      </div>
+    </div>
+  </div>
+
+  <div id="modal_backdrop" class="modal-backdrop hidden"></div>
+  <div id="modal" class="modal hidden"></div>
+  <script>
+    window.PAGE = { name: "node", nodeId: "{{ node.id }}" };
+  </script>
+{% endblock %}

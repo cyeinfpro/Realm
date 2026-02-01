@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="row between">
+    <div>
+      <div class="h1">全局连接图</div>
+      <div class="muted">跨节点展示 listen → remote 的网络拓扑</div>
+    </div>
+    <button class="btn" onclick="UI.renderGlobalTopology()">刷新</button>
+  </div>
+
+  <div class="card mt">
+    <div id="global_topology_canvas" class="topology"></div>
+  </div>
+
+  <script>
+    window.PAGE = { name: "topology" };
+  </script>
+{% endblock %}

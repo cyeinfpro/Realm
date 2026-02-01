@@ -1,0 +1,16 @@
+[Unit]
+Description=Realm Agent API Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/realm-agent/agent.env
+WorkingDirectory=/opt/realm-agent
+ExecStart=/opt/realm-agent/start.sh
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
