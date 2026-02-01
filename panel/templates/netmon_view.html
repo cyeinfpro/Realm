@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block content %}
+<div id="toast" class="toast" style="display:none;"></div>
+
+<div class="page-head netmon-view-head">
+  <div class="page-title">
+    <h1 class="h1">网络波动 · 只读展示</h1>
+    <div class="meta netmon-meta">
+      <span class="meta-item">只读</span>
+    </div>
+  </div>
+  <div class="right" style="display:flex; gap:10px; align-items:center;">
+    {% if user %}
+      <a class="btn sm secondary" href="/netmon">进入管理页</a>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card netmon-toolbar netmon-toolbar-ro">
+  <div class="row" style="gap:12px; flex-wrap:wrap; align-items:flex-end;">
+    <div class="col nm-win">
+      <label class="label">展示窗口</label>
+      <input class="input" id="netmonViewWindow" type="number" min="1" max="1440" value="10">
+    </div>
+    <div class="col nm-auto">
+      <label class="label">自动刷新</label>
+      <select class="select" id="netmonAutoRefresh">
+        <option value="on">开启（2s）</option>
+        <option value="off">关闭</option>
+      </select>
+    </div>
+    <div class="col nm-res">
+      <label class="label">显示精度</label>
+      <select class="select" id="netmonResolution">
+        <option value="auto">自动（后端分层聚合）</option>
+        <option value="0">原始（不聚合）</option>
+        <option value="10000">10s</option>
+        <option value="30000">30s</option>
+        <option value="60000">1m</option>
+        <option value="300000">5m</option>
+        <option value="900000">15m</option>
+        <option value="3600000">1h</option>
+      </select>
+    </div>
+    <div class="col nm-refresh" style="max-width:200px;">
+      <button class="btn sm ghost" type="button" id="netmonRefreshBtn">立即刷新</button>
+    </div>
+    <div class="col nm-status" style="min-width:220px;">
+      <div class="muted sm" id="netmonStatus">加载中…</div>
+    </div>
+  </div>
+</div>
+
+<div id="netmonCharts" class="netmon-charts"></div>
+
+<div class="card netmon-empty" id="netmonEmpty" style="display:none;">
+  <div class="card-title">暂无监控</div>
+  <div class="card-sub">当前分享链接对应的监控不存在或已删除。</div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/app.js?v=66.0"></script>
+<script>
+// Read-only display page (share / wallboard)
+window.__NETMON_NODE_GROUPS__ = [];
+window.__NETMON_READONLY__ = true;
+window.addEventListener('DOMContentLoaded', ()=>{
+  try{ document.body.classList.add('netmon-ro'); }catch(_e){}
+  initNetMonPage();
+});
+</script>
+{% endblock %}
