@@ -1,18 +1,8 @@
 {% extends "base.html" %}
 {% block content %}
-  <div class="row between">
-    <div>
-      <div class="h1">全局连接图</div>
-      <div class="muted">跨节点展示 listen → remote 的网络拓扑</div>
-    </div>
-    <button class="btn" onclick="UI.renderGlobalTopology()">刷新</button>
+  <div class="card">
+    <div class="card-title">拓扑视图已移除</div>
+    <div class="card-sub">为了保持面板简洁与稳定，本版本不再提供连接拓扑可视化。</div>
+    <div class="muted sm" style="margin-top:10px;">如需恢复该能力，可在后续单独作为可选插件形式提供，不影响主面板功能。</div>
   </div>
-
-  <div class="card mt">
-    <div id="global_topology_canvas" class="topology"></div>
-  </div>
-
-  <script>
-    window.PAGE = { name: "topology" };
-  </script>
 {% endblock %}

@@ -1,61 +1,129 @@
 <!doctype html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0B0F14">
-  <title>{% if title %}{{ title }} · Nexus Network Control Plane{% else %}Nexus Network Control Plane{% endif %}</title>
-  <link rel="icon" type="image/svg+xml" href="/static/nexus.svg">
-  <link rel="stylesheet" href="/static/style.css?v=60.0">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="theme-color" content="#0B0F14" />
+  <title>{{ title or "Realm Pro" }}</title>
+
+  <!-- Apply theme ASAP (before CSS) -->
+  <script>
+    (function(){
+      try{
+        var t = localStorage.getItem('realm_theme') || 'aurora';
+        document.documentElement.setAttribute('data-theme', t);
+      }catch(_e){}
+    })();
+  </script>
+
+  <link rel="icon" type="image/svg+xml" href="/static/nexus.svg" />
+  <link rel="stylesheet" href="/static/style.css?v=70.0" />
 </head>
 <body>
-  <!-- Flowing background (fixed, no seams on scroll) -->
+  {% set path = (request.url.path if request is defined else '') %}
+
   <div class="bg-flow" aria-hidden="true"></div>
   <div class="bg-noise" aria-hidden="true"></div>
 
-  <header class="topbar">
-    <a class="brand" href="/" aria-label="Nexus Network Control Plane">
-      <div class="logo" aria-hidden="true">
-        <img src="/static/nexus.svg" alt="" class="logo-img" />
-      </div>
+  <!-- Classic topbar: old design as a theme -->
+  <div class="topbar">
+    <a class="brand" href="/">
+      <span class="logo"></span>
       <div class="brand-text">
-        <div class="brand-name">Nexus</div>
-        <div class="brand-sub">Network Control Plane</div>
+        <div class="brand-title">Realm Pro</div>
+        <div class="brand-sub">Control Plane</div>
       </div>
     </a>
 
-    <nav class="nav">
-      {% if user %}
-        <div class="nav-desktop">
-          <a href="/" class="nav-link">控制台</a>
-          <a href="/netmon" class="nav-link">网络波动</a>
-          <a href="/logout" class="nav-link">退出</a>
-        </div>
+    <div class="top-actions">
+      <a class="btn sm ghost" href="/">控制台</a>
+      <a class="btn sm ghost" href="/netmon">网络波动</a>
+      <a class="btn sm ghost" href="/nodes/new">接入节点</a>
 
-        <details class="menu nav-mobile">
-          <summary class="btn icon xs ghost" aria-label="菜单">☰</summary>
+      <details class="menu theme-switch">
+        <summary class="btn sm secondary">主题 ▾</summary>
+        <div class="menu-pop">
+          <button class="menu-item" type="button" data-theme-set="aurora">Aurora（新版）</button>
+          <button class="menu-item" type="button" data-theme-set="classic">Classic（旧版）</button>
+        </div>
+      </details>
+
+      <div class="pill xs ghost" title="登录账号">{{ user or '' }}</div>
+      <a class="btn sm secondary" href="/logout">退出</a>
+    </div>
+  </div>
+
+  <!-- Aurora shell: new design as a theme -->
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="s-brand" href="/">
+        <span class="s-logo"></span>
+        <div class="s-brand-text">
+          <div class="s-title">Realm Pro</div>
+          <div class="s-sub">Aurora UI</div>
+        </div>
+      </a>
+
+      <nav class="s-nav">
+        <a class="s-item{% if path == '/' %} active{% endif %}" href="/">
+          <span class="s-ico">⌘</span>
+          <span>控制台</span>
+        </a>
+        <a class="s-item{% if path.startswith('/nodes') %} active{% endif %}" href="/nodes/new">
+          <span class="s-ico">⛓</span>
+          <span>节点</span>
+        </a>
+        <a class="s-item{% if path.startswith('/netmon') %} active{% endif %}" href="/netmon">
+          <span class="s-ico">◷</span>
+          <span>网络波动</span>
+        </a>
+      </nav>
+
+      <div class="s-foot">
+        <details class="menu theme-switch">
+          <summary class="btn sm ghost w100">主题切换 ▾</summary>
           <div class="menu-pop">
-            <a href="/" class="menu-item">控制台</a>
-            <a href="/netmon" class="menu-item">网络波动</a>
-            <div class="menu-sep"></div>
-            <a href="/logout" class="menu-item">退出</a>
+            <button class="menu-item" type="button" data-theme-set="aurora">Aurora（新版）</button>
+            <button class="menu-item" type="button" data-theme-set="classic">Classic（旧版）</button>
           </div>
         </details>
-      {% endif %}
-    </nav>
-  </header>
+        <div class="s-user">
+          <span class="pill xs ghost mono">{{ user or '' }}</span>
+          <a class="btn xs secondary" href="/logout">退出</a>
+        </div>
+      </div>
+    </aside>
 
-  <main class="container">
-    {% if flash %}
-      <div class="flash">{{ flash }}</div>
-    {% endif %}
-    {% block content %}{% endblock %}
-  </main>
+    <div class="app-main">
+      <header class="appbar">
+        <div class="appbar-left">
+          <div class="appbar-title">{{ title or '控制台' }}</div>
+          <div class="appbar-sub muted">{{ path }}</div>
+        </div>
+        <div class="appbar-right">
+          <a class="btn sm ghost" href="/">控制台</a>
+          <a class="btn sm ghost" href="/netmon">网络波动</a>
+          <a class="btn sm ghost" href="/nodes/new">接入节点</a>
+          <details class="menu theme-switch">
+            <summary class="btn sm secondary">主题 ▾</summary>
+            <div class="menu-pop">
+              <button class="menu-item" type="button" data-theme-set="aurora">Aurora（新版）</button>
+              <button class="menu-item" type="button" data-theme-set="classic">Classic（旧版）</button>
+            </div>
+          </details>
+        </div>
+      </header>
 
-  <footer class="footer">
-    <span>Nexus Control Plane · Human × AI Co-built System</span>
-  </footer>
+      <main class="container">
+        {% if flash %}
+          <div class="flash">{{ flash }}</div>
+        {% endif %}
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </div>
 
+  
   <!-- Group order modal (shared) -->
   <div id="groupOrderModal" class="modal" style="display:none;">
     <div class="modal-inner" style="max-width:520px;">
@@ -80,6 +148,8 @@
       </div>
     </div>
   </div>
+
+<script src="/static/theme.js?v=2.0"></script>
 
   {% block scripts %}{% endblock %}
 </body>

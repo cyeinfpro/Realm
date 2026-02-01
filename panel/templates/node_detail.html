@@ -13,7 +13,6 @@
 
   <div class="tabs mt">
     <button class="tab active" data-tab="rules" onclick="UI.switchTab('rules')">规则</button>
-    <button class="tab" data-tab="topology" onclick="UI.switchTab('topology')">连接图</button>
     <button class="tab" data-tab="lb" onclick="UI.switchTab('lb')">负载均衡</button>
     <button class="tab" data-tab="status" onclick="UI.switchTab('status')">系统状态</button>
   </div>
@@ -52,19 +51,6 @@
           <tbody></tbody>
         </table>
       </div>
-    </div>
-  </div>
-
-  <div id="tab_topology" class="tab-panel hidden">
-    <div class="row between mt">
-      <div>
-        <div class="h2">规则连接图</div>
-        <div class="muted">可视化展示 listen → remote 的关系（支持多目标 / WSS 参数）</div>
-      </div>
-      <button class="btn" onclick="UI.renderTopology()">重绘</button>
-    </div>
-    <div class="card mt">
-      <div id="topology_canvas" class="topology"></div>
     </div>
   </div>
 
