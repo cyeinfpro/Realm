@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="row between">
+    <div>
+      <div class="h1">节点管理</div>
+      <div class="muted">添加后即可远程管理该机器上的 Realm 规则（Agent 需要先安装）</div>
+    </div>
+    <button class="btn primary" onclick="UI.openAddNode()">+ 添加节点</button>
+  </div>
+
+  <div class="card mt">
+    <div class="table-wrap">
+      <table class="table" id="nodes_table">
+        <thead><tr><th>名称</th><th>Agent 地址</th><th>状态</th><th>规则</th><th>连接</th><th>操作</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="modal_backdrop" class="modal-backdrop hidden"></div>
+  <div id="modal" class="modal hidden"></div>
+  <script>
+    window.PAGE = { name: "nodes" };
+  </script>
+{% endblock %}
