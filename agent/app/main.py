@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import shlex
 import socket
 import subprocess
 import time
@@ -560,10 +561,51 @@ def _ipt_ensure_chain(table: str, chain: str) -> None:
 
 
 def _ipt_ensure_jump(table: str, base_chain: str, target_chain: str) -> None:
-    # 确保 base_chain 顶部有一条跳转到 target_chain 的规则
-    rc, _, _ = _run_iptables(['-t', table, '-C', base_chain, '-j', target_chain])
-    if rc != 0:
-        _run_iptables(['-t', table, '-I', base_chain, '1', '-j', target_chain])
+    """Ensure there is exactly ONE jump into the counting chain.
+
+    背景：早期版本/手工操作/不同 iptables 后端可能导致 base_chain 中存在多条
+    `-j <target_chain>` 的跳转规则。这样一个数据包会重复进入计数链，从而造成
+    规则流量被放大（常见 2x/3x/4x…）。
+
+    这里做“自愈”：
+    - 删除 base_chain 中所有跳转到 target_chain 的规则（包括带条件的跳转）；
+    - 再在第 1 条位置插入一条标准跳转：`-I <base_chain> 1 -j <target_chain>`。
+
+    计数器位于 target_chain 内的端口规则上，因此清理/重插 jump 不会清空
+    端口计数（只会影响 jump 本身的计数，我们不使用它）。
+    """
+    try:
+        rc, out, _ = _run_iptables(['-t', table, '-S', base_chain])
+    except Exception:
+        rc, out = 1, ''
+
+    # Fast-path: already exactly one canonical jump and it is the first rule.
+    want_line = f"-A {base_chain} -j {target_chain}"
+    if rc == 0:
+        rule_lines = [ln.strip() for ln in (out or '').splitlines() if ln.strip().startswith(f"-A {base_chain} ")]
+        jump_lines = [ln for ln in rule_lines if f"-j {target_chain}" in ln]
+        if len(jump_lines) == 1 and rule_lines:
+            if jump_lines[0] == want_line and rule_lines[0] == want_line:
+                return
+
+        # Delete all jump rules that point to target_chain (including conditional ones)
+        for ln in jump_lines:
+            try:
+                toks = shlex.split(ln)
+            except Exception:
+                continue
+            if len(toks) >= 2 and toks[0] == '-A' and toks[1] == base_chain:
+                toks[0] = '-D'
+                _run_iptables(['-t', table, *toks])
+    else:
+        # Fallback: if -S is not available, at least remove unconditional duplicates
+        while True:
+            rc_del, _, _ = _run_iptables(['-t', table, '-D', base_chain, '-j', target_chain])
+            if rc_del != 0:
+                break
+
+    # Insert one canonical jump at the top.
+    _run_iptables(['-t', table, '-I', base_chain, '1', '-j', target_chain])
 
 
 def _ipt_ensure_port_rule(table: str, chain: str, proto: str, flag: str, port: int) -> None:
