@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card" style="max-width:520px;margin:40px auto;">
+  <h1 class="h1">安全登录</h1>
+  <p class="muted">使用安装时设置的面板账号进入控制台</p>
+  <form method="post" action="/login" class="form">
+    <label class="label">用户名</label>
+    <input class="input" name="username" placeholder="admin" required>
+
+    <label class="label">密码</label>
+    <input class="input" type="password" name="password" placeholder="••••••" required>
+
+    <button class="btn" type="submit">进入控制台</button>
+  </form>
+</div>
+{% endblock %}

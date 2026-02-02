@@ -1,0 +1,16 @@
+[Unit]
+Description=Realm Panel Web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/realm-panel/panel.env
+WorkingDirectory=/opt/realm-panel
+ExecStart=/opt/realm-panel/start.sh
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
