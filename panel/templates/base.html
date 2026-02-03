@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0B0F14">
+  <title>{% if title %}{{ title }} · Nexus Network Control Plane{% else %}Nexus Network Control Plane{% endif %}</title>
+  <link rel="icon" type="image/svg+xml" href="/static/nexus.svg">
+  <link rel="stylesheet" href="/static/style.css?v=62.0">
+</head>
+<body>
+  <!-- Flowing background (fixed, no seams on scroll) -->
+  <div class="bg-flow" aria-hidden="true"></div>
+  <div class="bg-noise" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Nexus Network Control Plane">
+      <div class="logo" aria-hidden="true">
+        <img src="/static/nexus.svg" alt="" class="logo-img" />
+      </div>
+      <div class="brand-text">
+        <div class="brand-name">Nexus</div>
+        <div class="brand-sub">Network Control Plane</div>
+      </div>
+    </a>
+
+    <nav class="nav">
+      {% if user %}
+        <div class="nav-desktop">
+          <a href="/" class="nav-link">控制台</a>
+          <a href="/websites" class="nav-link">网站管理</a>
+          <a href="/netmon" class="nav-link">网络波动</a>
+          <a href="/logout" class="nav-link">退出</a>
+        </div>
+
+        <details class="menu nav-mobile">
+          <summary class="btn icon xs ghost" aria-label="菜单">☰</summary>
+          <div class="menu-pop">
+            <a href="/" class="menu-item">控制台</a>
+            <a href="/websites" class="menu-item">网站管理</a>
+            <a href="/netmon" class="menu-item">网络波动</a>
+            <div class="menu-sep"></div>
+            <a href="/logout" class="menu-item">退出</a>
+          </div>
+        </details>
+      {% endif %}
+    </nav>
+  </header>
+
+  <main class="container">
+    {% if flash %}
+      <div class="flash">{{ flash }}</div>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="footer">
+    <span>Nexus Control Plane · Human × AI Co-built System</span>
+  </footer>
+
+  <!-- Group order modal (shared) -->
+  <div id="groupOrderModal" class="modal" style="display:none;">
+    <div class="modal-inner" style="max-width:520px;">
+      <div class="row" style="align-items:center;">
+        <div class="col"><div class="h2">分组排序</div></div>
+        <div class="col right"><button class="btn xs ghost" type="button" onclick="closeGroupOrderModal()">关闭</button></div>
+      </div>
+
+      <div class="form" style="margin-top:10px;">
+        <label class="label">分组名称</label>
+        <input class="input" id="groupOrderName" readonly>
+
+        <label class="label" style="margin-top:10px;">排序序号 <span class="muted sm">（数字越小越靠前）</span></label>
+        <input class="input" id="groupOrderValue" type="number" step="1" placeholder="例如：10">
+        <div class="help">仅影响面板显示顺序，不影响规则与转发。</div>
+
+      <div id="groupOrderError" class="muted" style="margin-top:8px;color:var(--bad);"></div>
+        <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
+          <button class="btn xs ghost" type="button" onclick="closeGroupOrderModal()">取消</button>
+          <button class="btn xs" id="groupOrderSubmit" type="button" onclick="saveGroupOrder()">保存</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {% block scripts %}{% endblock %}
+</body>
+</html>

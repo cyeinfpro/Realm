@@ -1,0 +1,809 @@
+{% extends "base.html" %}
+{% block content %}
+<div id="toast" class="toast"></div>
+
+<div class="split-layout">
+  <!-- Left: nodes list -->
+  <aside class="card node-sidebar">
+    <div class="card-header">
+      <div style="min-width:0;">
+        <div class="card-title">节点列表</div>
+        <div class="card-sub">切换查看该节点的转发规则</div>
+      </div>
+      <div class="right" style="flex:0 0 auto;">
+        <button class="btn xs" type="button" onclick="openAddNodeModal()">接入节点</button>
+      </div>
+    </div>
+    <div class="node-list">
+      {% for g in (node_groups or []) %}
+        {% if not loop.first %}<div class="node-group-divider" aria-hidden="true"></div>{% endif %}
+        <div class="node-group">
+          <div class="node-group-head">
+            <div class="node-group-name" role="button" tabindex="0" data-group-name="{{ g.name or '默认分组' }}" data-group-order="{{ g.sort_order }}" title="点击设置分组排序 · 当前：{{ g.sort_order }}">{{ g.name or '默认分组' }}</div>
+            <div class="node-group-tools">
+              <div class="node-group-count muted sm">{{ g.online }}/{{ g.total }}</div>
+              <button class="btn icon xs ghost node-group-toggle" type="button" title="折叠/展开" data-group-toggle="{{ g.name or '默认分组' }}">▾</button>
+            </div>
+          </div>
+          <div class="node-group-items">
+            {% for n in (g.nodes or []) %}
+            <a class="node-item{% if n.id == node.id %} active{% endif %}" href="/nodes/{{ n.id }}">
+              <span class="dot {% if n.online %}online{% else %}offline{% endif %}"></span>
+              <div class="node-info">
+                <div class="node-name">{{ n.name or n.display_ip or ('节点-' ~ n.id) }}</div>
+                <div class="node-meta mono">{{ n.display_ip or '-' }}</div>
+                <div class="muted sm">{{ n.group_name or '默认分组' }}</div>
+              </div>
+            </a>
+            {% endfor %}
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+    <div class="sidebar-foot">
+      <a class="btn xs ghost w100" href="/">返回控制台</a>
+    </div>
+  </aside>
+
+  <!-- Right: current node rules -->
+  <main class="node-main">
+    <section>
+      <div class="card">
+        <div class="card-header node-head" style="align-items:flex-start;">
+          <div class="node-head-left" style="min-width:0;">
+            <div class="card-title">
+              <span class="node-title">{{ node.name or node.display_ip }}</span>
+              <span class="pill xs {% if node.online %}ok{% else %}ghost{% endif %}">{% if node.online %}在线{% else %}离线{% endif %}</span>
+              <span id="nodeDisplayIp" class="muted sm">· {{ node.display_ip or '-' }}</span>
+            </div>
+            <div class="meta" style="margin-top:6px;">
+              {% if node.agent_version %}<span class="meta-item">Agent：{{ node.agent_version }}</span>{% endif %}
+              <span class="meta-item">心跳 <span id="nodeLastSeen" class="mono" data-last-seen-mode="full" data-last-seen="{{ node.last_seen_at or '' }}" >{{ node.last_seen_at or "-" }}</span></span>
+              <span class="meta-item">分组 <span id="nodeGroupPill" class="pill xs ghost">{{ node.group_name or '默认分组' }}</span></span>
+            </div>
+            <div class="card-sub" style="margin-top:8px;">支持 TCP/UDP/WSS · WSS 自动同步（生成规则锁定）</div>
+          </div>
+          <div class="right node-tools node-head-right" style="gap:10px; flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end;">
+            <div class="search-pill">
+              <span class="muted">🔎</span>
+              <input class="input sm" id="ruleSearch" placeholder="搜索监听/目标/备注…（支持 type:wss status:running fav）" oninput="setRuleFilter(this.value)">
+            </div>
+
+            <div class="filter-pill" title="快速筛选">
+              <span class="muted">⛭</span>
+              <select id="ruleQuickFilter" class="filter-select" onchange="setRuleQuickFilter(this.value)">
+                <option value="">全部规则</option>
+                <option value="fav">仅收藏 ★</option>
+                <option value="running">运行中</option>
+                <option value="disabled">已暂停</option>
+                <option value="tcp">TCP/UDP</option>
+                <option value="wss">WSS 隧道</option>
+                <option value="intranet">内网穿透</option>
+                <option value="lb">负载均衡（多目标）</option>
+                <option value="remark">有备注</option>
+              </select>
+            </div>
+
+            <!-- Bulk operations (shown only when any rules are selected) -->
+            <div id="bulkBar" class="bulk-bar" style="display:none;">
+              <span class="pill xs ghost" id="bulkCount">已选 0</span>
+              <button class="btn xs ghost" type="button" title="批量启用" onclick="bulkSetDisabled(false)">▶ 启用</button>
+              <button class="btn xs ghost" type="button" title="批量暂停" onclick="bulkSetDisabled(true)">⏸ 暂停</button>
+              <button class="btn xs ghost" type="button" title="批量删除" onclick="bulkDeleteSelected()" style="color:var(--bad);">🗑 删除</button>
+              <button class="btn xs ghost" type="button" title="清空选择" onclick="clearRuleSelection()">清空</button>
+            </div>
+            <button class="btn sm" type="button" onclick="newRule()">+ 创建转发</button>
+            <button class="btn sm ghost" type="button" id="autoRefreshBtn" onclick="toggleAutoRefresh()">⟳ 自动刷新：开</button>
+
+            <details class="menu">
+              <summary class="btn sm ghost">更多 ▾</summary>
+              <div class="menu-pop">
+                <button class="menu-item" type="button" onclick="openEditNodeModal()">编辑节点 <span class="muted sm">名称/地址/分组</span></button>
+                <div class="menu-sep"></div>
+                <button class="menu-item" type="button" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">
+                  接入命令 <span class="muted sm">复制</span>
+                </button>
+                <button class="menu-item" type="button" onclick="openCommandModal('一键卸载 Agent', window.__UNINSTALL_CMD__)">
+                  卸载 Agent <span class="muted sm">复制</span>
+                </button>
+                <div class="menu-sep"></div>
+                <a class="menu-item" href="/api/nodes/{{ node.id }}/backup">备份规则 <span class="muted sm">下载</span></a>
+                <button class="menu-item" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则 <span class="muted sm">粘贴</span></button>
+                
+                <button class="menu-item" type="button" onclick="resetNodeTraffic()">重置流量统计 <span class="muted sm">清零</span></button>
+                <div class="menu-sep"></div>
+                <button class="menu-item" type="button" onclick="purgeAllRules()" style="color:var(--bad);">
+                  清空所有规则 <span class="muted sm">危险</span>
+                </button>
+                <div class="menu-sep"></div>
+                <form method="post" action="/nodes/{{ node.id }}/delete" style="margin:0;">
+                  <button class="menu-item" type="submit" onclick="return confirm('确认移除该节点？
+
+仅移除面板记录，不影响节点 Agent。')" style="color:var(--bad);">
+                    移除节点 <span class="muted sm">危险</span>
+                  </button>
+                </form>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <div id="nodeSummary" class="summary-bar" style="display:none;"></div>
+
+        <!-- Node system info removed (shown only in 控制台 cards) -->
+
+        <div id="rulesLoading" class="muted">正在加载规则…</div>
+
+        <!-- Mobile: card list (table is desktop only) -->
+        <div id="rulesMobile" class="rules-mobile" style="display:none;"></div>
+
+        <div class="table-wrap">
+          <table id="rulesTable" class="table rules-table" style="display:none;">
+            <thead>
+              <tr>
+                <th class="sel">
+                  <input type="checkbox" id="rulesSelectAll" title="全选/取消全选（当前筛选）" onclick="toggleSelectAllVisible(this.checked)">
+                </th>
+                <th>#</th>
+                <th>状态</th>
+                <th class="listen">监听</th>
+                <th class="health">连通</th>
+                <th class="stat">活跃</th>
+                <th class="stat">流量</th>
+                <th class="actions">操作</th>
+              </tr>
+            </thead>
+            <tbody id="rulesBody"></tbody>
+          </table>
+        </div>
+
+
+
+        <!-- Traffic / connections history curves (persistent on panel) -->
+        <details id="histPanel" class="hist-panel" open>
+          <summary class="hist-head">
+            <div class="hist-head-left">
+              <div class="hist-title">历史曲线</div>
+              <div class="hist-sub">流量速率 · 活跃连接</div>
+            </div>
+            <div class="hist-head-right muted sm" id="histHeadHint">自动刷新时实时更新</div>
+          </summary>
+
+          <div class="hist-body">
+            <div class="hist-controls">
+              <div class="hist-ctrl">
+                <label class="label">规则</label>
+                <select id="histRuleSelect" class="select">
+                  <option value="__all__">全部规则（汇总）</option>
+                </select>
+              </div>
+
+              <div class="hist-ctrl" style="max-width:200px;">
+                <label class="label">窗口</label>
+                <select id="histWindowSelect" class="select">
+                  <option value="300000">5 分钟</option>
+                  <option value="600000" selected>10 分钟</option>
+                  <option value="1800000">30 分钟</option>
+                  <option value="3600000">60 分钟</option>
+                </select>
+              </div>
+
+              <div class="hist-ctrl hist-ctrl-actions">
+                <label class="label">&nbsp;</label>
+                <div class="row" style="gap:8px; flex-wrap:wrap;">
+                  <button class="btn sm ghost" type="button" onclick="clearRuleHistory()">清空历史</button>
+                </div>
+              </div>
+
+              <div class="hist-ctrl hist-ctrl-kpi">
+                <label class="label">当前</label>
+                <div class="hist-kpis" id="histKpis">
+                  <span class="pill xs ghost">↓ —</span>
+                  <span class="pill xs ghost">↑ —</span>
+                  <span class="pill xs ghost">活跃 —</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="hist-charts">
+              <div class="hist-chart" id="histTrafficWrap">
+                <div class="hist-chart-head">
+                  <div class="name">流量速率</div>
+                  <div class="hint muted sm">↓下载 / ↑上传</div>
+                </div>
+                <canvas id="histTrafficCanvas" class="hist-canvas" aria-label="traffic history"></canvas>
+                <div class="hist-legend">
+                  <span class="hist-leg"><i class="dot dl"></i> 下载</span>
+                  <span class="hist-leg"><i class="dot ul"></i> 上传</span>
+                </div>
+                <div class="hist-tooltip" id="histTrafficTip" style="display:none;"></div>
+              </div>
+
+              <div class="hist-chart" id="histConnWrap">
+                <div class="hist-chart-head">
+                  <div class="name">活跃连接</div>
+                  <div class="hint muted sm">当前占用/并发</div>
+                </div>
+                <canvas id="histConnCanvas" class="hist-canvas small" aria-label="connections history"></canvas>
+                <div class="hist-legend">
+                  <span class="hist-leg"><i class="dot conn"></i> 活跃连接</span>
+                </div>
+                <div class="hist-tooltip" id="histConnTip" style="display:none;"></div>
+              </div>
+            </div>
+
+            <div id="histNoData" class="muted sm" style="margin-top:8px; display:none;">
+              暂无历史数据：面板会在收到节点上报后持续记录。若节点刚接入，请稍后再看。
+            </div>
+          </div>
+        </details>
+
+        <div id="statsLoading" class="muted">正在加载流量统计…</div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- Add Node Modal (for quick switching / onboarding) -->
+<!-- Add Node Modal -->
+<div id="addNodeModal" class="modal" style="display:none;">
+  <div class="modal-inner" style="max-width:560px;">
+    <div class="row" style="align-items:center;">
+      <div class="col"><div class="h2">接入节点</div></div>
+      <div class="col right"><button class="btn xs ghost" type="button" onclick="closeAddNodeModal()">关闭</button></div>
+    </div>
+
+    <div class="form" style="margin-top:10px;">
+      <div class="row" style="gap:12px;">
+        <div class="col">
+          <label class="label">节点名称（可选）</label>
+          <input class="input" id="addNodeName" placeholder="例如：香港-01 / US-Edge">
+        </div>
+        <div class="col" style="max-width:180px;">
+          <label class="label">协议</label>
+          <select class="select" id="addNodeScheme">
+            <option value="http">http</option>
+            <option value="https">https</option>
+          </select>
+        </div>
+      </div>
+
+      <label class="label">分组名称</label>
+      <input class="input" id="addNodeGroup" placeholder="例如：香港 / 美国 / 客户A" value="默认分组">
+      <div class="help">仅用于面板分类；不影响规则与转发。</div>
+
+      <label class="label">IP/域名</label>
+      <input class="input" id="addNodeIp" placeholder="例如：1.2.3.4 或 node.example.com">
+
+      <div class="row" style="gap:12px;align-items:center;margin-top:6px;">
+        <div class="col">
+          <label class="help"><input type="checkbox" id="addNodeVerifyTls" style="transform:translateY(1px);"> 验证 TLS 证书（https 才需要）</label>
+        </div>
+        <div class="col">
+          <label class="help"><input type="checkbox" id="addNodeIsPrivate" style="transform:translateY(1px);"> 内网机器（用于内网穿透出口）</label>
+        </div>
+      </div>
+
+      <div id="addNodeError" class="muted" style="margin-top:8px;color:var(--bad);"></div>
+
+      <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
+        <button class="btn xs ghost" type="button" onclick="closeAddNodeModal()">取消</button>
+        <button class="btn xs" id="addNodeSubmit" type="button" onclick="createNodeFromModal()">创建并进入</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+<!-- Edit Node Modal -->
+<div id="editNodeModal" class="modal" style="display:none;">
+  <div class="modal-inner" style="max-width:560px;">
+    <div class="row" style="align-items:center;">
+      <div class="col"><div class="h2">编辑节点</div></div>
+      <div class="col right"><button class="btn xs ghost" type="button" onclick="closeEditNodeModal()">关闭</button></div>
+    </div>
+
+    <div class="form" style="margin-top:10px;">
+      <label class="label">节点名称</label>
+      <input class="input" id="editNodeName" placeholder="例如：香港-01 / US-Edge">
+
+      <div class="row" style="gap:12px; margin-top:10px;">
+        <div class="col" style="max-width:180px;">
+          <label class="label">协议</label>
+          <select class="select" id="editNodeScheme">
+            <option value="http">http</option>
+            <option value="https">https</option>
+          </select>
+        </div>
+        <div class="col">
+          <label class="label">分组名称</label>
+          <input class="input" id="editNodeGroup" placeholder="例如：香港 / 美国 / 客户A">
+        </div>
+      </div>
+
+      <label class="label" style="margin-top:10px;">IP/域名</label>
+      <input class="input" id="editNodeIp" placeholder="例如：1.2.3.4 或 node.example.com">
+      <div class="help">端口无需单独填写，默认 18700；如需自定义可在地址中写 host:port（保存后仍不在列表展示端口）。</div>
+
+      <div class="row" style="gap:12px;align-items:center;margin-top:6px;">
+        <div class="col">
+          <label class="help"><input type="checkbox" id="editNodeVerifyTls" style="transform:translateY(1px);"> 验证 TLS 证书（https 才需要）</label>
+        </div>
+        <div class="col">
+          <label class="help"><input type="checkbox" id="editNodeIsPrivate" style="transform:translateY(1px);"> 内网机器（用于内网穿透出口）</label>
+        </div>
+        <div class="col">
+          <label class="help"><input type="checkbox" id="editNodeIsWebsite" style="transform:translateY(1px);"> 网站机（可管理站点/SSL/文件）</label>
+        </div>
+      </div>
+
+      <label class="label" style="margin-top:8px;">网站根目录</label>
+      <input class="input" id="editNodeWebsiteRoot" placeholder="/www">
+      <div class="help">仅对网站机生效，用于文件管理根目录限制。</div>
+
+      <div id="editNodeError" class="muted" style="margin-top:8px;color:var(--bad);"></div>
+
+      <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
+        <button class="btn xs ghost" type="button" onclick="closeEditNodeModal()">取消</button>
+        <button class="btn xs" id="editNodeSubmit" type="button" onclick="saveEditNode()">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Edit Modal -->
+<div id="modal" class="modal" style="display:none;">
+  <div class="modal-inner">
+    <div class="row" style="justify-content:space-between;align-items:center;">
+      <div class="col"><div class="h2" id="modalTitle">编辑规则</div></div>
+      <div class="right"><button class="btn xs ghost" type="button" onclick="closeModal()">关闭</button></div>
+    </div>
+
+    <div class="form">
+	      <!-- 保留原 select（JS/接口依赖 #f_type），仅隐藏不展示 -->
+	      <select class="select" id="f_type" style="display:none;">
+	        <option value="tcp">TCP/UDP</option>
+	        <option value="wss">WSS 隧道</option>
+	        <option value="intranet">内网穿透</option>
+	      </select>
+
+	      <!-- 模式卡片：直接放在参数页顶部（取消独立介绍页） -->
+	      <div class="mode-strip">
+	        <div class="mode-switch" id="modeSwitch" role="tablist" aria-label="转发模式选择">
+	          <button class="mode-card active" type="button" data-mode="tcp" role="tab" aria-selected="true">
+	            <div class="mode-card-head">
+	              <div class="mode-ico">⚡</div>
+	              <div class="mode-card-txt">
+	                <div class="mode-title">普通转发</div>
+	                <div class="mode-sub">单机监听 → 目标</div>
+	              </div>
+	            </div>
+	            <div class="mode-tags">
+	              <span class="mode-tag">最常用</span>
+	              <span class="mode-tag">单节点</span>
+	            </div>
+	          </button>
+
+	          <button class="mode-card" type="button" data-mode="wss" role="tab" aria-selected="false">
+	            <div class="mode-card-head">
+	              <div class="mode-ico">🛡️</div>
+	              <div class="mode-card-txt">
+	                <div class="mode-title">WSS 隧道</div>
+	                <div class="mode-sub">发送机 ↔ 接收机（自动同步）</div>
+	              </div>
+	            </div>
+	            <div class="mode-tags">
+	              <span class="mode-tag">伪装</span>
+	              <span class="mode-tag">双端</span>
+	            </div>
+	          </button>
+
+	          <button class="mode-card" type="button" data-mode="intranet" role="tab" aria-selected="false">
+	            <div class="mode-card-head">
+	              <div class="mode-ico">🏠</div>
+	              <div class="mode-card-txt">
+	                <div class="mode-title">内网穿透</div>
+	                <div class="mode-sub">公网入口 ↔ 内网出口（自动同步）</div>
+	              </div>
+	            </div>
+	            <div class="mode-tags">
+	              <span class="mode-tag">暴露内网</span>
+	              <span class="mode-tag">双端</span>
+	            </div>
+	          </button>
+	        </div>
+	      </div>
+
+	      <div class="form-section">
+	        <div class="section-head">
+	          <div style="min-width:0;">
+	            <div class="section-title">基础参数</div>
+	            <div class="section-sub muted sm">端口 + 目标；更多选项在「高级参数」。</div>
+	          </div>
+	        </div>
+
+	        <div class="row base-top-row" style="gap:12px;">
+	          <div class="col listen-col">
+	            <label class="label" id="listenLabel">
+	              <span id="listenLabelMain">监听端口</span> <span class="muted sm" id="listenLabelExample">（例如 443）</span>
+	            </label>
+	
+	            <div class="input-group">
+	              <span class="input-prefix mono" id="listenHostPrefix">0.0.0.0:</span>
+	              <input class="input" id="f_listen_port" placeholder="443" inputmode="numeric" pattern="\d*">
+	            </div>
+	            <!-- hidden full listen (ip:port), filled by JS -->
+	            <input id="f_listen" type="hidden" value="">
+	          </div>
+
+        <div class="col status-col" id="statusCol" style="max-width:220px;">
+	            <label class="label">状态</label>
+	            <select class="select" id="f_disabled">
+	              <option value="0">启用</option>
+	              <option value="1">暂停</option>
+	            </select>
+	          </div>
+
+	          <!-- WSS: 接收机节点 -->
+	          <div class="col peer-col" id="wssBox" style="display:none;">
+	            <label class="label">接收机节点 <span class="muted sm">（自动同步）</span></label>
+	            <select class="select" id="f_wss_receiver_node">
+	              <option value="">（不选择=手动配对码模式）</option>
+	            </select>
+	          </div>
+
+	          <!-- Intranet: 内网出口节点 -->
+	          <div class="col peer-col" id="intranetBox" style="display:none;">
+	            <label class="label">内网出口节点 <span class="muted sm">（自动同步）</span></label>
+	            <select class="select" id="f_intranet_receiver_node">
+	              <option value="">请选择内网节点…</option>
+	            </select>
+	          </div>
+	        </div>
+
+	        <div class="help compact" id="baseHelp"></div>
+
+	        <label class="label" id="remoteLabel">
+	          <span id="remoteLabelMain">目标地址</span> <span class="muted sm" id="remoteLabelExtra">（Remote，每行一个 host:port）</span>
+	        </label>
+	        <textarea class="textarea" id="f_remotes" rows="4" placeholder="203.0.113.10:443\n198.51.100.8:443"></textarea>
+	        <div class="help" id="remoteHelp"></div>
+
+	        <div class="row" style="gap:12px; align-items:flex-end;">
+	          <div class="col">
+	            <label class="label">备注 <span class="muted sm">（可选，用于搜索/筛选）</span></label>
+	            <input class="input" id="f_remark" placeholder="例如：客户A / 临时测试 / 走CF">
+	          </div>
+	          <div class="col" style="max-width:220px;">
+	            <label class="help" style="margin:0;">
+	              <input type="checkbox" id="f_favorite" style="transform:translateY(1px);">
+	              收藏（★）
+	            </label>
+	          </div>
+	        </div>
+	      </div>
+
+	      <details class="advanced-details" id="advancedDetails">
+                <summary>
+                  <div class="adv-summary-left">
+                    <div class="adv-title">高级参数</div>
+                    <div class="adv-hint">监听 IP / 协议 / 负载均衡 / 隧道参数</div>
+                  </div>
+                  <div class="adv-summary-right">
+                    <span class="pill xs ghost">可选</span>
+                  </div>
+                </summary>
+
+                <div class="adv-body">
+                  <div class="adv-grid">
+                    <div class="col">
+                      <label class="label">监听 IP（默认 0.0.0.0）</label>
+                      <input class="input" id="f_listen_host" placeholder="0.0.0.0">
+                      <div class="help">改为 127.0.0.1 可仅本机访问；或填指定网卡 IP 仅监听该地址。</div>
+                    </div>
+
+                    <div class="col" style="max-width:240px;">
+                      <label class="label">协议</label>
+                      <select class="select" id="f_protocol">
+                        <option value="tcp">TCP</option>
+                        <option value="udp">UDP</option>
+                        <option value="tcp+udp">TCP+UDP</option>
+                      </select>
+                    </div>
+
+                    <div class="col" style="max-width:240px;">
+                      <label class="label">策略</label>
+                      <select class="select" id="f_balance">
+                        <option value="roundrobin">轮询</option>
+                        <option value="iphash">IP Hash</option>
+                      </select>
+                      <div class="help">多目标时生效：轮询 / 按来源 IP 固定落点。</div>
+                    </div>
+
+                    <div class="col">
+                      <label class="label">权重（与 Remote 行数一致，逗号分隔，可空）</label>
+                      <input class="input" id="f_weights" placeholder="1,1,2">
+                      <div class="help">仅轮询生效；IP Hash 会忽略权重。权重数量必须与 Remote 行数一致。</div>
+                    </div>
+                  </div>
+
+                  <!-- Common advanced params (normal rules only) -->
+                  <div id="commonAdvancedBox" style="display:none;">
+                    <div class="adv-subtitle">绑定 / 路由</div>
+                    <div class="adv-grid" style="margin-top:6px;">
+                      <div class="col">
+                        <label class="label">Through（出站绑定 IP，可选）</label>
+                        <input class="input" id="f_through" placeholder="例如：1.2.3.4 或 [2001:db8::1] 或 1.2.3.4:50000(UDP)">
+                        <div class="help">TCP：出站连接前绑定指定 IP；UDP：支持 ip 或 ip:port。</div>
+                      </div>
+                      <div class="col">
+                        <label class="label">Interface（出站接口，可选）</label>
+                        <input class="input" id="f_interface" placeholder="例如：eth0">
+                        <div class="help">将出站流量绑定到指定网卡。</div>
+                      </div>
+                      <div class="col">
+                        <label class="label">Listen Interface（入站接口，可选）</label>
+                        <input class="input" id="f_listen_interface" placeholder="例如：eth0">
+                        <div class="help">仅监听指定网卡的入站连接（多网卡场景使用）。</div>
+                      </div>
+                    </div>
+
+                    <div class="adv-subtitle">Network（覆盖全局，可选）</div>
+                    <div class="adv-grid" style="margin-top:6px;">
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">TCP 连接超时（秒）</label>
+                        <input class="input" id="f_net_tcp_timeout" type="number" step="1" placeholder="默认 5；0=关闭">
+                        <div class="help">连接远端的超时；留空=继承全局。</div>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">UDP 关联超时（秒）</label>
+                        <input class="input" id="f_net_udp_timeout" type="number" step="1" placeholder="默认 30">
+                        <div class="help">UDP 会话空闲超时；留空=继承全局。</div>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">TCP Keepalive（秒）</label>
+                        <input class="input" id="f_net_tcp_keepalive" type="number" step="1" placeholder="默认 15；0=系统默认">
+                        <div class="help">留空=继承全局。</div>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">Keepalive 重试次数</label>
+                        <input class="input" id="f_net_tcp_keepalive_probe" type="number" step="1" placeholder="默认 3">
+                        <div class="help">留空=继承全局。</div>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">IPv6 Only（可选）</label>
+                        <select class="select" id="f_net_ipv6_only">
+                          <option value="">继承全局</option>
+                          <option value="1">开启</option>
+                          <option value="0">关闭</option>
+                        </select>
+                        <div class="help">禁用 ipv4-mapped-ipv6（仅在监听 IPv6 时生效）。</div>
+                      </div>
+                    </div>
+
+                    <div class="adv-subtitle">PROXY Protocol（可选）</div>
+                    <div class="adv-grid" style="margin-top:6px;">
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">入站解析 PROXY</label>
+                        <select class="select" id="f_accept_proxy">
+                          <option value="">继承全局</option>
+                          <option value="1">开启</option>
+                          <option value="0">关闭</option>
+                        </select>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">解析超时（秒）</label>
+                        <input class="input" id="f_accept_proxy_timeout" type="number" step="1" placeholder="默认 5">
+                        <div class="help">仅在入站解析 PROXY 时生效；留空=继承全局。</div>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">出站发送 PROXY</label>
+                        <select class="select" id="f_send_proxy">
+                          <option value="">继承全局</option>
+                          <option value="1">开启</option>
+                          <option value="0">关闭</option>
+                        </select>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">PROXY 版本</label>
+                        <select class="select" id="f_send_proxy_version">
+                          <option value="">继承全局</option>
+                          <option value="2">v2（默认）</option>
+                          <option value="1">v1</option>
+                        </select>
+                        <div class="help">仅在出站发送 PROXY 时生效。</div>
+                      </div>
+                    </div>
+
+                    <div class="adv-subtitle">MPTCP（Linux，可选）</div>
+                    <div class="adv-grid" style="margin-top:6px;">
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">出站 MPTCP</label>
+                        <select class="select" id="f_send_mptcp">
+                          <option value="">继承全局</option>
+                          <option value="1">开启</option>
+                          <option value="0">关闭</option>
+                        </select>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">入站 MPTCP</label>
+                        <select class="select" id="f_accept_mptcp">
+                          <option value="">继承全局</option>
+                          <option value="1">开启</option>
+                          <option value="0">关闭</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div class="adv-subtitle">Transport（可选）</div>
+                    <div class="adv-grid" style="margin-top:6px;">
+                      <div class="col">
+                        <label class="label">Listen Transport</label>
+                        <input class="input" id="f_listen_transport" placeholder='例如：ws;host=example.com;path=/;tls;servername=example.com'>
+                        <div class="help">高级用法：需要 realm transport 功能；留空=不使用。</div>
+                      </div>
+                      <div class="col">
+                        <label class="label">Remote Transport</label>
+                        <input class="input" id="f_remote_transport" placeholder='例如：ws;host=example.com;path=/;tls;sni=example.com;insecure'>
+                        <div class="help">高级用法：需要 realm transport 功能；留空=不使用。</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div id="wssAdvancedBox" style="display:none;">
+                    <div class="adv-subtitle">WSS 隧道参数</div>
+
+                    <div class="row" style="gap:12px;margin-top:6px;align-items:flex-end;">
+                      <div class="col" style="max-width:260px;">
+                        <label class="label">接收机监听端口</label>
+                        <input class="input" id="f_wss_receiver_port" placeholder="留空 = 与发送机端口一致">
+                        <div class="help">留空=沿用发送机端口；如冲突自动避让。</div>
+                      </div>
+                      <div class="col right" style="flex:0 0 auto;">
+                        <button class="btn xs ghost" type="button" onclick="randomizeWss()">随机生成参数</button>
+                      </div>
+                    </div>
+
+                    <div class="row" style="gap:12px;margin-top:10px;">
+                      <div class="col">
+                        <label class="label">WSS Host <span class="muted sm">（留空自动生成）</span></label>
+                        <input class="input" id="f_wss_host" placeholder="留空自动生成，例如 cdn.jsdelivr.net">
+                      </div>
+                      <div class="col">
+                        <label class="label">WSS Path <span class="muted sm">（留空自动生成）</span></label>
+                        <input class="input" id="f_wss_path" placeholder="留空自动生成，例如 /ws/xxxx">
+                      </div>
+                    </div>
+
+                    <div class="row" style="gap:12px;">
+                      <div class="col">
+                        <label class="label">SNI <span class="muted sm">（留空=同 Host）</span></label>
+                        <input class="input" id="f_wss_sni" placeholder="留空=同 Host，例如 cdn.jsdelivr.net">
+                      </div>
+                      <div class="col" style="max-width:220px;">
+                        <label class="label">TLS</label>
+                        <select class="select" id="f_wss_tls">
+                          <option value="1">启用</option>
+                          <option value="0">关闭</option>
+                        </select>
+                      </div>
+                      <div class="col" style="max-width:220px;">
+                        <label class="label" style="display:flex;align-items:center;gap:8px;">
+                          <input type="checkbox" id="f_wss_insecure" checked style="width:auto;margin:0;">
+                          跳过证书校验
+                        </label>
+                        <div class="help">兼容性更好，但安全性降低。</div>
+                      </div>
+                    </div>
+
+                    <div class="help" style="margin-top:6px;">Host/Path/SNI 建议与证书域名一致；留空会在保存时自动随机生成。</div>
+                  </div>
+
+                  <div id="intranetAdvancedBox" style="display:none;">
+                    <div class="adv-subtitle">内网穿透参数</div>
+
+                    <div class="row" style="gap:12px;margin-top:6px;">
+                      <div class="col" style="max-width:260px;">
+                        <label class="label">隧道服务端端口（A）</label>
+                        <input class="input" id="f_intranet_server_port" placeholder="18443" value="18443">
+                        <div class="help">用于 B → A 的加密隧道连接。请在 A 放行该端口。</div>
+                      </div>
+                      <div class="col">
+                        <label class="label">公网入口地址（A，可选）</label>
+                        <input class="input" id="f_intranet_server_host" placeholder="默认=使用当前节点 base_url 的主机名（建议填公网 IP/域名）">
+                        <div class="help">当面板管理 A 使用的是内网地址时，B 可能无法直连。这里可填写 B 可访问的公网 IP/域名（不含协议）。</div>
+                      </div>
+                    </div>
+
+                    <div class="help" style="margin-top:6px;">提示：Remote 写 B 内网可达地址（如 192.168.x.x:port）。</div>
+                  </div>
+                </div>
+              </details>
+
+              <div class="row" style="gap:10px; justify-content:flex-end;">
+                <button class="btn xs ghost" type="button" onclick="closeModal()">取消</button>
+                <button class="btn xs" type="button" onclick="saveRule()">保存</button>
+              </div>
+
+              <div id="modalMsg" class="form-error" style="margin-top:10px;"></div>
+    </div>
+  </div>
+</div>
+
+<div id="restoreModal" class="modal" style="display:none;">
+  <div class="modal-inner" style="max-width:860px;">
+    <div class="row" style="justify-content:space-between;align-items:center;">
+      <div class="col"><div class="h2">恢复规则</div></div>
+      <div class="right"><button class="btn xs ghost" type="button" onclick="closeRestoreModal()">关闭</button></div>
+    </div>
+    <div class="form">
+      <label class="label">粘贴备份文件内容（JSON）</label>
+      <textarea class="textarea" id="restoreText" rows="14" placeholder='{
+  "ok": true,
+  "pool": {
+    "endpoints": []
+  }
+}'></textarea>
+      <div class="row" style="gap:10px;justify-content:flex-end;margin-top:12px;">
+        <button class="btn xs ghost" type="button" onclick="closeRestoreModal()">取消</button>
+        <button class="btn xs" type="button" onclick="restoreFromText()">开始恢复</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="commandModal" class="modal" style="display:none;">
+  <div class="modal-inner">
+    <div class="row" style="justify-content:space-between;align-items:center;">
+      <div class="col"><div class="h2" id="commandTitle">命令</div></div>
+      <div class="right"><button class="btn xs ghost" type="button" onclick="closeCommandModal()">关闭</button></div>
+    </div>
+    <p class="muted" style="margin-top:8px;">在目标节点执行以下命令即可。</p>
+    <pre class="code-block" id="commandText"></pre>
+    <div class="row" style="justify-content:flex-end;">
+      <button class="btn xs" data-copy-target="commandText">复制命令</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/app.js?v=71.0"></script>
+<script>
+window.__NODE_ID__ = {{ node.id }};
+window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};
+window.__NODE_NAME__ = {{ (node.name or '')|tojson }};
+window.__NODE_BASE_URL__ = {{ (node.base_url or '')|tojson }};
+window.__NODE_VERIFY_TLS__ = {{ (1 if node.verify_tls else 0) }};
+window.__NODE_IS_PRIVATE__ = {{ (1 if node.is_private else 0) }};
+window.__NODE_ROLE__ = {{ (node.role or 'normal')|tojson }};
+window.__NODE_WEBSITE_ROOT__ = {{ (node.website_root_base or '')|tojson }};
+window.__NODE_GROUP__ = {{ (node.group_name or '默认分组')|tojson }};
+window.__INSTALL_CMD__ = {{ install_cmd|tojson }};
+window.__UNINSTALL_CMD__ = {{ uninstall_cmd|tojson }};
+window.__AUTO_OPEN_EDIT_NODE__ = {{ (1 if show_edit_node else 0) }};
+window.addEventListener('DOMContentLoaded', () => {
+  initNodePage();
+});
+
+document.querySelectorAll('[data-copy-target]').forEach((btn)=>{
+  btn.addEventListener('click', async ()=>{
+    const id = btn.getAttribute('data-copy-target');
+    const text = document.getElementById(id).textContent.trim();
+    try{
+      await navigator.clipboard.writeText(text);
+      const original = btn.dataset._orig || btn.textContent;
+      btn.dataset._orig = original;
+      btn.textContent = '已复制';
+      setTimeout(()=>{ btn.textContent = original; }, 1200);
+    }catch(e){
+      alert('复制失败：浏览器不允许访问剪贴板，请手动复制。');
+    }
+  });
+});
+
+{% if show_install_cmd %}
+openCommandModal('一键接入命令', window.__INSTALL_CMD__);
+{% endif %}
+</script>
+{% endblock %}
