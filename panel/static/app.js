@@ -126,11 +126,12 @@ function wssMode(e){
   // intranet tunnels are handled separately
   if(intranetMode(e)) return 'intranet';
   const ex = e.extra_config || {};
-  const listenTransport = e.listen_transport || ex.listen_transport || '';
-  const remoteTransport = e.remote_transport || ex.remote_transport || '';
-  const hasLisWs = String(listenTransport).includes('ws') || ex.listen_ws_host || ex.listen_ws_path || ex.listen_tls_servername;
-  const hasRemWs = String(remoteTransport).includes('ws') || ex.remote_ws_host || ex.remote_ws_path || ex.remote_tls_sni;
-  if(hasLisWs || hasRemWs) return 'wss';
+
+  // IMPORTANT:
+  // WSS 隧道属于「双节点自动同步」功能，应当仅由 sync_* 元数据判定。
+  // 如果用户在普通转发里手动配置了 ws/wss transport（listen_transport / remote_transport），
+  // 不能误判为隧道模式，否则会强制要求选择接收机节点并导致编辑/保存异常。
+  if(ex && (ex.sync_id || ex.sync_role || ex.sync_peer_node_id || ex.sync_lock)) return 'wss';
   return 'tcp';
 }
 
@@ -1768,12 +1769,167 @@ function fillIntranetFields(e){
   populateIntranetReceiverSelect();
 }
 
+
+// -------------------- Common advanced params (normal rules) --------------------
+
+function setTriBoolSelect(id, v){
+  const el = q(id);
+  if(!el) return;
+  if(v === true) el.value = '1';
+  else if(v === false) el.value = '0';
+  else el.value = '';
+}
+
+function readTriBoolSelect(id){
+  const el = q(id);
+  const v = el ? String(el.value || '').trim() : '';
+  if(v === '1') return {set:true, value:true};
+  if(v === '0') return {set:true, value:false};
+  return {set:false, value:false};
+}
+
+function readNonnegIntInput(id, label){
+  const el = q(id);
+  const raw = el ? String(el.value || '').trim() : '';
+  if(!raw) return {set:false, value:0};
+  if(!/^\d+$/.test(raw)) return {error:`${label} 必须是非负整数`};
+  const n = parseInt(raw, 10);
+  if(!(n >= 0)) return {error:`${label} 必须 ≥ 0`};
+  return {set:true, value:n};
+}
+
+function fillCommonAdvancedFields(e){
+  const ep = e || {};
+  const net = (ep.network && typeof ep.network === 'object' && !Array.isArray(ep.network)) ? ep.network : {};
+
+  if(q('f_through')) setField('f_through', ep.through || '');
+  if(q('f_interface')) setField('f_interface', ep.interface || '');
+  if(q('f_listen_interface')) setField('f_listen_interface', ep.listen_interface || '');
+
+  setTriBoolSelect('f_accept_proxy', ep.accept_proxy);
+  if(q('f_accept_proxy_timeout')) setField('f_accept_proxy_timeout', ep.accept_proxy_timeout != null ? ep.accept_proxy_timeout : '');
+  setTriBoolSelect('f_send_proxy', ep.send_proxy);
+  if(q('f_send_proxy_version')) setField('f_send_proxy_version', ep.send_proxy_version != null ? ep.send_proxy_version : '');
+  setTriBoolSelect('f_send_mptcp', ep.send_mptcp);
+  setTriBoolSelect('f_accept_mptcp', ep.accept_mptcp);
+
+  if(q('f_listen_transport')) setField('f_listen_transport', ep.listen_transport || '');
+  if(q('f_remote_transport')) setField('f_remote_transport', ep.remote_transport || '');
+
+  if(q('f_net_tcp_timeout')) setField('f_net_tcp_timeout', net.tcp_timeout != null ? net.tcp_timeout : '');
+  if(q('f_net_udp_timeout')) setField('f_net_udp_timeout', net.udp_timeout != null ? net.udp_timeout : '');
+  if(q('f_net_tcp_keepalive')) setField('f_net_tcp_keepalive', net.tcp_keepalive != null ? net.tcp_keepalive : '');
+  if(q('f_net_tcp_keepalive_probe')) setField('f_net_tcp_keepalive_probe', net.tcp_keepalive_probe != null ? net.tcp_keepalive_probe : '');
+
+  if(q('f_net_ipv6_only')){
+    if(net.ipv6_only === true) q('f_net_ipv6_only').value = '1';
+    else if(net.ipv6_only === false) q('f_net_ipv6_only').value = '0';
+    else q('f_net_ipv6_only').value = '';
+  }
+}
+
+function applyCommonAdvancedToEndpoint(endpoint){
+  const ep = endpoint || {};
+
+  // bind / route
+  const through = _trim(q('f_through') ? q('f_through').value : '');
+  if(through) ep.through = through; else delete ep.through;
+
+  const iface = _trim(q('f_interface') ? q('f_interface').value : '');
+  if(iface) ep.interface = iface; else delete ep.interface;
+
+  const liface = _trim(q('f_listen_interface') ? q('f_listen_interface').value : '');
+  if(liface) ep.listen_interface = liface; else delete ep.listen_interface;
+
+  // proxy
+  const ap = readTriBoolSelect('f_accept_proxy');
+  if(ap.set) ep.accept_proxy = ap.value; else delete ep.accept_proxy;
+
+  const apt = readNonnegIntInput('f_accept_proxy_timeout', '解析超时');
+  if(apt.error) return {ok:false, error:apt.error};
+  if(apt.set) ep.accept_proxy_timeout = apt.value; else delete ep.accept_proxy_timeout;
+
+  const sp = readTriBoolSelect('f_send_proxy');
+  if(sp.set) ep.send_proxy = sp.value; else delete ep.send_proxy;
+
+  const spvEl = q('f_send_proxy_version');
+  const spv = spvEl ? String(spvEl.value || '').trim() : '';
+  if(!spv){
+    delete ep.send_proxy_version;
+  }else if(spv === '1' || spv === '2'){
+    ep.send_proxy_version = parseInt(spv, 10);
+  }else{
+    return {ok:false, error:'PROXY 版本仅支持 1 或 2'};
+  }
+
+  // mptcp
+  const sm = readTriBoolSelect('f_send_mptcp');
+  if(sm.set) ep.send_mptcp = sm.value; else delete ep.send_mptcp;
+
+  const am = readTriBoolSelect('f_accept_mptcp');
+  if(am.set) ep.accept_mptcp = am.value; else delete ep.accept_mptcp;
+
+  // transport strings
+  const ltrans = _trim(q('f_listen_transport') ? q('f_listen_transport').value : '');
+  if(ltrans) ep.listen_transport = ltrans; else delete ep.listen_transport;
+
+  const rtrans = _trim(q('f_remote_transport') ? q('f_remote_transport').value : '');
+  if(rtrans) ep.remote_transport = rtrans; else delete ep.remote_transport;
+
+  // endpoint.network overrides
+  let net = (ep.network && typeof ep.network === 'object' && !Array.isArray(ep.network)) ? ep.network : {};
+
+  const t1 = readNonnegIntInput('f_net_tcp_timeout', 'TCP 连接超时');
+  if(t1.error) return {ok:false, error:t1.error};
+  if(t1.set) net.tcp_timeout = t1.value; else delete net.tcp_timeout;
+
+  const t2 = readNonnegIntInput('f_net_udp_timeout', 'UDP 关联超时');
+  if(t2.error) return {ok:false, error:t2.error};
+  if(t2.set) net.udp_timeout = t2.value; else delete net.udp_timeout;
+
+  const t3 = readNonnegIntInput('f_net_tcp_keepalive', 'TCP Keepalive');
+  if(t3.error) return {ok:false, error:t3.error};
+  if(t3.set) net.tcp_keepalive = t3.value; else delete net.tcp_keepalive;
+
+  const t4 = readNonnegIntInput('f_net_tcp_keepalive_probe', 'Keepalive 重试次数');
+  if(t4.error) return {ok:false, error:t4.error};
+  if(t4.set) net.tcp_keepalive_probe = t4.value; else delete net.tcp_keepalive_probe;
+
+  const ipv6El = q('f_net_ipv6_only');
+  const ipv6 = ipv6El ? String(ipv6El.value || '').trim() : '';
+  if(!ipv6){
+    delete net.ipv6_only;
+  }else if(ipv6 === '1'){
+    net.ipv6_only = true;
+  }else if(ipv6 === '0'){
+    net.ipv6_only = false;
+  }else{
+    return {ok:false, error:'IPv6 Only 参数无效'};
+  }
+
+  // cleanup empty network object
+  try{
+    const keys = Object.keys(net || {});
+    if(keys.length === 0){
+      delete ep.network;
+    }else{
+      ep.network = net;
+    }
+  }catch(_e){
+    // keep as-is
+  }
+
+  return {ok:true};
+}
+
 function showWssBox(){
   const mode = q('f_type').value;
   if(q('wssBox')) q('wssBox').style.display = (mode === 'wss') ? 'block' : 'none';
   if(q('intranetBox')) q('intranetBox').style.display = (mode === 'intranet') ? 'block' : 'none';
 
   // Advanced sections (collapsed area)
+  const commonAdv = document.getElementById('commonAdvancedBox');
+  if(commonAdv) commonAdv.style.display = (mode === 'tcp') ? 'block' : 'none';
   const wssAdv = document.getElementById('wssAdvancedBox');
   if(wssAdv) wssAdv.style.display = (mode === 'wss') ? 'block' : 'none';
   const intrAdv = document.getElementById('intranetAdvancedBox');
@@ -2341,6 +2497,7 @@ function newRule(){
   populateIntranetReceiverSelect();
   fillWssFields({});
   fillIntranetFields({});
+  fillCommonAdvancedFields({});
   showWssBox();
   openModal();
 }
@@ -2404,6 +2561,11 @@ function editRule(idx){
   }else{
     fillIntranetFields({});
   }
+
+  // common advanced fields (only meaningful for normal rules)
+  if(mode === 'tcp') fillCommonAdvancedFields(e);
+  else fillCommonAdvancedFields({});
+
   showWssBox();
   // Close/open advanced panel based on non-default values
   const adv = document.getElementById('advancedDetails');
@@ -2424,6 +2586,27 @@ function editRule(idx){
         if(q('f_wss_receiver_port') && String(q('f_wss_receiver_port').value || '').trim()) openAdv = true;
         if(q('f_wss_tls') && String(q('f_wss_tls').value || '1') !== '1') openAdv = true;
         if(q('f_wss_insecure') && q('f_wss_insecure').checked === false) openAdv = true;
+      }else{
+        // tcp/common advanced
+        if(q('f_through') && String(q('f_through').value || '').trim()) openAdv = true;
+        if(q('f_interface') && String(q('f_interface').value || '').trim()) openAdv = true;
+        if(q('f_listen_interface') && String(q('f_listen_interface').value || '').trim()) openAdv = true;
+
+        if(q('f_accept_proxy') && String(q('f_accept_proxy').value || '').trim()) openAdv = true;
+        if(q('f_accept_proxy_timeout') && String(q('f_accept_proxy_timeout').value || '').trim()) openAdv = true;
+        if(q('f_send_proxy') && String(q('f_send_proxy').value || '').trim()) openAdv = true;
+        if(q('f_send_proxy_version') && String(q('f_send_proxy_version').value || '').trim()) openAdv = true;
+        if(q('f_send_mptcp') && String(q('f_send_mptcp').value || '').trim()) openAdv = true;
+        if(q('f_accept_mptcp') && String(q('f_accept_mptcp').value || '').trim()) openAdv = true;
+
+        if(q('f_net_tcp_timeout') && String(q('f_net_tcp_timeout').value || '').trim()) openAdv = true;
+        if(q('f_net_udp_timeout') && String(q('f_net_udp_timeout').value || '').trim()) openAdv = true;
+        if(q('f_net_tcp_keepalive') && String(q('f_net_tcp_keepalive').value || '').trim()) openAdv = true;
+        if(q('f_net_tcp_keepalive_probe') && String(q('f_net_tcp_keepalive_probe').value || '').trim()) openAdv = true;
+        if(q('f_net_ipv6_only') && String(q('f_net_ipv6_only').value || '').trim()) openAdv = true;
+
+        if(q('f_listen_transport') && String(q('f_listen_transport').value || '').trim()) openAdv = true;
+        if(q('f_remote_transport') && String(q('f_remote_transport').value || '').trim()) openAdv = true;
       }
     }catch(_e){}
     adv.open = openAdv;
@@ -2828,32 +3011,59 @@ async function saveRule(){
   }
 
   // 普通转发（单机）
-  const endpoint = { listen, remotes, disabled, balance: balanceStr, protocol };
-  if(remark) endpoint.remark = remark;
-  if(favorite) endpoint.favorite = true;
-
+  let endpoint = {};
+  if(CURRENT_EDIT_INDEX >= 0){
     try{
-      setLoading(true);
-  
-      if(CURRENT_EDIT_INDEX >= 0){
-        CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX] = endpoint;
-      }else{
-        CURRENT_POOL.endpoints.push(endpoint);
+      const old = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX] : null;
+      // Only preserve extra fields when editing an existing normal rule.
+      if(old && wssMode(old) === 'tcp'){
+        endpoint = JSON.parse(JSON.stringify(old));
       }
-  
-      await savePool('已保存');
-      renderRules();
-      closeModal();
-  
-    }catch(err){
-      const msg = (err && err.message) ? err.message : String(err || '保存失败');
-      toast(msg, true);
-      // revert local changes
-      try{ await loadPool(); }catch(e){}
-    }finally{
-      setLoading(false);
-    }
+    }catch(_e){ endpoint = {}; }
   }
+
+  // Required fields
+  endpoint.listen = listen;
+  endpoint.remotes = remotes;
+  endpoint.disabled = disabled;
+  endpoint.balance = balanceStr;
+  endpoint.protocol = protocol;
+
+  // Clean legacy schema fields (if any)
+  try{ delete endpoint.remote; }catch(_e){}
+  try{ delete endpoint.extra_remotes; }catch(_e){}
+  try{ delete endpoint.balanceStr; }catch(_e){}
+
+  // meta
+  if(remark) endpoint.remark = remark; else { try{ delete endpoint.remark; }catch(_e){} }
+  if(favorite) endpoint.favorite = true; else { try{ delete endpoint.favorite; }catch(_e){} }
+
+  // Apply common advanced params
+  const advApply = applyCommonAdvancedToEndpoint(endpoint);
+  if(!advApply.ok){ toast(advApply.error || '高级参数无效', true); return; }
+
+  try{
+    setLoading(true);
+
+    if(CURRENT_EDIT_INDEX >= 0){
+      CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX] = endpoint;
+    }else{
+      CURRENT_POOL.endpoints.push(endpoint);
+    }
+
+    await savePool('已保存');
+    renderRules();
+    closeModal();
+
+  }catch(err){
+    const msg = (err && err.message) ? err.message : String(err || '保存失败');
+    toast(msg, true);
+    // revert local changes
+    try{ await loadPool(); }catch(e){}
+  }finally{
+    setLoading(false);
+  }
+}
 
 async function savePool(msg){
   q('modalMsg') && (q('modalMsg').textContent = '');

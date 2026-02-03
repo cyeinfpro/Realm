@@ -423,6 +423,130 @@
                     <div class="col">
                       <label class="label">权重（与 Remote 行数一致，逗号分隔，可空）</label>
                       <input class="input" id="f_weights" placeholder="1,1,2">
+                      <div class="help">仅轮询生效；IP Hash 会忽略权重。权重数量必须与 Remote 行数一致。</div>
+                    </div>
+                  </div>
+
+                  <!-- Common advanced params (normal rules only) -->
+                  <div id="commonAdvancedBox" style="display:none;">
+                    <div class="adv-subtitle">绑定 / 路由</div>
+                    <div class="adv-grid" style="margin-top:6px;">
+                      <div class="col">
+                        <label class="label">Through（出站绑定 IP，可选）</label>
+                        <input class="input" id="f_through" placeholder="例如：1.2.3.4 或 [2001:db8::1] 或 1.2.3.4:50000(UDP)">
+                        <div class="help">TCP：出站连接前绑定指定 IP；UDP：支持 ip 或 ip:port。</div>
+                      </div>
+                      <div class="col">
+                        <label class="label">Interface（出站接口，可选）</label>
+                        <input class="input" id="f_interface" placeholder="例如：eth0">
+                        <div class="help">将出站流量绑定到指定网卡。</div>
+                      </div>
+                      <div class="col">
+                        <label class="label">Listen Interface（入站接口，可选）</label>
+                        <input class="input" id="f_listen_interface" placeholder="例如：eth0">
+                        <div class="help">仅监听指定网卡的入站连接（多网卡场景使用）。</div>
+                      </div>
+                    </div>
+
+                    <div class="adv-subtitle">Network（覆盖全局，可选）</div>
+                    <div class="adv-grid" style="margin-top:6px;">
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">TCP 连接超时（秒）</label>
+                        <input class="input" id="f_net_tcp_timeout" type="number" step="1" placeholder="默认 5；0=关闭">
+                        <div class="help">连接远端的超时；留空=继承全局。</div>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">UDP 关联超时（秒）</label>
+                        <input class="input" id="f_net_udp_timeout" type="number" step="1" placeholder="默认 30">
+                        <div class="help">UDP 会话空闲超时；留空=继承全局。</div>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">TCP Keepalive（秒）</label>
+                        <input class="input" id="f_net_tcp_keepalive" type="number" step="1" placeholder="默认 15；0=系统默认">
+                        <div class="help">留空=继承全局。</div>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">Keepalive 重试次数</label>
+                        <input class="input" id="f_net_tcp_keepalive_probe" type="number" step="1" placeholder="默认 3">
+                        <div class="help">留空=继承全局。</div>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">IPv6 Only（可选）</label>
+                        <select class="select" id="f_net_ipv6_only">
+                          <option value="">继承全局</option>
+                          <option value="1">开启</option>
+                          <option value="0">关闭</option>
+                        </select>
+                        <div class="help">禁用 ipv4-mapped-ipv6（仅在监听 IPv6 时生效）。</div>
+                      </div>
+                    </div>
+
+                    <div class="adv-subtitle">PROXY Protocol（可选）</div>
+                    <div class="adv-grid" style="margin-top:6px;">
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">入站解析 PROXY</label>
+                        <select class="select" id="f_accept_proxy">
+                          <option value="">继承全局</option>
+                          <option value="1">开启</option>
+                          <option value="0">关闭</option>
+                        </select>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">解析超时（秒）</label>
+                        <input class="input" id="f_accept_proxy_timeout" type="number" step="1" placeholder="默认 5">
+                        <div class="help">仅在入站解析 PROXY 时生效；留空=继承全局。</div>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">出站发送 PROXY</label>
+                        <select class="select" id="f_send_proxy">
+                          <option value="">继承全局</option>
+                          <option value="1">开启</option>
+                          <option value="0">关闭</option>
+                        </select>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">PROXY 版本</label>
+                        <select class="select" id="f_send_proxy_version">
+                          <option value="">继承全局</option>
+                          <option value="2">v2（默认）</option>
+                          <option value="1">v1</option>
+                        </select>
+                        <div class="help">仅在出站发送 PROXY 时生效。</div>
+                      </div>
+                    </div>
+
+                    <div class="adv-subtitle">MPTCP（Linux，可选）</div>
+                    <div class="adv-grid" style="margin-top:6px;">
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">出站 MPTCP</label>
+                        <select class="select" id="f_send_mptcp">
+                          <option value="">继承全局</option>
+                          <option value="1">开启</option>
+                          <option value="0">关闭</option>
+                        </select>
+                      </div>
+                      <div class="col" style="max-width:240px;">
+                        <label class="label">入站 MPTCP</label>
+                        <select class="select" id="f_accept_mptcp">
+                          <option value="">继承全局</option>
+                          <option value="1">开启</option>
+                          <option value="0">关闭</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div class="adv-subtitle">Transport（可选）</div>
+                    <div class="adv-grid" style="margin-top:6px;">
+                      <div class="col">
+                        <label class="label">Listen Transport</label>
+                        <input class="input" id="f_listen_transport" placeholder='例如：ws;host=example.com;path=/;tls;servername=example.com'>
+                        <div class="help">高级用法：需要 realm transport 功能；留空=不使用。</div>
+                      </div>
+                      <div class="col">
+                        <label class="label">Remote Transport</label>
+                        <input class="input" id="f_remote_transport" placeholder='例如：ws;host=example.com;path=/;tls;sni=example.com;insecure'>
+                        <div class="help">高级用法：需要 realm transport 功能；留空=不使用。</div>
+                      </div>
                     </div>
                   </div>
 
@@ -544,7 +668,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=68.0"></script>
+<script src="/static/app.js?v=69.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};
