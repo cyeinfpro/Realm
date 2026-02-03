@@ -1,13 +1,12 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="page-head">
-  <div class="page-title">
-    <h1 class="h1">文件管理 · {{ site.name }}</h1>
-    <div class="meta">
-      <span class="meta-item">根目录：<span class="mono">{{ root }}</span></span>
-    </div>
+<div class="hero-card">
+  <div class="hero-left">
+    <span class="pill xs ghost">File Manager</span>
+    <div class="hero-title">文件管理 · {{ site.name }}</div>
+    <div class="hero-sub">根目录：<span class="mono">{{ root }}</span></div>
   </div>
-  <div class="right">
+  <div class="hero-right">
     <a class="btn sm ghost" href="/websites/{{ site.id }}">返回站点</a>
   </div>
 </div>
@@ -18,34 +17,36 @@
   </div>
 {% endif %}
 
-<div class="card">
+<div class="card" style="margin-top:12px;">
   <div class="row" style="justify-content:space-between;align-items:center;">
     <div class="col">
-      {% for name, p in breadcrumbs %}
-        <a href="/websites/{{ site.id }}/files?path={{ p }}" class="muted" style="text-decoration:none;margin-right:6px;">{{ name }}</a>
-        {% if not loop.last %}<span class="muted">/</span>{% endif %}
-      {% endfor %}
+      <div class="file-path">
+        {% for name, p in breadcrumbs %}
+          <a href="/websites/{{ site.id }}/files?path={{ p }}">{{ name }}</a>
+          {% if not loop.last %}<span class="sep">/</span>{% endif %}
+        {% endfor %}
+      </div>
+      <div class="help">单文件上传上限 200MB（分片上传 + 断点续传）。</div>
     </div>
-    <div class="col right">
+    <div class="col right toolbar">
       <form method="post" action="/websites/{{ site.id }}/files/mkdir" style="display:inline;">
         <input type="hidden" name="path" value="{{ path }}">
-        <input class="input" name="name" placeholder="新建目录" style="max-width:160px;">
+        <input class="input" name="name" placeholder="新建目录">
         <button class="btn xs ghost" type="submit">创建</button>
       </form>
       <form id="uploadForm" method="post" action="/websites/{{ site.id }}/files/upload" enctype="multipart/form-data" style="display:inline;">
         <input type="hidden" name="path" value="{{ path }}">
-        <input type="file" id="uploadFileInput" name="file" class="input" style="max-width:200px;">
+        <input type="file" id="uploadFileInput" name="file" class="input">
         <button class="btn xs secondary" type="submit" id="uploadBtn">上传</button>
       </form>
     </div>
   </div>
-  <div class="help" style="margin-top:6px;">单文件上传上限 200MB（分片上传）。</div>
+
   <div id="uploadPanel" style="margin-top:10px;display:none;">
     <div class="progress"><div class="progress-fill" id="uploadProgressFill"></div></div>
     <div class="muted sm" id="uploadStatus" style="margin-top:6px;"></div>
     <button class="btn xs ghost" type="button" id="uploadRetry" style="margin-top:8px;display:none;">重试上传</button>
   </div>
-  <div class="help" style="margin-top:8px;">上传支持大文件（当前限制 200MB）。</div>
 
   <div class="table-wrap" style="margin-top:12px;">
     <table class="table">
@@ -62,7 +63,7 @@
         <tr>
           <td>
             {% if it.is_dir %}
-              <a href="/websites/{{ site.id }}/files?path={{ it.path }}" style="text-decoration:none;">📁 {{ it.name }}</a>
+              <a href="/websites/{{ site.id }}/files?path={{ it.path }}" style="text-decoration:none;">目录 · {{ it.name }}</a>
             {% else %}
               {{ it.name }}
             {% endif %}

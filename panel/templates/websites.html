@@ -1,44 +1,75 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="page-head">
-  <div class="page-title">
-    <h1 class="h1">网站管理</h1>
-    <div class="meta">
-      <span class="meta-item">管理网站机节点、站点、SSL 与文件。</span>
+{% set stats = namespace(running=0, creating=0, error=0) %}
+{% for s in sites %}
+  {% if (s.status or '') == 'running' %}
+    {% set stats.running = stats.running + 1 %}
+  {% elif (s.status or '') in ['creating','pending'] %}
+    {% set stats.creating = stats.creating + 1 %}
+  {% elif (s.status or '') == 'error' %}
+    {% set stats.error = stats.error + 1 %}
+  {% endif %}
+{% endfor %}
+
+<div class="hero-card">
+  <div class="hero-left">
+    <span class="pill xs ghost">Website Ops</span>
+    <div class="hero-title">网站管理中心</div>
+    <div class="hero-sub">统一管理网站机节点、站点运行、SSL 与文件系统。支持一键安装环境与自动化运维。</div>
+    <div class="hero-metrics">
+      <span class="pill">网站机 {{ nodes|length }}</span>
+      <span class="pill">站点 {{ sites|length }}</span>
+      <span class="pill ok">运行中 {{ stats.running }}</span>
+      <span class="pill warn">创建中 {{ stats.creating }}</span>
+      <span class="pill bad">异常 {{ stats.error }}</span>
     </div>
   </div>
-  <div class="right">
+  <div class="hero-right">
     <a class="btn sm" href="/websites/new">新建站点</a>
+    <a class="btn sm secondary" href="/nodes">节点管理</a>
   </div>
 </div>
 
-<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr));">
+<div class="grid websites-grid" style="grid-template-columns:repeat(2,minmax(320px,1fr));">
   <div class="card">
-    <div class="card-header">
-      <div class="card-title">网站机节点</div>
+    <div class="section-head">
+      <div>
+        <div class="section-title">网站机节点</div>
+        <div class="section-sub">环境安装、卸载与节点能力信息。</div>
+      </div>
       <div class="muted sm">{{ nodes|length }} 台</div>
     </div>
     {% if nodes %}
       {% for n in nodes %}
-      <div class="card compact" style="margin-bottom:10px;">
-        <div class="row" style="gap:10px;align-items:center;">
+      <div class="panel">
+        <div class="panel-head">
           <div class="col">
-            <div style="font-weight:700;">{{ n.name }}</div>
-            <div class="muted sm mono">{{ n.base_url }}</div>
+            <div class="panel-title">{{ n.name }}</div>
+            <div class="panel-sub mono">{{ n.base_url }}</div>
+            <div class="panel-sub">根目录基准：<span class="mono">{{ n.website_root_base or '/www' }}</span></div>
           </div>
-          <div class="col right">
+          <div class="right">
             <a class="btn xs ghost" href="/nodes/{{ n.id }}">节点详情</a>
           </div>
         </div>
-        <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px;">
-          <form method="post" action="/websites/nodes/{{ n.id }}/env/ensure" class="row" style="gap:8px;align-items:center;flex-wrap:wrap;">
+        {% if n.capabilities %}
+          <div class="panel-actions">
+            {% for k, v in n.capabilities.items() %}
+              {% if v %}
+                <span class="pill xs ghost">{{ k }}</span>
+              {% endif %}
+            {% endfor %}
+          </div>
+        {% endif %}
+        <div class="panel-actions">
+          <form method="post" action="/websites/nodes/{{ n.id }}/env/ensure" class="toolbar">
             <label class="help"><input type="checkbox" name="include_php" checked style="transform:translateY(1px);"> 含 PHP</label>
             <button class="btn xs secondary" type="submit">一键安装环境</button>
           </form>
-          <form method="post" action="/websites/nodes/{{ n.id }}/env/uninstall" class="row" style="gap:8px;align-items:center;flex-wrap:wrap;" onsubmit="return confirm('确定卸载该节点的网站环境吗？');">
+          <form method="post" action="/websites/nodes/{{ n.id }}/env/uninstall" class="toolbar" onsubmit="return confirm('确定卸载该节点的网站环境吗？');">
             <label class="help"><input type="checkbox" name="purge_data" style="transform:translateY(1px);"> 删除网站数据</label>
             <label class="help"><input type="checkbox" name="deep_uninstall" style="transform:translateY(1px);"> 深度卸载</label>
-            <button class="btn xs" type="submit">卸载环境</button>
+            <button class="btn xs ghost" type="submit">卸载环境</button>
           </form>
         </div>
       </div>
@@ -49,13 +80,16 @@
   </div>
 
   <div class="card">
-    <div class="card-header">
-      <div class="card-title">站点总览</div>
+    <div class="section-head">
+      <div>
+        <div class="section-title">站点总览</div>
+        <div class="section-sub">站点状态、域名与管理入口。</div>
+      </div>
       <div class="muted sm">{{ sites|length }} 个</div>
     </div>
     {% if sites %}
     <div class="table-wrap">
-      <table class="table">
+      <table class="table site-table">
         <thead>
           <tr>
             <th>站点</th>
@@ -68,15 +102,21 @@
         </thead>
         <tbody>
           {% for s in sites %}
+          {% set st = (s.status or '') %}
+          {% set st_class = 'ok' if st == 'running' else ('warn' if st in ['creating','pending'] else ('bad' if st == 'error' else 'ghost')) %}
+          {% set type_map = {'static':'静态', 'php':'PHP', 'reverse_proxy':'反向代理'} %}
           <tr>
-            <td>{{ s.name }}</td>
+            <td>
+              <div style="font-weight:700;">{{ s.name }}</div>
+              <div class="muted-row">ID #{{ s.id }}</div>
+            </td>
             <td class="mono" style="word-break:break-all;">{{ s.domains_text }}</td>
             <td>{{ s.node.name if s.node else "-" }}</td>
-            <td>{{ s.type }}</td>
-            <td>{{ s.status }}</td>
+            <td>{{ type_map.get(s.type, s.type) }}</td>
+            <td><span class="pill xs {{ st_class }}">{{ st or 'unknown' }}</span></td>
             <td>
               <a class="btn xs ghost" href="/websites/{{ s.id }}">管理</a>
-              <a class="btn xs ghost" href="/websites/{{ s.id }}/files">文件</a>
+              <a class="btn xs secondary" href="/websites/{{ s.id }}/files">文件</a>
             </td>
           </tr>
           {% endfor %}
