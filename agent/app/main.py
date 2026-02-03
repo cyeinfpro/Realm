@@ -3629,7 +3629,8 @@ def api_website_env_uninstall(payload: Dict[str, Any], _: None = Depends(_api_ke
     if shutil.which("nginx") is not None:
         ok, out = _nginx_reload()
         if not ok:
-            return {"ok": False, "error": out}
+            # During uninstall we treat reload failures as warnings (nginx may be stopped already).
+            errors.append(out or "nginx reload 失败")
 
     removed_roots = 0
     errors: List[str] = []
