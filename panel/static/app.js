@@ -3925,7 +3925,8 @@ window.resetAllTraffic = resetAllTraffic;
 
 // -------------------- Node: Traffic / connections history curves --------------------
 // Design:
-// - Session-based history (kept in memory) updated on every stats refresh.
+// - Panel stores persistent history in SQLite (survives browser close).
+// - Frontend keeps an in-memory cache and updates it on every stats refresh.
 // - Supports "all rules (sum)" and per-rule (by listen) selection.
 // - Plots traffic rate (B/s) and active connections over a sliding time window.
 
@@ -3938,6 +3939,9 @@ const RULE_HIST_STATE = {
   selectedKey: '__all__',
   lastGlobalTs: 0,
   series: new Map(), // key -> HistSeries
+  // Persistent history (stored on panel DB)
+  persistLoaded: new Set(), // keys already loaded from server
+  persistLoading: new Set(), // keys currently in-flight
   trafficChart: null,
   connChart: null,
 };
@@ -4314,6 +4318,8 @@ function _histEnsureInited(){
   if(ruleSel){
     ruleSel.addEventListener('change', ()=>{
       RULE_HIST_STATE.selectedKey = String(ruleSel.value || '__all__') || '__all__';
+      // When user switches rule, load persisted history for that series (best-effort).
+      try{ histLoadPersisted(RULE_HIST_STATE.selectedKey, true); }catch(_e){}
       try{ histRender(); }catch(_e){}
     });
   }
@@ -4332,6 +4338,12 @@ function _histEnsureInited(){
 
   // Keep the select options in sync with pool/rules.
   try{ histSyncRuleSelect(); }catch(_e){}
+
+  // Prefill persisted history on first render (do not block UI).
+  try{
+    const k0 = String(RULE_HIST_STATE.selectedKey || '__all__') || '__all__';
+    setTimeout(()=>{ try{ histLoadPersisted(k0, true); }catch(_e){} }, 30);
+  }catch(_e){}
 
   return true;
 }
@@ -4393,6 +4405,118 @@ function histSyncRuleSelect(){
   selEl.value = RULE_HIST_STATE.selectedKey;
 }
 
+
+// -------------------- Persistent history (panel-side DB) --------------------
+
+function _histMergePersistedSeries(key, tArr, rxArr, txArr, connArr){
+  if(!_histEnsureInited()) return false;
+
+  const k = String(key || '__all__') || '__all__';
+  if(!Array.isArray(tArr) || !Array.isArray(rxArr) || !Array.isArray(txArr) || !Array.isArray(connArr)){
+    return false;
+  }
+
+  const n = Math.min(tArr.length, rxArr.length, txArr.length, connArr.length);
+  if(n <= 0) return false;
+
+  const sNew = new HistSeries();
+  // Build from persisted arrays
+  for(let i=0;i<n;i++){
+    const ts = Number(tArr[i]) || 0;
+    if(!ts) continue;
+    sNew.push(ts, Number(rxArr[i]) || 0, Number(txArr[i]) || 0, Number(connArr[i]) || 0, null);
+  }
+
+  // Merge any newer in-memory points (if we already started collecting in this session)
+  const old = RULE_HIST_STATE.series.get(k);
+  if(old && old.size && old.size() > 0){
+    try{
+      for(let i=old.start; i<old.t.length; i++){
+        const ts = old.t[i];
+        if(!ts) continue;
+        if(sNew.lastTs && ts <= sNew.lastTs) continue;
+        sNew.push(ts, old.rx[i], old.tx[i], old.conn[i], null);
+      }
+    }catch(_e){}
+  }
+
+  // Apply in-memory retention window
+  try{
+    const lastTs = sNew.lastTs || Date.now();
+    const pruneBefore = lastTs - (Number(RULE_HIST_STATE.maxRetentionMs) || (60 * 60 * 1000));
+    if(pruneBefore > 0){
+      while(sNew.start < sNew.t.length && sNew.t[sNew.start] < pruneBefore){
+        sNew.start += 1;
+      }
+      if(sNew.start > 200 && sNew.start > (sNew.t.length >> 1)){
+        sNew.t = sNew.t.slice(sNew.start);
+        sNew.rx = sNew.rx.slice(sNew.start);
+        sNew.tx = sNew.tx.slice(sNew.start);
+        sNew.conn = sNew.conn.slice(sNew.start);
+        sNew.start = 0;
+      }
+    }
+  }catch(_e){}
+
+  RULE_HIST_STATE.series.set(k, sNew);
+  return true;
+}
+
+
+async function histLoadPersisted(key='__all__', quiet=true){
+  if(!_histEnsureInited()) return false;
+  const nodeId = RULE_HIST_STATE.nodeId || String(window.__NODE_ID__ || '');
+  if(!nodeId) return false;
+
+  const k = String(key || '__all__') || '__all__';
+  if(RULE_HIST_STATE.persistLoaded && RULE_HIST_STATE.persistLoaded.has(k)){
+    return false;
+  }
+  if(RULE_HIST_STATE.persistLoading && RULE_HIST_STATE.persistLoading.has(k)){
+    return false;
+  }
+  try{ RULE_HIST_STATE.persistLoading.add(k); }catch(_e){}
+
+  // Load at least maxRetentionMs so user can switch windows without reloading.
+  const wantWin = Math.max(
+    Number(RULE_HIST_STATE.maxRetentionMs) || (60 * 60 * 1000),
+    Number(RULE_HIST_STATE.windowMs) || (10 * 60 * 1000),
+  );
+
+  const url = `/api/nodes/${encodeURIComponent(nodeId)}/stats_history?key=${encodeURIComponent(k)}&window_ms=${encodeURIComponent(String(wantWin))}`;
+  try{
+    const res = await fetchJSON(url);
+    if(res && res.ok){
+      const okMerge = _histMergePersistedSeries(k, res.t || [], res.rx || [], res.tx || [], res.conn || []);
+      if(okMerge){
+        try{ RULE_HIST_STATE.persistLoaded.add(k); }catch(_e){}
+        // Align lastGlobalTs to avoid immediate duplicate insertion
+        try{
+          const s = RULE_HIST_STATE.series.get(k);
+          if(s && s.lastTs && (!RULE_HIST_STATE.lastGlobalTs || s.lastTs > RULE_HIST_STATE.lastGlobalTs)){
+            RULE_HIST_STATE.lastGlobalTs = s.lastTs;
+          }
+        }catch(_e){}
+        try{ histRender(); }catch(_e){}
+      }
+      // Mark loaded even if empty to avoid spamming the API.
+      try{ RULE_HIST_STATE.persistLoaded.add(k); }catch(_e){}
+      return true;
+    }
+    if(!quiet){
+      toast((res && res.error) ? res.error : '加载历史失败', true);
+    }
+  }catch(err){
+    if(!quiet){
+      toast('加载历史失败：' + (err && err.message ? err.message : String(err)), true);
+    }
+  }finally{
+    try{ RULE_HIST_STATE.persistLoading.delete(k); }catch(_e){}
+  }
+  return false;
+}
+
+
 function histIngestStats(statsData){
   if(!_histEnsureInited()) return;
   if(!statsData){
@@ -4405,7 +4529,12 @@ function histIngestStats(statsData){
     return;
   }
 
-  const now = Date.now();
+  // Use panel-side timestamp when available (aligns with persistent DB history).
+  let now = Date.now();
+  try{
+    const serverTs = (statsData && statsData.ts_ms != null) ? Number(statsData.ts_ms) : 0;
+    if(Number.isFinite(serverTs) && serverTs > 0) now = serverTs;
+  }catch(_e){}
   // Guard: avoid double-insert within a very short time window.
   if(RULE_HIST_STATE.lastGlobalTs && (now - RULE_HIST_STATE.lastGlobalTs) < 800){
     return;
@@ -4593,22 +4722,60 @@ function histRender(){
   try{ RULE_HIST_STATE.connChart && RULE_HIST_STATE.connChart.setData(connData); }catch(_e){}
 }
 
-function clearRuleHistory(silent=false){
+async function clearRuleHistory(silent=false){
   if(!_histEnsureInited()) return;
-  try{
-    RULE_HIST_STATE.series = new Map();
-    RULE_HIST_STATE.lastGlobalTs = 0;
-  }catch(_e){}
 
-  try{ _histSetKpis(null, null, null); }catch(_e){}
-  try{ RULE_HIST_STATE.trafficChart && RULE_HIST_STATE.trafficChart.setData(null); }catch(_e){}
-  try{ RULE_HIST_STATE.connChart && RULE_HIST_STATE.connChart.setData(null); }catch(_e){}
+  const nodeId = RULE_HIST_STATE.nodeId || String(window.__NODE_ID__ || '');
+  if(!nodeId){
+    if(!silent) toast('缺少节点ID', true);
+    return;
+  }
 
-  const noDataEl = document.getElementById('histNoData');
-  if(noDataEl) noDataEl.style.display = '';
+  const doLocalClear = ()=>{
+    try{
+      RULE_HIST_STATE.series = new Map();
+      RULE_HIST_STATE.lastGlobalTs = 0;
+      // Reset persistent load markers so future loads are allowed.
+      RULE_HIST_STATE.persistLoaded = new Set();
+      RULE_HIST_STATE.persistLoading = new Set();
+    }catch(_e){}
+
+    try{ _histSetKpis(null, null, null); }catch(_e){}
+    try{ RULE_HIST_STATE.trafficChart && RULE_HIST_STATE.trafficChart.setData(null); }catch(_e){}
+    try{ RULE_HIST_STATE.connChart && RULE_HIST_STATE.connChart.setData(null); }catch(_e){}
+
+    const noDataEl = document.getElementById('histNoData');
+    if(noDataEl) noDataEl.style.display = '';
+  };
 
   if(!silent){
-    try{ toast('已清空历史曲线'); }catch(_e){}
+    const ok = confirm(
+      '确定清空该节点的“历史曲线”吗？\n\n' +
+      '这会删除面板已持久化存储的历史记录，无法恢复。'
+    );
+    if(!ok) return;
+  }
+
+  // Silent mode is used by traffic reset to avoid confusing charts; clear local immediately.
+  if(silent){
+    try{ doLocalClear(); }catch(_e){}
+  }
+
+  try{
+    const res = await fetchJSON(`/api/nodes/${encodeURIComponent(nodeId)}/stats_history/clear`, {
+      method: 'POST',
+      body: JSON.stringify({})
+    });
+    if(res && res.ok){
+      if(!silent){
+        doLocalClear();
+        toast('已清空历史记录');
+      }
+    }else{
+      if(!silent) toast((res && res.error) ? res.error : '清空失败', true);
+    }
+  }catch(err){
+    if(!silent) toast('清空失败：' + (err && err.message ? err.message : String(err)), true);
   }
 }
 window.clearRuleHistory = clearRuleHistory;

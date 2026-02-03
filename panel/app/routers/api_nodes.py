@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 import zipfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -23,6 +24,8 @@ from ..db import (
     get_node,
     get_node_by_api_key,
     get_node_by_base_url,
+    list_rule_stats_series,
+    clear_rule_stats_samples,
     list_nodes,
     set_desired_pool,
     set_desired_pool_exact,
@@ -34,6 +37,7 @@ from ..services.backup import get_pool_for_backup
 from ..services.assets import panel_public_base_url
 from ..services.node_status import is_report_fresh
 from ..services.pool_ops import load_pool_for_node, remove_endpoints_by_sync_id
+from ..services.stats_history import config as stats_history_config, ingest_stats_snapshot
 from ..utils.crypto import generate_api_key
 from ..utils.normalize import (
     extract_ip_for_display,
@@ -1068,14 +1072,152 @@ async def api_stats(request: Request, node_id: int, force: int = 0, user: str = 
         if isinstance(rep, dict) and isinstance(rep.get("stats"), dict):
             out = rep["stats"]
             out["source"] = "report"
+            # Provide a stable server-side timestamp for frontend history alignment.
+            try:
+                out["ts_ms"] = int(time.time() * 1000)
+            except Exception:
+                pass
             return out
 
     try:
         data = await agent_get(node["base_url"], node["api_key"], "/api/v1/stats", node_verify_tls(node))
+
+        # Provide a stable server-side timestamp for frontend history alignment.
+        try:
+            if isinstance(data, dict):
+                data["ts_ms"] = int(time.time() * 1000)
+                data.setdefault("source", "agent")
+        except Exception:
+            pass
+
+        # Fallback sampling: if push-report is not used, persist history from direct stats.
+        # Best-effort: never fail the request.
+        try:
+            if isinstance(data, dict) and data.get("ok") is True:
+                ingest_stats_snapshot(node_id=node_id, stats=data)
+        except Exception:
+            pass
+
         return data
     except Exception as exc:
         # Return 200 with ok=false to keep frontend error message stable.
         return {"ok": False, "error": str(exc), "rules": []}
+
+
+@router.get("/api/nodes/{node_id}/stats_history")
+async def api_stats_history(
+    request: Request,
+    node_id: int,
+    key: str = "__all__",
+    window_ms: int = 10 * 60 * 1000,
+    limit: int = 8000,
+    user: str = Depends(require_login),
+):
+    """Return persistent traffic/connection history series for a node.
+
+    Notes:
+      - The series is stored on the panel (SQLite) and will survive browser refresh/close.
+      - One extra point before the window is included (when available) so the UI can compute rate.
+    """
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+
+    # Clamp window to protect DB and payload size.
+    try:
+        win = int(window_ms)
+    except Exception:
+        win = 10 * 60 * 1000
+    if win < 60 * 1000:
+        win = 60 * 1000
+    if win > 24 * 3600 * 1000:
+        win = 24 * 3600 * 1000
+
+    now_ms = int(time.time() * 1000)
+    from_ms = now_ms - win
+    if from_ms < 0:
+        from_ms = 0
+
+    k = (key or "__all__").strip() or "__all__"
+
+    try:
+        rows = list_rule_stats_series(
+            node_id=int(node_id),
+            rule_key=k,
+            from_ts_ms=int(from_ms),
+            to_ts_ms=int(now_ms),
+            limit=int(limit),
+            include_prev=True,
+        )
+    except Exception:
+        rows = []
+
+    t: List[int] = []
+    rx: List[int] = []
+    tx: List[int] = []
+    conn: List[int] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            ts = int(r.get("ts_ms") or 0)
+        except Exception:
+            ts = 0
+        if ts <= 0:
+            continue
+        try:
+            rrx = int(r.get("rx_bytes") or 0)
+        except Exception:
+            rrx = 0
+        try:
+            rtx = int(r.get("tx_bytes") or 0)
+        except Exception:
+            rtx = 0
+        try:
+            rc = int(r.get("connections_active") or 0)
+        except Exception:
+            rc = 0
+        t.append(ts)
+        rx.append(max(0, rrx))
+        tx.append(max(0, rtx))
+        conn.append(max(0, rc))
+
+    return {
+        "ok": True,
+        "node_id": int(node_id),
+        "key": k,
+        "from_ts_ms": int(from_ms),
+        "to_ts_ms": int(now_ms),
+        "t": t,
+        "rx": rx,
+        "tx": tx,
+        "conn": conn,
+        "source": "db",
+        "config": stats_history_config(),
+    }
+
+
+@router.post("/api/nodes/{node_id}/stats_history/clear")
+async def api_stats_history_clear(
+    request: Request,
+    node_id: int,
+    user: str = Depends(require_login),
+):
+    """Clear persistent history for a node."""
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+
+    try:
+        deleted = clear_rule_stats_samples(int(node_id))
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+    return {
+        "ok": True,
+        "node_id": int(node_id),
+        "deleted": int(deleted or 0),
+    }
 
 
 @router.get("/api/nodes/{node_id}/sys")

@@ -25,6 +25,7 @@ from ..db import (
 from ..services.agent_commands import sign_cmd, single_rule_ops
 from ..services.assets import agent_asset_urls, file_sha256, panel_public_base_url, parse_agent_version_from_ua, read_latest_agent_version
 from ..services.node_status import is_report_fresh
+from ..services.stats_history import ingest_stats_snapshot
 
 router = APIRouter()
 
@@ -96,6 +97,13 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
         )
     except Exception:
         # 不要让写库失败影响 agent
+        pass
+
+    # Persist rule traffic/connection history (best-effort, never block agent report)
+    try:
+        if isinstance(report, dict) and isinstance(report.get("stats"), dict):
+            ingest_stats_snapshot(node_id=node_id, stats=report.get("stats"))
+    except Exception:
         pass
 
     # Persist agent version + update status (best-effort)

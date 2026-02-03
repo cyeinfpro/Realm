@@ -76,6 +76,23 @@ CREATE TABLE IF NOT EXISTS netmon_samples (
 
 CREATE INDEX IF NOT EXISTS idx_netmon_samples_monitor_ts ON netmon_samples(monitor_id, ts_ms);
 CREATE INDEX IF NOT EXISTS idx_netmon_samples_monitor_node_ts ON netmon_samples(monitor_id, node_id, ts_ms);
+
+-- Rule traffic/connection history (persistent time-series)
+CREATE TABLE IF NOT EXISTS rule_stats_samples (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  node_id INTEGER NOT NULL,
+  rule_key TEXT NOT NULL,
+  ts_ms INTEGER NOT NULL,
+  rx_bytes INTEGER NOT NULL DEFAULT 0,
+  tx_bytes INTEGER NOT NULL DEFAULT 0,
+  connections_active INTEGER NOT NULL DEFAULT 0,
+  connections_total INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rule_stats_samples_unique ON rule_stats_samples(node_id, rule_key, ts_ms);
+CREATE INDEX IF NOT EXISTS idx_rule_stats_samples_node_ts ON rule_stats_samples(node_id, ts_ms);
+CREATE INDEX IF NOT EXISTS idx_rule_stats_samples_node_rule_ts ON rule_stats_samples(node_id, rule_key, ts_ms);
 """
 
 
@@ -179,6 +196,20 @@ def ensure_db(db_path: str = DEFAULT_DB_PATH) -> None:
         try:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_netmon_samples_monitor_ts ON netmon_samples(monitor_id, ts_ms)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_netmon_samples_monitor_node_ts ON netmon_samples(monitor_id, node_id, ts_ms)")
+        except Exception:
+            pass
+
+        # Rule stats history indexes (best effort)
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_rule_stats_samples_unique ON rule_stats_samples(node_id, rule_key, ts_ms)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rule_stats_samples_node_ts ON rule_stats_samples(node_id, ts_ms)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rule_stats_samples_node_rule_ts ON rule_stats_samples(node_id, rule_key, ts_ms)"
+            )
         except Exception:
             pass
         conn.commit()
@@ -1018,5 +1049,161 @@ def prune_netmon_samples(before_ts_ms: int, db_path: str = DEFAULT_DB_PATH) -> i
         return 0
     with connect(db_path) as conn:
         cur = conn.execute("DELETE FROM netmon_samples WHERE ts_ms < ?", (cutoff,))
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+# ---------------- Rule stats history (persistent time-series) ----------------
+
+
+def insert_rule_stats_samples(
+    rows: List[Tuple[int, str, int, int, int, int, int]],
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    """Insert rule stats history rows.
+
+    Each row is:
+      (node_id, rule_key, ts_ms, rx_bytes, tx_bytes, connections_active, connections_total)
+
+    Uses INSERT OR IGNORE to avoid duplicates (unique index: node_id+rule_key+ts_ms).
+    Returns best-effort inserted count.
+    """
+    if not rows:
+        return 0
+    with connect(db_path) as conn:
+        before = int(conn.total_changes or 0)
+        conn.executemany(
+            "INSERT OR IGNORE INTO rule_stats_samples(node_id, rule_key, ts_ms, rx_bytes, tx_bytes, connections_active, connections_total) VALUES(?,?,?,?,?,?,?)",
+            rows,
+        )
+        conn.commit()
+        after = int(conn.total_changes or 0)
+        inserted = after - before
+        # sqlite3.total_changes is best-effort; never return negative.
+        return int(inserted if inserted > 0 else 0)
+
+
+def list_rule_stats_series(
+    node_id: int,
+    rule_key: str,
+    from_ts_ms: int,
+    to_ts_ms: int,
+    limit: int = 8000,
+    include_prev: bool = True,
+    db_path: str = DEFAULT_DB_PATH,
+) -> List[Dict[str, Any]]:
+    """List rule stats samples for a single node+rule within [from, to].
+
+    If include_prev=True, returns one extra sample immediately before `from_ts_ms`
+    (when available), so the frontend can compute rate at the window boundary.
+    """
+    try:
+        nid = int(node_id)
+    except Exception:
+        nid = 0
+    if nid <= 0:
+        return []
+
+    key = str(rule_key or "").strip() or "__all__"
+
+    try:
+        f = int(from_ts_ms)
+    except Exception:
+        f = 0
+    try:
+        t = int(to_ts_ms)
+    except Exception:
+        t = 0
+    if f <= 0 or t <= 0 or t <= f:
+        return []
+
+    try:
+        lim = int(limit)
+    except Exception:
+        lim = 8000
+    if lim < 200:
+        lim = 200
+    if lim > 200000:
+        lim = 200000
+
+    prev: List[sqlite3.Row] = []
+    if include_prev:
+        sql_prev = """
+            SELECT ts_ms, rx_bytes, tx_bytes, connections_active, connections_total
+            FROM rule_stats_samples
+            WHERE node_id=? AND rule_key=? AND ts_ms < ?
+            ORDER BY ts_ms DESC
+            LIMIT 1
+        """
+        with connect(db_path) as conn:
+            prev = conn.execute(sql_prev, (nid, key, f)).fetchall()
+
+    sql = """
+        SELECT ts_ms, rx_bytes, tx_bytes, connections_active, connections_total
+        FROM rule_stats_samples
+        WHERE node_id=? AND rule_key=? AND ts_ms>=? AND ts_ms<=?
+        ORDER BY ts_ms ASC
+        LIMIT ?
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute(sql, (nid, key, f, t, lim)).fetchall()
+
+    out: List[Dict[str, Any]] = []
+    if prev:
+        out.append(dict(prev[0]))
+    for r in rows:
+        out.append(dict(r))
+
+    # Deduplicate potential overlap between prev and first row.
+    if len(out) >= 2:
+        try:
+            if int(out[0].get("ts_ms") or 0) == int(out[1].get("ts_ms") or 0):
+                out.pop(0)
+        except Exception:
+            pass
+
+    return out
+
+
+def clear_rule_stats_samples(
+    node_id: int,
+    rule_key: Optional[str] = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    """Clear stats history.
+
+    - If rule_key is None: delete all history for the node.
+    - If rule_key is provided: delete only that series (node_id+rule_key).
+    """
+    try:
+        nid = int(node_id)
+    except Exception:
+        nid = 0
+    if nid <= 0:
+        return 0
+
+    key = str(rule_key or "").strip() if rule_key is not None else None
+    with connect(db_path) as conn:
+        if key is None:
+            cur = conn.execute("DELETE FROM rule_stats_samples WHERE node_id=?", (nid,))
+        else:
+            cur = conn.execute(
+                "DELETE FROM rule_stats_samples WHERE node_id=? AND rule_key=?",
+                (nid, key),
+            )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def prune_rule_stats_samples(before_ts_ms: int, db_path: str = DEFAULT_DB_PATH) -> int:
+    """Prune history rows older than cutoff timestamp."""
+    try:
+        cutoff = int(before_ts_ms)
+    except Exception:
+        cutoff = 0
+    if cutoff <= 0:
+        return 0
+    with connect(db_path) as conn:
+        cur = conn.execute("DELETE FROM rule_stats_samples WHERE ts_ms < ?", (cutoff,))
         conn.commit()
         return int(cur.rowcount or 0)

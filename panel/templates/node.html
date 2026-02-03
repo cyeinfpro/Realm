@@ -159,7 +159,7 @@
 
 
 
-        <!-- Traffic / connections history curves (session-based) -->
+        <!-- Traffic / connections history curves (persistent on panel) -->
         <details id="histPanel" class="hist-panel" open>
           <summary class="hist-head">
             <div class="hist-head-left">
@@ -233,7 +233,7 @@
             </div>
 
             <div id="histNoData" class="muted sm" style="margin-top:8px; display:none;">
-              暂无历史数据：请保持页面开启（自动刷新）一段时间后查看。
+              暂无历史数据：面板会在收到节点上报后持续记录。若节点刚接入，请稍后再看。
             </div>
           </div>
         </details>
@@ -761,7 +761,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=70.0"></script>
+<script src="/static/app.js?v=71.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};
