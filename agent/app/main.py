@@ -2838,6 +2838,72 @@ def _run_cmd(cmd: List[str]) -> Tuple[int, str]:
     return int(r.returncode or 0), out.strip()
 
 
+def _detect_pkg_mgr() -> Optional[str]:
+    if shutil.which("apt-get"):
+        return "apt"
+    if shutil.which("dnf"):
+        return "dnf"
+    if shutil.which("yum"):
+        return "yum"
+    if shutil.which("apk"):
+        return "apk"
+    return None
+
+
+_APT_UPDATED = False
+
+
+def _pkg_install(packages: List[str]) -> Tuple[bool, str]:
+    mgr = _detect_pkg_mgr()
+    if not mgr:
+        return False, "未检测到包管理器"
+    if not packages:
+        return True, ""
+    if mgr == "apt":
+        global _APT_UPDATED
+        if not _APT_UPDATED:
+            _run_cmd(["apt-get", "update", "-y"])
+            _APT_UPDATED = True
+        cmd = ["apt-get", "install", "-y", *packages]
+    elif mgr == "dnf":
+        cmd = ["dnf", "install", "-y", *packages]
+    elif mgr == "yum":
+        cmd = ["yum", "install", "-y", *packages]
+    else:
+        cmd = ["apk", "add", "--no-cache", *packages]
+    code, out = _run_cmd(cmd)
+    return code == 0, out
+
+
+def _pkg_remove(packages: List[str]) -> Tuple[bool, str]:
+    mgr = _detect_pkg_mgr()
+    if not mgr:
+        return False, "未检测到包管理器"
+    if not packages:
+        return True, ""
+    if mgr == "apt":
+        cmd = ["apt-get", "purge", "-y", *packages]
+    elif mgr == "dnf":
+        cmd = ["dnf", "remove", "-y", *packages]
+    elif mgr == "yum":
+        cmd = ["yum", "remove", "-y", *packages]
+    else:
+        cmd = ["apk", "del", *packages]
+    code, out = _run_cmd(cmd)
+    return code == 0, out
+
+
+def _start_service(name: str) -> None:
+    for cmd in (["systemctl", "enable", "--now", name], ["service", name, "start"], ["rc-service", name, "start"]):
+        if shutil.which(cmd[0]) is None:
+            continue
+        try:
+            subprocess.run(cmd, capture_output=True, text=True)
+            return
+        except Exception:
+            continue
+
+
 def _nginx_conf_locations() -> Tuple[Path, Optional[Path]]:
     sites_avail = Path("/etc/nginx/sites-available")
     sites_enabled = Path("/etc/nginx/sites-enabled")
@@ -2869,19 +2935,46 @@ def _detect_php_fpm_sock() -> Optional[str]:
     return None
 
 
+def _gzip_snippet() -> str:
+    return (
+        "  gzip on;\n"
+        "  gzip_comp_level 5;\n"
+        "  gzip_min_length 1024;\n"
+        "  gzip_vary on;\n"
+        "  gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;\n"
+    )
+
+
+def _render_custom_template(template: str, ctx: Dict[str, str]) -> str:
+    out = template or ""
+    for k, v in ctx.items():
+        out = out.replace(f"{{{{{k}}}}}", v)
+    return out
+
+
 def _render_nginx_conf(
     site_type: str,
     domains: List[str],
     root_path: str,
     proxy_target: str,
     php_sock: Optional[str] = None,
+    https_redirect: bool = False,
+    gzip_enabled: bool = True,
+    cert_paths: Optional[Tuple[str, str]] = None,
 ) -> str:
     server_name = " ".join(domains)
+    gzip = _gzip_snippet() if gzip_enabled else ""
+    has_ssl = bool(cert_paths and cert_paths[0] and cert_paths[1])
+    ssl_cert = cert_paths[0] if cert_paths else ""
+    ssl_key = cert_paths[1] if cert_paths else ""
+    redirect_line = "  return 301 https://$host$request_uri;\n" if (https_redirect and has_ssl) else ""
     if site_type == "reverse_proxy":
-        return (
+        http_block = (
             "server {\n"
             "  listen 80;\n"
             f"  server_name {server_name};\n"
+            f"{redirect_line}"
+            f"{gzip}"
             "  location / {\n"
             f"    proxy_pass {proxy_target};\n"
             "    proxy_set_header Host $host;\n"
@@ -2891,14 +2984,35 @@ def _render_nginx_conf(
             "  }\n"
             "}\n"
         )
+        if has_ssl:
+            https_block = (
+                "server {\n"
+                "  listen 443 ssl http2;\n"
+                f"  server_name {server_name};\n"
+                f"  ssl_certificate {ssl_cert};\n"
+                f"  ssl_certificate_key {ssl_key};\n"
+                f"{gzip}"
+                "  location / {\n"
+                f"    proxy_pass {proxy_target};\n"
+                "    proxy_set_header Host $host;\n"
+                "    proxy_set_header X-Real-IP $remote_addr;\n"
+                "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+                "    proxy_set_header X-Forwarded-Proto $scheme;\n"
+                "  }\n"
+                "}\n"
+            )
+            return http_block + "\n" + https_block
+        return http_block
     if site_type == "php":
         sock = php_sock or "/run/php/php-fpm.sock"
-        return (
+        http_block = (
             "server {\n"
             "  listen 80;\n"
             f"  server_name {server_name};\n"
             f"  root {root_path};\n"
             "  index index.php index.html index.htm;\n"
+            f"{redirect_line}"
+            f"{gzip}"
             "  location / {\n"
             "    try_files $uri $uri/ /index.php?$args;\n"
             "  }\n"
@@ -2909,18 +3023,59 @@ def _render_nginx_conf(
             "  }\n"
             "}\n"
         )
+        if has_ssl:
+            https_block = (
+                "server {\n"
+                "  listen 443 ssl http2;\n"
+                f"  server_name {server_name};\n"
+                f"  root {root_path};\n"
+                f"  ssl_certificate {ssl_cert};\n"
+                f"  ssl_certificate_key {ssl_key};\n"
+                "  index index.php index.html index.htm;\n"
+                f"{gzip}"
+                "  location / {\n"
+                "    try_files $uri $uri/ /index.php?$args;\n"
+                "  }\n"
+                "  location ~ \\.php$ {\n"
+                "    include fastcgi_params;\n"
+                "    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;\n"
+                f"    fastcgi_pass unix:{sock};\n"
+                "  }\n"
+                "}\n"
+            )
+            return http_block + "\n" + https_block
+        return http_block
     # default static
-    return (
+    http_block = (
         "server {\n"
         "  listen 80;\n"
         f"  server_name {server_name};\n"
         f"  root {root_path};\n"
         "  index index.html index.htm;\n"
+        f"{redirect_line}"
+        f"{gzip}"
         "  location / {\n"
         "    try_files $uri $uri/ =404;\n"
         "  }\n"
         "}\n"
     )
+    if has_ssl:
+        https_block = (
+            "server {\n"
+            "  listen 443 ssl http2;\n"
+            f"  server_name {server_name};\n"
+            f"  root {root_path};\n"
+            f"  ssl_certificate {ssl_cert};\n"
+            f"  ssl_certificate_key {ssl_key};\n"
+            "  index index.html index.htm;\n"
+            f"{gzip}"
+            "  location / {\n"
+            "    try_files $uri $uri/ =404;\n"
+            "  }\n"
+            "}\n"
+        )
+        return http_block + "\n" + https_block
+    return http_block
 
 
 def _write_nginx_conf(name: str, content: str) -> Path:
@@ -3016,6 +3171,29 @@ def _find_acme_sh() -> Optional[str]:
     return None
 
 
+def _install_acme_sh() -> Tuple[bool, str]:
+    if _find_acme_sh():
+        return True, ""
+    curl = shutil.which("curl")
+    if not curl:
+        return False, "缺少 curl"
+    cmd = [curl, "-fsSL", "https://get.acme.sh"]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out, err = proc.communicate()
+    except Exception as exc:
+        return False, str(exc)
+    if proc.returncode != 0:
+        return False, err or out or "acme.sh 下载失败"
+    try:
+        install = subprocess.run(["sh"], input=out, text=True, capture_output=True)
+        if install.returncode != 0:
+            return False, install.stderr or install.stdout or "acme.sh 安装失败"
+    except Exception as exc:
+        return False, str(exc)
+    return True, ""
+
+
 def _cert_dates(cert_path: Path) -> Dict[str, str]:
     out: Dict[str, str] = {}
     code, txt = _run_cmd(["openssl", "x509", "-noout", "-dates", "-in", str(cert_path)])
@@ -3037,6 +3215,69 @@ def _cert_dates(cert_path: Path) -> Dict[str, str]:
     return out
 
 
+@app.post("/api/v1/website/env/ensure")
+def api_website_env_ensure(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    need_nginx = bool(payload.get("need_nginx"))
+    need_php = bool(payload.get("need_php"))
+    need_acme = bool(payload.get("need_acme"))
+
+    installed: List[str] = []
+    already: List[str] = []
+    errors: List[str] = []
+
+    if need_nginx:
+        if shutil.which("nginx"):
+            already.append("nginx")
+        else:
+            ok, out = _pkg_install(["nginx"])
+            if ok:
+                installed.append("nginx")
+                _start_service("nginx")
+            else:
+                errors.append(out or "nginx 安装失败")
+
+    if need_php:
+        sock = _detect_php_fpm_sock()
+        if sock:
+            already.append("php-fpm")
+        else:
+            pkg_candidates = [
+                ["php-fpm", "php-cli"],
+                ["php81-fpm", "php81"],
+                ["php82-fpm", "php82"],
+                ["php8.2-fpm", "php8.2-cli"],
+                ["php8.1-fpm", "php8.1-cli"],
+                ["php8.0-fpm", "php8.0-cli"],
+            ]
+            ok = False
+            msg = ""
+            for pkgs in pkg_candidates:
+                ok, msg = _pkg_install(pkgs)
+                if ok:
+                    installed.append("php-fpm")
+                    for svc in ("php-fpm", "php8.2-fpm", "php8.1-fpm", "php8.0-fpm", "php81-fpm", "php82-fpm"):
+                        _start_service(svc)
+                    break
+            if not ok:
+                errors.append(msg or "php-fpm 安装失败")
+
+    if need_acme:
+        if _find_acme_sh():
+            already.append("acme.sh")
+        else:
+            ok, out = _install_acme_sh()
+            if ok:
+                installed.append("acme.sh")
+            else:
+                errors.append(out or "acme.sh 安装失败")
+
+    if errors:
+        return {"ok": False, "error": "；".join(errors), "installed": installed, "already": already}
+    return {"ok": True, "installed": installed, "already": already}
+
+
 @app.post("/api/v1/website/site/create")
 def api_website_create(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
     if not isinstance(payload, dict):
@@ -3048,6 +3289,9 @@ def api_website_create(payload: Dict[str, Any], _: None = Depends(_api_key_requi
     root_path = str(payload.get("root_path") or "").strip()
     proxy_target = str(payload.get("proxy_target") or "").strip()
     web_server = str(payload.get("web_server") or "nginx").strip().lower()
+    https_redirect = bool(payload.get("https_redirect"))
+    gzip_enabled = bool(payload.get("gzip_enabled", True))
+    nginx_tpl = str(payload.get("nginx_tpl") or "").strip()
 
     if web_server != "nginx":
         return {"ok": False, "error": "当前仅支持 nginx"}
@@ -3075,7 +3319,27 @@ def api_website_create(payload: Dict[str, Any], _: None = Depends(_api_key_requi
         if not php_sock:
             return {"ok": False, "error": "未检测到 php-fpm socket"}
 
-    conf = _render_nginx_conf(site_type, domains, root_path, proxy_target, php_sock)
+    if nginx_tpl:
+        ctx = {
+            "SERVER_NAME": " ".join(domains),
+            "ROOT_PATH": root_path,
+            "PROXY_TARGET": proxy_target,
+            "SSL_CERT": "",
+            "SSL_KEY": "",
+            "GZIP_CONF": _gzip_snippet() if gzip_enabled else "",
+        }
+        conf = _render_custom_template(nginx_tpl, ctx)
+    else:
+        conf = _render_nginx_conf(
+            site_type,
+            domains,
+            root_path,
+            proxy_target,
+            php_sock,
+            https_redirect=https_redirect,
+            gzip_enabled=gzip_enabled,
+            cert_paths=None,
+        )
     conf_path = _write_nginx_conf(domains[0], conf)
     ok, out = _nginx_reload()
     if not ok:
@@ -3138,6 +3402,39 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     if code != 0:
         return {"ok": False, "error": out or "证书安装失败"}
 
+    # Optional: update nginx config to enable HTTPS
+    update_conf = payload.get("update_conf") if isinstance(payload, dict) else None
+    if isinstance(update_conf, dict):
+        site_type = str(update_conf.get("type") or "static").strip()
+        proxy_target = str(update_conf.get("proxy_target") or "").strip()
+        https_redirect = bool(update_conf.get("https_redirect"))
+        gzip_enabled = bool(update_conf.get("gzip_enabled", True))
+        tpl = str(update_conf.get("nginx_tpl") or "").strip()
+        php_sock = _detect_php_fpm_sock()
+        if tpl:
+            ctx = {
+                "SERVER_NAME": " ".join(domains),
+                "ROOT_PATH": root_path,
+                "PROXY_TARGET": proxy_target,
+                "SSL_CERT": str(fullchain_path),
+                "SSL_KEY": str(key_path),
+                "GZIP_CONF": _gzip_snippet() if gzip_enabled else "",
+            }
+            conf = _render_custom_template(tpl, ctx)
+        else:
+            conf = _render_nginx_conf(
+                site_type,
+                domains,
+                root_path,
+                proxy_target,
+                php_sock,
+                https_redirect=https_redirect,
+                gzip_enabled=gzip_enabled,
+                cert_paths=(str(fullchain_path), str(key_path)),
+            )
+        _write_nginx_conf(domains[0], conf)
+        _nginx_reload()
+
     meta = _cert_dates(fullchain_path)
     return {
         "ok": True,
@@ -3193,6 +3490,38 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     if code != 0:
         return {"ok": False, "error": out or "证书安装失败"}
 
+    update_conf = payload.get("update_conf") if isinstance(payload, dict) else None
+    if isinstance(update_conf, dict):
+        site_type = str(update_conf.get("type") or "static").strip()
+        proxy_target = str(update_conf.get("proxy_target") or "").strip()
+        https_redirect = bool(update_conf.get("https_redirect"))
+        gzip_enabled = bool(update_conf.get("gzip_enabled", True))
+        tpl = str(update_conf.get("nginx_tpl") or "").strip()
+        php_sock = _detect_php_fpm_sock()
+        if tpl:
+            ctx = {
+                "SERVER_NAME": " ".join(domains),
+                "ROOT_PATH": root_path,
+                "PROXY_TARGET": proxy_target,
+                "SSL_CERT": str(fullchain_path),
+                "SSL_KEY": str(key_path),
+                "GZIP_CONF": _gzip_snippet() if gzip_enabled else "",
+            }
+            conf = _render_custom_template(tpl, ctx)
+        else:
+            conf = _render_nginx_conf(
+                site_type,
+                domains,
+                root_path,
+                proxy_target,
+                php_sock,
+                https_redirect=https_redirect,
+                gzip_enabled=gzip_enabled,
+                cert_paths=(str(fullchain_path), str(key_path)),
+            )
+        _write_nginx_conf(domains[0], conf)
+        _nginx_reload()
+
     meta = _cert_dates(fullchain_path)
     return {
         "ok": True,
@@ -3242,6 +3571,7 @@ def api_website_env_uninstall(payload: Dict[str, Any], _: None = Depends(_api_ke
     if not isinstance(payload, dict):
         payload = {}
     purge_data = bool(payload.get("purge_data"))
+    deep_uninstall = bool(payload.get("deep_uninstall"))
     sites = payload.get("sites") or []
     if not isinstance(sites, list):
         sites = []
@@ -3273,11 +3603,31 @@ def api_website_env_uninstall(payload: Dict[str, Any], _: None = Depends(_api_ke
         except Exception as exc:
             errors.append(str(exc))
 
+    removed_packages: List[str] = []
+    if deep_uninstall:
+        pkgs = ["nginx", "php-fpm", "php-cli", "acme.sh"]
+        ok, out = _pkg_remove(pkgs)
+        if ok:
+            removed_packages = pkgs
+        else:
+            errors.append(out or "深度卸载失败")
+        # remove acme.sh if installed via script
+        for p in ("/root/.acme.sh", "/usr/local/bin/acme.sh"):
+            try:
+                if Path(p).exists():
+                    if Path(p).is_dir():
+                        shutil.rmtree(p)
+                    else:
+                        Path(p).unlink()
+            except Exception:
+                pass
+
     return {
         "ok": True,
         "removed_conf": removed_conf,
         "purged_roots": removed_roots,
         "errors": errors,
+        "removed_packages": removed_packages,
     }
 
 
@@ -3429,16 +3779,28 @@ def api_files_upload_chunk(payload: Dict[str, Any], _: None = Depends(_api_key_r
         offset = 0
     done = bool(payload.get("done"))
     content_b64 = str(payload.get("content_b64") or "")
+    chunk_sha256 = str(payload.get("chunk_sha256") or "").strip().lower()
     if not content_b64:
         return {"ok": False, "error": "缺少文件内容"}
     try:
         raw = base64.b64decode(content_b64.encode("ascii"))
     except Exception:
         return {"ok": False, "error": "文件内容解析失败"}
+    if chunk_sha256:
+        calc = hashlib.sha256(raw).hexdigest()
+        if calc != chunk_sha256:
+            return {"ok": False, "error": "SHA256 校验失败"}
 
     target = _safe_join(root_path, f"{path.rstrip('/')}/{filename}")
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(target.name + f".part.{upload_id}")
+    if tmp.exists():
+        try:
+            cur = tmp.stat().st_size
+            if offset != cur:
+                return {"ok": False, "error": "offset mismatch", "expected_offset": cur}
+        except Exception:
+            pass
     try:
         mode = "r+b" if tmp.exists() else "wb"
         with open(tmp, mode) as f:
@@ -3454,6 +3816,26 @@ def api_files_upload_chunk(payload: Dict[str, Any], _: None = Depends(_api_key_r
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
     return {"ok": True, "done": done}
+
+
+@app.post("/api/v1/website/files/upload_status")
+def api_files_upload_status(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    root_path = _validate_root(str(payload.get("root") or ""))
+    path = str(payload.get("path") or "")
+    filename = str(payload.get("filename") or "upload.bin").strip()
+    filename = os.path.basename(filename) or "upload.bin"
+    upload_id = str(payload.get("upload_id") or "").strip()
+    if not upload_id:
+        return {"ok": False, "error": "upload_id 不能为空"}
+    target = _safe_join(root_path, f"{path.rstrip('/')}/{filename}")
+    tmp = target.with_name(target.name + f".part.{upload_id}")
+    try:
+        offset = tmp.stat().st_size if tmp.exists() else 0
+    except Exception:
+        offset = 0
+    return {"ok": True, "offset": offset}
 
 
 @app.get("/api/v1/website/files/raw")

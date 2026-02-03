@@ -41,6 +41,19 @@
     <input class="input" name="proxy_target" placeholder="http://127.0.0.1:8080">
     <div class="help">仅反向代理需要填写。</div>
 
+    <div class="row" style="gap:12px;align-items:center;margin-top:8px;">
+      <div class="col">
+        <label class="help"><input type="checkbox" name="https_redirect" style="transform:translateY(1px);"> 证书就绪后强制 HTTPS</label>
+      </div>
+      <div class="col">
+        <label class="help"><input type="checkbox" name="gzip_enabled" checked style="transform:translateY(1px);"> 启用 Gzip</label>
+      </div>
+    </div>
+
+    <label class="label">自定义 Nginx 模板（可选）</label>
+    <textarea class="textarea" name="nginx_tpl" rows="6" placeholder="支持变量：{{SERVER_NAME}} {{ROOT_PATH}} {{PROXY_TARGET}} {{SSL_CERT}} {{SSL_KEY}} {{GZIP_CONF}}"></textarea>
+    <div class="help">留空则使用内置模板；自定义模板需自行处理 80/443 与 SSL。</div>
+
     <div class="row" style="margin-top:14px;">
       <div class="col">
         <a href="/websites" class="btn ghost">返回</a>

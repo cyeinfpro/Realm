@@ -27,8 +27,13 @@
         </div>
         <div class="col right">
           <a class="btn xs ghost" href="/nodes/{{ n.id }}">节点详情</a>
+          <form method="post" action="/websites/nodes/{{ n.id }}/env/ensure" style="display:inline;">
+            <label class="help" style="margin-right:6px;"><input type="checkbox" name="include_php" checked style="transform:translateY(1px);"> 含 PHP</label>
+            <button class="btn xs secondary" type="submit">一键安装环境</button>
+          </form>
           <form method="post" action="/websites/nodes/{{ n.id }}/env/uninstall" style="display:inline;" onsubmit="return confirm('确定卸载该节点的网站环境吗？');">
             <label class="help" style="margin-right:6px;"><input type="checkbox" name="purge_data" style="transform:translateY(1px);"> 删除网站数据</label>
+            <label class="help" style="margin-right:6px;"><input type="checkbox" name="deep_uninstall" style="transform:translateY(1px);"> 深度卸载</label>
             <button class="btn xs" type="submit">卸载环境</button>
           </form>
         </div>

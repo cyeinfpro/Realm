@@ -58,8 +58,12 @@ CREATE TABLE IF NOT EXISTS sites (
   name TEXT NOT NULL,
   domains_json TEXT NOT NULL DEFAULT '[]',
   root_path TEXT NOT NULL DEFAULT '',
+  proxy_target TEXT NOT NULL DEFAULT '',
   type TEXT NOT NULL DEFAULT 'static',
   web_server TEXT NOT NULL DEFAULT 'nginx',
+  nginx_tpl TEXT NOT NULL DEFAULT '',
+  https_redirect INTEGER NOT NULL DEFAULT 0,
+  gzip_enabled INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL DEFAULT 'running',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -242,6 +246,21 @@ def ensure_db(db_path: str = DEFAULT_DB_PATH) -> None:
                     conn.execute("ALTER TABLE netmon_monitors ADD COLUMN last_run_ts_ms INTEGER NOT NULL DEFAULT 0")
                 if "last_run_msg" not in mcols:
                     conn.execute("ALTER TABLE netmon_monitors ADD COLUMN last_run_msg TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
+
+        # Website tables migrations
+        try:
+            scols = {row[1] for row in conn.execute("PRAGMA table_info(sites)").fetchall()}
+            if scols:
+                if "proxy_target" not in scols:
+                    conn.execute("ALTER TABLE sites ADD COLUMN proxy_target TEXT NOT NULL DEFAULT ''")
+                if "nginx_tpl" not in scols:
+                    conn.execute("ALTER TABLE sites ADD COLUMN nginx_tpl TEXT NOT NULL DEFAULT ''")
+                if "https_redirect" not in scols:
+                    conn.execute("ALTER TABLE sites ADD COLUMN https_redirect INTEGER NOT NULL DEFAULT 0")
+                if "gzip_enabled" not in scols:
+                    conn.execute("ALTER TABLE sites ADD COLUMN gzip_enabled INTEGER NOT NULL DEFAULT 1")
         except Exception:
             pass
 
@@ -1355,6 +1374,8 @@ def list_sites(node_id: Optional[int] = None, db_path: str = DEFAULT_DB_PATH) ->
         if not isinstance(domains, list):
             domains = []
         d["domains"] = domains
+        d["https_redirect"] = bool(d.get("https_redirect") or 0)
+        d["gzip_enabled"] = bool(d.get("gzip_enabled") or 0)
         out.append(d)
     return out
 
@@ -1369,6 +1390,8 @@ def get_site(site_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str,
     if not isinstance(domains, list):
         domains = []
     d["domains"] = domains
+    d["https_redirect"] = bool(d.get("https_redirect") or 0)
+    d["gzip_enabled"] = bool(d.get("gzip_enabled") or 0)
     return d
 
 
@@ -1377,23 +1400,31 @@ def add_site(
     name: str,
     domains: List[str],
     root_path: str,
+    proxy_target: str,
     site_type: str,
     web_server: str = "nginx",
+    nginx_tpl: str = "",
+    https_redirect: bool = False,
+    gzip_enabled: bool = True,
     status: str = "running",
     db_path: str = DEFAULT_DB_PATH,
 ) -> int:
     payload = _json_dumps(domains or [])
     with connect(db_path) as conn:
         cur = conn.execute(
-            "INSERT INTO sites(node_id, name, domains_json, root_path, type, web_server, status, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,datetime('now'),datetime('now'))",
+            "INSERT INTO sites(node_id, name, domains_json, root_path, proxy_target, type, web_server, nginx_tpl, https_redirect, gzip_enabled, status, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,datetime('now'),datetime('now'))",
             (
                 int(node_id),
                 (name or "").strip(),
                 payload,
                 (root_path or "").strip(),
+                (proxy_target or "").strip(),
                 (site_type or "static").strip(),
                 (web_server or "nginx").strip(),
+                (nginx_tpl or "").strip(),
+                1 if https_redirect else 0,
+                1 if gzip_enabled else 0,
                 (status or "running").strip(),
             ),
         )
@@ -1406,8 +1437,12 @@ def update_site(
     name: Optional[str] = None,
     domains: Optional[List[str]] = None,
     root_path: Optional[str] = None,
+    proxy_target: Optional[str] = None,
     site_type: Optional[str] = None,
     web_server: Optional[str] = None,
+    nginx_tpl: Optional[str] = None,
+    https_redirect: Optional[bool] = None,
+    gzip_enabled: Optional[bool] = None,
     status: Optional[str] = None,
     db_path: str = DEFAULT_DB_PATH,
 ) -> None:
@@ -1422,12 +1457,24 @@ def update_site(
     if root_path is not None:
         fields.append("root_path=?")
         params.append((root_path or "").strip())
+    if proxy_target is not None:
+        fields.append("proxy_target=?")
+        params.append((proxy_target or "").strip())
     if site_type is not None:
         fields.append("type=?")
         params.append((site_type or "").strip())
     if web_server is not None:
         fields.append("web_server=?")
         params.append((web_server or "").strip())
+    if nginx_tpl is not None:
+        fields.append("nginx_tpl=?")
+        params.append((nginx_tpl or "").strip())
+    if https_redirect is not None:
+        fields.append("https_redirect=?")
+        params.append(1 if https_redirect else 0)
+    if gzip_enabled is not None:
+        fields.append("gzip_enabled=?")
+        params.append(1 if gzip_enabled else 0)
     if status is not None:
         fields.append("status=?")
         params.append((status or "").strip())

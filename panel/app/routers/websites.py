@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -133,6 +134,9 @@ async def websites_new_action(
     web_server: str = Form("nginx"),
     root_path: str = Form(""),
     proxy_target: str = Form(""),
+    https_redirect: Optional[str] = Form(None),
+    gzip_enabled: Optional[str] = Form(None),
+    nginx_tpl: str = Form(""),
     user: str = Depends(require_login_page),
 ):
     node = get_node(int(node_id))
@@ -170,6 +174,31 @@ async def websites_new_action(
         set_flash(request, "反向代理必须填写目标地址")
         return RedirectResponse(url="/websites/new", status_code=303)
 
+    https_flag = bool(https_redirect)
+    gzip_flag = bool(gzip_enabled)
+    tpl = (nginx_tpl or "").strip()
+
+    # Ensure environment before creating site
+    try:
+        ensure_payload = {
+            "need_nginx": True,
+            "need_php": site_type == "php",
+            "need_acme": True,
+        }
+        data = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/env/ensure",
+            ensure_payload,
+            node_verify_tls(node),
+            timeout=120,
+        )
+        if not data.get("ok", True):
+            raise AgentError(str(data.get("error") or "环境安装失败"))
+    except Exception as exc:
+        set_flash(request, f"环境安装失败：{exc}")
+        return RedirectResponse(url="/websites/new", status_code=303)
+
     display_name = (name or "").strip() or domains_list[0]
 
     site_id = add_site(
@@ -177,8 +206,12 @@ async def websites_new_action(
         name=display_name,
         domains=domains_list,
         root_path=root_path,
+        proxy_target=(proxy_target or "").strip(),
         site_type=site_type,
         web_server=web_server,
+        nginx_tpl=tpl,
+        https_redirect=https_flag,
+        gzip_enabled=gzip_flag,
         status="creating",
     )
 
@@ -192,6 +225,9 @@ async def websites_new_action(
             "type": site_type,
             "web_server": web_server,
             "proxy_target": (proxy_target or "").strip(),
+            "https_redirect": https_flag,
+            "gzip_enabled": gzip_flag,
+            "nginx_tpl": tpl,
         },
         status="running",
         progress=10,
@@ -205,6 +241,9 @@ async def websites_new_action(
             "type": site_type,
             "web_server": web_server,
             "proxy_target": (proxy_target or "").strip(),
+            "https_redirect": https_flag,
+            "gzip_enabled": gzip_flag,
+            "nginx_tpl": tpl,
         }
         data = await agent_post(
             node["base_url"],
@@ -285,7 +324,18 @@ async def website_ssl_issue(request: Request, site_id: int, user: str = Depends(
             node["base_url"],
             node["api_key"],
             "/api/v1/website/ssl/issue",
-            {"domains": domains, "root_path": site.get("root_path") or ""},
+            {
+                "domains": domains,
+                "root_path": site.get("root_path") or "",
+                "update_conf": {
+                    "type": site.get("type") or "static",
+                    "root_path": site.get("root_path") or "",
+                    "proxy_target": site.get("proxy_target") or "",
+                    "https_redirect": bool(site.get("https_redirect") or False),
+                    "gzip_enabled": True if site.get("gzip_enabled") is None else bool(site.get("gzip_enabled")),
+                    "nginx_tpl": site.get("nginx_tpl") or "",
+                },
+            },
             node_verify_tls(node),
             timeout=20,
         )
@@ -363,7 +413,18 @@ async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(
             node["base_url"],
             node["api_key"],
             "/api/v1/website/ssl/renew",
-            {"domains": domains, "root_path": site.get("root_path") or ""},
+            {
+                "domains": domains,
+                "root_path": site.get("root_path") or "",
+                "update_conf": {
+                    "type": site.get("type") or "static",
+                    "root_path": site.get("root_path") or "",
+                    "proxy_target": site.get("proxy_target") or "",
+                    "https_redirect": bool(site.get("https_redirect") or False),
+                    "gzip_enabled": True if site.get("gzip_enabled") is None else bool(site.get("gzip_enabled")),
+                    "nginx_tpl": site.get("nginx_tpl") or "",
+                },
+            },
             node_verify_tls(node),
             timeout=20,
         )
@@ -458,6 +519,7 @@ async def website_env_uninstall(
     request: Request,
     node_id: int,
     purge_data: Optional[str] = Form(None),
+    deep_uninstall: Optional[str] = Form(None),
     user: str = Depends(require_login_page),
 ):
     node = get_node(int(node_id))
@@ -468,6 +530,7 @@ async def website_env_uninstall(
     sites = list_sites(node_id=int(node_id))
     payload = {
         "purge_data": bool(purge_data),
+        "deep_uninstall": bool(deep_uninstall),
         "sites": [
             {
                 "domains": s.get("domains") or [],
@@ -494,6 +557,40 @@ async def website_env_uninstall(
         set_flash(request, "网站环境已卸载")
     except Exception as exc:
         set_flash(request, f"卸载失败：{exc}")
+    return RedirectResponse(url="/websites", status_code=303)
+
+
+@router.post("/websites/nodes/{node_id}/env/ensure")
+async def website_env_ensure(
+    request: Request,
+    node_id: int,
+    include_php: Optional[str] = Form(None),
+    user: str = Depends(require_login_page),
+):
+    node = get_node(int(node_id))
+    if not node or str(node.get("role") or "") != "website":
+        set_flash(request, "节点不存在或不是网站机")
+        return RedirectResponse(url="/websites", status_code=303)
+
+    payload = {
+        "need_nginx": True,
+        "need_php": bool(include_php),
+        "need_acme": True,
+    }
+    try:
+        data = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/env/ensure",
+            payload,
+            node_verify_tls(node),
+            timeout=180,
+        )
+        if not data.get("ok", True):
+            raise AgentError(str(data.get("error") or "安装失败"))
+        set_flash(request, "环境安装完成")
+    except Exception as exc:
+        set_flash(request, f"环境安装失败：{exc}")
     return RedirectResponse(url="/websites", status_code=303)
 
 
@@ -558,6 +655,88 @@ async def website_files(request: Request, site_id: int, path: str = "", user: st
             "error": err_msg,
         },
     )
+
+
+@router.post("/websites/{site_id}/files/upload_chunk")
+async def website_files_upload_chunk(
+    request: Request,
+    site_id: int,
+    user: str = Depends(require_login_page),
+):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    site = get_site(int(site_id))
+    node = get_node(int(site.get("node_id") or 0)) if site else None
+    if not site or not node:
+        return {"ok": False, "error": "站点不存在"}
+
+    root = _agent_payload_root(site, node)
+    if not root:
+        return {"ok": False, "error": "该站点没有可管理的根目录"}
+
+    payload = {
+        "root": root,
+        "path": str(data.get("path") or ""),
+        "filename": str(data.get("filename") or "upload.bin"),
+        "upload_id": str(data.get("upload_id") or ""),
+        "offset": int(data.get("offset") or 0),
+        "done": bool(data.get("done")),
+        "content_b64": str(data.get("content_b64") or ""),
+        "chunk_sha256": str(data.get("chunk_sha256") or ""),
+    }
+    try:
+        resp = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/files/upload_chunk",
+            payload,
+            node_verify_tls(node),
+            timeout=30,
+        )
+        return resp
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@router.post("/websites/{site_id}/files/upload_status")
+async def website_files_upload_status(
+    request: Request,
+    site_id: int,
+    user: str = Depends(require_login_page),
+):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    site = get_site(int(site_id))
+    node = get_node(int(site.get("node_id") or 0)) if site else None
+    if not site or not node:
+        return {"ok": False, "error": "站点不存在"}
+
+    root = _agent_payload_root(site, node)
+    if not root:
+        return {"ok": False, "error": "该站点没有可管理的根目录"}
+
+    payload = {
+        "root": root,
+        "path": str(data.get("path") or ""),
+        "filename": str(data.get("filename") or "upload.bin"),
+        "upload_id": str(data.get("upload_id") or ""),
+    }
+    try:
+        resp = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/files/upload_status",
+            payload,
+            node_verify_tls(node),
+            timeout=10,
+        )
+        return resp
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 @router.post("/websites/{site_id}/files/mkdir")
@@ -640,6 +819,7 @@ async def website_files_upload(
                 "offset": offset,
                 "done": done,
                 "content_b64": base64.b64encode(chunk).decode("ascii"),
+                "chunk_sha256": hashlib.sha256(chunk).hexdigest(),
             }
             resp = await agent_post(
                 node["base_url"],

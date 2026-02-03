@@ -30,6 +30,10 @@
           <tr><th>站点类型</th><td>{{ site.type }}</td></tr>
           <tr><th>Web 服务器</th><td>{{ site.web_server }}</td></tr>
           <tr><th>根目录</th><td class="mono">{{ site.root_path or "-" }}</td></tr>
+          <tr><th>反向代理</th><td class="mono">{{ site.proxy_target or "-" }}</td></tr>
+          <tr><th>HTTPS 跳转</th><td>{{ "启用" if site.https_redirect else "关闭" }}</td></tr>
+          <tr><th>Gzip</th><td>{{ "启用" if site.gzip_enabled else "关闭" }}</td></tr>
+          <tr><th>自定义模板</th><td>{{ "已配置" if site.nginx_tpl else "未配置" }}</td></tr>
           <tr><th>状态</th><td>{{ site.status }}</td></tr>
           <tr><th>创建时间</th><td>{{ site.created_at }}</td></tr>
         </tbody>
