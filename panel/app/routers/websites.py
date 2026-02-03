@@ -191,7 +191,7 @@ async def websites_new_action(
             "/api/v1/website/env/ensure",
             ensure_payload,
             node_verify_tls(node),
-            timeout=120,
+            timeout=300,
         )
         if not data.get("ok", True):
             raise AgentError(str(data.get("error") or "环境安装失败"))
@@ -488,6 +488,12 @@ async def website_delete(
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
     domains = site.get("domains") or []
+    if not domains:
+        delete_certificates_by_site(int(site_id))
+        delete_site(int(site_id))
+        set_flash(request, "站点已删除（未找到域名，跳过节点清理）")
+        return RedirectResponse(url="/websites", status_code=303)
+
     payload = {
         "domains": domains,
         "root_path": site.get("root_path") or "",
@@ -507,7 +513,11 @@ async def website_delete(
             raise AgentError(str(data.get("error") or "删除站点失败"))
         delete_certificates_by_site(int(site_id))
         delete_site(int(site_id))
-        set_flash(request, "站点已删除")
+        warn = data.get("warnings") if isinstance(data, dict) else None
+        if isinstance(warn, list) and warn:
+            set_flash(request, f"站点已删除，但有警告：{'；'.join([str(x) for x in warn])}")
+        else:
+            set_flash(request, "站点已删除")
         return RedirectResponse(url="/websites", status_code=303)
     except Exception as exc:
         set_flash(request, f"删除站点失败：{exc}")
@@ -554,7 +564,11 @@ async def website_env_uninstall(
         if purge_data:
             delete_certificates_by_node(int(node_id))
             delete_sites_by_node(int(node_id))
-        set_flash(request, "网站环境已卸载")
+        errors = data.get("errors") if isinstance(data, dict) else None
+        if isinstance(errors, list) and errors:
+            set_flash(request, f"卸载完成，但有警告：{'；'.join([str(x) for x in errors])}")
+        else:
+            set_flash(request, "网站环境已卸载")
     except Exception as exc:
         set_flash(request, f"卸载失败：{exc}")
     return RedirectResponse(url="/websites", status_code=303)
@@ -584,11 +598,18 @@ async def website_env_ensure(
             "/api/v1/website/env/ensure",
             payload,
             node_verify_tls(node),
-            timeout=180,
+            timeout=300,
         )
         if not data.get("ok", True):
             raise AgentError(str(data.get("error") or "安装失败"))
-        set_flash(request, "环境安装完成")
+        installed = data.get("installed") if isinstance(data, dict) else None
+        already = data.get("already") if isinstance(data, dict) else None
+        msg = "环境安装完成"
+        if installed:
+            msg += f"（新安装：{', '.join([str(x) for x in installed])}）"
+        if already:
+            msg += f"（已存在：{', '.join([str(x) for x in already])}）"
+        set_flash(request, msg)
     except Exception as exc:
         set_flash(request, f"环境安装失败：{exc}")
     return RedirectResponse(url="/websites", status_code=303)

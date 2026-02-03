@@ -1,9 +1,10 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="card" style="max-width:760px;margin:20px auto;">
+<div class="card" style="max-width:900px;margin:20px auto;">
   <h1 class="h1">新建网站</h1>
-  <p class="muted">选择网站机节点并填写域名与站点类型。</p>
+  <p class="muted">选择网站机节点并填写域名与站点类型。系统会自动安装所需环境。</p>
   <form method="post" action="/websites/new" class="form">
+    <div class="h2" style="margin-top:6px;">基础信息</div>
     <label class="label">网站机节点</label>
     <select class="select" name="node_id" required>
       {% for n in nodes %}
@@ -14,32 +15,49 @@
       <div class="help" style="color:var(--bad);">暂无网站机节点，请先在接入节点时勾选“网站机”。</div>
     {% endif %}
 
-    <label class="label">站点名称</label>
-    <input class="input" name="name" placeholder="例如：官网 / 客户A">
+    <div class="row" style="gap:12px;align-items:center;">
+      <div class="col">
+        <label class="label">站点名称</label>
+        <input class="input" name="name" placeholder="例如：官网 / 客户A">
+      </div>
+      <div class="col">
+        <label class="label">域名（支持多个）</label>
+        <input class="input" name="domains" placeholder="example.com, www.example.com" required>
+        <div class="help">多个域名用逗号或空格分隔。</div>
+      </div>
+    </div>
 
-    <label class="label">域名（支持多个）</label>
-    <input class="input" name="domains" placeholder="example.com, www.example.com" required>
-    <div class="help">多个域名用逗号或空格分隔。</div>
+    <div style="height:1px;background:var(--line);margin:12px 0;"></div>
+    <div class="h2">运行配置</div>
+    <div class="row" style="gap:12px;align-items:center;">
+      <div class="col">
+        <label class="label">站点类型</label>
+        <select class="select" name="site_type">
+          <option value="static">静态站点</option>
+          <option value="php">PHP 站点</option>
+          <option value="reverse_proxy">反向代理</option>
+        </select>
+      </div>
+      <div class="col">
+        <label class="label">Web 服务器</label>
+        <select class="select" name="web_server">
+          <option value="nginx">nginx</option>
+        </select>
+      </div>
+    </div>
 
-    <label class="label">站点类型</label>
-    <select class="select" name="site_type">
-      <option value="static">静态站点</option>
-      <option value="php">PHP 站点</option>
-      <option value="reverse_proxy">反向代理</option>
-    </select>
-
-    <label class="label">Web 服务器</label>
-    <select class="select" name="web_server">
-      <option value="nginx">nginx</option>
-    </select>
-
-    <label class="label">根目录</label>
-    <input class="input" name="root_path" placeholder="默认：/www/wwwroot/<domain>">
-    <div class="help">静态/PHP 站点生效；反向代理可留空。</div>
-
-    <label class="label">反向代理目标</label>
-    <input class="input" name="proxy_target" placeholder="http://127.0.0.1:8080">
-    <div class="help">仅反向代理需要填写。</div>
+    <div class="row" style="gap:12px;align-items:center;">
+      <div class="col">
+        <label class="label">根目录</label>
+        <input class="input" name="root_path" placeholder="默认：/www/wwwroot/<domain>">
+        <div class="help">静态/PHP 站点生效；反向代理可留空。</div>
+      </div>
+      <div class="col">
+        <label class="label">反向代理目标</label>
+        <input class="input" name="proxy_target" placeholder="http://127.0.0.1:8080">
+        <div class="help">仅反向代理需要填写。</div>
+      </div>
+    </div>
 
     <div class="row" style="gap:12px;align-items:center;margin-top:8px;">
       <div class="col">
@@ -50,8 +68,10 @@
       </div>
     </div>
 
+    <div style="height:1px;background:var(--line);margin:12px 0;"></div>
+    <div class="h2">模板扩展</div>
     <label class="label">自定义 Nginx 模板（可选）</label>
-    <textarea class="textarea" name="nginx_tpl" rows="6" placeholder="支持变量：{{SERVER_NAME}} {{ROOT_PATH}} {{PROXY_TARGET}} {{SSL_CERT}} {{SSL_KEY}} {{GZIP_CONF}}"></textarea>
+    <textarea class="textarea" name="nginx_tpl" rows="8" placeholder="支持变量：{{SERVER_NAME}} {{ROOT_PATH}} {{PROXY_TARGET}} {{SSL_CERT}} {{SSL_KEY}} {{GZIP_CONF}}"></textarea>
     <div class="help">留空则使用内置模板；自定义模板需自行处理 80/443 与 SSL。</div>
 
     <div class="row" style="margin-top:14px;">

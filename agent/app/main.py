@@ -2829,9 +2829,15 @@ def _safe_join(root: Path, subpath: str) -> Path:
     return target
 
 
-def _run_cmd(cmd: List[str]) -> Tuple[int, str]:
+def _run_cmd(
+    cmd: List[str],
+    timeout: Optional[int] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> Tuple[int, str]:
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return 124, f"命令超时（{timeout}s）"
     except Exception as exc:
         return 1, str(exc)
     out = (r.stdout or "") + (r.stderr or "")
@@ -2859,20 +2865,52 @@ def _pkg_install(packages: List[str]) -> Tuple[bool, str]:
         return False, "未检测到包管理器"
     if not packages:
         return True, ""
+    env = os.environ.copy()
     if mgr == "apt":
+        env.setdefault("DEBIAN_FRONTEND", "noninteractive")
+        env.setdefault("APT_LISTCHANGES_FRONTEND", "none")
         global _APT_UPDATED
         if not _APT_UPDATED:
-            _run_cmd(["apt-get", "update", "-y"])
+            code, out = _run_cmd(
+                ["apt-get", "update", "-y", "-o", "Acquire::Retries=3", "-o", "Dpkg::Lock::Timeout=30"],
+                timeout=180,
+                env=env,
+            )
+            if code != 0:
+                return False, out or "apt-get update 失败"
             _APT_UPDATED = True
-        cmd = ["apt-get", "install", "-y", *packages]
+        cmd = [
+            "apt-get",
+            "install",
+            "-y",
+            "--no-install-recommends",
+            "-o",
+            "Dpkg::Lock::Timeout=30",
+            *packages,
+        ]
     elif mgr == "dnf":
         cmd = ["dnf", "install", "-y", *packages]
     elif mgr == "yum":
         cmd = ["yum", "install", "-y", *packages]
     else:
         cmd = ["apk", "add", "--no-cache", *packages]
-    code, out = _run_cmd(cmd)
+    code, out = _run_cmd(cmd, timeout=600, env=env)
     return code == 0, out
+
+
+def _pkg_is_installed(mgr: str, pkg: str) -> bool:
+    if not pkg:
+        return False
+    if mgr == "apt":
+        code, _ = _run_cmd(["dpkg", "-s", pkg], timeout=10)
+        return code == 0
+    if mgr in ("yum", "dnf"):
+        code, _ = _run_cmd(["rpm", "-q", pkg], timeout=10)
+        return code == 0
+    if mgr == "apk":
+        code, _ = _run_cmd(["apk", "info", "-e", pkg], timeout=10)
+        return code == 0
+    return False
 
 
 def _pkg_remove(packages: List[str]) -> Tuple[bool, str]:
@@ -2881,15 +2919,21 @@ def _pkg_remove(packages: List[str]) -> Tuple[bool, str]:
         return False, "未检测到包管理器"
     if not packages:
         return True, ""
+    installed = [p for p in packages if _pkg_is_installed(mgr, p)]
+    if not installed:
+        return True, ""
+    env = os.environ.copy()
     if mgr == "apt":
-        cmd = ["apt-get", "purge", "-y", *packages]
+        env.setdefault("DEBIAN_FRONTEND", "noninteractive")
+        env.setdefault("APT_LISTCHANGES_FRONTEND", "none")
+        cmd = ["apt-get", "purge", "-y", *installed]
     elif mgr == "dnf":
-        cmd = ["dnf", "remove", "-y", *packages]
+        cmd = ["dnf", "remove", "-y", *installed]
     elif mgr == "yum":
-        cmd = ["yum", "remove", "-y", *packages]
+        cmd = ["yum", "remove", "-y", *installed]
     else:
-        cmd = ["apk", "del", *packages]
-    code, out = _run_cmd(cmd)
+        cmd = ["apk", "del", *installed]
+    code, out = _run_cmd(cmd, timeout=300, env=env)
     return code == 0, out
 
 
@@ -3176,21 +3220,22 @@ def _install_acme_sh() -> Tuple[bool, str]:
         return True, ""
     curl = shutil.which("curl")
     if not curl:
-        return False, "缺少 curl"
-    cmd = [curl, "-fsSL", "https://get.acme.sh"]
+        ok, out = _pkg_install(["curl"])
+        if not ok:
+            return False, out or "缺少 curl"
+        curl = shutil.which("curl")
+        if not curl:
+            return False, "缺少 curl"
+    cmd = f"{curl} -fsSL https://get.acme.sh | sh"
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        out, err = proc.communicate()
+        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        return False, "acme.sh 安装超时"
     except Exception as exc:
         return False, str(exc)
-    if proc.returncode != 0:
-        return False, err or out or "acme.sh 下载失败"
-    try:
-        install = subprocess.run(["sh"], input=out, text=True, capture_output=True)
-        if install.returncode != 0:
-            return False, install.stderr or install.stdout or "acme.sh 安装失败"
-    except Exception as exc:
-        return False, str(exc)
+    if r.returncode != 0:
+        out = (r.stdout or "") + (r.stderr or "")
+        return False, out.strip() or "acme.sh 安装失败"
     return True, ""
 
 
@@ -3541,16 +3586,17 @@ def api_website_delete(payload: Dict[str, Any], _: None = Depends(_api_key_requi
     delete_root = bool(payload.get("delete_root"))
     delete_cert = bool(payload.get("delete_cert"))
 
+    warnings: List[str] = []
     removed_conf = _remove_nginx_conf_by_domain(str(domains[0]))
     if shutil.which("nginx") is not None:
         ok, out = _nginx_reload()
         if not ok:
-            return {"ok": False, "error": out}
+            warnings.append(out or "nginx reload 失败")
 
     if delete_root:
         err = _delete_site_root(root_path)
         if err:
-            return {"ok": False, "error": f"删除站点目录失败：{err}"}
+            warnings.append(f"删除站点目录失败：{err}")
 
     removed_cert = False
     if delete_cert:
@@ -3563,7 +3609,7 @@ def api_website_delete(payload: Dict[str, Any], _: None = Depends(_api_key_requi
         except Exception:
             removed_cert = False
 
-    return {"ok": True, "removed_conf": removed_conf, "removed_cert": removed_cert}
+    return {"ok": True, "removed_conf": removed_conf, "removed_cert": removed_cert, "warnings": warnings}
 
 
 @app.post("/api/v1/website/env/uninstall")
@@ -3605,10 +3651,29 @@ def api_website_env_uninstall(payload: Dict[str, Any], _: None = Depends(_api_ke
 
     removed_packages: List[str] = []
     if deep_uninstall:
-        pkgs = ["nginx", "php-fpm", "php-cli", "acme.sh"]
+        pkgs = [
+            "nginx",
+            "apache2",
+            "httpd",
+            "php-fpm",
+            "php-cli",
+            "php",
+            "php8.3-fpm",
+            "php8.2-fpm",
+            "php8.1-fpm",
+            "php8.0-fpm",
+            "php7.4-fpm",
+            "php82-fpm",
+            "php81-fpm",
+            "php80-fpm",
+            "certbot",
+            "acme.sh",
+        ]
+        mgr = _detect_pkg_mgr()
+        installed_before = [p for p in pkgs if mgr and _pkg_is_installed(mgr, p)]
         ok, out = _pkg_remove(pkgs)
         if ok:
-            removed_packages = pkgs
+            removed_packages = installed_before
         else:
             errors.append(out or "深度卸载失败")
         # remove acme.sh if installed via script

@@ -20,20 +20,24 @@
     </div>
     {% if nodes %}
       {% for n in nodes %}
-      <div class="row" style="gap:8px;align-items:center;margin-bottom:8px;">
-        <div class="col">
-          <div style="font-weight:700;">{{ n.name }}</div>
-          <div class="muted sm mono">{{ n.base_url }}</div>
+      <div class="card compact" style="margin-bottom:10px;">
+        <div class="row" style="gap:10px;align-items:center;">
+          <div class="col">
+            <div style="font-weight:700;">{{ n.name }}</div>
+            <div class="muted sm mono">{{ n.base_url }}</div>
+          </div>
+          <div class="col right">
+            <a class="btn xs ghost" href="/nodes/{{ n.id }}">节点详情</a>
+          </div>
         </div>
-        <div class="col right">
-          <a class="btn xs ghost" href="/nodes/{{ n.id }}">节点详情</a>
-          <form method="post" action="/websites/nodes/{{ n.id }}/env/ensure" style="display:inline;">
-            <label class="help" style="margin-right:6px;"><input type="checkbox" name="include_php" checked style="transform:translateY(1px);"> 含 PHP</label>
+        <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px;">
+          <form method="post" action="/websites/nodes/{{ n.id }}/env/ensure" class="row" style="gap:8px;align-items:center;flex-wrap:wrap;">
+            <label class="help"><input type="checkbox" name="include_php" checked style="transform:translateY(1px);"> 含 PHP</label>
             <button class="btn xs secondary" type="submit">一键安装环境</button>
           </form>
-          <form method="post" action="/websites/nodes/{{ n.id }}/env/uninstall" style="display:inline;" onsubmit="return confirm('确定卸载该节点的网站环境吗？');">
-            <label class="help" style="margin-right:6px;"><input type="checkbox" name="purge_data" style="transform:translateY(1px);"> 删除网站数据</label>
-            <label class="help" style="margin-right:6px;"><input type="checkbox" name="deep_uninstall" style="transform:translateY(1px);"> 深度卸载</label>
+          <form method="post" action="/websites/nodes/{{ n.id }}/env/uninstall" class="row" style="gap:8px;align-items:center;flex-wrap:wrap;" onsubmit="return confirm('确定卸载该节点的网站环境吗？');">
+            <label class="help"><input type="checkbox" name="purge_data" style="transform:translateY(1px);"> 删除网站数据</label>
+            <label class="help"><input type="checkbox" name="deep_uninstall" style="transform:translateY(1px);"> 深度卸载</label>
             <button class="btn xs" type="submit">卸载环境</button>
           </form>
         </div>
@@ -66,7 +70,7 @@
           {% for s in sites %}
           <tr>
             <td>{{ s.name }}</td>
-            <td class="mono">{{ s.domains_text }}</td>
+            <td class="mono" style="word-break:break-all;">{{ s.domains_text }}</td>
             <td>{{ s.node.name if s.node else "-" }}</td>
             <td>{{ s.type }}</td>
             <td>{{ s.status }}</td>
