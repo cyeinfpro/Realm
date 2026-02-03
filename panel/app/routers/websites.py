@@ -60,6 +60,17 @@ def _parse_domains(raw: str) -> List[str]:
     return cleaned
 
 
+def _normalize_proxy_target(target: str) -> str:
+    t = (target or "").strip()
+    if not t:
+        return ""
+    if t.startswith("unix:"):
+        return t
+    if "://" in t:
+        return t
+    return f"http://{t}"
+
+
 def _format_bytes(num: int) -> str:
     try:
         n = float(num)
@@ -83,6 +94,10 @@ def _agent_payload_root(site: Dict[str, Any], node: Dict[str, Any]) -> str:
     if base and not root.startswith(base.rstrip("/") + "/") and root != base.rstrip("/"):
         return root
     return root
+
+
+def _node_root_base(node: Dict[str, Any]) -> str:
+    return str(node.get("website_root_base") or "").strip()
 
 
 @router.get("/websites", response_class=HTMLResponse)
@@ -161,6 +176,8 @@ async def websites_new_action(
     # prevent duplicate domains on same node
     existing = list_sites(node_id=int(node_id))
     for s in existing:
+        if str(s.get("status") or "").strip().lower() == "error":
+            continue
         s_domains = set([str(x).lower() for x in (s.get("domains") or [])])
         if s_domains.intersection(set(domains_list)):
             set_flash(request, "该节点已有重复域名的站点")
@@ -170,6 +187,7 @@ async def websites_new_action(
     root_path = (root_path or "").strip()
     if not root_path and site_type != "reverse_proxy":
         root_path = f"{root_base.rstrip('/')}/wwwroot/{domains_list[0]}"
+    proxy_target = _normalize_proxy_target(proxy_target or "")
     if site_type == "reverse_proxy" and not proxy_target.strip():
         set_flash(request, "反向代理必须填写目标地址")
         return RedirectResponse(url="/websites/new", status_code=303)
@@ -206,7 +224,7 @@ async def websites_new_action(
         name=display_name,
         domains=domains_list,
         root_path=root_path,
-        proxy_target=(proxy_target or "").strip(),
+        proxy_target=proxy_target,
         site_type=site_type,
         web_server=web_server,
         nginx_tpl=tpl,
@@ -224,7 +242,7 @@ async def websites_new_action(
             "root_path": root_path,
             "type": site_type,
             "web_server": web_server,
-            "proxy_target": (proxy_target or "").strip(),
+            "proxy_target": proxy_target,
             "https_redirect": https_flag,
             "gzip_enabled": gzip_flag,
             "nginx_tpl": tpl,
@@ -240,10 +258,11 @@ async def websites_new_action(
             "root_path": root_path,
             "type": site_type,
             "web_server": web_server,
-            "proxy_target": (proxy_target or "").strip(),
+            "proxy_target": proxy_target,
             "https_redirect": https_flag,
             "gzip_enabled": gzip_flag,
             "nginx_tpl": tpl,
+            "root_base": _node_root_base(node),
         }
         data = await agent_post(
             node["base_url"],
@@ -251,7 +270,7 @@ async def websites_new_action(
             "/api/v1/website/site/create",
             payload,
             node_verify_tls(node),
-            timeout=12,
+            timeout=30,
         )
         if not data.get("ok", True):
             raise AgentError(str(data.get("error") or "创建站点失败"))
@@ -327,10 +346,11 @@ async def website_ssl_issue(request: Request, site_id: int, user: str = Depends(
             {
                 "domains": domains,
                 "root_path": site.get("root_path") or "",
+                "root_base": _node_root_base(node),
                 "update_conf": {
                     "type": site.get("type") or "static",
                     "root_path": site.get("root_path") or "",
-                    "proxy_target": site.get("proxy_target") or "",
+                    "proxy_target": _normalize_proxy_target(site.get("proxy_target") or ""),
                     "https_redirect": bool(site.get("https_redirect") or False),
                     "gzip_enabled": True if site.get("gzip_enabled") is None else bool(site.get("gzip_enabled")),
                     "nginx_tpl": site.get("nginx_tpl") or "",
@@ -363,7 +383,11 @@ async def website_ssl_issue(request: Request, site_id: int, user: str = Depends(
                 last_error="",
             )
         update_task(task_id, status="success", progress=100, result=data)
-        set_flash(request, "证书申请成功")
+        warn = str(data.get("warning") or "").strip() if isinstance(data, dict) else ""
+        if warn:
+            set_flash(request, f"证书申请成功，但有警告：{warn}")
+        else:
+            set_flash(request, "证书申请成功")
     except Exception as exc:
         if cert_id:
             update_certificate(cert_id, status="failed", last_error=str(exc))
@@ -416,10 +440,11 @@ async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(
             {
                 "domains": domains,
                 "root_path": site.get("root_path") or "",
+                "root_base": _node_root_base(node),
                 "update_conf": {
                     "type": site.get("type") or "static",
                     "root_path": site.get("root_path") or "",
-                    "proxy_target": site.get("proxy_target") or "",
+                    "proxy_target": _normalize_proxy_target(site.get("proxy_target") or ""),
                     "https_redirect": bool(site.get("https_redirect") or False),
                     "gzip_enabled": True if site.get("gzip_enabled") is None else bool(site.get("gzip_enabled")),
                     "nginx_tpl": site.get("nginx_tpl") or "",
@@ -453,7 +478,11 @@ async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(
             )
 
         update_task(task_id, status="success", progress=100, result=data)
-        set_flash(request, "证书续期成功")
+        warn = str(data.get("warning") or "").strip() if isinstance(data, dict) else ""
+        if warn:
+            set_flash(request, f"证书续期成功，但有警告：{warn}")
+        else:
+            set_flash(request, "证书续期成功")
     except Exception as exc:
         if cert_id:
             update_certificate(cert_id, status="failed", last_error=str(exc))
@@ -634,7 +663,7 @@ async def website_files(request: Request, site_id: int, path: str = "", user: st
     err_msg = ""
     items: List[Dict[str, Any]] = []
     try:
-        q = urlencode({"root": root, "path": path})
+        q = urlencode({"root": root, "path": path, "root_base": _node_root_base(node)})
         data = await agent_get(
             node["base_url"],
             node["api_key"],
@@ -706,6 +735,7 @@ async def website_files_upload_chunk(
         "done": bool(data.get("done")),
         "content_b64": str(data.get("content_b64") or ""),
         "chunk_sha256": str(data.get("chunk_sha256") or ""),
+        "root_base": _node_root_base(node),
     }
     try:
         resp = await agent_post(
@@ -745,6 +775,7 @@ async def website_files_upload_status(
         "path": str(data.get("path") or ""),
         "filename": str(data.get("filename") or "upload.bin"),
         "upload_id": str(data.get("upload_id") or ""),
+        "root_base": _node_root_base(node),
     }
     try:
         resp = await agent_post(
@@ -789,7 +820,7 @@ async def website_files_mkdir(
             node["base_url"],
             node["api_key"],
             "/api/v1/website/files/mkdir",
-            {"root": root, "path": path, "name": name},
+            {"root": root, "path": path, "name": name, "root_base": _node_root_base(node)},
             node_verify_tls(node),
             timeout=10,
         )
@@ -841,6 +872,7 @@ async def website_files_upload(
                 "done": done,
                 "content_b64": base64.b64encode(chunk).decode("ascii"),
                 "chunk_sha256": hashlib.sha256(chunk).hexdigest(),
+                "root_base": _node_root_base(node),
             }
             resp = await agent_post(
                 node["base_url"],
@@ -884,7 +916,7 @@ async def website_files_edit(
     content = ""
     error = ""
     try:
-        q = urlencode({"root": root, "path": path})
+        q = urlencode({"root": root, "path": path, "root_base": _node_root_base(node)})
         data = await agent_get(
             node["base_url"],
             node["api_key"],
@@ -938,7 +970,7 @@ async def website_files_save(
             node["base_url"],
             node["api_key"],
             "/api/v1/website/files/write",
-            {"root": root, "path": path, "content": content},
+            {"root": root, "path": path, "content": content, "root_base": _node_root_base(node)},
             node_verify_tls(node),
             timeout=10,
         )
@@ -971,7 +1003,7 @@ async def website_files_delete(
             node["base_url"],
             node["api_key"],
             "/api/v1/website/files/delete",
-            {"root": root, "path": path},
+            {"root": root, "path": path, "root_base": _node_root_base(node)},
             node_verify_tls(node),
             timeout=10,
         )
@@ -1003,7 +1035,7 @@ async def website_files_download(
     import httpx
 
     url = f"{node['base_url'].rstrip('/')}/api/v1/website/files/raw"
-    params = {"root": root, "path": path}
+    params = {"root": root, "path": path, "root_base": _node_root_base(node)}
     headers = {"X-API-Key": node.get("api_key") or ""}
     async with httpx.AsyncClient(timeout=20, verify=node_verify_tls(node)) as client:
         r = await client.get(url, params=params, headers=headers)

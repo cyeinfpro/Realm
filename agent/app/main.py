@@ -2799,6 +2799,21 @@ def _website_root_bases() -> List[Path]:
     return bases
 
 
+def _extra_root_bases(extra: Optional[List[str]] = None) -> List[Path]:
+    out: List[Path] = []
+    if not extra:
+        return out
+    for item in extra:
+        p = (item or "").strip()
+        if not p:
+            continue
+        try:
+            out.append(Path(p).expanduser().resolve())
+        except Exception:
+            continue
+    return out
+
+
 def _is_subpath(child: Path, parent: Path) -> bool:
     try:
         child.relative_to(parent)
@@ -2807,7 +2822,7 @@ def _is_subpath(child: Path, parent: Path) -> bool:
         return False
 
 
-def _validate_root(root: str) -> Path:
+def _validate_root(root: str, extra_bases: Optional[List[str]] = None) -> Path:
     root = (root or "").strip()
     if not root:
         raise HTTPException(status_code=400, detail="root 不能为空")
@@ -2815,7 +2830,7 @@ def _validate_root(root: str) -> Path:
     if not p.is_absolute():
         raise HTTPException(status_code=400, detail="root 必须是绝对路径")
     resolved = p.resolve()
-    allowed = _website_root_bases()
+    allowed = _website_root_bases() + _extra_root_bases(extra_bases)
     if not any(_is_subpath(resolved, base) or resolved == base for base in allowed):
         raise HTTPException(status_code=403, detail="root 不在允许范围内")
     return resolved
@@ -2996,6 +3011,94 @@ def _render_custom_template(template: str, ctx: Dict[str, str]) -> str:
     return out
 
 
+def _normalize_proxy_target(target: str) -> str:
+    t = (target or "").strip()
+    if not t:
+        return ""
+    if t.startswith("unix:"):
+        return t
+    if "://" in t:
+        return t
+    # default to http for bare host:port
+    return f"http://{t}"
+
+
+def _payload_root_bases(payload: Dict[str, Any]) -> List[str]:
+    raw = None
+    if isinstance(payload, dict):
+        raw = payload.get("root_bases")
+        if raw is None:
+            raw = payload.get("root_base")
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list):
+        return [str(x) for x in raw if str(x or "").strip()]
+    return []
+
+
+def _apply_nginx_conf(name: str, content: str) -> Tuple[bool, str, str]:
+    """Write nginx conf and reload with rollback on failure.
+
+    Returns (ok, conf_path, message)
+    """
+    conf_dir, enabled_dir = _nginx_conf_locations()
+    conf_dir.mkdir(parents=True, exist_ok=True)
+    conf_name = f"nexus-{_slugify(name)}.conf"
+    conf_path = conf_dir / conf_name
+
+    old_exists = conf_path.exists()
+    old_content = ""
+    if old_exists:
+        try:
+            old_content = conf_path.read_text(encoding="utf-8")
+        except Exception:
+            old_content = ""
+
+    # atomic write
+    tmp_path = conf_path.with_suffix(conf_path.suffix + ".tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    try:
+        tmp_path.replace(conf_path)
+    except Exception:
+        # fallback: direct write
+        conf_path.write_text(content, encoding="utf-8")
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+
+    if enabled_dir:
+        enabled_dir.mkdir(parents=True, exist_ok=True)
+        link = enabled_dir / conf_name
+        if not link.exists():
+            try:
+                link.symlink_to(conf_path)
+            except Exception:
+                pass
+
+    ok, out = _nginx_reload()
+    if ok:
+        return True, str(conf_path), out
+
+    # rollback
+    try:
+        if old_exists:
+            conf_path.write_text(old_content, encoding="utf-8")
+        else:
+            if conf_path.exists() or conf_path.is_symlink():
+                conf_path.unlink()
+    except Exception:
+        pass
+    try:
+        _nginx_reload()
+    except Exception:
+        pass
+    return False, str(conf_path), out or "nginx reload 失败"
+
+
 def _render_nginx_conf(
     site_type: str,
     domains: List[str],
@@ -3141,16 +3244,23 @@ def _write_nginx_conf(name: str, content: str) -> Path:
 
 def _nginx_reload() -> Tuple[bool, str]:
     # nginx -t first
-    code, out = _run_cmd(["nginx", "-t"])
+    code, out = _run_cmd(["nginx", "-t"], timeout=15)
     if code != 0:
         return False, out or "nginx -t 失败"
     # reload
     for cmd in (["nginx", "-s", "reload"], ["systemctl", "reload", "nginx"], ["service", "nginx", "reload"]):
         if shutil.which(cmd[0]) is None:
             continue
-        code, out = _run_cmd(cmd)
+        code, out = _run_cmd(cmd, timeout=20)
         if code == 0:
             return True, out
+    # fallback: try start if reload failed (fresh install / service not running)
+    for cmd in (["systemctl", "start", "nginx"], ["service", "nginx", "start"], ["nginx"]):
+        if shutil.which(cmd[0]) is None:
+            continue
+        code, out = _run_cmd(cmd, timeout=20)
+        if code == 0:
+            return True, "nginx started"
     return False, "nginx reload 失败"
 
 
@@ -3327,12 +3437,13 @@ def api_website_env_ensure(payload: Dict[str, Any], _: None = Depends(_api_key_r
 def api_website_create(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         payload = {}
+    extra_bases = _payload_root_bases(payload)
     domains = payload.get("domains") or []
     if not isinstance(domains, list) or not domains:
         return {"ok": False, "error": "domains 不能为空"}
     site_type = str(payload.get("type") or "static").strip()
     root_path = str(payload.get("root_path") or "").strip()
-    proxy_target = str(payload.get("proxy_target") or "").strip()
+    proxy_target = _normalize_proxy_target(str(payload.get("proxy_target") or ""))
     web_server = str(payload.get("web_server") or "nginx").strip().lower()
     https_redirect = bool(payload.get("https_redirect"))
     gzip_enabled = bool(payload.get("gzip_enabled", True))
@@ -3347,7 +3458,7 @@ def api_website_create(payload: Dict[str, Any], _: None = Depends(_api_key_requi
         if not root_path:
             return {"ok": False, "error": "root_path 不能为空"}
         try:
-            root_valid = _validate_root(root_path)
+            root_valid = _validate_root(root_path, extra_bases)
             root_valid.mkdir(parents=True, exist_ok=True)
             idx = Path(root_path) / "index.html"
             if not idx.exists():
@@ -3385,13 +3496,8 @@ def api_website_create(payload: Dict[str, Any], _: None = Depends(_api_key_requi
             gzip_enabled=gzip_enabled,
             cert_paths=None,
         )
-    conf_path = _write_nginx_conf(domains[0], conf)
-    ok, out = _nginx_reload()
+    ok, conf_path, out = _apply_nginx_conf(domains[0], conf)
     if not ok:
-        try:
-            conf_path.unlink()
-        except Exception:
-            pass
         return {"ok": False, "error": out}
 
     return {"ok": True, "conf_path": str(conf_path)}
@@ -3401,6 +3507,7 @@ def api_website_create(payload: Dict[str, Any], _: None = Depends(_api_key_requi
 def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         payload = {}
+    extra_bases = _payload_root_bases(payload)
     domains = payload.get("domains") or []
     if not isinstance(domains, list) or not domains:
         return {"ok": False, "error": "domains 不能为空"}
@@ -3408,7 +3515,7 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     if not root_path:
         return {"ok": False, "error": "root_path 不能为空"}
     try:
-        _validate_root(root_path)
+        _validate_root(root_path, extra_bases)
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -3451,7 +3558,7 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     update_conf = payload.get("update_conf") if isinstance(payload, dict) else None
     if isinstance(update_conf, dict):
         site_type = str(update_conf.get("type") or "static").strip()
-        proxy_target = str(update_conf.get("proxy_target") or "").strip()
+        proxy_target = _normalize_proxy_target(str(update_conf.get("proxy_target") or ""))
         https_redirect = bool(update_conf.get("https_redirect"))
         gzip_enabled = bool(update_conf.get("gzip_enabled", True))
         tpl = str(update_conf.get("nginx_tpl") or "").strip()
@@ -3477,8 +3584,15 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
                 gzip_enabled=gzip_enabled,
                 cert_paths=(str(fullchain_path), str(key_path)),
             )
-        _write_nginx_conf(domains[0], conf)
-        _nginx_reload()
+        ok_conf, _conf_path, msg = _apply_nginx_conf(domains[0], conf)
+        if not ok_conf:
+            meta = _cert_dates(fullchain_path)
+            return {
+                "ok": True,
+                "cert_dir": str(cert_dir),
+                "warning": f"证书签发成功，但更新 Nginx 配置失败：{msg}",
+                **meta,
+            }
 
     meta = _cert_dates(fullchain_path)
     return {
@@ -3492,6 +3606,7 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
 def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         payload = {}
+    extra_bases = _payload_root_bases(payload)
     domains = payload.get("domains") or []
     if not isinstance(domains, list) or not domains:
         return {"ok": False, "error": "domains 不能为空"}
@@ -3499,7 +3614,7 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     if not root_path:
         return {"ok": False, "error": "root_path 不能为空"}
     try:
-        _validate_root(root_path)
+        _validate_root(root_path, extra_bases)
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -3538,7 +3653,7 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     update_conf = payload.get("update_conf") if isinstance(payload, dict) else None
     if isinstance(update_conf, dict):
         site_type = str(update_conf.get("type") or "static").strip()
-        proxy_target = str(update_conf.get("proxy_target") or "").strip()
+        proxy_target = _normalize_proxy_target(str(update_conf.get("proxy_target") or ""))
         https_redirect = bool(update_conf.get("https_redirect"))
         gzip_enabled = bool(update_conf.get("gzip_enabled", True))
         tpl = str(update_conf.get("nginx_tpl") or "").strip()
@@ -3564,8 +3679,15 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
                 gzip_enabled=gzip_enabled,
                 cert_paths=(str(fullchain_path), str(key_path)),
             )
-        _write_nginx_conf(domains[0], conf)
-        _nginx_reload()
+        ok_conf, _conf_path, msg = _apply_nginx_conf(domains[0], conf)
+        if not ok_conf:
+            meta = _cert_dates(fullchain_path)
+            return {
+                "ok": True,
+                "cert_dir": str(cert_dir),
+                "warning": f"证书续期成功，但更新 Nginx 配置失败：{msg}",
+                **meta,
+            }
 
     meta = _cert_dates(fullchain_path)
     return {
@@ -3698,8 +3820,9 @@ def api_website_env_uninstall(payload: Dict[str, Any], _: None = Depends(_api_ke
 
 
 @app.get("/api/v1/website/files/list")
-def api_files_list(root: str, path: str = "", _: None = Depends(_api_key_required)) -> Dict[str, Any]:
-    root_path = _validate_root(root)
+def api_files_list(root: str, path: str = "", root_base: Optional[str] = None, _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    extra = [root_base] if root_base else None
+    root_path = _validate_root(root, extra)
     target = _safe_join(root_path, path)
     if not target.exists() or not target.is_dir():
         return {"ok": False, "error": "目录不存在"}
@@ -3730,8 +3853,9 @@ def api_files_list(root: str, path: str = "", _: None = Depends(_api_key_require
 
 
 @app.get("/api/v1/website/files/read")
-def api_files_read(root: str, path: str, _: None = Depends(_api_key_required)) -> Dict[str, Any]:
-    root_path = _validate_root(root)
+def api_files_read(root: str, path: str, root_base: Optional[str] = None, _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    extra = [root_base] if root_base else None
+    root_path = _validate_root(root, extra)
     if not path:
         return {"ok": False, "error": "文件路径不能为空"}
     target = _safe_join(root_path, path)
@@ -3750,7 +3874,8 @@ def api_files_read(root: str, path: str, _: None = Depends(_api_key_required)) -
 def api_files_write(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         payload = {}
-    root_path = _validate_root(str(payload.get("root") or ""))
+    extra_bases = _payload_root_bases(payload)
+    root_path = _validate_root(str(payload.get("root") or ""), extra_bases)
     path = str(payload.get("path") or "")
     if not path:
         return {"ok": False, "error": "文件路径不能为空"}
@@ -3768,7 +3893,8 @@ def api_files_write(payload: Dict[str, Any], _: None = Depends(_api_key_required
 def api_files_mkdir(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         payload = {}
-    root_path = _validate_root(str(payload.get("root") or ""))
+    extra_bases = _payload_root_bases(payload)
+    root_path = _validate_root(str(payload.get("root") or ""), extra_bases)
     path = str(payload.get("path") or "")
     name = str(payload.get("name") or "").strip()
     if not name:
@@ -3787,7 +3913,8 @@ def api_files_mkdir(payload: Dict[str, Any], _: None = Depends(_api_key_required
 def api_files_delete(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         payload = {}
-    root_path = _validate_root(str(payload.get("root") or ""))
+    extra_bases = _payload_root_bases(payload)
+    root_path = _validate_root(str(payload.get("root") or ""), extra_bases)
     path = str(payload.get("path") or "")
     if not path:
         return {"ok": False, "error": "禁止删除根目录"}
@@ -3808,7 +3935,8 @@ def api_files_delete(payload: Dict[str, Any], _: None = Depends(_api_key_require
 def api_files_upload(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         payload = {}
-    root_path = _validate_root(str(payload.get("root") or ""))
+    extra_bases = _payload_root_bases(payload)
+    root_path = _validate_root(str(payload.get("root") or ""), extra_bases)
     path = str(payload.get("path") or "")
     filename = str(payload.get("filename") or "upload.bin").strip()
     filename = os.path.basename(filename) or "upload.bin"
@@ -3832,7 +3960,8 @@ def api_files_upload(payload: Dict[str, Any], _: None = Depends(_api_key_require
 def api_files_upload_chunk(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         payload = {}
-    root_path = _validate_root(str(payload.get("root") or ""))
+    extra_bases = _payload_root_bases(payload)
+    root_path = _validate_root(str(payload.get("root") or ""), extra_bases)
     path = str(payload.get("path") or "")
     filename = str(payload.get("filename") or "upload.bin").strip()
     filename = os.path.basename(filename) or "upload.bin"
@@ -3888,7 +4017,8 @@ def api_files_upload_chunk(payload: Dict[str, Any], _: None = Depends(_api_key_r
 def api_files_upload_status(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         payload = {}
-    root_path = _validate_root(str(payload.get("root") or ""))
+    extra_bases = _payload_root_bases(payload)
+    root_path = _validate_root(str(payload.get("root") or ""), extra_bases)
     path = str(payload.get("path") or "")
     filename = str(payload.get("filename") or "upload.bin").strip()
     filename = os.path.basename(filename) or "upload.bin"
@@ -3905,8 +4035,9 @@ def api_files_upload_status(payload: Dict[str, Any], _: None = Depends(_api_key_
 
 
 @app.get("/api/v1/website/files/raw")
-def api_files_raw(root: str, path: str, _: None = Depends(_api_key_required)):
-    root_path = _validate_root(root)
+def api_files_raw(root: str, path: str, root_base: Optional[str] = None, _: None = Depends(_api_key_required)):
+    extra = [root_base] if root_base else None
+    root_path = _validate_root(root, extra)
     if not path:
         raise HTTPException(status_code=400, detail="文件路径不能为空")
     target = _safe_join(root_path, path)
