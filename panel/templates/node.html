@@ -157,6 +157,87 @@
           </table>
         </div>
 
+
+
+        <!-- Traffic / connections history curves (session-based) -->
+        <details id="histPanel" class="hist-panel" open>
+          <summary class="hist-head">
+            <div class="hist-head-left">
+              <div class="hist-title">历史曲线</div>
+              <div class="hist-sub">流量速率 · 活跃连接</div>
+            </div>
+            <div class="hist-head-right muted sm" id="histHeadHint">自动刷新时实时更新</div>
+          </summary>
+
+          <div class="hist-body">
+            <div class="hist-controls">
+              <div class="hist-ctrl">
+                <label class="label">规则</label>
+                <select id="histRuleSelect" class="select">
+                  <option value="__all__">全部规则（汇总）</option>
+                </select>
+              </div>
+
+              <div class="hist-ctrl" style="max-width:200px;">
+                <label class="label">窗口</label>
+                <select id="histWindowSelect" class="select">
+                  <option value="300000">5 分钟</option>
+                  <option value="600000" selected>10 分钟</option>
+                  <option value="1800000">30 分钟</option>
+                  <option value="3600000">60 分钟</option>
+                </select>
+              </div>
+
+              <div class="hist-ctrl hist-ctrl-actions">
+                <label class="label">&nbsp;</label>
+                <div class="row" style="gap:8px; flex-wrap:wrap;">
+                  <button class="btn sm ghost" type="button" onclick="clearRuleHistory()">清空历史</button>
+                </div>
+              </div>
+
+              <div class="hist-ctrl hist-ctrl-kpi">
+                <label class="label">当前</label>
+                <div class="hist-kpis" id="histKpis">
+                  <span class="pill xs ghost">↓ —</span>
+                  <span class="pill xs ghost">↑ —</span>
+                  <span class="pill xs ghost">活跃 —</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="hist-charts">
+              <div class="hist-chart" id="histTrafficWrap">
+                <div class="hist-chart-head">
+                  <div class="name">流量速率</div>
+                  <div class="hint muted sm">↓下载 / ↑上传</div>
+                </div>
+                <canvas id="histTrafficCanvas" class="hist-canvas" aria-label="traffic history"></canvas>
+                <div class="hist-legend">
+                  <span class="hist-leg"><i class="dot dl"></i> 下载</span>
+                  <span class="hist-leg"><i class="dot ul"></i> 上传</span>
+                </div>
+                <div class="hist-tooltip" id="histTrafficTip" style="display:none;"></div>
+              </div>
+
+              <div class="hist-chart" id="histConnWrap">
+                <div class="hist-chart-head">
+                  <div class="name">活跃连接</div>
+                  <div class="hint muted sm">当前占用/并发</div>
+                </div>
+                <canvas id="histConnCanvas" class="hist-canvas small" aria-label="connections history"></canvas>
+                <div class="hist-legend">
+                  <span class="hist-leg"><i class="dot conn"></i> 活跃连接</span>
+                </div>
+                <div class="hist-tooltip" id="histConnTip" style="display:none;"></div>
+              </div>
+            </div>
+
+            <div id="histNoData" class="muted sm" style="margin-top:8px; display:none;">
+              暂无历史数据：请保持页面开启（自动刷新）一段时间后查看。
+            </div>
+          </div>
+        </details>
+
         <div id="statsLoading" class="muted">正在加载流量统计…</div>
       </div>
     </section>
@@ -680,7 +761,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=69.0"></script>
+<script src="/static/app.js?v=70.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};

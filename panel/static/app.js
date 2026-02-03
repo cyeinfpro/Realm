@@ -1597,6 +1597,10 @@ function renderRules(){
     LAST_VISIBLE_RULE_KEYS = [];
     updateBulkBar();
     updateSelectAllCheckbox();
+
+    // History curves: keep rule select options in sync
+    try{ histSyncRuleSelect(); }catch(_e){}
+
     q('rulesLoading').style.display = '';
     q('rulesLoading').textContent = hasAnyFilter ? '未找到匹配规则' : '暂无规则';
     table.style.display = 'none';
@@ -1692,6 +1696,9 @@ function renderRules(){
   // Bulk selection UI
   updateBulkBar();
   updateSelectAllCheckbox();
+
+  // History curves: keep rule select options in sync
+  try{ histSyncRuleSelect(); }catch(_e){}
 }
 
 function openModal(){ q('modal').style.display = 'flex'; }
@@ -3839,6 +3846,8 @@ async function resetNodeTraffic(){
       body: JSON.stringify({})
     });
     if(res && res.ok){
+      try{ clearRuleHistory(true); }catch(_e){}
+
       if(res.queued){
         toast('已加入队列：等待节点上报后自动重置');
         try{ await refreshStats(false); }catch(_e){}
@@ -3914,6 +3923,698 @@ async function resetAllTraffic(){
 window.resetAllTraffic = resetAllTraffic;
 
 
+// -------------------- Node: Traffic / connections history curves --------------------
+// Design:
+// - Session-based history (kept in memory) updated on every stats refresh.
+// - Supports "all rules (sum)" and per-rule (by listen) selection.
+// - Plots traffic rate (B/s) and active connections over a sliding time window.
+
+const RULE_HIST_STATE = {
+  inited: false,
+  nodeId: null,
+  // max retention in memory (ms). Keep bounded to avoid memory growth on nodes with many rules.
+  maxRetentionMs: 60 * 60 * 1000, // 60 min
+  windowMs: 10 * 60 * 1000, // default 10 min
+  selectedKey: '__all__',
+  lastGlobalTs: 0,
+  series: new Map(), // key -> HistSeries
+  trafficChart: null,
+  connChart: null,
+};
+
+class HistSeries {
+  constructor(){
+    this.t = [];
+    this.rx = [];
+    this.tx = [];
+    this.conn = [];
+    this.start = 0; // index of first valid sample
+    this.lastTs = 0;
+  }
+
+  push(ts, rx, tx, conn, pruneBefore){
+    const t = Number(ts) || 0;
+    if(!t) return;
+    if(this.lastTs && t <= this.lastTs){
+      // Ignore non-monotonic samples (can happen when system clock adjusts or duplicate pushes).
+      return;
+    }
+
+    this.t.push(t);
+    this.rx.push(Number(rx) || 0);
+    this.tx.push(Number(tx) || 0);
+    this.conn.push(Number(conn) || 0);
+    this.lastTs = t;
+
+    if(typeof pruneBefore === 'number' && pruneBefore > 0){
+      while(this.start < this.t.length && this.t[this.start] < pruneBefore){
+        this.start += 1;
+      }
+
+      // Compact arrays periodically to avoid unbounded growth due to start index.
+      if(this.start > 200 && this.start > (this.t.length >> 1)){
+        this.t = this.t.slice(this.start);
+        this.rx = this.rx.slice(this.start);
+        this.tx = this.tx.slice(this.start);
+        this.conn = this.conn.slice(this.start);
+        this.start = 0;
+      }
+    }
+  }
+
+  // Index of the first sample with ts >= cutoff (binary search)
+  lowerBound(cutoff){
+    const tArr = this.t;
+    let lo = this.start;
+    let hi = tArr.length;
+    while(lo < hi){
+      const mid = (lo + hi) >> 1;
+      if(tArr[mid] < cutoff) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  size(){
+    return Math.max(0, this.t.length - this.start);
+  }
+}
+
+function _histCssVar(name, fallback){
+  try{
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name);
+    const s = (v || '').trim();
+    return s || fallback;
+  }catch(_e){
+    return fallback;
+  }
+}
+
+function _histFmtTimeHHMMSS(ts){
+  try{
+    const d = new Date(Number(ts) || 0);
+    const hh = String(d.getHours()).padStart(2,'0');
+    const mm = String(d.getMinutes()).padStart(2,'0');
+    const ss = String(d.getSeconds()).padStart(2,'0');
+    return `${hh}:${mm}:${ss}`;
+  }catch(_e){
+    return '';
+  }
+}
+
+function _histNearestIndex(tArr, target){
+  // Binary search for nearest timestamp in sorted tArr.
+  const n = tArr.length;
+  if(!n) return -1;
+  let lo = 0, hi = n - 1;
+  while(lo < hi){
+    const mid = (lo + hi) >> 1;
+    if(tArr[mid] < target) lo = mid + 1;
+    else hi = mid;
+  }
+  // lo is first >= target
+  if(lo <= 0) return 0;
+  if(lo >= n) return n - 1;
+  const a = tArr[lo - 1];
+  const b = tArr[lo];
+  return (Math.abs(a - target) <= Math.abs(b - target)) ? (lo - 1) : lo;
+}
+
+class MiniLineChart {
+  constructor(canvas, tooltipEl){
+    this.canvas = canvas;
+    this.tooltipEl = tooltipEl;
+    this.ctx = canvas ? canvas.getContext('2d') : null;
+    this.data = null;
+    this._cache = null;
+
+    this._onMove = (e)=>{ this._handleMove(e); };
+    this._onLeave = ()=>{ this._hideTip(); };
+    this._onResize = ()=>{ this.render(); };
+
+    try{
+      if(this.canvas){
+        this.canvas.addEventListener('mousemove', this._onMove);
+        this.canvas.addEventListener('mouseleave', this._onLeave);
+        this.canvas.addEventListener('touchstart', this._onMove, {passive:true});
+        this.canvas.addEventListener('touchmove', this._onMove, {passive:true});
+        this.canvas.addEventListener('touchend', this._onLeave, {passive:true});
+      }
+      window.addEventListener('resize', this._onResize);
+    }catch(_e){}
+  }
+
+  setData(data){
+    this.data = data;
+    this.render();
+  }
+
+  _resize(){
+    if(!this.canvas) return;
+    const rect = this.canvas.getBoundingClientRect();
+    const cssW = Math.max(10, Math.floor(rect.width));
+    const cssH = Math.max(10, Math.floor(rect.height));
+    const dpr = Math.max(1, Math.floor((window.devicePixelRatio || 1) * 100) / 100);
+    const w = Math.floor(cssW * dpr);
+    const h = Math.floor(cssH * dpr);
+    if(this.canvas.width !== w || this.canvas.height !== h){
+      this.canvas.width = w;
+      this.canvas.height = h;
+    }
+    this._dpr = dpr;
+    this._cssW = cssW;
+    this._cssH = cssH;
+  }
+
+  render(){
+    if(!this.canvas || !this.ctx) return;
+    this._resize();
+
+    const ctx = this.ctx;
+    const dpr = this._dpr || 1;
+    const W = this._cssW || 10;
+    const H = this._cssH || 10;
+
+    // Draw in CSS pixels (scale once).
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const data = this.data;
+    if(!data || !Array.isArray(data.t) || data.t.length < 2){
+      // Placeholder
+      ctx.fillStyle = _histCssVar('--muted', '#9CA3AF');
+      ctx.font = '12px ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial';
+      ctx.fillText('暂无数据', 12, 18);
+      this._cache = null;
+      return;
+    }
+
+    const padL = 52;
+    const padR = 12;
+    const padT = 10;
+    const padB = 22;
+    const x0 = padL;
+    const y0 = padT;
+    const pw = Math.max(10, W - padL - padR);
+    const ph = Math.max(10, H - padT - padB);
+
+    const tMin = Number(data.xMin != null ? data.xMin : data.t[0]) || data.t[0];
+    const tMax = Number(data.xMax != null ? data.xMax : data.t[data.t.length - 1]) || data.t[data.t.length - 1];
+    const tSpan = Math.max(1, tMax - tMin);
+
+    // y range
+    let yMax = 0;
+    const series = Array.isArray(data.series) ? data.series : [];
+    for(const s of series){
+      const arr = Array.isArray(s.v) ? s.v : [];
+      for(const v of arr){
+        const num = Number(v);
+        if(Number.isFinite(num) && num > yMax) yMax = num;
+      }
+    }
+    if(!Number.isFinite(yMax) || yMax <= 0) yMax = 1;
+    yMax *= 1.15; // headroom
+
+    const yToPx = (v)=> y0 + ph - (Math.max(0, Number(v) || 0) / yMax) * ph;
+    const xToPx = (t)=> x0 + ((Number(t) - tMin) / tSpan) * pw;
+
+    // grid
+    const grid = _histCssVar('--line', 'rgba(255,255,255,0.10)');
+    ctx.strokeStyle = grid;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    const hN = 4;
+    for(let i=0;i<=hN;i++){
+      const y = y0 + (ph * i / hN);
+      ctx.moveTo(x0, y);
+      ctx.lineTo(x0 + pw, y);
+    }
+    const vN = 5;
+    for(let i=0;i<=vN;i++){
+      const x = x0 + (pw * i / vN);
+      ctx.moveTo(x, y0);
+      ctx.lineTo(x, y0 + ph);
+    }
+    ctx.stroke();
+
+    // labels
+    const muted = _histCssVar('--muted', '#9CA3AF');
+    ctx.fillStyle = muted;
+    ctx.font = '11px ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial';
+
+    const fmtY = (typeof data.fmtY === 'function') ? data.fmtY : (v)=>String(v);
+    const yMaxLabel = fmtY(yMax / 1.15); // label without headroom
+    ctx.fillText(yMaxLabel, 8, y0 + 10);
+    ctx.fillText('0', 8, y0 + ph);
+
+    const leftT = _histFmtTimeHHMMSS(tMin);
+    const rightT = _histFmtTimeHHMMSS(tMax);
+    ctx.fillText(leftT, x0, y0 + ph + 16);
+    const wRight = ctx.measureText(rightT).width;
+    ctx.fillText(rightT, x0 + pw - wRight, y0 + ph + 16);
+
+    // lines
+    for(const s of series){
+      const arrT = data.t;
+      const arrV = Array.isArray(s.v) ? s.v : [];
+      if(arrV.length !== arrT.length || arrT.length < 2) continue;
+
+      ctx.beginPath();
+      let started = false;
+      for(let i=0;i<arrT.length;i++){
+        const tt = arrT[i];
+        const vv = Number(arrV[i]);
+        if(!Number.isFinite(vv)) continue;
+        const x = xToPx(tt);
+        const y = yToPx(vv);
+        if(!started){
+          ctx.moveTo(x, y);
+          started = true;
+        }else{
+          ctx.lineTo(x, y);
+        }
+      }
+      if(!started) continue;
+      ctx.strokeStyle = s.color || _histCssVar('--accent', '#3B82F6');
+      ctx.lineWidth = 1.8;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.stroke();
+    }
+
+    // Keep cache for tooltip
+    this._cache = {
+      tMin, tMax, x0, y0, pw, ph,
+      t: data.t,
+      series,
+      fmtY,
+    };
+  }
+
+  _hideTip(){
+    try{
+      if(this.tooltipEl) this.tooltipEl.style.display = 'none';
+    }catch(_e){}
+  }
+
+  _handleMove(evt){
+    if(!this.canvas || !this.tooltipEl || !this.data) return;
+    if(!this._cache || !Array.isArray(this._cache.t) || this._cache.t.length < 2) return;
+
+    let clientX = 0, clientY = 0;
+    if(evt && evt.touches && evt.touches.length){
+      clientX = evt.touches[0].clientX;
+      clientY = evt.touches[0].clientY;
+    }else{
+      clientX = evt.clientX;
+      clientY = evt.clientY;
+    }
+
+    const rect = this.canvas.getBoundingClientRect();
+    const xCss = clientX - rect.left;
+
+    const c = this._cache;
+    const x0 = c.x0, pw = c.pw;
+    const tMin = c.tMin, tMax = c.tMax;
+    const x = Math.min(Math.max(xCss, x0), x0 + pw);
+    const t = tMin + ((x - x0) / pw) * (tMax - tMin);
+
+    const idx = _histNearestIndex(c.t, t);
+    if(idx < 0) return;
+
+    // Tooltip HTML
+    const tt = c.t[idx];
+    let html = `<div class="t">${escapeHtml(_histFmtTimeHHMMSS(tt))}</div>`;
+    for(const s of (c.series || [])){
+      const vv = (Array.isArray(s.v) && s.v.length > idx) ? s.v[idx] : null;
+      const name = s.name || '';
+      const val = (typeof c.fmtY === 'function') ? c.fmtY(vv) : String(vv);
+      html += `<div class="k"><span class="name">${escapeHtml(name)}</span><span class="val">${escapeHtml(val)}</span></div>`;
+    }
+
+    try{
+      this.tooltipEl.innerHTML = html;
+      this.tooltipEl.style.display = '';
+
+      // position relative to chart wrapper
+      const wrap = this.tooltipEl.parentElement;
+      if(wrap){
+        const wrect = wrap.getBoundingClientRect();
+        let left = clientX - wrect.left + 12;
+        let top = clientY - wrect.top + 12;
+
+        // clamp
+        const tipRect = this.tooltipEl.getBoundingClientRect();
+        const maxLeft = Math.max(8, wrect.width - tipRect.width - 8);
+        const maxTop = Math.max(8, wrect.height - tipRect.height - 8);
+        left = Math.min(Math.max(8, left), maxLeft);
+        top = Math.min(Math.max(8, top), maxTop);
+        this.tooltipEl.style.left = `${left}px`;
+        this.tooltipEl.style.top = `${top}px`;
+      }
+    }catch(_e){}
+  }
+}
+
+function _histEnsureInited(){
+  const panel = document.getElementById('histPanel');
+  if(!panel) return false;
+  if(RULE_HIST_STATE.inited) return true;
+
+  RULE_HIST_STATE.inited = true;
+  RULE_HIST_STATE.nodeId = String(window.__NODE_ID__ || '');
+
+  const ruleSel = document.getElementById('histRuleSelect');
+  const winSel = document.getElementById('histWindowSelect');
+
+  if(winSel){
+    try{
+      const val = parseInt(String(winSel.value || ''), 10);
+      if(val > 0) RULE_HIST_STATE.windowMs = val;
+
+      // Max retention = max window option
+      let maxV = RULE_HIST_STATE.maxRetentionMs;
+      const opts = Array.from(winSel.options || []);
+      for(const o of opts){
+        const n = parseInt(String(o.value || '0'), 10);
+        if(n > maxV) maxV = n;
+      }
+      RULE_HIST_STATE.maxRetentionMs = maxV;
+    }catch(_e){}
+
+    winSel.addEventListener('change', ()=>{
+      const n = parseInt(String(winSel.value || '0'), 10);
+      if(n > 0){
+        RULE_HIST_STATE.windowMs = n;
+        try{ histRender(); }catch(_e){}
+      }
+    });
+  }
+
+  if(ruleSel){
+    ruleSel.addEventListener('change', ()=>{
+      RULE_HIST_STATE.selectedKey = String(ruleSel.value || '__all__') || '__all__';
+      try{ histRender(); }catch(_e){}
+    });
+  }
+
+  const trafficCanvas = document.getElementById('histTrafficCanvas');
+  const connCanvas = document.getElementById('histConnCanvas');
+  const trafficTip = document.getElementById('histTrafficTip');
+  const connTip = document.getElementById('histConnTip');
+
+  if(trafficCanvas){
+    RULE_HIST_STATE.trafficChart = new MiniLineChart(trafficCanvas, trafficTip);
+  }
+  if(connCanvas){
+    RULE_HIST_STATE.connChart = new MiniLineChart(connCanvas, connTip);
+  }
+
+  // Keep the select options in sync with pool/rules.
+  try{ histSyncRuleSelect(); }catch(_e){}
+
+  return true;
+}
+
+function histSyncRuleSelect(){
+  if(!_histEnsureInited()) return;
+  const selEl = document.getElementById('histRuleSelect');
+  if(!selEl) return;
+
+  const keep = String(RULE_HIST_STATE.selectedKey || '__all__');
+  const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
+
+  const options = [];
+  options.push({ value: '__all__', label: '全部规则（汇总）' });
+
+  const seen = new Set(['__all__']);
+  for(let i=0;i<eps.length;i++){
+    const e = eps[i];
+    if(!e) continue;
+    const lis = (e.listen != null) ? String(e.listen).trim() : '';
+    if(!lis) continue;
+    if(seen.has(lis)) continue;
+    seen.add(lis);
+
+    let label = `${i+1}. ${lis}`;
+    const remark = getRuleRemark(e);
+    if(remark) label += ` · ${remark}`;
+    if(e.disabled) label += '（暂停）';
+    options.push({ value: lis, label });
+  }
+
+  // Update DOM only if changed (avoid losing focus)
+  let changed = false;
+  if(selEl.options.length !== options.length){
+    changed = true;
+  }else{
+    for(let i=0;i<options.length;i++){
+      const o = selEl.options[i];
+      const want = options[i];
+      if(!o || o.value !== want.value || (o.textContent || '') !== want.label){
+        changed = true;
+        break;
+      }
+    }
+  }
+
+  if(changed){
+    selEl.innerHTML = '';
+    for(const it of options){
+      const o = document.createElement('option');
+      o.value = it.value;
+      o.textContent = it.label;
+      selEl.appendChild(o);
+    }
+  }
+
+  const hasKeep = options.some(o=>o.value === keep);
+  RULE_HIST_STATE.selectedKey = hasKeep ? keep : '__all__';
+  selEl.value = RULE_HIST_STATE.selectedKey;
+}
+
+function histIngestStats(statsData){
+  if(!_histEnsureInited()) return;
+  if(!statsData){
+    try{ histRender(); }catch(_e){}
+    return;
+  }
+  if(statsData.ok === false){
+    // Keep existing history, just refresh UI hint/messages.
+    try{ histRender(); }catch(_e){}
+    return;
+  }
+
+  const now = Date.now();
+  // Guard: avoid double-insert within a very short time window.
+  if(RULE_HIST_STATE.lastGlobalTs && (now - RULE_HIST_STATE.lastGlobalTs) < 800){
+    return;
+  }
+  RULE_HIST_STATE.lastGlobalTs = now;
+
+  const rules = Array.isArray(statsData.rules) ? statsData.rules : [];
+  const pruneBefore = now - RULE_HIST_STATE.maxRetentionMs;
+
+  // Aggregate
+  let sumRx = 0;
+  let sumTx = 0;
+  let sumConn = 0;
+
+  for(const r of rules){
+    if(!r) continue;
+    sumRx += (Number(r.rx_bytes) || 0);
+    sumTx += (Number(r.tx_bytes) || 0);
+    sumConn += (Number(r.connections_active ?? 0) || 0);
+  }
+
+  let sAll = RULE_HIST_STATE.series.get('__all__');
+  if(!sAll){
+    sAll = new HistSeries();
+    RULE_HIST_STATE.series.set('__all__', sAll);
+  }
+  sAll.push(now, sumRx, sumTx, sumConn, pruneBefore);
+
+  // Per-rule
+  for(const r of rules){
+    if(!r) continue;
+    const key = (r.listen != null) ? String(r.listen).trim() : '';
+    if(!key) continue;
+
+    let s = RULE_HIST_STATE.series.get(key);
+    if(!s){
+      s = new HistSeries();
+      RULE_HIST_STATE.series.set(key, s);
+    }
+    s.push(
+      now,
+      Number(r.rx_bytes) || 0,
+      Number(r.tx_bytes) || 0,
+      Number(r.connections_active ?? 0) || 0,
+      pruneBefore,
+    );
+  }
+
+  // Keep selection valid
+  const sel = String(RULE_HIST_STATE.selectedKey || '__all__');
+  if(sel !== '__all__' && !RULE_HIST_STATE.series.has(sel)){
+    RULE_HIST_STATE.selectedKey = '__all__';
+    const selEl = document.getElementById('histRuleSelect');
+    if(selEl) selEl.value = '__all__';
+  }
+
+  // If the panel is open, re-render the charts
+  try{ histRender(); }catch(_e){}
+}
+
+function _histSetKpis(rxBps, txBps, conn){
+  const kpis = document.getElementById('histKpis');
+  if(!kpis) return;
+  const rxTxt = (rxBps == null) ? '—' : formatBps(rxBps);
+  const txTxt = (txBps == null) ? '—' : formatBps(txBps);
+  const connTxt = (conn == null) ? '—' : String(Math.max(0, Math.round(Number(conn) || 0)));
+
+  kpis.innerHTML = `
+    <span class="pill xs ghost">↓ ${escapeHtml(rxTxt)}</span>
+    <span class="pill xs ghost">↑ ${escapeHtml(txTxt)}</span>
+    <span class="pill xs ghost">活跃 ${escapeHtml(connTxt)}</span>
+  `;
+}
+
+function histRender(){
+  if(!_histEnsureInited()) return;
+
+  const panel = document.getElementById('histPanel');
+  const isOpen = !(panel && panel.open === false);
+
+  const noDataEl = document.getElementById('histNoData');
+
+  const key = String(RULE_HIST_STATE.selectedKey || '__all__');
+  const s = RULE_HIST_STATE.series.get(key);
+
+  // Hint in header (auto-refresh state)
+  try{
+    const hint = document.getElementById('histHeadHint');
+    if(hint){
+      const ar = !!AUTO_REFRESH_TIMER;
+      const t = (s && s.lastTs ? _histFmtTimeHHMMSS(s.lastTs) : '—');
+      hint.textContent = ar ? `自动刷新：开 · 更新于 ${t}` : `自动刷新：关 · 最近更新 ${t}`;
+    }
+  }catch(_e){}
+
+  if(!isOpen){
+    // Panel collapsed: skip canvas redraw.
+    return;
+  }
+  if(!s || s.size() < 2){
+    if(noDataEl) noDataEl.style.display = '';
+    _histSetKpis(null, null, null);
+    try{ RULE_HIST_STATE.trafficChart && RULE_HIST_STATE.trafficChart.setData(null); }catch(_e){}
+    try{ RULE_HIST_STATE.connChart && RULE_HIST_STATE.connChart.setData(null); }catch(_e){}
+    return;
+  }
+
+  if(noDataEl) noDataEl.style.display = 'none';
+
+  const now = Date.now();
+  const windowMs = Math.max(60 * 1000, Number(RULE_HIST_STATE.windowMs) || (10 * 60 * 1000));
+  const cutoff = now - windowMs;
+
+  const tArr = s.t;
+  const rxArr = s.rx;
+  const txArr = s.tx;
+  const connArr = s.conn;
+  const end = tArr.length;
+
+  // Connections series (raw)
+  const i0 = s.lowerBound(cutoff);
+  const tConn = [];
+  const vConn = [];
+  for(let i=i0; i<end; i++){
+    tConn.push(tArr[i]);
+    vConn.push(connArr[i]);
+  }
+
+  // Traffic rate series (delta/second) needs previous point
+  let iRate = Math.max(i0, s.start + 1);
+  const tRate = [];
+  const vRx = [];
+  const vTx = [];
+  for(let i=iRate; i<end; i++){
+    const prev = i - 1;
+    const dt = (tArr[i] - tArr[prev]) / 1000.0;
+    if(!Number.isFinite(dt) || dt <= 0) continue;
+
+    let drx = (Number(rxArr[i]) || 0) - (Number(rxArr[prev]) || 0);
+    let dtx = (Number(txArr[i]) || 0) - (Number(txArr[prev]) || 0);
+    if(drx < 0) drx = 0; // counter reset
+    if(dtx < 0) dtx = 0;
+
+    tRate.push(tArr[i]);
+    vRx.push(drx / dt);
+    vTx.push(dtx / dt);
+  }
+
+  // Update KPIs using the latest point
+  const lastRx = vRx.length ? vRx[vRx.length - 1] : null;
+  const lastTx = vTx.length ? vTx[vTx.length - 1] : null;
+  const lastConn = vConn.length ? vConn[vConn.length - 1] : null;
+  _histSetKpis(lastRx, lastTx, lastConn);
+
+  const cDl = _histCssVar('--accent2', '#22D3EE');
+  const cUl = _histCssVar('--accent', '#3B82F6');
+  const cConn = _histCssVar('--ok', '#22C55E');
+
+  // Render charts
+  const trafficData = {
+    t: tRate,
+    xMin: cutoff,
+    xMax: now,
+    fmtY: (v)=>formatBps(v),
+    series: [
+      { name: '下载', color: cDl, v: vRx },
+      { name: '上传', color: cUl, v: vTx },
+    ],
+  };
+
+  const connData = {
+    t: tConn,
+    xMin: cutoff,
+    xMax: now,
+    fmtY: (v)=>{
+      const n = Number(v) || 0;
+      return String(Math.max(0, Math.round(n)));
+    },
+    series: [
+      { name: '活跃', color: cConn, v: vConn },
+    ],
+  };
+
+  try{ RULE_HIST_STATE.trafficChart && RULE_HIST_STATE.trafficChart.setData(trafficData); }catch(_e){}
+  try{ RULE_HIST_STATE.connChart && RULE_HIST_STATE.connChart.setData(connData); }catch(_e){}
+}
+
+function clearRuleHistory(silent=false){
+  if(!_histEnsureInited()) return;
+  try{
+    RULE_HIST_STATE.series = new Map();
+    RULE_HIST_STATE.lastGlobalTs = 0;
+  }catch(_e){}
+
+  try{ _histSetKpis(null, null, null); }catch(_e){}
+  try{ RULE_HIST_STATE.trafficChart && RULE_HIST_STATE.trafficChart.setData(null); }catch(_e){}
+  try{ RULE_HIST_STATE.connChart && RULE_HIST_STATE.connChart.setData(null); }catch(_e){}
+
+  const noDataEl = document.getElementById('histNoData');
+  if(noDataEl) noDataEl.style.display = '';
+
+  if(!silent){
+    try{ toast('已清空历史曲线'); }catch(_e){}
+  }
+}
+window.clearRuleHistory = clearRuleHistory;
+
+
+
 
 async function refreshStats(forceAgent=false){
   const id = window.__NODE_ID__;
@@ -3926,8 +4627,10 @@ async function refreshStats(forceAgent=false){
     const statsUrl = `/api/nodes/${id}/stats` + (forceAgent ? `?force=1` : ``);
     const statsData = await fetchJSON(statsUrl);
     CURRENT_STATS = statsData;
+    try{ histIngestStats(CURRENT_STATS); }catch(_e){}
   }catch(e){
     CURRENT_STATS = { ok: false, error: e.message, rules: [] };
+    try{ histIngestStats(CURRENT_STATS); }catch(_e){}
   }
   await refreshSys();
   renderRules();
@@ -3953,6 +4656,7 @@ async function loadPool(){
     CURRENT_POOL = data.pool;
     if(!CURRENT_POOL.endpoints) CURRENT_POOL.endpoints = [];
     CURRENT_STATS = statsData;
+    try{ histIngestStats(CURRENT_STATS); }catch(_e){}
     renderRules();
     await refreshSys();
   }catch(e){
