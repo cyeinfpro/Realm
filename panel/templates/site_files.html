@@ -1,17 +1,12 @@
 {% extends "base.html" %}
-
 {% block content %}
-<div class="page-head">
-  <div class="page-title">
-    <h1 class="h1">文件管理 · {{ site.name }}</h1>
-    <div class="meta" style="flex-wrap:wrap;">
-      <span class="meta-item">根目录：<span class="mono" style="word-break:break-all;">{{ root }}</span></span>
-      {% if path %}
-        <span class="meta-item">当前路径：<span class="mono" style="word-break:break-all;">{{ path }}</span></span>
-      {% endif %}
-    </div>
+<div class="hero-card">
+  <div class="hero-left">
+    <span class="pill xs ghost">File Manager</span>
+    <div class="hero-title">文件管理 · {{ site.name }}</div>
+    <div class="hero-sub">根目录：<span class="mono">{{ root }}</span></div>
   </div>
-  <div class="right">
+  <div class="hero-right">
     <a class="btn sm ghost" href="/websites/{{ site.id }}">返回站点</a>
   </div>
 </div>
@@ -22,34 +17,26 @@
   </div>
 {% endif %}
 
-<div class="card">
-  <div class="row" style="justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
-    <div class="col" style="min-width:240px;">
-      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+<div class="card" style="margin-top:12px;">
+  <div class="row" style="justify-content:space-between;align-items:center;">
+    <div class="col">
+      <div class="file-path">
         {% for name, p in breadcrumbs %}
-          <a href="/websites/{{ site.id }}/files?path={{ p }}" class="chip" style="text-decoration:none;">{{ name }}</a>
-          {% if not loop.last %}<span class="muted">/</span>{% endif %}
+          <a href="/websites/{{ site.id }}/files?path={{ p }}">{{ name }}</a>
+          {% if not loop.last %}<span class="sep">/</span>{% endif %}
         {% endfor %}
       </div>
-      <div class="help compact" style="margin-top:6px;">提示：单文件上传上限 200MB（分片上传）。删除操作不可恢复。</div>
+      <div class="help">单文件上传上限 200MB（分片上传 + 断点续传）。</div>
     </div>
-
-    <div class="col right" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-      <div class="dash-search" role="search" style="min-width:240px;">
-        <span class="dash-search-ico" aria-hidden="true">⌕</span>
-        <input id="fileSearch" class="dash-search-input" placeholder="搜索文件/目录" autocomplete="off" />
-        <button id="fileSearchClear" class="dash-search-clear" type="button" title="清空">×</button>
-      </div>
-
-      <form method="post" action="/websites/{{ site.id }}/files/mkdir" class="row" style="gap:6px;align-items:center;flex-wrap:wrap;">
+    <div class="col right toolbar">
+      <form method="post" action="/websites/{{ site.id }}/files/mkdir" style="display:inline;">
         <input type="hidden" name="path" value="{{ path }}">
-        <input class="input" name="name" placeholder="新建目录" style="max-width:160px;">
+        <input class="input" name="name" placeholder="新建目录">
         <button class="btn xs ghost" type="submit">创建</button>
       </form>
-
-      <form id="uploadForm" method="post" action="/websites/{{ site.id }}/files/upload" enctype="multipart/form-data" class="row" style="gap:6px;align-items:center;flex-wrap:wrap;">
+      <form id="uploadForm" method="post" action="/websites/{{ site.id }}/files/upload" enctype="multipart/form-data" style="display:inline;">
         <input type="hidden" name="path" value="{{ path }}">
-        <input type="file" id="uploadFileInput" name="file" class="input" style="max-width:220px;">
+        <input type="file" id="uploadFileInput" name="file" class="input">
         <button class="btn xs secondary" type="submit" id="uploadBtn">上传</button>
       </form>
     </div>
@@ -62,46 +49,36 @@
   </div>
 
   <div class="table-wrap" style="margin-top:12px;">
-    <table class="table" id="filesTable">
+    <table class="table">
       <thead>
         <tr>
           <th>名称</th>
           <th>大小</th>
           <th>修改时间</th>
-          <th style="text-align:right;">操作</th>
+          <th>操作</th>
         </tr>
       </thead>
       <tbody>
         {% for it in items %}
-        <tr data-name="{{ (it.name or '')|lower }}" data-dir="{{ '1' if it.is_dir else '0' }}">
+        <tr>
           <td>
             {% if it.is_dir %}
-              <a href="/websites/{{ site.id }}/files?path={{ it.path }}" style="text-decoration:none;">📁 {{ it.name }}</a>
+              <a href="/websites/{{ site.id }}/files?path={{ it.path }}" style="text-decoration:none;">目录 · {{ it.name }}</a>
             {% else %}
-              <span>📄 {{ it.name }}</span>
+              {{ it.name }}
             {% endif %}
           </td>
           <td class="mono">{{ it.size_h }}</td>
           <td class="mono">{{ it.mtime or "-" }}</td>
-          <td style="text-align:right; white-space:nowrap;">
-            <details class="menu">
-              <summary class="btn xs ghost">操作 ▾</summary>
-              <div class="menu-pop">
-                {% if it.is_dir %}
-                  <a class="menu-item" href="/websites/{{ site.id }}/files?path={{ it.path }}">进入目录</a>
-                  <div class="menu-sep"></div>
-                {% else %}
-                  <a class="menu-item" href="/websites/{{ site.id }}/files/edit?path={{ it.path }}">编辑</a>
-                  <a class="menu-item" href="/websites/{{ site.id }}/files/download?path={{ it.path }}">下载</a>
-                  <div class="menu-sep"></div>
-                {% endif %}
-
-                <form method="post" action="/websites/{{ site.id }}/files/delete" onsubmit="return confirm('确定删除 {{ it.name }} 吗？该操作不可恢复。');">
-                  <input type="hidden" name="path" value="{{ it.path }}">
-                  <button class="menu-item" type="submit">删除</button>
-                </form>
-              </div>
-            </details>
+          <td>
+            {% if not it.is_dir %}
+              <a class="btn xs ghost" href="/websites/{{ site.id }}/files/edit?path={{ it.path }}">编辑</a>
+              <a class="btn xs ghost" href="/websites/{{ site.id }}/files/download?path={{ it.path }}">下载</a>
+            {% endif %}
+            <form method="post" action="/websites/{{ site.id }}/files/delete" style="display:inline;">
+              <input type="hidden" name="path" value="{{ it.path }}">
+              <button class="btn xs ghost" type="submit">删除</button>
+            </form>
           </td>
         </tr>
         {% else %}
@@ -113,197 +90,157 @@
     </table>
   </div>
 </div>
-{% endblock %}
 
-{% block scripts %}
 <script>
-  // -------- File list search --------
-  (function(){
-    const input = document.getElementById('fileSearch');
-    const clear = document.getElementById('fileSearchClear');
-    const table = document.getElementById('filesTable');
-    if(!input || !table) return;
-    const rows = Array.from(table.querySelectorAll('tbody tr[data-name]'));
+const uploadForm = document.getElementById('uploadForm');
+const uploadFileInput = document.getElementById('uploadFileInput');
+const uploadBtn = document.getElementById('uploadBtn');
+const uploadPanel = document.getElementById('uploadPanel');
+const uploadProgressFill = document.getElementById('uploadProgressFill');
+const uploadStatus = document.getElementById('uploadStatus');
+const uploadRetry = document.getElementById('uploadRetry');
 
-    function apply(){
-      const q = (input.value || '').trim().toLowerCase();
-      rows.forEach(r => {
-        const name = r.dataset.name || '';
-        r.style.display = (!q || name.includes(q)) ? '' : 'none';
-      });
-    }
+const CHUNK_SIZE = 1024 * 512;
+const SITE_ID = {{ site.id }};
+const CUR_PATH = {{ path|tojson }};
 
-    input.addEventListener('input', apply);
-    clear?.addEventListener('click', () => { input.value=''; input.focus(); apply(); });
-  })();
+function bytesToHuman(n){
+  if(!n) return '0 B';
+  const units = ['B','KB','MB','GB','TB'];
+  let i = 0;
+  let v = n;
+  while(v >= 1024 && i < units.length - 1){
+    v /= 1024;
+    i++;
+  }
+  return v.toFixed(1) + ' ' + units[i];
+}
 
-  // -------- Chunked upload (resume capable) --------
-  (function(){
-    const uploadForm = document.getElementById('uploadForm');
-    const uploadFileInput = document.getElementById('uploadFileInput');
-    const uploadBtn = document.getElementById('uploadBtn');
-    const uploadPanel = document.getElementById('uploadPanel');
-    const uploadProgressFill = document.getElementById('uploadProgressFill');
-    const uploadStatus = document.getElementById('uploadStatus');
-    const uploadRetry = document.getElementById('uploadRetry');
+function bufToHex(buffer){
+  const bytes = new Uint8Array(buffer);
+  const hex = [];
+  for(const b of bytes){
+    hex.push(b.toString(16).padStart(2, '0'));
+  }
+  return hex.join('');
+}
 
-    const CHUNK_SIZE = 1024 * 512;
-    const SITE_ID = {{ site.id }};
-    const CUR_PATH = {{ path|tojson }};
+async function sha256Hex(arrayBuffer){
+  const hash = await crypto.subtle.digest('SHA-256', arrayBuffer);
+  return bufToHex(hash);
+}
 
-    if(!uploadForm || !uploadFileInput || !uploadBtn) return;
+async function chunkToBase64(arrayBuffer){
+  let binary = '';
+  const bytes = new Uint8Array(arrayBuffer);
+  const len = bytes.byteLength;
+  for(let i=0;i<len;i++){
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
 
-    function bytesToHuman(n){
-      if(!n) return '0 B';
-      const units = ['B','KB','MB','GB','TB'];
-      let i = 0;
-      let v = n;
-      while(v >= 1024 && i < units.length - 1){
-        v /= 1024;
-        i++;
-      }
-      return v.toFixed(1) + ' ' + units[i];
-    }
+function uploadKey(file){
+  return `nexus_upload_${SITE_ID}_${CUR_PATH}_${file.name}_${file.size}_${file.lastModified}`;
+}
 
-    function bufToHex(buffer){
-      const bytes = new Uint8Array(buffer);
-      const hex = [];
-      for(const b of bytes){
-        hex.push(b.toString(16).padStart(2, '0'));
-      }
-      return hex.join('');
-    }
+async function getResumeOffset(file, uploadId){
+  const resp = await fetch(`/websites/${SITE_ID}/files/upload_status`, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ path: CUR_PATH, filename: file.name, upload_id: uploadId })
+  });
+  const data = await resp.json().catch(()=>({ok:false}));
+  if(!data.ok) return 0;
+  return parseInt(data.offset || 0, 10) || 0;
+}
 
-    async function sha256Hex(arrayBuffer){
-      const hash = await crypto.subtle.digest('SHA-256', arrayBuffer);
-      return bufToHex(hash);
-    }
-
-    function chunkToBase64(arrayBuffer){
-      // Faster + safer than byte-by-byte string concatenation.
-      const bytes = new Uint8Array(arrayBuffer);
-      let binary = '';
-      const step = 0x8000; // 32KB
-      for(let i=0;i<bytes.length;i+=step){
-        binary += String.fromCharCode.apply(null, bytes.subarray(i, i+step));
-      }
-      return btoa(binary);
-    }
-
-    function uploadKey(file){
-      return `nexus_upload_${SITE_ID}_${CUR_PATH}_${file.name}_${file.size}_${file.lastModified}`;
-    }
-
-    async function getResumeOffset(file, uploadId){
-      const resp = await fetch(`/websites/${SITE_ID}/files/upload_status`, {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ path: CUR_PATH, filename: file.name, upload_id: uploadId })
-      });
-      const data = await resp.json().catch(()=>({ok:false}));
-      if(!data.ok) return 0;
-      return parseInt(data.offset || 0, 10) || 0;
-    }
-
-    async function uploadFile(file, uploadId, startOffset){
-      let offset = startOffset || 0;
-      const total = file.size;
-
-      uploadPanel.style.display = 'block';
-      uploadRetry.style.display = 'none';
-      uploadBtn.disabled = true;
-      uploadStatus.textContent = `准备上传 ${file.name} (${bytesToHuman(total)})…`;
-
-      while(offset < total){
-        const chunk = file.slice(offset, offset + CHUNK_SIZE);
-        const buf = await chunk.arrayBuffer();
-        const chunkSha = await sha256Hex(buf);
-        const b64 = chunkToBase64(buf);
-        const done = (offset + chunk.size) >= total;
-
-        const resp = await fetch(`/websites/${SITE_ID}/files/upload_chunk`, {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({
-            path: CUR_PATH,
-            filename: file.name,
-            upload_id: uploadId,
-            offset: offset,
-            done: done,
-            content_b64: b64,
-            chunk_sha256: chunkSha
-          })
-        });
-
-        const data = await resp.json().catch(()=>({ok:false,error:'上传失败'}));
-        if(!data.ok){
-          if(data.expected_offset !== undefined){
-            offset = parseInt(data.expected_offset || 0, 10) || 0;
-            continue;
-          }
-          throw new Error(data.error || '上传失败');
-        }
-
-        offset += chunk.size;
-        const pct = Math.min(100, Math.round((offset / total) * 100));
-        uploadProgressFill.style.width = pct + '%';
-        uploadStatus.textContent = `已上传 ${bytesToHuman(offset)} / ${bytesToHuman(total)} (${pct}%)`;
-        localStorage.setItem(uploadKey(file), uploadId);
-      }
-
-      localStorage.removeItem(uploadKey(file));
-      uploadStatus.textContent = '上传完成';
-      uploadBtn.disabled = false;
-    }
-
-    uploadForm.addEventListener('submit', async (e)=>{
-      // Fallback: if browser doesn't support WebCrypto, let the server handle upload.
-      if(!window.crypto || !window.crypto.subtle){
-        return;
-      }
-      e.preventDefault();
-
-      const file = uploadFileInput.files?.[0];
-      if(!file){
-        alert('请选择文件');
-        return;
-      }
-
-      const key = uploadKey(file);
-      let uploadId = localStorage.getItem(key) || '';
-      if(!uploadId){
-        uploadId = Math.random().toString(16).slice(2) + Date.now().toString(16);
-      }
-
-      try{
-        const offset = await getResumeOffset(file, uploadId);
-        await uploadFile(file, uploadId, offset);
-        window.location.reload();
-      }catch(err){
-        uploadStatus.textContent = String(err);
-        uploadRetry.style.display = 'inline-block';
-        uploadBtn.disabled = false;
-      }
+async function uploadFile(file, uploadId, startOffset){
+  let offset = startOffset || 0;
+  const total = file.size;
+  uploadPanel.style.display = 'block';
+  uploadRetry.style.display = 'none';
+  uploadBtn.disabled = true;
+  uploadStatus.textContent = `准备上传 ${file.name} (${bytesToHuman(total)})…`;
+  while(offset < total){
+    const chunk = file.slice(offset, offset + CHUNK_SIZE);
+    const buf = await chunk.arrayBuffer();
+    const chunkSha = await sha256Hex(buf);
+    const b64 = await chunkToBase64(buf);
+    const done = (offset + chunk.size) >= total;
+    const resp = await fetch(`/websites/${SITE_ID}/files/upload_chunk`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        path: CUR_PATH,
+        filename: file.name,
+        upload_id: uploadId,
+        offset: offset,
+        done: done,
+        content_b64: b64,
+        chunk_sha256: chunkSha
+      })
     });
+    const data = await resp.json().catch(()=>({ok:false,error:'上传失败'}));
+    if(!data.ok){
+      if(data.expected_offset !== undefined){
+        offset = parseInt(data.expected_offset || 0, 10) || 0;
+        continue;
+      }
+      throw new Error(data.error || '上传失败');
+    }
+    offset += chunk.size;
+    const pct = Math.min(100, Math.round((offset / total) * 100));
+    uploadProgressFill.style.width = pct + '%';
+    uploadStatus.textContent = `已上传 ${bytesToHuman(offset)} / ${bytesToHuman(total)} (${pct}%)`;
+    localStorage.setItem(uploadKey(file), uploadId);
+  }
+  localStorage.removeItem(uploadKey(file));
+  uploadStatus.textContent = '上传完成';
+  uploadBtn.disabled = false;
+}
 
-    uploadRetry?.addEventListener('click', async ()=>{
-      const file = uploadFileInput.files?.[0];
-      if(!file) return;
-      const key = uploadKey(file);
-      const uploadId = localStorage.getItem(key) || '';
-      if(!uploadId){
-        uploadStatus.textContent = '找不到可恢复的上传';
-        return;
-      }
-      try{
-        const offset = await getResumeOffset(file, uploadId);
-        await uploadFile(file, uploadId, offset);
-        window.location.reload();
-      }catch(err){
-        uploadStatus.textContent = String(err);
-        uploadBtn.disabled = false;
-      }
-    });
-  })();
+uploadForm?.addEventListener('submit', async (e)=>{
+  if(!window.crypto || !window.crypto.subtle){
+    return;
+  }
+  e.preventDefault();
+  const file = uploadFileInput?.files?.[0];
+  if(!file){
+    alert('请选择文件');
+    return;
+  }
+  const key = uploadKey(file);
+  let uploadId = localStorage.getItem(key) || '';
+  if(!uploadId){
+    uploadId = Math.random().toString(16).slice(2) + Date.now().toString(16);
+  }
+  try{
+    const offset = await getResumeOffset(file, uploadId);
+    await uploadFile(file, uploadId, offset);
+    window.location.reload();
+  }catch(err){
+    uploadStatus.textContent = String(err);
+    uploadRetry.style.display = 'inline-block';
+  }
+});
+
+uploadRetry?.addEventListener('click', async ()=>{
+  const file = uploadFileInput?.files?.[0];
+  if(!file) return;
+  const key = uploadKey(file);
+  const uploadId = localStorage.getItem(key) || '';
+  if(!uploadId){
+    uploadStatus.textContent = '找不到可恢复的上传';
+    return;
+  }
+  try{
+    const offset = await getResumeOffset(file, uploadId);
+    await uploadFile(file, uploadId, offset);
+    window.location.reload();
+  }catch(err){
+    uploadStatus.textContent = String(err);
+  }
+});
 </script>
 {% endblock %}

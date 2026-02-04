@@ -65,9 +65,38 @@ CREATE TABLE IF NOT EXISTS sites (
   https_redirect INTEGER NOT NULL DEFAULT 0,
   gzip_enabled INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL DEFAULT 'running',
+  health_status TEXT NOT NULL DEFAULT '',
+  health_code INTEGER NOT NULL DEFAULT 0,
+  health_latency_ms INTEGER NOT NULL DEFAULT 0,
+  health_error TEXT NOT NULL DEFAULT '',
+  health_checked_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS site_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'success',
+  actor TEXT NOT NULL DEFAULT '',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  result_json TEXT NOT NULL DEFAULT '{}',
+  error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_site_events_site_ts ON site_events(site_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS site_checks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id INTEGER NOT NULL,
+  ok INTEGER NOT NULL DEFAULT 0,
+  status_code INTEGER NOT NULL DEFAULT 0,
+  latency_ms INTEGER NOT NULL DEFAULT 0,
+  error TEXT NOT NULL DEFAULT '',
+  checked_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_site_checks_site_ts ON site_checks(site_id, checked_at DESC);
 
 CREATE TABLE IF NOT EXISTS certificates (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -261,6 +290,47 @@ def ensure_db(db_path: str = DEFAULT_DB_PATH) -> None:
                     conn.execute("ALTER TABLE sites ADD COLUMN https_redirect INTEGER NOT NULL DEFAULT 0")
                 if "gzip_enabled" not in scols:
                     conn.execute("ALTER TABLE sites ADD COLUMN gzip_enabled INTEGER NOT NULL DEFAULT 1")
+                if "health_status" not in scols:
+                    conn.execute("ALTER TABLE sites ADD COLUMN health_status TEXT NOT NULL DEFAULT ''")
+                if "health_code" not in scols:
+                    conn.execute("ALTER TABLE sites ADD COLUMN health_code INTEGER NOT NULL DEFAULT 0")
+                if "health_latency_ms" not in scols:
+                    conn.execute("ALTER TABLE sites ADD COLUMN health_latency_ms INTEGER NOT NULL DEFAULT 0")
+                if "health_error" not in scols:
+                    conn.execute("ALTER TABLE sites ADD COLUMN health_error TEXT NOT NULL DEFAULT ''")
+                if "health_checked_at" not in scols:
+                    conn.execute("ALTER TABLE sites ADD COLUMN health_checked_at TEXT")
+        except Exception:
+            pass
+
+        # Site events / checks tables
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS site_events ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "site_id INTEGER NOT NULL,"
+                "action TEXT NOT NULL,"
+                "status TEXT NOT NULL DEFAULT 'success',"
+                "actor TEXT NOT NULL DEFAULT '',"
+                "payload_json TEXT NOT NULL DEFAULT '{}',"
+                "result_json TEXT NOT NULL DEFAULT '{}',"
+                "error TEXT NOT NULL DEFAULT '',"
+                "created_at TEXT NOT NULL DEFAULT (datetime('now'))"
+                ")"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_site_events_site_ts ON site_events(site_id, created_at DESC)")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS site_checks ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "site_id INTEGER NOT NULL,"
+                "ok INTEGER NOT NULL DEFAULT 0,"
+                "status_code INTEGER NOT NULL DEFAULT 0,"
+                "latency_ms INTEGER NOT NULL DEFAULT 0,"
+                "error TEXT NOT NULL DEFAULT '',"
+                "checked_at TEXT NOT NULL DEFAULT (datetime('now'))"
+                ")"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_site_checks_site_ts ON site_checks(site_id, checked_at DESC)")
         except Exception:
             pass
 
@@ -1376,6 +1446,10 @@ def list_sites(node_id: Optional[int] = None, db_path: str = DEFAULT_DB_PATH) ->
         d["domains"] = domains
         d["https_redirect"] = bool(d.get("https_redirect") or 0)
         d["gzip_enabled"] = bool(d.get("gzip_enabled") or 0)
+        d["health_status"] = str(d.get("health_status") or "").strip()
+        d["health_code"] = int(d.get("health_code") or 0)
+        d["health_latency_ms"] = int(d.get("health_latency_ms") or 0)
+        d["health_error"] = str(d.get("health_error") or "").strip()
         out.append(d)
     return out
 
@@ -1392,6 +1466,10 @@ def get_site(site_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str,
     d["domains"] = domains
     d["https_redirect"] = bool(d.get("https_redirect") or 0)
     d["gzip_enabled"] = bool(d.get("gzip_enabled") or 0)
+    d["health_status"] = str(d.get("health_status") or "").strip()
+    d["health_code"] = int(d.get("health_code") or 0)
+    d["health_latency_ms"] = int(d.get("health_latency_ms") or 0)
+    d["health_error"] = str(d.get("health_error") or "").strip()
     return d
 
 
@@ -1487,6 +1565,126 @@ def update_site(
             (*params, int(site_id)),
         )
         conn.commit()
+
+
+def update_site_health(
+    site_id: int,
+    health_status: str,
+    health_code: int = 0,
+    health_latency_ms: int = 0,
+    health_error: str = "",
+    health_checked_at: Optional[str] = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    fields = [
+        "health_status=?",
+        "health_code=?",
+        "health_latency_ms=?",
+        "health_error=?",
+    ]
+    params: List[Any] = [
+        (health_status or "").strip(),
+        int(health_code or 0),
+        int(health_latency_ms or 0),
+        (health_error or "").strip(),
+    ]
+    if health_checked_at is not None:
+        fields.append("health_checked_at=?")
+        params.append(health_checked_at)
+    else:
+        fields.append("health_checked_at=datetime('now')")
+    with connect(db_path) as conn:
+        conn.execute(
+            f"UPDATE sites SET {', '.join(fields)} WHERE id=?",
+            (*params, int(site_id)),
+        )
+        conn.commit()
+
+
+def add_site_event(
+    site_id: int,
+    action: str,
+    status: str = "success",
+    actor: str = "",
+    payload: Optional[Dict[str, Any]] = None,
+    result: Optional[Dict[str, Any]] = None,
+    error: str = "",
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO site_events(site_id, action, status, actor, payload_json, result_json, error, created_at) "
+            "VALUES(?,?,?,?,?,?,?,datetime('now'))",
+            (
+                int(site_id),
+                (action or "").strip(),
+                (status or "success").strip(),
+                (actor or "").strip(),
+                _json_dumps(payload or {}, default="{}"),
+                _json_dumps(result or {}, default="{}"),
+                (error or "").strip(),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid or 0)
+
+
+def list_site_events(site_id: int, limit: int = 100, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM site_events WHERE site_id=? ORDER BY id DESC LIMIT ?",
+            (int(site_id), int(limit)),
+        ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        d["payload"] = _json_loads(str(d.get("payload_json") or "{}"), {})
+        d["result"] = _json_loads(str(d.get("result_json") or "{}"), {})
+        out.append(d)
+    return out
+
+
+def add_site_check(
+    site_id: int,
+    ok: bool,
+    status_code: int = 0,
+    latency_ms: int = 0,
+    error: str = "",
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO site_checks(site_id, ok, status_code, latency_ms, error, checked_at) "
+            "VALUES(?,?,?,?,?,datetime('now'))",
+            (int(site_id), 1 if ok else 0, int(status_code or 0), int(latency_ms or 0), (error or "").strip()),
+        )
+        conn.commit()
+        return int(cur.lastrowid or 0)
+
+
+def list_site_checks(site_id: int, limit: int = 60, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM site_checks WHERE site_id=? ORDER BY id DESC LIMIT ?",
+            (int(site_id), int(limit)),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def prune_site_checks(days: int = 7, db_path: str = DEFAULT_DB_PATH) -> int:
+    try:
+        d = int(days)
+    except Exception:
+        d = 7
+    if d < 1:
+        d = 1
+    if d > 365:
+        d = 365
+    cutoff = f"-{d} days"
+    with connect(db_path) as conn:
+        cur = conn.execute("DELETE FROM site_checks WHERE checked_at < datetime('now', ?)", (cutoff,))
+        conn.commit()
+        return int(cur.rowcount or 0)
 
 
 def delete_site(site_id: int, db_path: str = DEFAULT_DB_PATH) -> None:

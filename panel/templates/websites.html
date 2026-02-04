@@ -1,341 +1,139 @@
 {% extends "base.html" %}
-
 {% block content %}
-<div class="page-head">
-  <div class="page-title">
-    <h1 class="h1">网站管理</h1>
-    <div class="meta">
-      <span class="meta-item">统一管理网站节点、站点、SSL 与文件，支持一键安装/卸载环境。</span>
+{% set stats = namespace(running=0, creating=0, error=0, health_fail=0) %}
+{% for s in sites %}
+  {% if (s.status or '') == 'running' %}
+    {% set stats.running = stats.running + 1 %}
+  {% elif (s.status or '') in ['creating','pending'] %}
+    {% set stats.creating = stats.creating + 1 %}
+  {% elif (s.status or '') == 'error' %}
+    {% set stats.error = stats.error + 1 %}
+  {% endif %}
+  {% if (s.health_status or '') == 'fail' %}
+    {% set stats.health_fail = stats.health_fail + 1 %}
+  {% endif %}
+{% endfor %}
+
+<div class="hero-card">
+  <div class="hero-left">
+    <span class="pill xs ghost">Website Ops</span>
+    <div class="hero-title">网站管理中心</div>
+    <div class="hero-sub">统一管理网站机节点、站点运行、SSL 与文件系统。支持一键安装环境与自动化运维。</div>
+    <div class="hero-metrics">
+      <span class="pill">网站机 {{ nodes|length }}</span>
+      <span class="pill">站点 {{ sites|length }}</span>
+      <span class="pill ok">运行中 {{ stats.running }}</span>
+      <span class="pill warn">创建中 {{ stats.creating }}</span>
+      <span class="pill bad">异常 {{ stats.error }}</span>
+      <span class="pill bad">健康异常 {{ stats.health_fail }}</span>
     </div>
   </div>
-  <div class="right">
-    <a class="btn sm secondary" href="/websites/new">+ 新建站点</a>
+  <div class="hero-right">
+    <a class="btn sm" href="/websites/new">新建站点</a>
+    <a class="btn sm secondary" href="/nodes">节点管理</a>
   </div>
 </div>
 
-{# ---- KPI pills ---- #}
-{% set st = stats or {} %}
-<div class="au-stats" style="margin: 6px 0 10px 0;">
-  <span class="pill-stat info" title="网站节点总数">节点 <strong>{{ st.nodes or (nodes|length) }}</strong></span>
-  <span class="pill-stat ok" title="在线节点">在线 <strong>{{ st.nodes_online or 0 }}</strong></span>
-  <span class="pill-stat info" title="站点总数">站点 <strong>{{ st.sites or (sites|length) }}</strong></span>
-  <span class="pill-stat ok" title="运行中站点">运行 <strong>{{ st.sites_running or 0 }}</strong></span>
-  <span class="pill-stat warn" title="创建中站点">创建中 <strong>{{ st.sites_creating or 0 }}</strong></span>
-  <span class="pill-stat bad" title="异常站点">异常 <strong>{{ st.sites_error or 0 }}</strong></span>
-  <span class="pill-stat ok" title="SSL 有效">SSL 有效 <strong>{{ st.ssl_valid or 0 }}</strong></span>
-  <span class="pill-stat warn" title="SSL 待处理">SSL 待处理 <strong>{{ st.ssl_pending or 0 }}</strong></span>
-  <span class="pill-stat bad" title="SSL 失败">SSL 失败 <strong>{{ st.ssl_failed or 0 }}</strong></span>
-</div>
-
-<div class="grid" style="grid-template-columns: 1fr; gap: 12px;">
-  {# =====================
-     Website Nodes
-     ===================== #}
+<div class="grid websites-grid" style="grid-template-columns:repeat(2,minmax(320px,1fr));">
   <div class="card">
-    <div class="card-header">
+    <div class="section-head">
       <div>
-        <div class="card-title">网站节点</div>
-        <div class="card-sub">只展示角色为“网站机”的节点。环境操作会记录到任务列表，便于排查。</div>
+        <div class="section-title">网站机节点</div>
+        <div class="section-sub">环境安装、卸载与节点能力信息。</div>
       </div>
       <div class="muted sm">{{ nodes|length }} 台</div>
     </div>
-
     {% if nodes %}
-      <div class="table-wrap">
-        <table class="table" id="nodesTable">
-          <thead>
-            <tr>
-              <th>节点</th>
-              <th>Agent 地址</th>
-              <th>状态</th>
-              <th>网站根目录</th>
-              <th style="text-align:right;">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for n in nodes %}
-            <tr>
-              <td>
-                <div style="font-weight:850;">{{ n.name or ("节点-" ~ n.id) }}</div>
-                <div class="muted sm">ID: <span class="mono">{{ n.id }}</span></div>
-              </td>
-              <td class="mono" style="word-break:break-all;">{{ n.base_url }}</td>
-              <td>
-                <span class="node-state {{ 'online' if n.online else 'offline' }}" title="{{ '在线' if n.online else '离线' }}">
-                  <span class="node-dot {{ 'online' if n.online else 'offline' }}"></span>
-                  <span>{{ '在线' if n.online else '离线' }}</span>
-                </span>
-              </td>
-              <td class="mono">{{ n.website_root_base or '/www' }}</td>
-              <td style="text-align:right;">
-                <details class="menu">
-                  <summary class="btn xs secondary">环境 ▾</summary>
-                  <div class="menu-pop">
-                    <form method="post" action="/websites/nodes/{{ n.id }}/env/ensure">
-                      <input type="hidden" name="include_php" value="1" />
-                      <button class="menu-item" type="submit">一键安装环境 <span class="muted sm">Nginx + ACME + PHP</span></button>
-                    </form>
-                    <form method="post" action="/websites/nodes/{{ n.id }}/env/ensure">
-                      <button class="menu-item" type="submit">安装环境 <span class="muted sm">仅 Nginx + ACME</span></button>
-                    </form>
-                    <div class="menu-sep"></div>
-                    <form method="post" action="/websites/nodes/{{ n.id }}/env/uninstall" onsubmit="return confirm('确定卸载该节点的网站环境吗？');">
-                      <button class="menu-item" type="submit">卸载环境 <span class="muted sm">保留数据</span></button>
-                    </form>
-                    <form method="post" action="/websites/nodes/{{ n.id }}/env/uninstall" onsubmit="return confirm('确定卸载环境并删除网站数据吗？该操作不可恢复。');">
-                      <input type="hidden" name="purge_data" value="1" />
-                      <button class="menu-item" type="submit">卸载并删除数据 <span class="muted sm">清理站点根目录</span></button>
-                    </form>
-                    <form method="post" action="/websites/nodes/{{ n.id }}/env/uninstall" onsubmit="return confirm('深度卸载会尝试移除相关软件包，并删除网站数据。确定继续吗？');">
-                      <input type="hidden" name="purge_data" value="1" />
-                      <input type="hidden" name="deep_uninstall" value="1" />
-                      <button class="menu-item" type="submit">深度卸载 <span class="muted sm">清理包 + 数据</span></button>
-                    </form>
-                  </div>
-                </details>
-                <a class="btn xs ghost" href="/nodes/{{ n.id }}">节点详情</a>
-              </td>
-            </tr>
+      {% for n in nodes %}
+      <div class="panel">
+        <div class="panel-head">
+          <div class="col">
+            <div class="panel-title">{{ n.name }}</div>
+            <div class="panel-sub mono">{{ n.base_url }}</div>
+            <div class="panel-sub">根目录基准：<span class="mono">{{ n.website_root_base or '/www' }}</span></div>
+          </div>
+          <div class="right">
+            <a class="btn xs ghost" href="/nodes/{{ n.id }}">节点详情</a>
+          </div>
+        </div>
+        {% if n.capabilities %}
+          <div class="panel-actions">
+            {% for k, v in n.capabilities.items() %}
+              {% if v %}
+                <span class="pill xs ghost">{{ k }}</span>
+              {% endif %}
             {% endfor %}
-          </tbody>
-        </table>
+          </div>
+        {% endif %}
+        <div class="panel-actions">
+          <form method="post" action="/websites/nodes/{{ n.id }}/env/ensure" class="toolbar">
+            <label class="help"><input type="checkbox" name="include_php" checked style="transform:translateY(1px);"> 含 PHP</label>
+            <button class="btn xs secondary" type="submit">一键安装环境</button>
+          </form>
+          <form method="post" action="/websites/nodes/{{ n.id }}/env/uninstall" class="toolbar" onsubmit="return confirm('确定卸载该节点的网站环境吗？');">
+            <label class="help"><input type="checkbox" name="purge_data" style="transform:translateY(1px);"> 删除网站数据</label>
+            <label class="help"><input type="checkbox" name="deep_uninstall" style="transform:translateY(1px);"> 深度卸载</label>
+            <button class="btn xs ghost" type="submit">卸载环境</button>
+          </form>
+        </div>
       </div>
+      {% endfor %}
     {% else %}
-      <div class="muted">暂无网站机节点。请先在接入节点时选择“网站机”角色。</div>
+      <div class="muted">暂无网站机节点，请先在接入节点时勾选“网站机”。</div>
     {% endif %}
   </div>
 
-  {# =====================
-     Sites
-     ===================== #}
   <div class="card">
-    <div class="card-header" style="margin-bottom:8px;">
+    <div class="section-head">
       <div>
-        <div class="card-title">站点列表</div>
-        <div class="card-sub">支持按状态/SSL 筛选与搜索域名/名称。</div>
+        <div class="section-title">站点总览</div>
+        <div class="section-sub">站点状态、域名与管理入口。</div>
       </div>
-      <div class="muted sm">共 <strong class="mono">{{ sites|length }}</strong> 个 · 显示 <strong class="mono" id="sitesVisibleCount">{{ sites|length }}</strong> 个</div>
+      <div class="muted sm">{{ sites|length }} 个</div>
     </div>
-
-    <div class="dashboard-toolbar" style="margin-top:0;">
-      <div class="dash-filters" role="tablist" aria-label="站点状态筛选">
-        <button class="chip" type="button" data-status="all" aria-selected="true">全部 <strong>{{ sites|length }}</strong></button>
-        <button class="chip" type="button" data-status="running">运行 <strong>{{ st.sites_running or 0 }}</strong></button>
-        <button class="chip" type="button" data-status="creating">创建中 <strong>{{ st.sites_creating or 0 }}</strong></button>
-        <button class="chip" type="button" data-status="error">异常 <strong>{{ st.sites_error or 0 }}</strong></button>
-        <div style="width:10px;"></div>
-        <label class="muted sm" for="sitesSslFilter" style="align-self:center;">SSL</label>
-        <select id="sitesSslFilter" class="select" style="padding:6px 10px; border-radius:12px; font-size:12px;">
-          <option value="all">全部</option>
-          <option value="valid">有效</option>
-          <option value="pending">待处理</option>
-          <option value="failed">失败</option>
-          <option value="none">无证书</option>
-        </select>
-        <label class="muted sm" for="sitesNodeFilter" style="align-self:center;">节点</label>
-        <select id="sitesNodeFilter" class="select" style="padding:6px 10px; border-radius:12px; font-size:12px;">
-          <option value="all">全部</option>
-          {% for n in nodes %}
-            <option value="{{ n.id }}">{{ n.name or ("节点-" ~ n.id) }}</option>
-          {% endfor %}
-        </select>
-      </div>
-
-      <div class="dash-search" role="search">
-        <span class="dash-search-ico" aria-hidden="true">⌕</span>
-        <input id="sitesSearch" class="dash-search-input" placeholder="搜索站点 / 域名" autocomplete="off" />
-        <button id="sitesSearchClear" class="dash-search-clear" type="button" title="清空">×</button>
-      </div>
-    </div>
-
     {% if sites %}
-      <div class="table-wrap">
-        <table class="table" id="sitesTable">
-          <thead>
-            <tr>
-              <th>站点</th>
-              <th>域名</th>
-              <th>节点</th>
-              <th>类型</th>
-              <th>SSL</th>
-              <th>状态</th>
-              <th style="text-align:right;">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for s in sites %}
-              {% set t = (s.type or 'static')|lower %}
-              {% set stt = (s.status or '')|lower %}
-              {% set ssl = (s.ssl_status or 'none')|lower %}
-              {% set primary = (s.domains[0] if s.domains else '') %}
-              <tr
-                data-name="{{ (s.name or '')|lower }}"
-                data-domains="{{ (s.domains_text or '')|lower }}"
-                data-node="{{ s.node.id if s.node else 0 }}"
-                data-status="{{ stt }}"
-                data-ssl="{{ ssl }}"
-                data-type="{{ t }}"
-              >
-                <td>
-                  <div style="font-weight:850;">{{ s.name }}</div>
-                  {% if s.root_path %}
-                    <div class="muted sm">根目录：<span class="mono">{{ s.root_path }}</span></div>
-                  {% elif t == 'reverse_proxy' %}
-                    <div class="muted sm">反代：<span class="mono">{{ s.proxy_target or '-' }}</span></div>
-                  {% else %}
-                    <div class="muted sm">—</div>
-                  {% endif %}
-                </td>
-                <td class="mono" style="word-break:break-all;">{{ s.domains_text }}</td>
-                <td>
-                  {% if s.node %}
-                    <div style="font-weight:700;">{{ s.node.name }}</div>
-                    <div class="muted sm mono">ID: {{ s.node.id }}</div>
-                  {% else %}
-                    <span class="muted">-</span>
-                  {% endif %}
-                </td>
-                <td>
-                  {% if t == 'php' %}
-                    <span class="badge warn">PHP</span>
-                  {% elif t == 'reverse_proxy' %}
-                    <span class="badge info">反代</span>
-                  {% else %}
-                    <span class="badge info">静态</span>
-                  {% endif %}
-                </td>
-                <td>
-                  {% if ssl == 'valid' %}
-                    <span class="badge ok">有效</span>
-                  {% elif ssl == 'pending' %}
-                    <span class="badge warn">待处理</span>
-                  {% elif ssl == 'failed' %}
-                    <span class="badge bad">失败</span>
-                  {% else %}
-                    <span class="badge muted">无</span>
-                  {% endif %}
-                </td>
-                <td>
-                  {% if stt == 'running' %}
-                    <span class="badge ok">运行中</span>
-                  {% elif stt == 'creating' %}
-                    <span class="badge warn">创建中</span>
-                  {% elif stt == 'error' %}
-                    <span class="badge bad">异常</span>
-                  {% else %}
-                    <span class="badge muted">{{ s.status or '-' }}</span>
-                  {% endif %}
-                </td>
-                <td style="text-align:right; white-space:nowrap;">
-                  <details class="menu">
-                    <summary class="btn xs ghost">操作 ▾</summary>
-                    <div class="menu-pop">
-                      <a class="menu-item" href="/websites/{{ s.id }}">管理 <span class="muted sm">详情/SSL/任务</span></a>
-                      {% if s.root_path %}
-                        <a class="menu-item" href="/websites/{{ s.id }}/files">文件管理 <span class="muted sm">根目录</span></a>
-                      {% else %}
-                        <span class="menu-item" style="cursor:default; opacity:0.6;">文件管理 <span class="muted sm">无根目录</span></span>
-                      {% endif %}
-                      {% if primary %}
-                        <div class="menu-sep"></div>
-                        <a class="menu-item" href="http://{{ primary }}" target="_blank" rel="noreferrer">打开 HTTP <span class="muted sm">↗</span></a>
-                        <a class="menu-item" href="https://{{ primary }}" target="_blank" rel="noreferrer">打开 HTTPS <span class="muted sm">↗</span></a>
-                      {% endif %}
-                    </div>
-                  </details>
-                </td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
+    <div class="table-wrap">
+      <table class="table site-table">
+        <thead>
+          <tr>
+            <th>站点</th>
+            <th>域名</th>
+            <th>节点</th>
+            <th>类型</th>
+            <th>状态</th>
+            <th>健康</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for s in sites %}
+          {% set st = (s.status or '') %}
+          {% set st_class = 'ok' if st == 'running' else ('warn' if st in ['creating','pending'] else ('bad' if st == 'error' else 'ghost')) %}
+          {% set type_map = {'static':'静态', 'php':'PHP', 'reverse_proxy':'反向代理'} %}
+          {% set h = (s.health_status or '') %}
+          {% set hcls = 'ok' if h == 'ok' else ('bad' if h == 'fail' else 'ghost') %}
+          <tr>
+            <td>
+              <div style="font-weight:700;">{{ s.name }}</div>
+              <div class="muted-row">ID #{{ s.id }}</div>
+            </td>
+            <td class="mono" style="word-break:break-all;">{{ s.domains_text }}</td>
+            <td>{{ s.node.name if s.node else "-" }}</td>
+            <td>{{ type_map.get(s.type, s.type) }}</td>
+            <td><span class="pill xs {{ st_class }}">{{ st or 'unknown' }}</span></td>
+            <td><span class="pill xs {{ hcls }}">{{ h or 'unknown' }}</span></td>
+            <td>
+              <a class="btn xs ghost" href="/websites/{{ s.id }}">管理</a>
+              <a class="btn xs secondary" href="/websites/{{ s.id }}/files">文件</a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
     {% else %}
       <div class="muted">暂无站点</div>
     {% endif %}
   </div>
 </div>
-{% endblock %}
-
-{% block scripts %}
-<script>
-  (function(){
-    const table = document.getElementById('sitesTable');
-    if(!table) return;
-
-    const rows = Array.from(table.querySelectorAll('tbody tr'));
-    // Only the filter chips (avoid matching table rows that also have data-status).
-    const chips = Array.from(document.querySelectorAll('.dash-filters .chip[data-status]'));
-    const search = document.getElementById('sitesSearch');
-    const clearBtn = document.getElementById('sitesSearchClear');
-    const sslSel = document.getElementById('sitesSslFilter');
-    const nodeSel = document.getElementById('sitesNodeFilter');
-    const countEl = document.getElementById('sitesVisibleCount');
-
-    let status = 'all';
-
-    function setActiveChip(target){
-      chips.forEach(c => {
-        const isActive = c === target;
-        c.setAttribute('aria-selected', isActive ? 'true' : 'false');
-        c.style.borderColor = isActive ? 'rgba(255,255,255,0.22)' : '';
-        c.style.background = isActive ? 'rgba(148,163,184,0.12)' : '';
-        c.style.color = isActive ? 'var(--text)' : '';
-      });
-    }
-
-    function apply(){
-      const q = (search?.value || '').trim().toLowerCase();
-      const ssl = (sslSel?.value || 'all');
-      const node = (nodeSel?.value || 'all');
-      let shown = 0;
-
-      rows.forEach(r => {
-        const rn = (r.dataset.name || '');
-        const rd = (r.dataset.domains || '');
-        const rs = (r.dataset.status || '');
-        const rssl = (r.dataset.ssl || 'none');
-        const rnode = (r.dataset.node || '0');
-
-        const okQ = !q || (rn + ' ' + rd).includes(q);
-        const okS = status === 'all' || rs === status;
-        const okSSL = ssl === 'all' || rssl === ssl;
-        const okNode = node === 'all' || rnode === node;
-
-        const show = okQ && okS && okSSL && okNode;
-        r.style.display = show ? '' : 'none';
-        if(show) shown++;
-      });
-
-      if(countEl) countEl.textContent = String(shown);
-    }
-
-    chips.forEach(c => {
-      c.addEventListener('click', () => {
-        status = c.dataset.status || 'all';
-        setActiveChip(c);
-        apply();
-      });
-    });
-
-    if(search){
-      search.addEventListener('input', apply);
-    }
-
-    if(clearBtn && search){
-      clearBtn.addEventListener('click', () => {
-        search.value = '';
-        search.focus();
-        apply();
-      });
-    }
-
-    sslSel?.addEventListener('change', apply);
-    nodeSel?.addEventListener('change', apply);
-
-    // initial
-    const firstChip = chips.find(x => (x.dataset.status || 'all') === 'all');
-    if(firstChip) setActiveChip(firstChip);
-    apply();
-  })();
-</script>
 {% endblock %}

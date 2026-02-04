@@ -20,6 +20,7 @@ from .routers import (
     websites,
 )
 from .services.netmon import start_background as start_netmon_background
+from .services.site_monitor import start_background as start_site_monitor_background
 
 
 # Ensure DB exists before serving.
@@ -57,4 +58,9 @@ async def _startup() -> None:
         await start_netmon_background(app)
     except Exception:
         # Never fail panel startup due to bg worker.
+        pass
+    # Background site monitor
+    try:
+        await start_site_monitor_background(app)
+    except Exception:
         pass

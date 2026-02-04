@@ -17,6 +17,7 @@ from ..core.templates import templates
 from ..db import (
     add_certificate,
     add_site,
+    add_site_event,
     add_task,
     delete_certificates_by_node,
     delete_certificates_by_site,
@@ -25,15 +26,15 @@ from ..db import (
     get_node,
     get_site,
     list_certificates,
+    list_site_checks,
+    list_site_events,
     list_nodes,
     list_sites,
-    list_tasks,
     update_certificate,
     update_site,
     update_task,
 )
 from ..services.apply import node_verify_tls
-from ..services.node_status import is_report_fresh
 
 router = APIRouter()
 UPLOAD_CHUNK_SIZE = 1024 * 512
@@ -66,6 +67,8 @@ def _normalize_proxy_target(target: str) -> str:
     t = (target or "").strip()
     if not t:
         return ""
+    if t.startswith("unix:"):
+        return t
     if "://" in t:
         return t
     return f"http://{t}"
@@ -96,76 +99,20 @@ def _agent_payload_root(site: Dict[str, Any], node: Dict[str, Any]) -> str:
     return root
 
 
+def _node_root_base(node: Dict[str, Any]) -> str:
+    return str(node.get("website_root_base") or "").strip()
+
+
 @router.get("/websites", response_class=HTMLResponse)
 async def websites_index(request: Request, user: str = Depends(require_login_page)):
-    # ---- Nodes (website role only) ----
     nodes = [n for n in list_nodes() if str(n.get("role") or "") == "website"]
-    for n in nodes:
-        # Match console behaviour: show online/offline based on last report time.
-        n["online"] = is_report_fresh(n)
-
+    sites = list_sites()
     node_map = {int(n["id"]): n for n in nodes}
 
-    # ---- Sites ----
-    sites = list_sites()
-    # Attach node + pretty fields (always safe even if node missing)
     for s in sites:
         nid = int(s.get("node_id") or 0)
         s["node"] = node_map.get(nid)
         s["domains_text"] = ", ".join(s.get("domains") or [])
-
-    # ---- SSL summary (latest cert per site) ----
-    latest_cert_by_site: Dict[int, Dict[str, Any]] = {}
-    try:
-        for c in list_certificates():
-            sid = c.get("site_id")
-            if sid is None:
-                continue
-            try:
-                sid_i = int(sid)
-            except Exception:
-                continue
-            if sid_i <= 0:
-                continue
-            if sid_i in latest_cert_by_site:
-                continue
-            c["domains_text"] = ", ".join(c.get("domains") or [])
-            latest_cert_by_site[sid_i] = c
-    except Exception:
-        latest_cert_by_site = {}
-
-    # Per-site derived SSL state
-    for s in sites:
-        sid = int(s.get("id") or 0)
-        cert = latest_cert_by_site.get(sid)
-        s["cert"] = cert
-        if not cert:
-            s["ssl_status"] = "none"
-        else:
-            st = str(cert.get("status") or "").strip().lower()
-            s["ssl_status"] = st or "unknown"
-
-    # ---- High-level stats (for UI chips) ----
-    total_sites = len(sites)
-    running_sites = sum(1 for s in sites if str(s.get("status") or "").lower() == "running")
-    creating_sites = sum(1 for s in sites if str(s.get("status") or "").lower() == "creating")
-    error_sites = sum(1 for s in sites if str(s.get("status") or "").lower() == "error")
-
-    ssl_valid = sum(1 for s in sites if str(s.get("ssl_status")) == "valid")
-    ssl_pending = sum(1 for s in sites if str(s.get("ssl_status")) == "pending")
-    ssl_failed = sum(1 for s in sites if str(s.get("ssl_status")) == "failed")
-
-    stats = {
-        "nodes": len(nodes),
-        "nodes_online": sum(1 for n in nodes if n.get("online")),
-        "sites": total_sites,
-        "sites_running": running_sites,
-        "sites_creating": creating_sites,
-        "sites_error": error_sites,
-        "ssl_valid": ssl_valid,
-        "ssl_pending": ssl_pending,
-        "ssl_failed": ssl_failed,
-    }
 
     return templates.TemplateResponse(
         "websites.html",
@@ -176,7 +123,6 @@ async def websites_index(request: Request, user: str = Depends(require_login_pag
             "title": "网站管理",
             "nodes": nodes,
             "sites": sites,
-            "stats": stats,
         },
     )
 
@@ -289,6 +235,20 @@ async def websites_new_action(
         gzip_enabled=gzip_flag,
         status="creating",
     )
+    add_site_event(
+        site_id,
+        "site_create",
+        status="running",
+        actor=str(user or ""),
+        payload={
+            "node_id": int(node_id),
+            "domains": domains_list,
+            "root_path": root_path,
+            "type": site_type,
+            "web_server": web_server,
+            "proxy_target": proxy_target,
+        },
+    )
 
     task_id = add_task(
         node_id=int(node_id),
@@ -319,6 +279,7 @@ async def websites_new_action(
             "https_redirect": https_flag,
             "gzip_enabled": gzip_flag,
             "nginx_tpl": tpl,
+            "root_base": _node_root_base(node),
         }
         data = await agent_post(
             node["base_url"],
@@ -326,18 +287,19 @@ async def websites_new_action(
             "/api/v1/website/site/create",
             payload,
             node_verify_tls(node),
-            # Creating a site may include filesystem operations + nginx reload.
-            timeout=60,
+            timeout=30,
         )
         if not data.get("ok", True):
             raise AgentError(str(data.get("error") or "创建站点失败"))
         update_site(site_id, status="running")
         update_task(task_id, status="success", progress=100, result=data)
+        add_site_event(site_id, "site_create", status="success", actor=str(user or ""), result=data)
         set_flash(request, "站点创建成功")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
     except Exception as exc:
         update_site(site_id, status="error")
         update_task(task_id, status="failed", progress=100, error=str(exc))
+        add_site_event(site_id, "site_create", status="failed", actor=str(user or ""), error=str(exc))
         set_flash(request, f"站点创建失败：{exc}")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
@@ -352,24 +314,8 @@ async def website_detail(request: Request, site_id: int, user: str = Depends(req
     certs = list_certificates(site_id=int(site_id))
     for c in certs:
         c["domains_text"] = ", ".join(c.get("domains") or [])
-
-    # Recent tasks for this site (create/ssl/renew/delete...). Helpful for troubleshooting.
-    tasks: List[Dict[str, Any]] = []
-    try:
-        all_tasks = list_tasks(node_id=int(site.get("node_id") or 0), limit=80)
-        for t in all_tasks:
-            payload = t.get("payload") if isinstance(t, dict) else None
-            if not isinstance(payload, dict):
-                continue
-            try:
-                if int(payload.get("site_id") or 0) != int(site_id):
-                    continue
-            except Exception:
-                continue
-            tasks.append(t)
-        tasks = tasks[:20]
-    except Exception:
-        tasks = []
+    events = list_site_events(int(site_id), limit=60)
+    checks = list_site_checks(int(site_id), limit=30)
     return templates.TemplateResponse(
         "site_detail.html",
         {
@@ -380,7 +326,64 @@ async def website_detail(request: Request, site_id: int, user: str = Depends(req
             "site": site,
             "node": node,
             "certs": certs,
-            "tasks": tasks,
+            "events": events,
+            "checks": checks,
+        },
+    )
+
+
+@router.get("/websites/{site_id}/diagnose", response_class=HTMLResponse)
+async def website_diagnose(request: Request, site_id: int, user: str = Depends(require_login_page)):
+    site = get_site(int(site_id))
+    if not site:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(int(site.get("node_id") or 0))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    payload = {
+        "domains": site.get("domains") or [],
+        "type": site.get("type") or "static",
+        "root_path": site.get("root_path") or "",
+        "proxy_target": site.get("proxy_target") or "",
+        "root_base": _node_root_base(node),
+    }
+
+    diag: Dict[str, Any] = {}
+    err_msg = ""
+    try:
+        data = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/diagnose",
+            payload,
+            node_verify_tls(node),
+            timeout=15,
+        )
+        diag = data if isinstance(data, dict) else {}
+        if not diag.get("ok", True):
+            err_msg = str(diag.get("error") or "诊断失败")
+    except Exception as exc:
+        err_msg = str(exc)
+
+    events = list_site_events(int(site_id), limit=80)
+    checks = list_site_checks(int(site_id), limit=40)
+
+    return templates.TemplateResponse(
+        "site_diagnose.html",
+        {
+            "request": request,
+            "user": user,
+            "flash": flash(request),
+            "title": f"诊断 · {site.get('name')}",
+            "site": site,
+            "node": node,
+            "diag": diag,
+            "diag_error": err_msg,
+            "events": events,
+            "checks": checks,
         },
     )
 
@@ -413,6 +416,7 @@ async def website_ssl_issue(request: Request, site_id: int, user: str = Depends(
         status="running",
         progress=10,
     )
+    add_site_event(site_id, "ssl_issue", status="running", actor=str(user or ""), payload={"domains": domains})
 
     try:
         data = await agent_post(
@@ -422,6 +426,7 @@ async def website_ssl_issue(request: Request, site_id: int, user: str = Depends(
             {
                 "domains": domains,
                 "root_path": site.get("root_path") or "",
+                "root_base": _node_root_base(node),
                 "update_conf": {
                     "type": site.get("type") or "static",
                     "root_path": site.get("root_path") or "",
@@ -432,8 +437,7 @@ async def website_ssl_issue(request: Request, site_id: int, user: str = Depends(
                 },
             },
             node_verify_tls(node),
-            # ACME issuance may take time (CA latency, network jitter).
-            timeout=360,
+            timeout=20,
         )
         if not data.get("ok", True):
             raise AgentError(str(data.get("error") or "证书申请失败"))
@@ -460,6 +464,7 @@ async def website_ssl_issue(request: Request, site_id: int, user: str = Depends(
             )
         update_task(task_id, status="success", progress=100, result=data)
         warn = str(data.get("warning") or "").strip() if isinstance(data, dict) else ""
+        add_site_event(site_id, "ssl_issue", status="success", actor=str(user or ""), result=data)
         if warn:
             set_flash(request, f"证书申请成功，但有警告：{warn}")
         else:
@@ -476,6 +481,7 @@ async def website_ssl_issue(request: Request, site_id: int, user: str = Depends(
                 last_error=str(exc),
             )
         update_task(task_id, status="failed", progress=100, error=str(exc))
+        add_site_event(site_id, "ssl_issue", status="failed", actor=str(user or ""), error=str(exc))
         set_flash(request, f"证书申请失败：{exc}")
 
     return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
@@ -507,6 +513,7 @@ async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(
         status="running",
         progress=10,
     )
+    add_site_event(site_id, "ssl_renew", status="running", actor=str(user or ""), payload={"domains": domains})
 
     try:
         data = await agent_post(
@@ -516,6 +523,7 @@ async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(
             {
                 "domains": domains,
                 "root_path": site.get("root_path") or "",
+                "root_base": _node_root_base(node),
                 "update_conf": {
                     "type": site.get("type") or "static",
                     "root_path": site.get("root_path") or "",
@@ -526,8 +534,7 @@ async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(
                 },
             },
             node_verify_tls(node),
-            # ACME renew may take time (CA latency, network jitter).
-            timeout=360,
+            timeout=20,
         )
         if not data.get("ok", True):
             raise AgentError(str(data.get("error") or "证书续期失败"))
@@ -555,6 +562,7 @@ async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(
 
         update_task(task_id, status="success", progress=100, result=data)
         warn = str(data.get("warning") or "").strip() if isinstance(data, dict) else ""
+        add_site_event(site_id, "ssl_renew", status="success", actor=str(user or ""), result=data)
         if warn:
             set_flash(request, f"证书续期成功，但有警告：{warn}")
         else:
@@ -571,6 +579,7 @@ async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(
                 last_error=str(exc),
             )
         update_task(task_id, status="failed", progress=100, error=str(exc))
+        add_site_event(site_id, "ssl_renew", status="failed", actor=str(user or ""), error=str(exc))
         set_flash(request, f"证书续期失败：{exc}")
     return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
@@ -604,19 +613,14 @@ async def website_delete(
         "root_path": site.get("root_path") or "",
         "delete_root": bool(delete_files),
         "delete_cert": bool(delete_cert),
+        "root_base": _node_root_base(node),
     }
-
-    task_id = add_task(
-        node_id=int(site.get("node_id") or 0),
-        task_type="site_delete",
-        payload={
-            "site_id": site_id,
-            "domains": domains,
-            "delete_root": bool(delete_files),
-            "delete_cert": bool(delete_cert),
-        },
+    add_site_event(
+        int(site_id),
+        "site_delete",
         status="running",
-        progress=10,
+        actor=str(user or ""),
+        payload=payload,
     )
     try:
         data = await agent_post(
@@ -625,22 +629,21 @@ async def website_delete(
             "/api/v1/website/site/delete",
             payload,
             node_verify_tls(node),
-            # Deleting a site may include deleting a large root directory.
-            timeout=300,
+            timeout=20,
         )
         if not data.get("ok", True):
             raise AgentError(str(data.get("error") or "删除站点失败"))
         delete_certificates_by_site(int(site_id))
         delete_site(int(site_id))
-        update_task(task_id, status="success", progress=100, result=data)
         warn = data.get("warnings") if isinstance(data, dict) else None
+        add_site_event(int(site_id), "site_delete", status="success", actor=str(user or ""), result=data)
         if isinstance(warn, list) and warn:
             set_flash(request, f"站点已删除，但有警告：{'；'.join([str(x) for x in warn])}")
         else:
             set_flash(request, "站点已删除")
         return RedirectResponse(url="/websites", status_code=303)
     except Exception as exc:
-        update_task(task_id, status="failed", progress=100, error=str(exc))
+        add_site_event(int(site_id), "site_delete", status="failed", actor=str(user or ""), error=str(exc))
         set_flash(request, f"删除站点失败：{exc}")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
@@ -666,26 +669,11 @@ async def website_env_uninstall(
             {
                 "domains": s.get("domains") or [],
                 "root_path": s.get("root_path") or "",
+                "root_base": _node_root_base(node),
             }
             for s in sites
         ],
     }
-
-    task_id = add_task(
-        node_id=int(node_id),
-        task_type="env_uninstall",
-        payload={
-            "node_id": int(node_id),
-            "purge_data": bool(purge_data),
-            "deep_uninstall": bool(deep_uninstall),
-            "sites": [
-                {"domains": s.get("domains") or [], "root_path": s.get("root_path") or ""}
-                for s in sites
-            ],
-        },
-        status="running",
-        progress=10,
-    )
 
     try:
         data = await agent_post(
@@ -694,22 +682,19 @@ async def website_env_uninstall(
             "/api/v1/website/env/uninstall",
             payload,
             node_verify_tls(node),
-            # Uninstall may purge large roots; allow enough time.
-            timeout=600,
+            timeout=30,
         )
         if not data.get("ok", True):
             raise AgentError(str(data.get("error") or "卸载失败"))
         if purge_data:
             delete_certificates_by_node(int(node_id))
             delete_sites_by_node(int(node_id))
-        update_task(task_id, status="success", progress=100, result=data)
         errors = data.get("errors") if isinstance(data, dict) else None
         if isinstance(errors, list) and errors:
             set_flash(request, f"卸载完成，但有警告：{'；'.join([str(x) for x in errors])}")
         else:
             set_flash(request, "网站环境已卸载")
     except Exception as exc:
-        update_task(task_id, status="failed", progress=100, error=str(exc))
         set_flash(request, f"卸载失败：{exc}")
     return RedirectResponse(url="/websites", status_code=303)
 
@@ -731,14 +716,6 @@ async def website_env_ensure(
         "need_php": bool(include_php),
         "need_acme": True,
     }
-
-    task_id = add_task(
-        node_id=int(node_id),
-        task_type="env_ensure",
-        payload={"node_id": int(node_id), "include_php": bool(include_php)},
-        status="running",
-        progress=10,
-    )
     try:
         data = await agent_post(
             node["base_url"],
@@ -758,9 +735,7 @@ async def website_env_ensure(
         if already:
             msg += f"（已存在：{', '.join([str(x) for x in already])}）"
         set_flash(request, msg)
-        update_task(task_id, status="success", progress=100, result=data)
     except Exception as exc:
-        update_task(task_id, status="failed", progress=100, error=str(exc))
         set_flash(request, f"环境安装失败：{exc}")
     return RedirectResponse(url="/websites", status_code=303)
 
@@ -784,13 +759,13 @@ async def website_files(request: Request, site_id: int, path: str = "", user: st
     err_msg = ""
     items: List[Dict[str, Any]] = []
     try:
-        q = urlencode({"root": root, "path": path})
+        q = urlencode({"root": root, "path": path, "root_base": _node_root_base(node)})
         data = await agent_get(
             node["base_url"],
             node["api_key"],
             f"/api/v1/website/files/list?{q}",
             node_verify_tls(node),
-            timeout=20,
+            timeout=10,
         )
         if not data.get("ok", True):
             raise AgentError(str(data.get("error") or "读取目录失败"))
@@ -856,6 +831,7 @@ async def website_files_upload_chunk(
         "done": bool(data.get("done")),
         "content_b64": str(data.get("content_b64") or ""),
         "chunk_sha256": str(data.get("chunk_sha256") or ""),
+        "root_base": _node_root_base(node),
     }
     try:
         resp = await agent_post(
@@ -895,6 +871,7 @@ async def website_files_upload_status(
         "path": str(data.get("path") or ""),
         "filename": str(data.get("filename") or "upload.bin"),
         "upload_id": str(data.get("upload_id") or ""),
+        "root_base": _node_root_base(node),
     }
     try:
         resp = await agent_post(
@@ -939,7 +916,7 @@ async def website_files_mkdir(
             node["base_url"],
             node["api_key"],
             "/api/v1/website/files/mkdir",
-            {"root": root, "path": path, "name": name},
+            {"root": root, "path": path, "name": name, "root_base": _node_root_base(node)},
             node_verify_tls(node),
             timeout=10,
         )
@@ -991,6 +968,7 @@ async def website_files_upload(
                 "done": done,
                 "content_b64": base64.b64encode(chunk).decode("ascii"),
                 "chunk_sha256": hashlib.sha256(chunk).hexdigest(),
+                "root_base": _node_root_base(node),
             }
             resp = await agent_post(
                 node["base_url"],
@@ -1034,13 +1012,13 @@ async def website_files_edit(
     content = ""
     error = ""
     try:
-        q = urlencode({"root": root, "path": path})
+        q = urlencode({"root": root, "path": path, "root_base": _node_root_base(node)})
         data = await agent_get(
             node["base_url"],
             node["api_key"],
             f"/api/v1/website/files/read?{q}",
             node_verify_tls(node),
-            timeout=20,
+            timeout=10,
         )
         if not data.get("ok", True):
             raise AgentError(str(data.get("error") or "读取文件失败"))
@@ -1088,7 +1066,7 @@ async def website_files_save(
             node["base_url"],
             node["api_key"],
             "/api/v1/website/files/write",
-            {"root": root, "path": path, "content": content},
+            {"root": root, "path": path, "content": content, "root_base": _node_root_base(node)},
             node_verify_tls(node),
             timeout=10,
         )
@@ -1121,7 +1099,7 @@ async def website_files_delete(
             node["base_url"],
             node["api_key"],
             "/api/v1/website/files/delete",
-            {"root": root, "path": path},
+            {"root": root, "path": path, "root_base": _node_root_base(node)},
             node_verify_tls(node),
             timeout=10,
         )
@@ -1153,7 +1131,7 @@ async def website_files_download(
     import httpx
 
     url = f"{node['base_url'].rstrip('/')}/api/v1/website/files/raw"
-    params = {"root": root, "path": path}
+    params = {"root": root, "path": path, "root_base": _node_root_base(node)}
     headers = {"X-API-Key": node.get("api_key") or ""}
     async with httpx.AsyncClient(timeout=20, verify=node_verify_tls(node)) as client:
         r = await client.get(url, params=params, headers=headers)
