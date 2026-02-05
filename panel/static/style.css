@@ -682,6 +682,30 @@ details.menu summary::-webkit-details-marker{display:none}
 .btn.disabled{opacity:.55;cursor:not-allowed;pointer-events:none}
 .input.sm{padding:8px 10px;font-size:12px;border-radius:10px}
 
+.fm-upload-modal .modal-body{display:flex;flex-direction:column;gap:10px}
+.fm-upload-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.fm-upload-list{
+  border:1px solid var(--line);
+  border-radius:12px;
+  background:rgba(17,24,39,0.55);
+  padding:8px 10px;
+  max-height:240px;
+  overflow:auto;
+  font-size:12px;
+}
+.fm-upload-item{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  padding:4px 0;
+  border-bottom:1px dashed rgba(148,163,184,0.15);
+}
+.fm-upload-item:last-child{border-bottom:none}
+.fm-upload-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:70%}
+.fm-upload-size{color:var(--muted);flex-shrink:0}
+.fm-upload-stats{margin-top:2px}
+
 @media (max-width: 860px){
   .fm-toolbar{align-items:flex-start}
   .fm-search .input{min-width:180px}

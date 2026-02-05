@@ -143,6 +143,36 @@
   </div>
 </div>
 
+<div id="fmUploadModal" class="modal" style="display:none;">
+  <div class="modal-inner modal-pro fm-upload-modal">
+    <div class="modal-head">
+      <div class="title-wrap">
+        <div class="h2">上传文件夹</div>
+        <div class="muted sm">选择文件夹后确认上传</div>
+      </div>
+      <button class="btn xs ghost" type="button" id="fmModalCloseTop">关闭</button>
+    </div>
+    <div class="modal-body fm-upload-body">
+      <div class="fm-upload-row">
+        <button class="btn xs" type="button" id="fmModalPick">选择文件夹</button>
+        <input type="file" id="fmModalFolderInput" class="fm-file-input" webkitdirectory directory mozdirectory multiple>
+        <div class="muted sm" id="fmModalHint">未选择文件夹</div>
+      </div>
+      <div class="fm-upload-list" id="fmModalFileList">未选择文件夹</div>
+      <div class="fm-upload-stats muted sm" id="fmModalStats"></div>
+      <div id="fmModalProgress" style="margin-top:10px;display:none;">
+        <div class="progress"><div class="progress-fill" id="fmModalProgressFill"></div></div>
+        <div class="muted sm" id="fmModalStatus" style="margin-top:6px;"></div>
+        <button class="btn xs ghost" type="button" id="fmModalRetry" style="margin-top:8px;display:none;">重试上传</button>
+      </div>
+      <div class="row" style="justify-content:flex-end;gap:10px;margin-top:14px;">
+        <button class="btn xs ghost" type="button" id="fmModalClose">取消</button>
+        <button class="btn xs" type="button" id="fmModalStart" disabled>开始上传</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 const uploadForm = document.getElementById('uploadForm');
 const uploadFileInput = document.getElementById('uploadFileInput');
@@ -163,13 +193,42 @@ const uploadPanel = document.getElementById('uploadPanel');
 const uploadProgressFill = document.getElementById('uploadProgressFill');
 const uploadStatus = document.getElementById('uploadStatus');
 const uploadRetry = document.getElementById('uploadRetry');
+const fmUploadModal = document.getElementById('fmUploadModal');
+const fmModalPick = document.getElementById('fmModalPick');
+const fmModalFolderInput = document.getElementById('fmModalFolderInput');
+const fmModalHint = document.getElementById('fmModalHint');
+const fmModalFileList = document.getElementById('fmModalFileList');
+const fmModalStats = document.getElementById('fmModalStats');
+const fmModalStart = document.getElementById('fmModalStart');
+const fmModalClose = document.getElementById('fmModalClose');
+const fmModalCloseTop = document.getElementById('fmModalCloseTop');
+const fmModalProgress = document.getElementById('fmModalProgress');
+const fmModalProgressFill = document.getElementById('fmModalProgressFill');
+const fmModalStatus = document.getElementById('fmModalStatus');
+const fmModalRetry = document.getElementById('fmModalRetry');
 
 const CHUNK_SIZE = 1024 * 512;
 const UPLOAD_MAX_BYTES = {{ upload_max_bytes }};
 const SITE_ID = {{ site.id }};
 const CUR_PATH = {{ path|tojson }};
 let bypassChunked = false;
-const SUPPORTS_FOLDER_PICK = !!(uploadFolderInput && (('webkitdirectory' in uploadFolderInput) || ('mozdirectory' in uploadFolderInput)));
+const folderPickerEl = uploadFolderInput || fmModalFolderInput;
+const SUPPORTS_FOLDER_PICK = !!(folderPickerEl && (('webkitdirectory' in folderPickerEl) || ('mozdirectory' in folderPickerEl)));
+const defaultUI = {
+  panel: uploadPanel,
+  progressFill: uploadProgressFill,
+  status: uploadStatus,
+  retry: uploadRetry,
+  button: uploadBtn
+};
+const modalUI = {
+  panel: fmModalProgress,
+  progressFill: fmModalProgressFill,
+  status: fmModalStatus,
+  retry: fmModalRetry,
+  button: fmModalStart
+};
+let modalFiles = [];
 
 function bytesToHuman(n){
   if(!n) return '0 B';
@@ -191,7 +250,7 @@ function getPickedFiles(){
 }
 
 function updateUploadSelection(){
-  const {files} = getPickedFiles();
+  const {files, folderFiles} = getPickedFiles();
   const totalBytes = files.reduce((s,f)=>s + (f.size || 0), 0) || 0;
   if(uploadSelectionInfo){
     if(!files.length){
@@ -207,6 +266,51 @@ function updateUploadSelection(){
   if(uploadBtn){
     uploadBtn.disabled = !files.length;
   }
+}
+
+function openModal(){
+  if(!fmUploadModal) return;
+  fmUploadModal.style.display = 'flex';
+  document.body.classList.add('modal-open');
+}
+
+function closeModal(){
+  if(!fmUploadModal) return;
+  fmUploadModal.style.display = 'none';
+  document.body.classList.remove('modal-open');
+}
+
+function renderModalList(files){
+  if(!fmModalFileList || !fmModalStats) return;
+  fmModalFileList.innerHTML = '';
+  if(!files.length){
+    fmModalFileList.textContent = '未选择文件夹';
+    fmModalStats.textContent = '';
+    return;
+  }
+  const limit = 200;
+  const totalBytes = files.reduce((s,f)=>s + (f.size || 0), 0) || 0;
+  const show = files.slice(0, limit);
+  show.forEach((f)=>{
+    const row = document.createElement('div');
+    row.className = 'fm-upload-item';
+    const name = document.createElement('span');
+    name.className = 'fm-upload-name';
+    name.textContent = f.webkitRelativePath || f.name;
+    const size = document.createElement('span');
+    size.className = 'fm-upload-size';
+    size.textContent = bytesToHuman(f.size || 0);
+    row.appendChild(name);
+    row.appendChild(size);
+    fmModalFileList.appendChild(row);
+  });
+  if(files.length > limit){
+    const more = document.createElement('div');
+    more.className = 'muted sm';
+    more.textContent = `仅显示前 ${limit} 项，实际 ${files.length} 项`;
+    fmModalFileList.appendChild(more);
+  }
+  fmModalStats.textContent = `共 ${files.length} 个文件 · ${bytesToHuman(totalBytes)}`;
 }
 
 function bufToHex(buffer){
@@ -346,13 +450,18 @@ function resolveUploadTarget(file){
   return {path: CUR_PATH, filename: file.name};
 }
 
-async function uploadFile(file, uploadId, startOffset, path, filename, totalBytes, progressCb){
+async function uploadFile(file, uploadId, startOffset, path, filename, totalBytes, progressCb, ui){
   let offset = startOffset || 0;
   const total = file.size;
-  uploadPanel.style.display = 'block';
-  uploadRetry.style.display = 'none';
-  uploadBtn.disabled = true;
-  uploadStatus.textContent = `准备上传 ${file.name} (${bytesToHuman(total)})…`;
+  const panel = ui?.panel;
+  const progressFill = ui?.progressFill;
+  const status = ui?.status;
+  const retry = ui?.retry;
+  const button = ui?.button;
+  if(panel) panel.style.display = 'block';
+  if(retry) retry.style.display = 'none';
+  if(button) button.disabled = true;
+  if(status) status.textContent = `准备上传 ${file.name} (${bytesToHuman(total)})…`;
   if(total === 0){
     const resp = await fetch(`/websites/${SITE_ID}/files/upload_chunk`, {
       method: 'POST',
@@ -408,8 +517,72 @@ async function uploadFile(file, uploadId, startOffset, path, filename, totalByte
     localStorage.setItem(uploadKey(file, path, filename), uploadId);
   }
   localStorage.removeItem(uploadKey(file, path, filename));
-  uploadStatus.textContent = '上传完成';
-  uploadBtn.disabled = false;
+  if(status) status.textContent = '上传完成';
+  if(button) button.disabled = false;
+}
+
+async function startChunkedUpload(files, ui, resumeOnly){
+  if(!files.length){
+    alert('请选择文件或文件夹');
+    return;
+  }
+  if(!HAS_SUBTLE && ui?.status){
+    ui.status.textContent = '提示：当前环境不支持 SHA256（将跳过校验）。建议使用 HTTPS 或现代浏览器。';
+  }
+  for(const f of files){
+    if(UPLOAD_MAX_BYTES && f.size > UPLOAD_MAX_BYTES){
+      alert(`文件过大：${f.name}（${bytesToHuman(f.size)}），超过限制 ${bytesToHuman(UPLOAD_MAX_BYTES)}`);
+      return;
+    }
+  }
+  const totalBytes = files.reduce((s,f)=>s + (f.size || 0), 0) || 0;
+  let uploadedBytes = 0;
+  try{
+    const tasks = [];
+    for(let i=0;i<files.length;i++){
+      const file = files[i];
+      const target = resolveUploadTarget(file);
+      const key = uploadKey(file, target.path, target.filename);
+      let uploadId = localStorage.getItem(key) || '';
+      if(!uploadId){
+        if(resumeOnly){
+          throw new Error('找不到可恢复的上传');
+        }
+        uploadId = Math.random().toString(16).slice(2) + Date.now().toString(16);
+      }
+      const offset = await getResumeOffset(file, uploadId, target.path, target.filename);
+      uploadedBytes += offset;
+      tasks.push({file, target, uploadId, offset});
+    }
+    const total = totalBytes || 0;
+    const updateProgress = (delta, name)=>{
+      uploadedBytes += delta;
+      const pct = total > 0 ? Math.min(100, Math.round((uploadedBytes / total) * 100)) : 100;
+      if(ui?.progressFill) ui.progressFill.style.width = pct + '%';
+      if(ui?.status){
+        ui.status.textContent = `上传中：${name} · ${bytesToHuman(uploadedBytes)} / ${bytesToHuman(total)} (${pct}%)`;
+      }
+    };
+    const concurrency = 3;
+    let cursor = 0;
+    const worker = async ()=>{
+      while(true){
+        if(cursor >= tasks.length) return;
+        const t = tasks[cursor++];
+        await uploadFile(t.file, t.uploadId, t.offset, t.target.path, t.target.filename, total, (d)=>updateProgress(d, t.file.name), ui);
+      }
+    };
+    const workers = [];
+    for(let i=0;i<Math.min(concurrency, tasks.length);i++){
+      workers.push(worker());
+    }
+    await Promise.all(workers);
+    window.location.reload();
+  }catch(err){
+    if(ui?.status) ui.status.textContent = String(err);
+    if(ui?.retry) ui.retry.style.display = 'inline-block';
+    if(ui?.button) ui.button.disabled = false;
+  }
 }
 
 pickFilesBtn?.addEventListener('click', ()=>{
@@ -421,7 +594,67 @@ pickFolderBtn?.addEventListener('click', ()=>{
     alert('当前浏览器不支持文件夹选择，请使用 Chrome / Edge 或尝试“兼容上传”。');
     return;
   }
-  uploadFolderInput?.click();
+  modalFiles = [];
+  if(fmModalHint) fmModalHint.textContent = '未选择文件夹';
+  if(fmModalStart) fmModalStart.disabled = true;
+  if(fmModalProgress){
+    fmModalProgress.style.display = 'none';
+  }
+  if(fmModalProgressFill) fmModalProgressFill.style.width = '0%';
+  if(fmModalStatus) fmModalStatus.textContent = '';
+  if(fmModalRetry) fmModalRetry.style.display = 'none';
+  renderModalList([]);
+  openModal();
+});
+
+fmModalPick?.addEventListener('click', ()=>{
+  if(!SUPPORTS_FOLDER_PICK){
+    alert('当前浏览器不支持文件夹选择，请使用 Chrome / Edge。');
+    return;
+  }
+  fmModalFolderInput?.click();
+});
+
+fmModalFolderInput?.addEventListener('change', ()=>{
+  modalFiles = fmModalFolderInput?.files ? Array.from(fmModalFolderInput.files) : [];
+  if(fmModalHint){
+    if(modalFiles.length){
+      const rel = modalFiles[0].webkitRelativePath || '';
+      const folderName = rel ? rel.split('/')[0] : '文件夹';
+      fmModalHint.textContent = `已选择：${folderName}`;
+    }else{
+      fmModalHint.textContent = '未选择文件夹';
+    }
+  }
+  renderModalList(modalFiles);
+  if(fmModalStart) fmModalStart.disabled = !modalFiles.length;
+});
+
+fmModalStart?.addEventListener('click', async ()=>{
+  if(!modalFiles.length){
+    alert('请选择文件夹');
+    return;
+  }
+  await startChunkedUpload(modalFiles, modalUI, false);
+});
+
+fmModalRetry?.addEventListener('click', async ()=>{
+  if(!modalFiles.length) return;
+  await startChunkedUpload(modalFiles, modalUI, true);
+});
+
+const modalClose = ()=>{
+  closeModal();
+};
+fmModalClose?.addEventListener('click', modalClose);
+fmModalCloseTop?.addEventListener('click', modalClose);
+fmUploadModal?.addEventListener('click', (e)=>{
+  if(e.target === fmUploadModal) closeModal();
+});
+document.addEventListener('keydown', (e)=>{
+  if(e.key === 'Escape' && fmUploadModal && fmUploadModal.style.display !== 'none'){
+    closeModal();
+  }
 });
 
 uploadFileInput?.addEventListener('change', ()=>{
@@ -487,6 +720,11 @@ if(!SUPPORTS_FOLDER_PICK && pickFolderBtn){
   pickFolderBtn.classList.add('disabled');
   pickFolderBtn.title = '当前浏览器不支持文件夹选择';
 }
+if(!SUPPORTS_FOLDER_PICK && fmModalPick){
+  fmModalPick.setAttribute('disabled', 'disabled');
+  fmModalPick.classList.add('disabled');
+  fmModalPick.title = '当前浏览器不支持文件夹选择';
+}
 
 computeTableStats();
 applySearchFilter();
@@ -498,121 +736,14 @@ uploadForm?.addEventListener('submit', async (e)=>{
     return;
   }
   e.preventDefault();
-  const {files, folderFiles} = getPickedFiles();
-  if(!files.length){
-    alert('请选择文件或文件夹');
-    return;
-  }
-  if(!HAS_SUBTLE){
-    uploadStatus.textContent = '提示：当前环境不支持 SHA256（将跳过校验）。建议使用 HTTPS 或现代浏览器。';
-  }
-  for(const f of files){
-    if(UPLOAD_MAX_BYTES && f.size > UPLOAD_MAX_BYTES){
-      alert(`文件过大：${f.name}（${bytesToHuman(f.size)}），超过限制 ${bytesToHuman(UPLOAD_MAX_BYTES)}`);
-      return;
-    }
-  }
-  const totalBytes = files.reduce((s,f)=>s + (f.size || 0), 0) || 0;
-  let uploadedBytes = 0;
-  try{
-    const tasks = [];
-    for(let i=0;i<files.length;i++){
-      const file = files[i];
-      const target = resolveUploadTarget(file);
-      const key = uploadKey(file, target.path, target.filename);
-      let uploadId = localStorage.getItem(key) || '';
-      if(!uploadId){
-        uploadId = Math.random().toString(16).slice(2) + Date.now().toString(16);
-      }
-      const offset = await getResumeOffset(file, uploadId, target.path, target.filename);
-      uploadedBytes += offset;
-      tasks.push({file, target, uploadId, offset, idx: i});
-    }
-    const total = totalBytes || 0;
-    const updateProgress = (delta, name)=>{
-      uploadedBytes += delta;
-      const pct = total > 0 ? Math.min(100, Math.round((uploadedBytes / total) * 100)) : 100;
-      uploadProgressFill.style.width = pct + '%';
-      uploadStatus.textContent = `上传中：${name} · ${bytesToHuman(uploadedBytes)} / ${bytesToHuman(total)} (${pct}%)`;
-    };
-    const concurrency = 3;
-    let cursor = 0;
-    const worker = async ()=>{
-      while(true){
-        let t;
-        if(cursor >= tasks.length) return;
-        t = tasks[cursor++];
-        await uploadFile(t.file, t.uploadId, t.offset, t.target.path, t.target.filename, total, (d)=>updateProgress(d, t.file.name));
-      }
-    };
-    const workers = [];
-    for(let i=0;i<Math.min(concurrency, tasks.length);i++){
-      workers.push(worker());
-    }
-    await Promise.all(workers);
-    window.location.reload();
-  }catch(err){
-    uploadStatus.textContent = String(err);
-    uploadRetry.style.display = 'inline-block';
-    uploadBtn.disabled = false;
-  }
+  const {files} = getPickedFiles();
+  await startChunkedUpload(files, defaultUI, false);
 });
 
 uploadRetry?.addEventListener('click', async ()=>{
   const {files} = getPickedFiles();
   if(!files.length) return;
-  if(!HAS_SUBTLE){
-    uploadStatus.textContent = '提示：当前环境不支持 SHA256（将跳过校验）。建议使用 HTTPS 或现代浏览器。';
-  }
-  for(const f of files){
-    if(UPLOAD_MAX_BYTES && f.size > UPLOAD_MAX_BYTES){
-      uploadStatus.textContent = `文件过大：${f.name}`;
-      return;
-    }
-  }
-  const totalBytes = files.reduce((s,f)=>s + (f.size || 0), 0) || 0;
-  let uploadedBytes = 0;
-  try{
-    const tasks = [];
-    for(let i=0;i<files.length;i++){
-      const file = files[i];
-      const target = resolveUploadTarget(file);
-      const key = uploadKey(file, target.path, target.filename);
-      const uploadId = localStorage.getItem(key) || '';
-      if(!uploadId){
-        uploadStatus.textContent = '找不到可恢复的上传';
-        return;
-      }
-      const offset = await getResumeOffset(file, uploadId, target.path, target.filename);
-      uploadedBytes += offset;
-      tasks.push({file, target, uploadId, offset});
-    }
-    const total = totalBytes || 0;
-    const updateProgress = (delta, name)=>{
-      uploadedBytes += delta;
-      const pct = total > 0 ? Math.min(100, Math.round((uploadedBytes / total) * 100)) : 100;
-      uploadProgressFill.style.width = pct + '%';
-      uploadStatus.textContent = `上传中：${name} · ${bytesToHuman(uploadedBytes)} / ${bytesToHuman(total)} (${pct}%)`;
-    };
-    const concurrency = 3;
-    let cursor = 0;
-    const worker = async ()=>{
-      while(true){
-        if(cursor >= tasks.length) return;
-        const t = tasks[cursor++];
-        await uploadFile(t.file, t.uploadId, t.offset, t.target.path, t.target.filename, total, (d)=>updateProgress(d, t.file.name));
-      }
-    };
-    const workers = [];
-    for(let i=0;i<Math.min(concurrency, tasks.length);i++){
-      workers.push(worker());
-    }
-    await Promise.all(workers);
-    window.location.reload();
-  }catch(err){
-    uploadStatus.textContent = String(err);
-    uploadBtn.disabled = false;
-  }
+  await startChunkedUpload(files, defaultUI, true);
 });
 </script>
 {% endblock %}
