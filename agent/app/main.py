@@ -4323,7 +4323,16 @@ def api_files_upload_chunk(payload: Dict[str, Any], _: None = Depends(_api_key_r
     done = bool(payload.get("done"))
     content_b64 = str(payload.get("content_b64") or "")
     chunk_sha256 = str(payload.get("chunk_sha256") or "").strip().lower()
+    allow_empty = bool(payload.get("allow_empty"))
     if not content_b64:
+        if allow_empty and done and offset == 0:
+            target = _safe_join(root_path, f"{path.rstrip('/')}/{filename}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                target.write_bytes(b"")
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+            return {"ok": True, "done": True, "empty": True}
         return {"ok": False, "error": "缺少文件内容"}
     try:
         raw = base64.b64decode(content_b64.encode("ascii"))

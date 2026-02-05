@@ -879,6 +879,7 @@ async def website_files_upload_chunk(
         "done": bool(data.get("done")),
         "content_b64": str(data.get("content_b64") or ""),
         "chunk_sha256": str(data.get("chunk_sha256") or ""),
+        "allow_empty": bool(data.get("allow_empty")),
         "root_base": _node_root_base(node),
     }
     try:
@@ -1000,7 +1001,29 @@ async def website_files_upload(
         total = 0
         chunk = await file.read(UPLOAD_CHUNK_SIZE)
         if not chunk:
-            raise RuntimeError("空文件")
+            # allow empty file
+            payload = {
+                "root": root,
+                "path": path,
+                "filename": filename,
+                "upload_id": upload_id,
+                "offset": 0,
+                "done": True,
+                "allow_empty": True,
+                "root_base": _node_root_base(node),
+            }
+            resp = await agent_post(
+                node["base_url"],
+                node["api_key"],
+                "/api/v1/website/files/upload_chunk",
+                payload,
+                node_verify_tls(node),
+                timeout=10,
+            )
+            if not resp.get("ok", True):
+                raise AgentError(str(resp.get("error") or "上传失败"))
+            set_flash(request, "上传成功")
+            return RedirectResponse(url=f"/websites/{site_id}/files?path={path}", status_code=303)
         while True:
             next_chunk = await file.read(UPLOAD_CHUNK_SIZE)
             done = not next_chunk

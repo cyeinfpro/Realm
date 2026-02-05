@@ -26,7 +26,7 @@
           {% if not loop.last %}<span class="sep">/</span>{% endif %}
         {% endfor %}
       </div>
-      <div class="help">单文件上传上限 200MB（分片上传 + 断点续传）。</div>
+      <div class="help">支持选择文件夹批量上传（含子目录）；单文件上限 200MB（分片 + 断点续传）。</div>
     </div>
     <div class="col right toolbar">
       <form method="post" action="/websites/{{ site.id }}/files/mkdir" style="display:inline;">
@@ -37,6 +37,7 @@
       <form id="uploadForm" method="post" action="/websites/{{ site.id }}/files/upload" enctype="multipart/form-data" style="display:inline;">
         <input type="hidden" name="path" value="{{ path }}">
         <input type="file" id="uploadFileInput" name="file" class="input">
+        <input type="file" id="uploadFolderInput" name="folder" class="input" webkitdirectory directory multiple>
         <button class="btn xs secondary" type="submit" id="uploadBtn">上传</button>
       </form>
     </div>
@@ -94,6 +95,7 @@
 <script>
 const uploadForm = document.getElementById('uploadForm');
 const uploadFileInput = document.getElementById('uploadFileInput');
+const uploadFolderInput = document.getElementById('uploadFolderInput');
 const uploadBtn = document.getElementById('uploadBtn');
 const uploadPanel = document.getElementById('uploadPanel');
 const uploadProgressFill = document.getElementById('uploadProgressFill');
@@ -140,28 +142,77 @@ async function chunkToBase64(arrayBuffer){
   return btoa(binary);
 }
 
-function uploadKey(file){
-  return `nexus_upload_${SITE_ID}_${CUR_PATH}_${file.name}_${file.size}_${file.lastModified}`;
+function uploadKey(file, path, filename){
+  const p = path || CUR_PATH || '';
+  const f = filename || file.name || '';
+  return `nexus_upload_${SITE_ID}_${p}_${f}_${file.size}_${file.lastModified}`;
 }
 
-async function getResumeOffset(file, uploadId){
+async function getResumeOffset(file, uploadId, path, filename){
   const resp = await fetch(`/websites/${SITE_ID}/files/upload_status`, {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ path: CUR_PATH, filename: file.name, upload_id: uploadId })
+    body: JSON.stringify({ path: path || CUR_PATH, filename: filename || file.name, upload_id: uploadId })
   });
   const data = await resp.json().catch(()=>({ok:false}));
   if(!data.ok) return 0;
   return parseInt(data.offset || 0, 10) || 0;
 }
 
-async function uploadFile(file, uploadId, startOffset){
+function splitRelPath(rel){
+  const clean = String(rel || '').replace(/^\\/+/, '').replace(/\\\\/g, '/');
+  if(!clean) return {dir:'', name:''};
+  const parts = clean.split('/').filter(Boolean);
+  const name = parts.pop() || '';
+  return {dir: parts.join('/'), name};
+}
+
+function joinPath(a,b){
+  const aa = String(a || '').replace(/\\/+$/,'');
+  const bb = String(b || '').replace(/^\\/+/, '');
+  if(!aa) return bb;
+  if(!bb) return aa;
+  return aa + '/' + bb;
+}
+
+function resolveUploadTarget(file){
+  const rel = file.webkitRelativePath || '';
+  if(rel){
+    const info = splitRelPath(rel);
+    return {path: joinPath(CUR_PATH, info.dir), filename: info.name || file.name};
+  }
+  return {path: CUR_PATH, filename: file.name};
+}
+
+async function uploadFile(file, uploadId, startOffset, path, filename, totalBytes, baseUploaded){
   let offset = startOffset || 0;
   const total = file.size;
   uploadPanel.style.display = 'block';
   uploadRetry.style.display = 'none';
   uploadBtn.disabled = true;
   uploadStatus.textContent = `准备上传 ${file.name} (${bytesToHuman(total)})…`;
+  if(total === 0){
+    const resp = await fetch(`/websites/${SITE_ID}/files/upload_chunk`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        path: path || CUR_PATH,
+        filename: filename || file.name,
+        upload_id: uploadId,
+        offset: 0,
+        done: true,
+        allow_empty: true
+      })
+    });
+    const data = await resp.json().catch(()=>({ok:false,error:'上传失败'}));
+    if(!data.ok){
+      throw new Error(data.error || '上传失败');
+    }
+    const pct = totalBytes > 0 ? Math.min(100, Math.round(((baseUploaded + total) / totalBytes) * 100)) : 100;
+    uploadProgressFill.style.width = pct + '%';
+    uploadStatus.textContent = `已上传 ${bytesToHuman(baseUploaded + total)} / ${bytesToHuman(totalBytes)} (${pct}%)`;
+    return;
+  }
   while(offset < total){
     const chunk = file.slice(offset, offset + CHUNK_SIZE);
     const buf = await chunk.arrayBuffer();
@@ -172,8 +223,8 @@ async function uploadFile(file, uploadId, startOffset){
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({
-        path: CUR_PATH,
-        filename: file.name,
+        path: path || CUR_PATH,
+        filename: filename || file.name,
         upload_id: uploadId,
         offset: offset,
         done: done,
@@ -190,12 +241,13 @@ async function uploadFile(file, uploadId, startOffset){
       throw new Error(data.error || '上传失败');
     }
     offset += chunk.size;
-    const pct = Math.min(100, Math.round((offset / total) * 100));
+    const overall = baseUploaded + offset;
+    const pct = totalBytes > 0 ? Math.min(100, Math.round((overall / totalBytes) * 100)) : 100;
     uploadProgressFill.style.width = pct + '%';
-    uploadStatus.textContent = `已上传 ${bytesToHuman(offset)} / ${bytesToHuman(total)} (${pct}%)`;
-    localStorage.setItem(uploadKey(file), uploadId);
+    uploadStatus.textContent = `已上传 ${bytesToHuman(overall)} / ${bytesToHuman(totalBytes)} (${pct}%)`;
+    localStorage.setItem(uploadKey(file, path, filename), uploadId);
   }
-  localStorage.removeItem(uploadKey(file));
+  localStorage.removeItem(uploadKey(file, path, filename));
   uploadStatus.textContent = '上传完成';
   uploadBtn.disabled = false;
 }
@@ -205,19 +257,30 @@ uploadForm?.addEventListener('submit', async (e)=>{
     return;
   }
   e.preventDefault();
-  const file = uploadFileInput?.files?.[0];
-  if(!file){
-    alert('请选择文件');
+  const folderFiles = uploadFolderInput?.files ? Array.from(uploadFolderInput.files) : [];
+  const singleFile = uploadFileInput?.files?.[0];
+  const files = folderFiles.length ? folderFiles : (singleFile ? [singleFile] : []);
+  if(!files.length){
+    alert('请选择文件或文件夹');
     return;
   }
-  const key = uploadKey(file);
-  let uploadId = localStorage.getItem(key) || '';
-  if(!uploadId){
-    uploadId = Math.random().toString(16).slice(2) + Date.now().toString(16);
-  }
+  const totalBytes = files.reduce((s,f)=>s + (f.size || 0), 0) || 0;
+  let uploadedBytes = 0;
   try{
-    const offset = await getResumeOffset(file, uploadId);
-    await uploadFile(file, uploadId, offset);
+    for(let i=0;i<files.length;i++){
+      const file = files[i];
+      const target = resolveUploadTarget(file);
+      uploadStatus.textContent = `上传中：${i+1}/${files.length} · ${file.name}`;
+      const key = uploadKey(file, target.path, target.filename);
+      let uploadId = localStorage.getItem(key) || '';
+      if(!uploadId){
+        uploadId = Math.random().toString(16).slice(2) + Date.now().toString(16);
+      }
+      const offset = await getResumeOffset(file, uploadId, target.path, target.filename);
+      uploadedBytes += offset;
+      await uploadFile(file, uploadId, offset, target.path, target.filename, totalBytes, uploadedBytes - offset);
+      uploadedBytes += (file.size - offset);
+    }
     window.location.reload();
   }catch(err){
     uploadStatus.textContent = String(err);
@@ -226,17 +289,28 @@ uploadForm?.addEventListener('submit', async (e)=>{
 });
 
 uploadRetry?.addEventListener('click', async ()=>{
-  const file = uploadFileInput?.files?.[0];
-  if(!file) return;
-  const key = uploadKey(file);
-  const uploadId = localStorage.getItem(key) || '';
-  if(!uploadId){
-    uploadStatus.textContent = '找不到可恢复的上传';
-    return;
-  }
+  const folderFiles = uploadFolderInput?.files ? Array.from(uploadFolderInput.files) : [];
+  const singleFile = uploadFileInput?.files?.[0];
+  const files = folderFiles.length ? folderFiles : (singleFile ? [singleFile] : []);
+  if(!files.length) return;
+  const totalBytes = files.reduce((s,f)=>s + (f.size || 0), 0) || 0;
+  let uploadedBytes = 0;
   try{
-    const offset = await getResumeOffset(file, uploadId);
-    await uploadFile(file, uploadId, offset);
+    for(let i=0;i<files.length;i++){
+      const file = files[i];
+      const target = resolveUploadTarget(file);
+      uploadStatus.textContent = `上传中：${i+1}/${files.length} · ${file.name}`;
+      const key = uploadKey(file, target.path, target.filename);
+      const uploadId = localStorage.getItem(key) || '';
+      if(!uploadId){
+        uploadStatus.textContent = '找不到可恢复的上传';
+        return;
+      }
+      const offset = await getResumeOffset(file, uploadId, target.path, target.filename);
+      uploadedBytes += offset;
+      await uploadFile(file, uploadId, offset, target.path, target.filename, totalBytes, uploadedBytes - offset);
+      uploadedBytes += (file.size - offset);
+    }
     window.location.reload();
   }catch(err){
     uploadStatus.textContent = String(err);
