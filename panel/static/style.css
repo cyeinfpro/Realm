@@ -599,6 +599,14 @@ details.menu summary::-webkit-details-marker{display:none}
 .table th,.table td{padding:8px 8px;border-bottom:1px solid var(--line);text-align:left;font-size:13px;vertical-align:top}
 .table th{color:var(--muted);font-weight:700}
 .table tr:hover td{background:rgba(148,163,184,0.06)}
+.table.no-sticky thead th{
+  position:static;
+  top:auto;
+  z-index:auto;
+  background: rgba(11,15,20,0.78);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
 
 .rules-table{min-width:940px}
 .rules-table th,.rules-table td{white-space:nowrap}
