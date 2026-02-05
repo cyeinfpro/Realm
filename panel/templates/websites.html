@@ -18,112 +18,133 @@
   <div class="hero-left">
     <span class="pill xs ghost">Website Ops</span>
     <div class="hero-title">网站管理中心</div>
-    <div class="hero-sub">统一管理网站机、站点运行与证书。更清晰的状态、路径与操作入口。</div>
+    <div class="hero-sub">统一管理网站机节点、站点运行、SSL 与文件系统。支持一键安装环境与自动化运维。</div>
     <div class="hero-metrics">
-      <span class="pill">站点 {{ sites|length }}</span>
       <span class="pill">网站机 {{ nodes|length }}</span>
-      <span class="pill ok">运行 {{ stats.running }}</span>
-      <span class="pill warn">处理中 {{ stats.creating }}</span>
+      <span class="pill">站点 {{ sites|length }}</span>
+      <span class="pill ok">运行中 {{ stats.running }}</span>
+      <span class="pill warn">创建中 {{ stats.creating }}</span>
       <span class="pill bad">异常 {{ stats.error }}</span>
       <span class="pill bad">健康异常 {{ stats.health_fail }}</span>
     </div>
   </div>
   <div class="hero-right">
     <a class="btn sm" href="/websites/new">新建站点</a>
-    <a class="btn sm ghost" href="/nodes">节点管理</a>
+    <a class="btn sm secondary" href="/nodes">节点管理</a>
   </div>
 </div>
 
-<div class="websites-layout">
+<div class="grid websites-grid" style="grid-template-columns:repeat(2,minmax(320px,1fr));">
   <div class="card">
     <div class="section-head">
       <div>
-        <div class="section-title">站点总览</div>
-        <div class="section-sub">域名、健康状态与管理入口。</div>
+        <div class="section-title">网站机节点</div>
+        <div class="section-sub">环境安装、卸载与节点能力信息。</div>
       </div>
-      <div class="muted sm">{{ sites|length }} 个</div>
+      <div class="muted sm">{{ nodes|length }} 台</div>
     </div>
-    {% if sites %}
-    <div class="site-list">
-      {% for s in sites %}
-      {% set st = (s.status or '') %}
-      {% set st_class = 'ok' if st == 'running' else ('warn' if st in ['creating','pending'] else ('bad' if st == 'error' else 'ghost')) %}
-      {% set type_map = {'static':'静态', 'php':'PHP', 'reverse_proxy':'反向代理'} %}
-      {% set h = (s.health_status or '') %}
-      {% set hcls = 'ok' if h == 'ok' else ('bad' if h == 'fail' else 'ghost') %}
-      <div class="site-row">
-        <div class="site-main">
-          <div class="site-title">{{ s.name }}</div>
-          <div class="site-domains mono">{{ s.domains_text }}</div>
-          <div class="site-meta">
-            <span class="pill xs {{ st_class }}">{{ st or 'unknown' }}</span>
-            <span class="pill xs {{ hcls }}">{{ h or 'unknown' }}</span>
-            <span class="pill xs ghost">{{ type_map.get(s.type, s.type) }}</span>
-            <span class="pill xs ghost">{{ s.web_server }}</span>
+    {% if nodes %}
+      {% for n in nodes %}
+      <div class="panel">
+        <div class="panel-head">
+          <div class="col">
+            <div class="panel-title">{{ n.name }}</div>
+            <div class="panel-sub mono">{{ n.base_url }}</div>
+            <div class="panel-sub">根目录基准：<span class="mono">{{ n.website_root_base or '/www' }}</span></div>
+          </div>
+          <div class="right">
+            <a class="btn xs ghost" href="/nodes/{{ n.id }}">节点详情</a>
           </div>
         </div>
-        <div class="site-side">
-          <div class="site-node">节点：{{ s.node.name if s.node else '-' }}</div>
-          <div class="site-id muted sm">ID #{{ s.id }}</div>
-          <div class="site-actions">
-            <a class="btn xs" href="/websites/{{ s.id }}">管理</a>
+        {% if n.capabilities %}
+          <div class="panel-actions">
+            {% for k, v in n.capabilities.items() %}
+              {% if v %}
+                <span class="pill xs ghost">{{ k }}</span>
+              {% endif %}
+            {% endfor %}
           </div>
+        {% endif %}
+        <div class="panel-actions">
+          <form method="post" action="/websites/nodes/{{ n.id }}/env/ensure" class="toolbar">
+            <label class="help"><input type="checkbox" name="include_php" checked style="transform:translateY(1px);"> 含 PHP</label>
+            <button class="btn xs secondary" type="submit">一键安装环境</button>
+          </form>
+          <form method="post" action="/websites/nodes/{{ n.id }}/env/uninstall" class="toolbar" onsubmit="return confirm('确定卸载该节点的网站环境吗？');">
+            <label class="help"><input type="checkbox" name="purge_data" style="transform:translateY(1px);"> 删除网站数据</label>
+            <label class="help"><input type="checkbox" name="deep_uninstall" style="transform:translateY(1px);"> 深度卸载</label>
+            <button class="btn xs ghost" type="submit">卸载环境</button>
+          </form>
         </div>
       </div>
       {% endfor %}
-    </div>
     {% else %}
-      <div class="muted">暂无站点</div>
+      <div class="muted">暂无网站机节点，请先在接入节点时勾选“网站机”。</div>
     {% endif %}
   </div>
 
   <div class="card">
     <div class="section-head">
       <div>
-        <div class="section-title">网站机节点</div>
-        <div class="section-sub">环境状态与安装操作。</div>
+        <div class="section-title">站点总览</div>
+        <div class="section-sub">站点状态、域名与管理入口。</div>
       </div>
-      <div class="muted sm">{{ nodes|length }} 台</div>
+      <div class="muted sm">{{ sites|length }} 个</div>
     </div>
-    {% if nodes %}
-      <div class="node-list">
-        {% for n in nodes %}
-        <div class="node-card">
-          <div class="node-head">
-            <div>
-              <div class="node-title">{{ n.name }}</div>
-              <div class="node-sub mono">{{ n.base_url }}</div>
-              <div class="node-sub">根目录基准：<span class="mono">{{ n.website_root_base or '/www' }}</span></div>
-            </div>
-            <div>
-              <a class="btn xs ghost" href="/nodes/{{ n.id }}">节点详情</a>
-            </div>
-          </div>
-          {% if n.capabilities %}
-            <div class="pill-group">
-              {% for k, v in n.capabilities.items() %}
-                {% if v %}
-                  <span class="pill xs ghost">{{ k }}</span>
-                {% endif %}
-              {% endfor %}
-            </div>
-          {% endif %}
-          <div class="node-actions">
-            <form method="post" action="/websites/nodes/{{ n.id }}/env/ensure" class="toolbar">
-              <label class="help"><input type="checkbox" name="include_php" checked style="transform:translateY(1px);"> 含 PHP</label>
-              <button class="btn xs secondary" type="submit">安装环境</button>
-            </form>
-            <form method="post" action="/websites/nodes/{{ n.id }}/env/uninstall" class="toolbar" onsubmit="return confirm('确定卸载该节点的网站环境吗？');">
-              <label class="help"><input type="checkbox" name="purge_data" style="transform:translateY(1px);"> 删除网站数据</label>
-              <label class="help"><input type="checkbox" name="deep_uninstall" style="transform:translateY(1px);"> 深度卸载</label>
-              <button class="btn xs ghost" type="submit">卸载环境</button>
-            </form>
-          </div>
-        </div>
-        {% endfor %}
-      </div>
+    {% if sites %}
+    <div class="table-wrap">
+      <table class="table site-table no-sticky">
+        <thead>
+          <tr>
+            <th>站点</th>
+            <th>域名</th>
+            <th>节点</th>
+            <th>类型</th>
+            <th>状态</th>
+            <th>健康</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for s in sites %}
+          {% set st = (s.status or '') %}
+          {% set st_class = 'ok' if st == 'running' else ('warn' if st in ['creating','pending'] else ('bad' if st == 'error' else 'ghost')) %}
+          {% set type_map = {'static':'静态', 'php':'PHP', 'reverse_proxy':'反向代理'} %}
+          {% set h = (s.health_status or '') %}
+          {% set hcls = 'ok' if h == 'ok' else ('bad' if h == 'fail' else 'ghost') %}
+          <tr>
+            <td>
+              <div style="font-weight:700;">{{ s.name }}</div>
+              <div class="muted-row">ID #{{ s.id }}</div>
+            </td>
+            <td class="mono" style="word-break:break-all;">{{ s.domains_text }}</td>
+            <td>{{ s.node.name if s.node else "-" }}</td>
+            <td>{{ type_map.get(s.type, s.type) }}</td>
+            <td><span class="pill xs {{ st_class }}">{{ st or 'unknown' }}</span></td>
+            <td>
+              <span class="pill xs {{ hcls }}">{{ h or 'unknown' }}</span>
+              <div class="muted-row">{{ s.health_code or '-' }} · {{ s.health_latency_ms or 0 }}ms</div>
+            </td>
+            <td>
+              <a class="btn xs ghost" href="/websites/{{ s.id }}">进入</a>
+              <details class="menu">
+                <summary class="btn xs icon" title="更多">⋯</summary>
+                <div class="menu-pop">
+                  <a class="menu-item" href="/websites/{{ s.id }}/edit">编辑</a>
+                  <a class="menu-item" href="/websites/{{ s.id }}/diagnose">诊断</a>
+                  {% if s.type != 'reverse_proxy' and s.root_path %}
+                    <a class="menu-item" href="/websites/{{ s.id }}/files">文件管理</a>
+                  {% endif %}
+                </div>
+              </details>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
     {% else %}
-      <div class="muted">暂无网站机节点，请先在接入节点时勾选“网站机”。</div>
+      <div class="muted">暂无站点</div>
     {% endif %}
   </div>
 </div>

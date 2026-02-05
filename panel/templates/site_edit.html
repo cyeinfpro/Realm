@@ -1,109 +1,118 @@
 {% extends "base.html" %}
+
 {% block content %}
-<div class="hero-card">
-  <div class="hero-left">
-    <span class="pill xs ghost">Edit</span>
-    <div class="hero-title">编辑站点 · {{ site.name }}</div>
-    <div class="hero-sub">节点：{{ node.name if node else '-' }} · 域名：<span class="mono">{{ (site.domains or [])|join(', ') }}</span></div>
+<div class="hero">
+  <div>
+    <h1>编辑站点</h1>
+    <div class="muted">节点：{{ node.name or node.base_url }} · 站点ID：{{ site.id }}</div>
   </div>
   <div class="hero-right">
-    <a class="btn sm ghost" href="/websites/{{ site.id }}">返回站点</a>
+    <a class="btn ghost" href="/websites/{{ site.id }}">返回详情</a>
   </div>
 </div>
 
-<div class="card" style="margin-top:12px;">
-  <form method="post" action="/websites/{{ site.id }}/edit" class="form">
-    <div class="form-section">
-      <div class="section-head">
-        <div>
-          <div class="section-title">基础信息</div>
-          <div class="section-sub">名称与域名。</div>
-        </div>
-      </div>
-      <div class="form-grid">
-        <div class="col">
-          <label class="label">站点名称</label>
-          <input class="input" name="name" value="{{ site.name or '' }}" placeholder="例如：官网 / 客户A">
-          <div class="help">留空默认使用主域名。</div>
-        </div>
-        <div class="col">
-          <label class="label">域名（支持多个）</label>
-          <input class="input" name="domains" value="{{ site.domains_text }}" placeholder="example.com, www.example.com" required>
-          <div class="help">多个域名用逗号或空格分隔。</div>
-        </div>
-      </div>
-    </div>
+<div class="grid two">
+  <div class="card">
+    <h3>站点配置</h3>
+    <p class="muted" style="margin-top:6px;">修改后会立即重写 Nginx 配置并 reload（不会删除网站数据）。</p>
 
-    <div class="form-section">
-      <div class="section-head">
-        <div>
-          <div class="section-title">站点类型</div>
-          <div class="section-sub">调整类型将重写 Nginx 配置。</div>
-        </div>
-      </div>
-      <div class="form-grid">
-        <div class="col">
-          <label class="label">站点类型</label>
-          <select class="select" name="site_type">
-            <option value="static" {% if site.type == 'static' %}selected{% endif %}>静态站点</option>
-            <option value="php" {% if site.type == 'php' %}selected{% endif %}>PHP 站点</option>
-            <option value="reverse_proxy" {% if site.type == 'reverse_proxy' %}selected{% endif %}>反向代理</option>
-          </select>
-        </div>
-        <div class="col">
-          <label class="label">Web 服务器</label>
-          <select class="select" name="web_server">
-            <option value="nginx" selected>nginx</option>
-          </select>
-        </div>
-      </div>
-    </div>
+    <form method="post" action="/websites/{{ site.id }}/edit">
+      <label>站点名称（可选）</label>
+      <input name="name" value="{{ site.name or '' }}" placeholder="例如：官网/博客/业务站" />
 
-    <div class="form-section">
-      <div class="section-head">
-        <div>
-          <div class="section-title">运行配置</div>
-          <div class="section-sub">根目录与代理目标。</div>
-        </div>
-      </div>
-      <div class="form-grid">
-        <div class="col">
-          <label class="label">根目录</label>
-          <input class="input" name="root_path" value="{{ site.root_path or '' }}" placeholder="例如：/www/wwwroot/example.com">
-          <div class="help">静态/PHP 必填；反向代理可留空。</div>
-        </div>
-        <div class="col">
-          <label class="label">反向代理目标</label>
-          <input class="input" name="proxy_target" value="{{ site.proxy_target or '' }}" placeholder="127.0.0.1:8080 或 http://127.0.0.1:8080">
-          <div class="help">系统会自动补全 http://。</div>
-        </div>
-      </div>
-      <div class="row" style="gap:12px;margin-top:6px;">
-        <label class="help"><input type="checkbox" name="https_redirect" {% if site.https_redirect %}checked{% endif %} style="transform:translateY(1px);"> 证书就绪后强制 HTTPS</label>
-        <label class="help"><input type="checkbox" name="gzip_enabled" {% if site.gzip_enabled %}checked{% endif %} style="transform:translateY(1px);"> 启用 Gzip</label>
-      </div>
-    </div>
+      <label>域名（多个用逗号分隔）</label>
+      <input name="domains" value="{{ site.domains_text or '' }}" placeholder="example.com, www.example.com" />
 
-    <div class="form-section">
-      <div class="section-head">
-        <div>
-          <div class="section-title">模板扩展</div>
-          <div class="section-sub">可选自定义 Nginx 配置模板。</div>
+      <label>站点类型</label>
+      <select name="site_type" id="site_type">
+        <option value="static" {% if site.type == 'static' %}selected{% endif %}>静态站点（HTML/前端）</option>
+        <option value="php" {% if site.type == 'php' %}selected{% endif %}>PHP 站点</option>
+        <option value="reverse_proxy" {% if site.type == 'reverse_proxy' %}selected{% endif %}>反向代理（转发到其它服务）</option>
+      </select>
+
+      <div id="root_row" style="margin-top:10px;">
+        <label>网站根目录</label>
+        <input name="root_path" id="root_path" value="{{ site.root_path or '' }}" placeholder="/www/wwwroot/example.com" />
+        <div class="muted" style="margin-top:6px;">
+          静态/PHP 站点必须填写。反向代理可留空（系统会自动创建用于 SSL 验证的目录）。
         </div>
       </div>
-      <label class="label">自定义 Nginx 模板（可选）</label>
-      <textarea class="textarea" name="nginx_tpl" rows="8" placeholder="支持变量：{{SERVER_NAME}} {{ROOT_PATH}} {{PROXY_TARGET}} {{SSL_CERT}} {{SSL_KEY}} {{GZIP_CONF}}">{{ site.nginx_tpl or '' }}</textarea>
-      <div class="help">留空则使用内置模板；自定义模板需自行处理 80/443 与 SSL。</div>
-    </div>
 
-    <div class="row" style="margin-top:12px;">
-      <div class="col">
-        <a href="/websites/{{ site.id }}" class="btn ghost">取消</a>
+      <div id="proxy_row" style="margin-top:10px;">
+        <label>代理目标</label>
+        <input name="proxy_target" id="proxy_target" value="{{ site.proxy_target or '' }}" placeholder="127.0.0.1:8080 或 http://127.0.0.1:8080" />
+        <div class="muted" style="margin-top:6px;">仅反向代理需要填写，支持 http(s)://host:port 或 unix:/path.sock。</div>
       </div>
-      <div class="col right">
-        <button class="btn" type="submit">保存修改</button>
+
+      <div style="display:flex; gap:18px; flex-wrap:wrap; margin-top:12px;">
+        <label style="display:flex; gap:8px; align-items:center;">
+          <input type="checkbox" name="https_redirect" {% if site.https_redirect %}checked{% endif %} />
+          HTTP 自动跳转 HTTPS
+        </label>
+        <label style="display:flex; gap:8px; align-items:center;">
+          {% set gz = site.gzip_enabled %}
+          <input type="checkbox" name="gzip_enabled" {% if gz is none or gz %}checked{% endif %} />
+          启用 Gzip
+        </label>
       </div>
+
+      <details style="margin-top:12px;">
+        <summary class="btn xs ghost">高级：自定义 Nginx 模板</summary>
+        <div style="margin-top:10px;">
+          <p class="muted" style="margin-top:0;">
+            可用变量：<code>{{'{{'}}SERVER_NAME{{'}}'}}</code>、<code>{{'{{'}}ROOT_PATH{{'}}'}}</code>、<code>{{'{{'}}PROXY_TARGET{{'}}'}}</code>、
+            <code>{{'{{'}}SSL_CERT{{'}}'}}</code>、<code>{{'{{'}}SSL_KEY{{'}}'}}</code>、<code>{{'{{'}}GZIP_CONF{{'}}'}}</code>、
+            <code>{{'{{'}}ACME_ROOT{{'}}'}}</code>
+          </p>
+          <textarea name="nginx_tpl" rows="10" style="width:100%; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;">{{ site.nginx_tpl or '' }}</textarea>
+          <p class="muted">提示：自定义模板需要你自行保证 <code>/.well-known/acme-challenge/</code> 能被访问，否则 SSL 申请会失败。</p>
+        </div>
+      </details>
+
+      <div style="display:flex; gap:10px; margin-top:14px;">
+        <button class="btn primary" type="submit">保存并应用</button>
+        <a class="btn" href="/websites/{{ site.id }}">取消</a>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h3>改动影响</h3>
+    <ul class="muted" style="margin-top:8px;">
+      <li>仅更新 Nginx 配置，不会删除你的站点目录和文件。</li>
+      <li>如更改了域名，旧证书可能不再匹配，请到详情页重新申请/续期 SSL。</li>
+      <li>反向代理站点为保证 SSL 正常申请，会自动创建用于 ACME 验证的目录（无需你手动维护）。</li>
+    </ul>
+
+    <h3 style="margin-top:16px;">快速入口</h3>
+    <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
+      <a class="btn" href="/websites/{{ site.id }}">站点详情</a>
+      <a class="btn" href="/websites/{{ site.id }}/diagnose">诊断</a>
+      {% if site.type != 'reverse_proxy' and site.root_path %}
+      <a class="btn" href="/websites/{{ site.id }}/files">文件管理</a>
+      {% endif %}
     </div>
-  </form>
+  </div>
 </div>
+
+<script>
+(function(){
+  const sel = document.getElementById('site_type');
+  const rootRow = document.getElementById('root_row');
+  const proxyRow = document.getElementById('proxy_row');
+
+  function toggle(){
+    const t = sel.value;
+    if(t === 'reverse_proxy'){
+      proxyRow.style.display = '';
+      rootRow.style.display = '';
+    }else{
+      proxyRow.style.display = 'none';
+      rootRow.style.display = '';
+    }
+  }
+  sel.addEventListener('change', toggle);
+  toggle();
+})();
+</script>
 {% endblock %}

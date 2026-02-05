@@ -400,6 +400,7 @@ async def website_detail(request: Request, site_id: int, user: str = Depends(req
 
 @router.get("/websites/{site_id}/edit", response_class=HTMLResponse)
 async def website_edit(request: Request, site_id: int, user: str = Depends(require_login_page)):
+    """Edit site configuration without having to delete & recreate."""
     site = get_site(int(site_id))
     if not site:
         set_flash(request, "站点不存在")
@@ -409,28 +410,30 @@ async def website_edit(request: Request, site_id: int, user: str = Depends(requi
         set_flash(request, "节点不存在")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
-    site["domains_text"] = ", ".join(site.get("domains") or [])
+    # UI helper: comma-separated domains
+    site_view = dict(site)
+    site_view["domains_text"] = ", ".join(site.get("domains") or [])
+
     return templates.TemplateResponse(
         "site_edit.html",
         {
             "request": request,
             "user": user,
             "flash": flash(request),
-            "title": f"编辑 · {site.get('name')}",
-            "site": site,
+            "title": f"编辑 · {site.get('name') or (site.get('domains') or ['站点'])[0]}",
+            "site": site_view,
             "node": node,
         },
     )
 
 
 @router.post("/websites/{site_id}/edit")
-async def website_edit_action(
+async def website_edit_post(
     request: Request,
     site_id: int,
     name: str = Form(""),
     domains: str = Form(""),
     site_type: str = Form("static"),
-    web_server: str = Form("nginx"),
     root_path: str = Form(""),
     proxy_target: str = Form(""),
     https_redirect: Optional[str] = Form(None),
@@ -447,109 +450,151 @@ async def website_edit_action(
         set_flash(request, "节点不存在")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
-    domains_list = _parse_domains(domains)
+    # -------- Parse & validate --------
+    raw = (domains or "").strip()
+    parts = []
+    for token in raw.replace("\n", ",").replace("\t", ",").split(","):
+        t = (token or "").strip()
+        if not t:
+            continue
+        parts.append(t)
+    # de-dup, keep order
+    seen = set()
+    domains_list: List[str] = []
+    for d in parts:
+        dl = d.strip()
+        if not dl or dl in seen:
+            continue
+        seen.add(dl)
+        domains_list.append(dl)
+
     if not domains_list:
         set_flash(request, "域名不能为空")
         return RedirectResponse(url=f"/websites/{site_id}/edit", status_code=303)
 
-    site_type = (site_type or site.get("type") or "static").strip()
     if site_type not in ("static", "php", "reverse_proxy"):
-        site_type = str(site.get("type") or "static")
-
-    web_server = (web_server or site.get("web_server") or "nginx").strip() or "nginx"
-    if web_server != "nginx":
-        set_flash(request, "当前仅支持 nginx")
+        set_flash(request, "站点类型无效")
         return RedirectResponse(url=f"/websites/{site_id}/edit", status_code=303)
-
-    existing = list_sites(node_id=int(site.get("node_id") or 0))
-    for s in existing:
-        if int(s.get("id") or 0) == int(site_id):
-            continue
-        if str(s.get("status") or "").strip().lower() == "error":
-            continue
-        s_domains = set([str(x).lower() for x in (s.get("domains") or [])])
-        if s_domains.intersection(set(domains_list)):
-            set_flash(request, "该节点已有重复域名的站点")
-            return RedirectResponse(url=f"/websites/{site_id}/edit", status_code=303)
 
     root_path = (root_path or "").strip()
     proxy_target = _normalize_proxy_target(proxy_target or "")
-    if not root_path:
-        root_path = str(site.get("root_path") or "").strip()
-    if not proxy_target:
-        proxy_target = _normalize_proxy_target(site.get("proxy_target") or "")
-
-    if site_type == "reverse_proxy" and not proxy_target.strip():
-        set_flash(request, "反向代理必须填写目标地址")
-        return RedirectResponse(url=f"/websites/{site_id}/edit", status_code=303)
-    if site_type != "reverse_proxy" and not root_path:
-        set_flash(request, "根目录不能为空")
-        return RedirectResponse(url=f"/websites/{site_id}/edit", status_code=303)
-
     https_flag = bool(https_redirect)
     gzip_flag = bool(gzip_enabled)
     tpl = (nginx_tpl or "").strip()
 
-    display_name = (name or "").strip() or domains_list[0]
+    if site_type != "reverse_proxy":
+        if not root_path:
+            # keep consistent with create default: <root_base>/wwwroot/<primary_domain>
+            rb = _node_root_base(node)
+            root_path = os.path.join(rb, "wwwroot", domains_list[0])
+    else:
+        if not proxy_target:
+            set_flash(request, "反向代理站点必须填写代理目标")
+            return RedirectResponse(url=f"/websites/{site_id}/edit", status_code=303)
+
+    # Domain collision on the same node (exclude self)
+    try:
+        other_sites = list_sites(node_id=int(site.get("node_id") or 0))
+        other_domains = set()
+        for s in other_sites:
+            if int(s.get("id") or 0) == int(site_id):
+                continue
+            if s.get("status") == "error":
+                continue
+            for d in (s.get("domains") or []):
+                other_domains.add(str(d).strip())
+        dup = [d for d in domains_list if d in other_domains]
+        if dup:
+            set_flash(request, f"域名冲突：{', '.join(dup)}")
+            return RedirectResponse(url=f"/websites/{site_id}/edit", status_code=303)
+    except Exception:
+        # don't hard-fail on domain collision checks
+        pass
+
+    # -------- Apply on node --------
+    old_domains = site.get("domains") or []
+    old_primary = str(old_domains[0]) if old_domains else ""
+    new_primary = str(domains_list[0])
 
     task_id = add_task(
         node_id=int(site.get("node_id") or 0),
-        task_type="update_site",
-        payload={
-            "site_id": int(site_id),
-            "domains": domains_list,
-            "prev_domains": site.get("domains") or [],
-            "root_path": root_path,
-            "proxy_target": proxy_target,
-            "type": site_type,
-            "web_server": web_server,
-            "https_redirect": https_flag,
-            "gzip_enabled": gzip_flag,
-            "nginx_tpl": tpl,
-        },
+        task_type="site_update",
+        payload={"site_id": site_id, "old_domains": old_domains, "new_domains": domains_list},
         status="running",
-        progress=10,
+        progress=5,
     )
     add_site_event(
         int(site_id),
         "site_update",
         status="running",
         actor=str(user or ""),
-        payload={
-            "domains": domains_list,
-            "root_path": root_path,
-            "proxy_target": proxy_target,
-            "type": site_type,
-        },
+        payload={"old_domains": old_domains, "new_domains": domains_list, "type": site_type},
     )
 
     try:
+        # Ensure required runtime (idempotent)
+        ensure = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/env/ensure",
+            {
+                "need_nginx": True,
+                "need_php": bool(site_type == "php"),
+                "need_acme": True,
+            },
+            node_verify_tls(node),
+            timeout=300,
+        )
+        if not ensure.get("ok", True):
+            raise AgentError(str(ensure.get("error") or "环境检查失败"))
+        update_task(task_id, progress=15)
+
+        # If primary domain changed, remove old nginx conf first (keep data/cert)
+        if old_primary and old_primary != new_primary:
+            await agent_post(
+                node["base_url"],
+                node["api_key"],
+                "/api/v1/website/site/delete",
+                {
+                    "domains": old_domains,
+                    "root_path": site.get("root_path") or "",
+                    "root_base": _node_root_base(node),
+                    "delete_root": False,
+                    "delete_cert": False,
+                },
+                node_verify_tls(node),
+                timeout=30,
+            )
+        update_task(task_id, progress=35)
+
         payload = {
             "domains": domains_list,
-            "prev_domains": site.get("domains") or [],
-            "root_path": root_path,
-            "proxy_target": proxy_target,
             "type": site_type,
-            "web_server": web_server,
+            "web_server": "nginx",
+            "proxy_target": proxy_target,
             "https_redirect": https_flag,
             "gzip_enabled": gzip_flag,
             "nginx_tpl": tpl,
+            "root_path": root_path,
             "root_base": _node_root_base(node),
         }
         data = await agent_post(
             node["base_url"],
             node["api_key"],
-            "/api/v1/website/site/update",
+            "/api/v1/website/site/create",
             payload,
             node_verify_tls(node),
-            timeout=30,
+            timeout=45,
         )
         if not data.get("ok", True):
-            raise AgentError(str(data.get("error") or "更新站点失败"))
+            raise AgentError(str(data.get("error") or "站点更新失败"))
 
+        update_task(task_id, progress=60)
+
+        # post-update health check
         health_status = "unknown"
         health_error = ""
-        health: Dict[str, Any] = {}
+        health = {}
         try:
             health = await agent_post(
                 node["base_url"],
@@ -575,20 +620,19 @@ async def website_edit_action(
             health_status = "fail"
             health_error = str(exc)
 
+        # Update DB
         update_site(
             int(site_id),
-            name=display_name,
+            name=(name or site.get("name") or domains_list[0]).strip(),
             domains=domains_list,
-            root_path=root_path,
+            type=site_type,
+            root_path=root_path if site_type != "reverse_proxy" else (root_path or ""),
             proxy_target=proxy_target,
-            site_type=site_type,
-            web_server=web_server,
+            https_redirect=1 if https_flag else 0,
+            gzip_enabled=1 if gzip_flag else 0,
             nginx_tpl=tpl,
-            https_redirect=https_flag,
-            gzip_enabled=gzip_flag,
             status="running" if health_status != "fail" else "error",
         )
-
         try:
             if health_status in ("ok", "fail"):
                 update_site_health(
@@ -601,18 +645,31 @@ async def website_edit_action(
         except Exception:
             pass
 
+        # If domains changed, mark cert record as pending to nudge re-issue
+        try:
+            if set(map(str, old_domains)) != set(map(str, domains_list)):
+                certs = list_certificates(site_id=int(site_id))
+                if certs:
+                    update_certificate(
+                        int(certs[0].get("id") or 0),
+                        domains=domains_list,
+                        status="pending",
+                        last_error="站点域名已变更，建议重新申请/续期 SSL 证书",
+                    )
+        except Exception:
+            pass
+
         update_task(task_id, status="success", progress=100, result=data)
         add_site_event(int(site_id), "site_update", status="success", actor=str(user or ""), result=data)
         if health_status == "fail":
-            set_flash(request, f"更新成功，但健康检查失败：{health_error or 'HTTP 探测失败'}")
+            set_flash(request, f"站点更新成功，但健康检查失败：{health_error or 'HTTP 探测失败'}")
         else:
-            set_flash(request, "站点已更新")
+            set_flash(request, "站点更新成功")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
     except Exception as exc:
-        update_site(int(site_id), status="error")
         update_task(task_id, status="failed", progress=100, error=str(exc))
         add_site_event(int(site_id), "site_update", status="failed", actor=str(user or ""), error=str(exc))
-        set_flash(request, f"更新失败：{exc}")
+        set_flash(request, f"站点更新失败：{exc}")
         return RedirectResponse(url=f"/websites/{site_id}/edit", status_code=303)
 
 
@@ -721,7 +778,8 @@ async def website_ssl_issue(request: Request, site_id: int, user: str = Depends(
                 },
             },
             node_verify_tls(node),
-            timeout=20,
+            # SSL issuance can take a while (DNS, CA validation, network).
+            timeout=240,
         )
         if not data.get("ok", True):
             raise AgentError(str(data.get("error") or "证书申请失败"))
@@ -818,7 +876,8 @@ async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(
                 },
             },
             node_verify_tls(node),
-            timeout=20,
+            # SSL renewal may take time as well.
+            timeout=240,
         )
         if not data.get("ok", True):
             raise AgentError(str(data.get("error") or "证书续期失败"))

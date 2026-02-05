@@ -103,7 +103,7 @@
         </div>
       </div>
       <label class="label">自定义 Nginx 模板（可选）</label>
-      <textarea class="textarea" name="nginx_tpl" rows="8" placeholder="支持变量：{{SERVER_NAME}} {{ROOT_PATH}} {{PROXY_TARGET}} {{SSL_CERT}} {{SSL_KEY}} {{GZIP_CONF}}"></textarea>
+      <textarea class="textarea" name="nginx_tpl" rows="8" placeholder="支持变量：{{ '{{SERVER_NAME}}' }} {{ '{{ROOT_PATH}}' }} {{ '{{PROXY_TARGET}}' }} {{ '{{SSL_CERT}}' }} {{ '{{SSL_KEY}}' }} {{ '{{GZIP_CONF}}' }}"></textarea>
       <div class="help">留空则使用内置模板；自定义模板需自行处理 80/443 与 SSL。</div>
     </div>
 

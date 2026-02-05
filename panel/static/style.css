@@ -185,6 +185,7 @@ a{color:inherit}
 .muted{color:var(--muted)}
 .muted.sm{font-size:11px}
 .mono{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}
+.truncate{max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* Cards */
 .card{
@@ -2909,72 +2910,3 @@ body.netmon-wall .netmon-realtime-btn{ display:none !important; }
 .netmon-evt-table .n-dot.offline{ background: rgba(100,116,139,0.92); }
 .netmon-evt-table .bad{ color: rgba(248,113,113,0.95); font-weight: 900; }
 .netmon-evt-table .warnc{ color: rgba(245,158,11,0.95); font-weight: 900; }
-
-/* =========================
-   Website Management Refresh
-   ========================= */
-.websites-layout{
-  display:grid;
-  grid-template-columns:minmax(0,1.25fr) minmax(0,0.85fr);
-  gap:16px;
-  margin-top:14px;
-}
-@media (max-width: 980px){
-  .websites-layout{ grid-template-columns:1fr; }
-}
-
-.site-list{ display:flex; flex-direction:column; gap:12px; margin-top:10px; }
-.site-row{
-  display:flex;
-  gap:16px;
-  padding:12px;
-  border:1px solid var(--line);
-  border-radius:var(--radius-sm);
-  background:var(--surface-2);
-}
-.site-main{ flex:1; min-width:0; }
-.site-title{ font-weight:800; letter-spacing:0.2px; }
-.site-domains{ color:var(--muted); font-size:12px; margin-top:6px; word-break:break-all; }
-.site-meta{ display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
-.site-side{ min-width:160px; display:flex; flex-direction:column; gap:8px; align-items:flex-end; justify-content:space-between; }
-.site-node{ color:var(--muted); font-size:12px; }
-.site-id{ text-transform:uppercase; letter-spacing:0.6px; }
-.site-actions{ display:flex; gap:8px; }
-
-.node-list{ display:flex; flex-direction:column; gap:12px; margin-top:10px; }
-.node-card{ padding:12px; border:1px solid var(--line); border-radius:var(--radius-sm); background:var(--surface-2); }
-.node-head{ display:flex; gap:12px; align-items:flex-start; justify-content:space-between; }
-.node-title{ font-weight:800; letter-spacing:0.2px; }
-.node-sub{ color:var(--muted); font-size:12px; margin-top:4px; }
-.pill-group{ display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
-.node-actions{ display:flex; flex-direction:column; gap:8px; margin-top:10px; }
-
-.site-detail-grid{
-  display:grid;
-  grid-template-columns:minmax(0,1.1fr) minmax(0,0.9fr);
-  gap:16px;
-  margin-top:14px;
-}
-@media (max-width: 980px){
-  .site-detail-grid{ grid-template-columns:1fr; }
-}
-
-.action-card .action-grid{
-  display:flex;
-  flex-wrap:wrap;
-  gap:10px;
-  margin-top:8px;
-}
-.action-card .action-grid form{ margin:0; display:inline-block; }
-
-.stack-list{ display:flex; flex-direction:column; gap:8px; }
-.stack-row{ display:flex; align-items:center; gap:10px; }
-.stack-main{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; min-width:0; }
-.stack-sub{ margin-left:26px; color:var(--muted); font-size:12px; word-break:break-all; }
-.stack-scroll{ max-height:320px; overflow:auto; padding-right:6px; }
-
-@media (max-width: 640px){
-  .site-row{ flex-direction:column; align-items:flex-start; }
-  .site-side{ align-items:flex-start; min-width:0; }
-  .node-head{ flex-direction:column; align-items:flex-start; }
-}

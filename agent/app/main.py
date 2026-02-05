@@ -3057,6 +3057,79 @@ def _slugify(name: str) -> str:
     return safe or "site"
 
 
+def _existing_cert_paths(main_domain: str) -> Optional[Tuple[str, str]]:
+    """Return (fullchain, privkey) if certificate files already exist.
+
+    Used to preserve HTTPS config when re-applying nginx conf (e.g. site edit).
+    """
+    d = str(main_domain or "").strip()
+    if not d:
+        return None
+    safe = _slugify(d)
+    cert_dir = Path("/etc/ssl/nexus") / safe
+    fullchain_path = cert_dir / "fullchain.pem"
+    key_path = cert_dir / "privkey.pem"
+    try:
+        if fullchain_path.exists() and key_path.exists():
+            return str(fullchain_path), str(key_path)
+    except Exception:
+        return None
+    return None
+
+
+def _default_webroot(main_domain: str, extra_bases: Optional[List[str]] = None) -> str:
+    """Choose a sensible default webroot under the allowed base paths.
+
+    For reverse_proxy sites, this webroot is primarily used for ACME HTTP-01
+    challenge files.
+    """
+    d = str(main_domain or "").strip() or "site"
+    # Prefer the first extra base from payload, else the global bases.
+    bases = _extra_root_bases(extra_bases)
+    base = bases[0] if bases else (_website_root_bases()[0] if _website_root_bases() else Path("/www").resolve())
+    # Keep it consistent with panel defaults: <base>/wwwroot/<domain>
+    return str((base / "wwwroot" / d).absolute())
+
+
+def _ensure_acme_webroot(root_path: str, extra_bases: Optional[List[str]] = None) -> Tuple[Optional[Path], str]:
+    """Validate and ensure ACME challenge directory exists.
+
+    Returns (resolved_root_path, error_message).
+    """
+    try:
+        root_valid = _validate_root(root_path, extra_bases)
+        # Ensure webroot exists
+        root_valid.mkdir(parents=True, exist_ok=True)
+        # Ensure ACME dir exists
+        acme_dir = root_valid / ".well-known" / "acme-challenge"
+        acme_dir.mkdir(parents=True, exist_ok=True)
+        return root_valid, ""
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _normalize_proxy_pass_target(proxy_target: str) -> str:
+    """Normalize user-supplied reverse proxy target for nginx `proxy_pass`.
+
+    - Accepts full URLs (http://..., https://...).
+    - Accepts plain host:port and prefixes http://.
+    - Accepts unix socket via `unix:/path.sock` (or `unix:/path.sock:`).
+    """
+    t = (proxy_target or "").strip()
+    if not t:
+        return ""
+    if t.startswith("unix:"):
+        sock = t[len("unix:") :].strip()
+        if not sock.startswith("/"):
+            sock = "/" + sock
+        if not sock.endswith(":"):
+            sock = sock + ":"
+        return f"http://unix:{sock}"
+    if "://" in t:
+        return t
+    return f"http://{t}"
+
+
 def _detect_php_fpm_sock() -> Optional[str]:
     candidates = [
         "/run/php/php-fpm.sock",
@@ -3247,22 +3320,52 @@ def _render_nginx_conf(
     has_ssl = bool(cert_paths and cert_paths[0] and cert_paths[1])
     ssl_cert = cert_paths[0] if cert_paths else ""
     ssl_key = cert_paths[1] if cert_paths else ""
-    redirect_line = "  return 301 https://$host$request_uri;\n" if (https_redirect and has_ssl) else ""
+    # NOTE: do NOT use a server-level `return 301` for http->https redirect.
+    # Otherwise ACME HTTP-01 challenge may be redirected and fail when cert is expired.
+    redirect_https = bool(https_redirect and has_ssl)
+
+    # Always try to keep ACME challenge reachable (both on :80 and :443).
+    # acme.sh webroot mode writes challenge files under:
+    #   <root_path>/.well-known/acme-challenge/<token>
+    acme_loc = ""
+    if str(root_path or "").strip():
+        acme_loc = (
+            "  # ACME HTTP-01 challenge\n"
+            "  location ^~ /.well-known/acme-challenge/ {\n"
+            f"    root {root_path};\n"
+            "    default_type \"text/plain\";\n"
+            "    try_files $uri =404;\n"
+            "  }\n"
+        )
     if site_type == "reverse_proxy":
+        pt = _normalize_proxy_pass_target(proxy_target)
+        http_locations = ""
+        if redirect_https:
+            http_locations = (
+                f"{acme_loc}"
+                "  location ^~ / {\n"
+                "    return 301 https://$host$request_uri;\n"
+                "  }\n"
+            )
+        else:
+            http_locations = (
+                f"{acme_loc}"
+                "  location / {\n"
+                f"    proxy_pass {pt};\n"
+                "    proxy_set_header Host $host;\n"
+                "    proxy_set_header X-Real-IP $remote_addr;\n"
+                "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+                "    proxy_set_header X-Forwarded-Proto $scheme;\n"
+                "  }\n"
+            )
+
         http_block = (
             "server {\n"
             "  listen 80;\n"
             f"  server_name {server_name};\n"
             f"{nexus_header}"
-            f"{redirect_line}"
             f"{gzip}"
-            "  location / {\n"
-            f"    proxy_pass {proxy_target};\n"
-            "    proxy_set_header Host $host;\n"
-            "    proxy_set_header X-Real-IP $remote_addr;\n"
-            "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
-            "    proxy_set_header X-Forwarded-Proto $scheme;\n"
-            "  }\n"
+            f"{http_locations}"
             "}\n"
         )
         if has_ssl:
@@ -3274,8 +3377,9 @@ def _render_nginx_conf(
                 f"  ssl_certificate {ssl_cert};\n"
                 f"  ssl_certificate_key {ssl_key};\n"
                 f"{gzip}"
+                f"{acme_loc}"
                 "  location / {\n"
-                f"    proxy_pass {proxy_target};\n"
+                f"    proxy_pass {pt};\n"
                 "    proxy_set_header Host $host;\n"
                 "    proxy_set_header X-Real-IP $remote_addr;\n"
                 "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
@@ -3287,25 +3391,41 @@ def _render_nginx_conf(
         return http_block
     if site_type == "php":
         sock = php_sock or "/run/php/php-fpm.sock"
-        http_block = (
-            "server {\n"
-            "  listen 80;\n"
-            f"  server_name {server_name};\n"
-            f"{nexus_header}"
-            f"  root {root_path};\n"
-            "  index index.php index.html index.htm;\n"
-            f"{redirect_line}"
-            f"{gzip}"
-            "  location / {\n"
-            "    try_files $uri $uri/ /index.php?$args;\n"
-            "  }\n"
-            "  location ~ \\.php$ {\n"
-            "    include fastcgi_params;\n"
-            "    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;\n"
-            f"    fastcgi_pass unix:{sock};\n"
-            "  }\n"
-            "}\n"
-        )
+        if redirect_https:
+            http_block = (
+                "server {\n"
+                "  listen 80;\n"
+                f"  server_name {server_name};\n"
+                f"{nexus_header}"
+                f"  root {root_path};\n"
+                "  index index.php index.html index.htm;\n"
+                f"{gzip}"
+                f"{acme_loc}"
+                "  location ^~ / {\n"
+                "    return 301 https://$host$request_uri;\n"
+                "  }\n"
+                "}\n"
+            )
+        else:
+            http_block = (
+                "server {\n"
+                "  listen 80;\n"
+                f"  server_name {server_name};\n"
+                f"{nexus_header}"
+                f"  root {root_path};\n"
+                "  index index.php index.html index.htm;\n"
+                f"{gzip}"
+                f"{acme_loc}"
+                "  location / {\n"
+                "    try_files $uri $uri/ /index.php?$args;\n"
+                "  }\n"
+                "  location ~ \\.php$ {\n"
+                "    include fastcgi_params;\n"
+                "    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;\n"
+                f"    fastcgi_pass unix:{sock};\n"
+                "  }\n"
+                "}\n"
+            )
         if has_ssl:
             https_block = (
                 "server {\n"
@@ -3317,6 +3437,7 @@ def _render_nginx_conf(
                 f"  ssl_certificate_key {ssl_key};\n"
                 "  index index.php index.html index.htm;\n"
                 f"{gzip}"
+                f"{acme_loc}"
                 "  location / {\n"
                 "    try_files $uri $uri/ /index.php?$args;\n"
                 "  }\n"
@@ -3330,20 +3451,36 @@ def _render_nginx_conf(
             return http_block + "\n" + https_block
         return http_block
     # default static
-    http_block = (
-        "server {\n"
-        "  listen 80;\n"
-        f"  server_name {server_name};\n"
-        f"{nexus_header}"
-        f"  root {root_path};\n"
-        "  index index.html index.htm;\n"
-        f"{redirect_line}"
-        f"{gzip}"
-        "  location / {\n"
-        "    try_files $uri $uri/ =404;\n"
-        "  }\n"
-        "}\n"
-    )
+    if redirect_https:
+        http_block = (
+            "server {\n"
+            "  listen 80;\n"
+            f"  server_name {server_name};\n"
+            f"{nexus_header}"
+            f"  root {root_path};\n"
+            "  index index.html index.htm;\n"
+            f"{gzip}"
+            f"{acme_loc}"
+            "  location ^~ / {\n"
+            "    return 301 https://$host$request_uri;\n"
+            "  }\n"
+            "}\n"
+        )
+    else:
+        http_block = (
+            "server {\n"
+            "  listen 80;\n"
+            f"  server_name {server_name};\n"
+            f"{nexus_header}"
+            f"  root {root_path};\n"
+            "  index index.html index.htm;\n"
+            f"{gzip}"
+            f"{acme_loc}"
+            "  location / {\n"
+            "    try_files $uri $uri/ =404;\n"
+            "  }\n"
+            "}\n"
+        )
     if has_ssl:
         https_block = (
             "server {\n"
@@ -3355,6 +3492,7 @@ def _render_nginx_conf(
             f"  ssl_certificate_key {ssl_key};\n"
             "  index index.html index.htm;\n"
             f"{gzip}"
+            f"{acme_loc}"
             "  location / {\n"
             "    try_files $uri $uri/ =404;\n"
             "  }\n"
@@ -3511,16 +3649,12 @@ def _delete_site_root(root_path: str, extra_bases: Optional[List[str]] = None) -
 
 
 def _find_acme_sh() -> Optional[str]:
-    env_path = os.getenv("REALM_ACME_SH", "").strip()
-    if env_path and Path(env_path).exists():
-        return env_path
     acme = shutil.which("acme.sh")
     if acme:
         return acme
-    for p in ("/root/.acme.sh/acme.sh", "/usr/local/bin/acme.sh", "~/.acme.sh/acme.sh"):
-        pp = Path(p).expanduser()
-        if pp.exists():
-            return str(pp)
+    for p in ("/root/.acme.sh/acme.sh", "/usr/local/bin/acme.sh"):
+        if Path(p).exists():
+            return p
     return None
 
 
@@ -3567,21 +3701,6 @@ def _cert_dates(cert_path: Path) -> Dict[str, str]:
         except Exception:
             pass
     return out
-
-
-def _detect_cert_paths(domains: List[str]) -> Optional[Tuple[str, str]]:
-    if not domains:
-        return None
-    main_domain = str(domains[0])
-    if not main_domain:
-        return None
-    safe = _slugify(main_domain)
-    cert_dir = Path("/etc/ssl/nexus") / safe
-    fullchain = cert_dir / "fullchain.pem"
-    privkey = cert_dir / "privkey.pem"
-    if fullchain.exists() and privkey.exists():
-        return str(fullchain), str(privkey)
-    return None
 
 
 @app.post("/api/v1/website/env/ensure")
@@ -3680,119 +3799,59 @@ def api_website_create(payload: Dict[str, Any], _: None = Depends(_api_key_requi
     else:
         if not proxy_target:
             return {"ok": False, "error": "proxy_target 不能为空"}
+        # Reverse proxy still needs a local webroot for ACME HTTP-01 challenge.
+        # Old panel versions may not send root_path at all.
+        if not root_path:
+            root_path = _default_webroot(str(domains[0]), extra_bases)
 
     created_root = False
-    created_index = False
     root_valid: Optional[Path] = None
-    if site_type != "reverse_proxy":
+    created_index_path: Optional[Path] = None
+
+    # Prepare webroot (also for reverse_proxy, only used for ACME challenge)
+    root_pre_exists = False
+    if root_path:
         try:
-            root_valid = _validate_root(root_path, extra_bases)
-            if not root_valid.exists():
-                root_valid.mkdir(parents=True, exist_ok=True)
-                created_root = True
-            idx = Path(root_path) / "index.html"
-            if not idx.exists():
-                idx.write_text("<h1>It works!</h1>", encoding="utf-8")
-                created_index = True
-        except Exception as exc:
-            return {"ok": False, "error": f"创建目录失败：{exc}"}
+            root_pre_exists = Path(root_path).exists()
+        except Exception:
+            root_pre_exists = False
+        root_valid, err = _ensure_acme_webroot(root_path, extra_bases)
+        if err:
+            return {"ok": False, "error": f"创建目录失败：{err}"}
+        created_root = not root_pre_exists
+
+    if site_type != "reverse_proxy":
+        # Create a friendly default index when empty
+        try:
+            if site_type == "php":
+                idxp = Path(root_path) / "index.php"
+                if not idxp.exists():
+                    idxp.write_text("<?php phpinfo(); ?>\n", encoding="utf-8")
+                    created_index_path = idxp
+            else:
+                idx = Path(root_path) / "index.html"
+                if not idx.exists():
+                    idx.write_text("<h1>It works!</h1>", encoding="utf-8")
+                    created_index_path = idx
+        except Exception:
+            # ignore default index creation errors
+            pass
+
+    # If certificate already exists for the primary domain, keep HTTPS enabled.
+    cert_paths = _existing_cert_paths(str(domains[0]))
 
     if nginx_tpl:
+        ssl_cert = cert_paths[0] if cert_paths else ""
+        ssl_key = cert_paths[1] if cert_paths else ""
         ctx = {
             "SERVER_NAME": " ".join(domains),
             "ROOT_PATH": root_path,
             "PROXY_TARGET": proxy_target,
-            "SSL_CERT": "",
-            "SSL_KEY": "",
+            "SSL_CERT": ssl_cert,
+            "SSL_KEY": ssl_key,
             "GZIP_CONF": _gzip_snippet() if gzip_enabled else "",
-        }
-        conf = _render_custom_template(nginx_tpl, ctx)
-    else:
-        conf = _render_nginx_conf(
-            site_type,
-            domains,
-            root_path,
-            proxy_target,
-            php_sock,
-            https_redirect=https_redirect,
-            gzip_enabled=gzip_enabled,
-            cert_paths=None,
-        )
-    ok, conf_path, out = _apply_nginx_conf(domains[0], conf)
-    if not ok:
-        # rollback root if we just created it
-        try:
-            if created_root and root_valid and root_valid.exists():
-                shutil.rmtree(root_valid)
-            elif created_index and root_valid:
-                idx = root_valid / "index.html"
-                if idx.exists():
-                    idx.unlink()
-        except Exception:
-            pass
-        return {"ok": False, "error": out}
-
-    return {"ok": True, "conf_path": str(conf_path)}
-
-
-@app.post("/api/v1/website/site/update")
-def api_website_update(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
-    if not isinstance(payload, dict):
-        payload = {}
-    extra_bases = _payload_root_bases(payload)
-    domains = payload.get("domains") or []
-    if not isinstance(domains, list) or not domains:
-        return {"ok": False, "error": "domains 不能为空"}
-    prev_domains = payload.get("prev_domains") or payload.get("old_domains") or []
-    if not isinstance(prev_domains, list):
-        prev_domains = []
-
-    site_type = str(payload.get("type") or "static").strip()
-    root_path = str(payload.get("root_path") or "").strip()
-    proxy_target = _normalize_proxy_target(str(payload.get("proxy_target") or ""))
-    web_server = str(payload.get("web_server") or "nginx").strip().lower()
-    https_redirect = bool(payload.get("https_redirect"))
-    gzip_enabled = bool(payload.get("gzip_enabled", True))
-    nginx_tpl = str(payload.get("nginx_tpl") or "").strip()
-
-    if web_server != "nginx":
-        return {"ok": False, "error": "当前仅支持 nginx"}
-    if shutil.which("nginx") is None:
-        return {"ok": False, "error": "未检测到 nginx"}
-
-    php_sock = None
-    if site_type == "php":
-        php_sock = _detect_php_fpm_sock()
-        if not php_sock:
-            return {"ok": False, "error": "未检测到 php-fpm socket"}
-
-    if site_type != "reverse_proxy":
-        if not root_path:
-            return {"ok": False, "error": "root_path 不能为空"}
-        try:
-            root_valid = _validate_root(root_path, extra_bases)
-            if not root_valid.exists():
-                root_valid.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
-    else:
-        if not proxy_target:
-            return {"ok": False, "error": "proxy_target 不能为空"}
-        if root_path:
-            try:
-                _validate_root(root_path, extra_bases)
-            except Exception as exc:
-                return {"ok": False, "error": str(exc)}
-
-    cert_paths = _detect_cert_paths(domains)
-    if nginx_tpl:
-        ctx = {
-            "SERVER_NAME": " ".join([str(x) for x in domains]),
-            "ROOT_PATH": root_path,
-            "PROXY_TARGET": proxy_target,
-            "SSL_CERT": cert_paths[0] if cert_paths else "",
-            "SSL_KEY": cert_paths[1] if cert_paths else "",
-            "GZIP_CONF": _gzip_snippet() if gzip_enabled else "",
+            # Optional helpers for custom templates
+            "ACME_ROOT": root_path,
         }
         conf = _render_custom_template(nginx_tpl, ctx)
     else:
@@ -3806,23 +3865,19 @@ def api_website_update(payload: Dict[str, Any], _: None = Depends(_api_key_requi
             gzip_enabled=gzip_enabled,
             cert_paths=cert_paths,
         )
-
     ok, conf_path, out = _apply_nginx_conf(domains[0], conf)
     if not ok:
-        return {"ok": False, "error": out or "更新配置失败", "conf_path": str(conf_path)}
+        # rollback root if we just created it
+        try:
+            if created_root and root_valid and root_valid.exists():
+                shutil.rmtree(root_valid)
+            elif created_index_path and created_index_path.exists():
+                created_index_path.unlink()
+        except Exception:
+            pass
+        return {"ok": False, "error": out}
 
-    removed = 0
-    if prev_domains:
-        prev_main = str(prev_domains[0] or "")
-        if prev_main and _slugify(prev_main) != _slugify(str(domains[0])):
-            removed = _remove_nginx_conf_by_domain(prev_main)
-            if removed:
-                try:
-                    _nginx_reload()
-                except Exception:
-                    pass
-
-    return {"ok": True, "conf_path": str(conf_path), "removed": removed}
+    return {"ok": True, "conf_path": str(conf_path)}
 
 
 @app.post("/api/v1/website/ssl/issue")
@@ -3833,43 +3888,74 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     domains = payload.get("domains") or []
     if not isinstance(domains, list) or not domains:
         return {"ok": False, "error": "domains 不能为空"}
-    root_path = str(payload.get("root_path") or "").strip()
     update_conf = payload.get("update_conf") if isinstance(payload, dict) else None
-    site_type = ""
+    site_type = "static"
     if isinstance(update_conf, dict):
-        site_type = str(update_conf.get("type") or "").strip()
-    if not site_type:
-        site_type = str(payload.get("type") or "static").strip()
+        site_type = str(update_conf.get("type") or "static").strip()
 
-    use_nginx = False
-    if not root_path:
-        if site_type == "reverse_proxy":
-            use_nginx = True
-        else:
-            return {"ok": False, "error": "root_path 不能为空"}
-    if root_path:
-        try:
-            _validate_root(root_path, extra_bases)
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+    # webroot is required for ACME HTTP-01 challenge.
+    root_path = str(payload.get("root_path") or "").strip()
+    if not root_path and isinstance(update_conf, dict):
+        # Prefer update_conf.root_path when available
+        root_path = str(update_conf.get("root_path") or "").strip()
+    if not root_path and site_type == "reverse_proxy":
+        # Reverse proxy needs a synthetic webroot just for ACME.
+        root_path = _default_webroot(str(domains[0]), extra_bases)
+    if not root_path and site_type != "reverse_proxy":
+        return {"ok": False, "error": "root_path 不能为空"}
+
+    root_valid, err = _ensure_acme_webroot(root_path, extra_bases)
+    if err:
+        return {"ok": False, "error": err}
 
     acme = _find_acme_sh()
     if not acme:
-        ok, out = _install_acme_sh()
-        if not ok:
-            return {"ok": False, "error": out or "未安装 acme.sh"}
-        acme = _find_acme_sh()
-        if not acme:
-            return {"ok": False, "error": "未安装 acme.sh"}
+        return {"ok": False, "error": "未安装 acme.sh"}
+
+    # Best-effort: ensure Nginx config has ACME location before issuing.
+    # This is important for reverse_proxy sites created by older versions.
+    if isinstance(update_conf, dict):
+        proxy_target = _normalize_proxy_target(str(update_conf.get("proxy_target") or ""))
+        https_redirect = bool(update_conf.get("https_redirect"))
+        gzip_enabled = bool(update_conf.get("gzip_enabled", True))
+        tpl = str(update_conf.get("nginx_tpl") or "").strip()
+        php_sock = _detect_php_fpm_sock() if site_type == "php" else None
+        # Keep any existing cert config during issuance to avoid unnecessary downtime.
+        pre_cert = _existing_cert_paths(str(domains[0]))
+        root_for_conf = str(update_conf.get("root_path") or root_path).strip() or root_path
+        if site_type == "reverse_proxy" and not root_for_conf:
+            root_for_conf = root_path
+        if tpl:
+            ctx = {
+                "SERVER_NAME": " ".join(domains),
+                "ROOT_PATH": root_for_conf,
+                "PROXY_TARGET": proxy_target,
+                "SSL_CERT": pre_cert[0] if pre_cert else "",
+                "SSL_KEY": pre_cert[1] if pre_cert else "",
+                "GZIP_CONF": _gzip_snippet() if gzip_enabled else "",
+                "ACME_ROOT": root_path,
+            }
+            conf_pre = _render_custom_template(tpl, ctx)
+        else:
+            conf_pre = _render_nginx_conf(
+                site_type,
+                domains,
+                root_for_conf,
+                proxy_target,
+                php_sock,
+                https_redirect=https_redirect,
+                gzip_enabled=gzip_enabled,
+                cert_paths=pre_cert,
+            )
+        ok_conf, _conf_path, msg = _apply_nginx_conf(domains[0], conf_pre)
+        if not ok_conf:
+            return {"ok": False, "error": f"更新 Nginx 配置失败：{msg}"}
 
     cmd = [acme, "--issue"]
     for d in domains:
         cmd += ["-d", str(d)]
-    if use_nginx:
-        cmd += ["--nginx"]
-    else:
-        cmd += ["-w", root_path]
-    code, out = _run_cmd(cmd)
+    cmd += ["-w", root_path]
+    code, out = _run_cmd(cmd, timeout=300)
     if code != 0:
         return {"ok": False, "error": out or "证书申请失败"}
 
@@ -3892,33 +3978,36 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
         "--reloadcmd",
         "nginx -s reload",
     ]
-    code, out = _run_cmd(install_cmd)
+    code, out = _run_cmd(install_cmd, timeout=90)
     if code != 0:
         return {"ok": False, "error": out or "证书安装失败"}
 
     # Optional: update nginx config to enable HTTPS
     if isinstance(update_conf, dict):
-        site_type = str(update_conf.get("type") or "static").strip()
         proxy_target = _normalize_proxy_target(str(update_conf.get("proxy_target") or ""))
         https_redirect = bool(update_conf.get("https_redirect"))
         gzip_enabled = bool(update_conf.get("gzip_enabled", True))
         tpl = str(update_conf.get("nginx_tpl") or "").strip()
-        php_sock = _detect_php_fpm_sock()
+        php_sock = _detect_php_fpm_sock() if site_type == "php" else None
+        root_for_conf = str(update_conf.get("root_path") or root_path).strip() or root_path
+        if site_type == "reverse_proxy" and not root_for_conf:
+            root_for_conf = root_path
         if tpl:
             ctx = {
                 "SERVER_NAME": " ".join(domains),
-                "ROOT_PATH": root_path,
+                "ROOT_PATH": root_for_conf,
                 "PROXY_TARGET": proxy_target,
                 "SSL_CERT": str(fullchain_path),
                 "SSL_KEY": str(key_path),
                 "GZIP_CONF": _gzip_snippet() if gzip_enabled else "",
+                "ACME_ROOT": root_path,
             }
             conf = _render_custom_template(tpl, ctx)
         else:
             conf = _render_nginx_conf(
                 site_type,
                 domains,
-                root_path,
+                root_for_conf,
                 proxy_target,
                 php_sock,
                 https_redirect=https_redirect,
@@ -3951,26 +4040,70 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     domains = payload.get("domains") or []
     if not isinstance(domains, list) or not domains:
         return {"ok": False, "error": "domains 不能为空"}
+    update_conf = payload.get("update_conf") if isinstance(payload, dict) else None
+    site_type = "static"
+    if isinstance(update_conf, dict):
+        site_type = str(update_conf.get("type") or "static").strip()
+
+    # For renewal, root_path is only needed to ensure ACME challenge can be served
+    # and to render nginx config (ROOT_PATH for non-reverse_proxy sites).
     root_path = str(payload.get("root_path") or "").strip()
-    if not root_path:
+    if not root_path and isinstance(update_conf, dict):
+        root_path = str(update_conf.get("root_path") or "").strip()
+    if not root_path and site_type == "reverse_proxy":
+        root_path = _default_webroot(str(domains[0]), extra_bases)
+    if not root_path and site_type != "reverse_proxy" and isinstance(update_conf, dict):
         return {"ok": False, "error": "root_path 不能为空"}
-    try:
-        _validate_root(root_path, extra_bases)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+
+    if root_path:
+        _root_valid, err = _ensure_acme_webroot(root_path, extra_bases)
+        if err:
+            return {"ok": False, "error": err}
 
     acme = _find_acme_sh()
     if not acme:
-        ok, out = _install_acme_sh()
-        if not ok:
-            return {"ok": False, "error": out or "未安装 acme.sh"}
-        acme = _find_acme_sh()
-        if not acme:
-            return {"ok": False, "error": "未安装 acme.sh"}
+        return {"ok": False, "error": "未安装 acme.sh"}
+
+    # Best-effort: ensure Nginx config has ACME location before renewing.
+    if isinstance(update_conf, dict):
+        proxy_target = _normalize_proxy_target(str(update_conf.get("proxy_target") or ""))
+        https_redirect = bool(update_conf.get("https_redirect"))
+        gzip_enabled = bool(update_conf.get("gzip_enabled", True))
+        tpl = str(update_conf.get("nginx_tpl") or "").strip()
+        php_sock = _detect_php_fpm_sock() if site_type == "php" else None
+        pre_cert = _existing_cert_paths(str(domains[0]))
+        root_for_conf = str(update_conf.get("root_path") or root_path).strip() or root_path
+        if site_type == "reverse_proxy" and not root_for_conf:
+            root_for_conf = root_path
+        if tpl:
+            ctx = {
+                "SERVER_NAME": " ".join(domains),
+                "ROOT_PATH": root_for_conf,
+                "PROXY_TARGET": proxy_target,
+                "SSL_CERT": pre_cert[0] if pre_cert else "",
+                "SSL_KEY": pre_cert[1] if pre_cert else "",
+                "GZIP_CONF": _gzip_snippet() if gzip_enabled else "",
+                "ACME_ROOT": root_path,
+            }
+            conf_pre = _render_custom_template(tpl, ctx)
+        else:
+            conf_pre = _render_nginx_conf(
+                site_type,
+                domains,
+                root_for_conf,
+                proxy_target,
+                php_sock,
+                https_redirect=https_redirect,
+                gzip_enabled=gzip_enabled,
+                cert_paths=pre_cert,
+            )
+        ok_conf, _conf_path, msg = _apply_nginx_conf(domains[0], conf_pre)
+        if not ok_conf:
+            return {"ok": False, "error": f"更新 Nginx 配置失败：{msg}"}
 
     main_domain = str(domains[0])
     cmd = [acme, "--renew", "-d", main_domain]
-    code, out = _run_cmd(cmd)
+    code, out = _run_cmd(cmd, timeout=300)
     if code != 0:
         return {"ok": False, "error": out or "证书续期失败"}
 
@@ -3992,33 +4125,35 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
         "--reloadcmd",
         "nginx -s reload",
     ]
-    code, out = _run_cmd(install_cmd)
+    code, out = _run_cmd(install_cmd, timeout=90)
     if code != 0:
         return {"ok": False, "error": out or "证书安装失败"}
 
-    update_conf = payload.get("update_conf") if isinstance(payload, dict) else None
     if isinstance(update_conf, dict):
-        site_type = str(update_conf.get("type") or "static").strip()
         proxy_target = _normalize_proxy_target(str(update_conf.get("proxy_target") or ""))
         https_redirect = bool(update_conf.get("https_redirect"))
         gzip_enabled = bool(update_conf.get("gzip_enabled", True))
         tpl = str(update_conf.get("nginx_tpl") or "").strip()
-        php_sock = _detect_php_fpm_sock()
+        php_sock = _detect_php_fpm_sock() if site_type == "php" else None
+        root_for_conf = str(update_conf.get("root_path") or root_path).strip() or root_path
+        if site_type == "reverse_proxy" and not root_for_conf:
+            root_for_conf = root_path
         if tpl:
             ctx = {
                 "SERVER_NAME": " ".join(domains),
-                "ROOT_PATH": root_path,
+                "ROOT_PATH": root_for_conf,
                 "PROXY_TARGET": proxy_target,
                 "SSL_CERT": str(fullchain_path),
                 "SSL_KEY": str(key_path),
                 "GZIP_CONF": _gzip_snippet() if gzip_enabled else "",
+                "ACME_ROOT": root_path,
             }
             conf = _render_custom_template(tpl, ctx)
         else:
             conf = _render_nginx_conf(
                 site_type,
                 domains,
-                root_path,
+                root_for_conf,
                 proxy_target,
                 php_sock,
                 https_redirect=https_redirect,
@@ -4111,7 +4246,11 @@ def api_website_env_uninstall(payload: Dict[str, Any], _: None = Depends(_api_ke
             if not isinstance(s, dict):
                 continue
             rb = str(s.get("root_base") or "").strip()
-            err = _delete_site_root(str(s.get("root_path") or "").strip(), [rb] if rb else None)
+            root = str(s.get("root_path") or "").strip()
+            if not root:
+                # reverse_proxy sites may not have a root_path in old panel versions
+                continue
+            err = _delete_site_root(root, [rb] if rb else None)
             if err:
                 errors.append(err)
             else:

@@ -1790,6 +1790,7 @@ def add_certificate(
 
 def update_certificate(
     cert_id: int,
+    domains: Optional[List[str]] = None,
     status: Optional[str] = None,
     not_before: Optional[str] = None,
     not_after: Optional[str] = None,
@@ -1799,6 +1800,18 @@ def update_certificate(
 ) -> None:
     fields: List[str] = []
     params: List[Any] = []
+    if domains is not None:
+        # keep original ordering, remove duplicates
+        uniq: List[str] = []
+        seen = set()
+        for d in (domains or []):
+            ds = str(d or "").strip()
+            if not ds or ds in seen:
+                continue
+            seen.add(ds)
+            uniq.append(ds)
+        fields.append("domains_json=?")
+        params.append(json.dumps(uniq, ensure_ascii=False))
     if status is not None:
         fields.append("status=?")
         params.append((status or "").strip())

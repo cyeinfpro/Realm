@@ -25,108 +25,118 @@
   </div>
 {% endif %}
 
-<div class="site-detail-grid">
-  <div class="site-col">
-    <div class="card">
-      <div class="section-head">
-        <div>
-          <div class="section-title">诊断摘要</div>
-          <div class="section-sub">关键检查项。</div>
-        </div>
-      </div>
-      <div class="kv-grid" style="margin-top:10px;">
-        <div class="kv-item"><div class="kv-label">Nginx 配置</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.nginx_test_ok else 'bad' }}">{{ 'ok' if diag.checks.nginx_test_ok else 'fail' }}</span></div></div>
-        <div class="kv-item"><div class="kv-label">Nginx 运行</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.nginx_active else 'warn' }}">{{ diag.checks.nginx_active if diag.checks.nginx_active is not none else 'unknown' }}</span></div></div>
-        <div class="kv-item"><div class="kv-label">配置存在</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.conf_exists else 'bad' }}">{{ 'ok' if diag.checks.conf_exists else 'missing' }}</span></div></div>
-        <div class="kv-item"><div class="kv-label">配置已加载</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.conf_included else 'warn' }}">{{ 'ok' if diag.checks.conf_included else 'unknown' }}</span></div></div>
-        <div class="kv-item"><div class="kv-label">根目录</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.root_exists else 'bad' }}">{{ 'ok' if diag.checks.root_exists else 'missing' }}</span></div></div>
-        <div class="kv-item"><div class="kv-label">PHP-FPM</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.php_ok else 'warn' }}">{{ 'ok' if diag.checks.php_ok else 'not ready' }}</span></div></div>
-        <div class="kv-item"><div class="kv-label">HTTP 探测</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.http_ok else 'bad' }}">{{ diag.checks.http_status or '-' }}</span></div></div>
-        <div class="kv-item"><div class="kv-label">虚拟主机命中</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.vhost_match else 'warn' if diag.checks.vhost_match is none else 'bad' }}">{{ 'ok' if diag.checks.vhost_match else 'unknown' if diag.checks.vhost_match is none else 'mismatch' }}</span></div></div>
-        <div class="kv-item" style="grid-column:1 / -1;"><div class="kv-label">错误</div><div class="kv-value mono">{{ diag.error or '-' }}</div></div>
+<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr));">
+  <div class="card">
+    <div class="section-head">
+      <div>
+        <div class="section-title">诊断摘要</div>
+        <div class="section-sub">当前健康状态与关键检查项。</div>
       </div>
     </div>
-
-    <div class="card">
-      <div class="section-head">
-        <div>
-          <div class="section-title">关键路径</div>
-          <div class="section-sub">配置与目录位置。</div>
-        </div>
-      </div>
-      <div class="kv-grid" style="margin-top:10px;">
-        <div class="kv-item"><div class="kv-label">配置路径</div><div class="kv-value mono">{{ diag.checks.conf_path or '-' }}</div></div>
-        <div class="kv-item"><div class="kv-label">根目录</div><div class="kv-value mono">{{ site.root_path or '-' }}</div></div>
-        <div class="kv-item"><div class="kv-label">反向代理</div><div class="kv-value mono">{{ site.proxy_target or '-' }}</div></div>
-        <div class="kv-item"><div class="kv-label">HTTP 延迟</div><div class="kv-value">{{ diag.latency_ms or 0 }} ms</div></div>
-        <div class="kv-item" style="grid-column:1 / -1;"><div class="kv-label">Nginx 测试输出</div><div class="kv-value mono" style="white-space:pre-wrap;">{{ diag.checks.nginx_test_output or '-' }}</div></div>
-      </div>
+    <div class="kv-grid" style="margin-top:10px;">
+      <div class="kv-item"><div class="kv-label">Nginx 配置</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.nginx_test_ok else 'bad' }}">{{ 'ok' if diag.checks.nginx_test_ok else 'fail' }}</span></div></div>
+      <div class="kv-item"><div class="kv-label">Nginx 运行</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.nginx_active else 'warn' }}">{{ diag.checks.nginx_active if diag.checks.nginx_active is not none else 'unknown' }}</span></div></div>
+      <div class="kv-item"><div class="kv-label">配置存在</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.conf_exists else 'bad' }}">{{ 'ok' if diag.checks.conf_exists else 'missing' }}</span></div></div>
+      <div class="kv-item"><div class="kv-label">配置已加载</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.conf_included else 'warn' }}">{{ 'ok' if diag.checks.conf_included else 'unknown' }}</span></div></div>
+      <div class="kv-item"><div class="kv-label">根目录</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.root_exists else 'bad' }}">{{ 'ok' if diag.checks.root_exists else 'missing' }}</span></div></div>
+      <div class="kv-item"><div class="kv-label">PHP-FPM</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.php_ok else 'warn' }}">{{ 'ok' if diag.checks.php_ok else 'not ready' }}</span></div></div>
+      <div class="kv-item"><div class="kv-label">HTTP 探测</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.http_ok else 'bad' }}">{{ diag.checks.http_status or '-' }}</span></div></div>
+      <div class="kv-item"><div class="kv-label">虚拟主机命中</div><div class="kv-value"><span class="pill xs {{ 'ok' if diag.checks.vhost_match else 'warn' if diag.checks.vhost_match is none else 'bad' }}">{{ 'ok' if diag.checks.vhost_match else 'unknown' if diag.checks.vhost_match is none else 'mismatch' }}</span></div></div>
+      <div class="kv-item" style="grid-column:1 / -1;"><div class="kv-label">错误</div><div class="kv-value mono">{{ diag.error or '-' }}</div></div>
     </div>
   </div>
 
-  <div class="site-col">
-    <div class="card">
-      <div class="section-head">
-        <div>
-          <div class="section-title">最近检查</div>
-          <div class="section-sub">健康监测记录。</div>
-        </div>
+  <div class="card">
+    <div class="section-head">
+      <div>
+        <div class="section-title">关键路径</div>
+        <div class="section-sub">配置与目录位置。</div>
       </div>
-      {% if checks %}
-        <div class="stack-scroll" style="margin-top:10px;">
-          <div class="stack-list">
-            {% for c in checks %}
-              {% set ok = (c.ok or 0) %}
-              <div class="stack-row">
-                <span class="pill xs {{ 'ok' if ok else 'bad' }}">{{ 'ok' if ok else 'fail' }}</span>
-                <div class="stack-main">
-                  <span class="mono">{{ c.checked_at }}</span>
-                  <span class="muted sm">HTTP {{ c.status_code or '-' }}</span>
-                  <span class="muted sm">{{ c.latency_ms or 0 }} ms</span>
-                </div>
-              </div>
-              {% if c.error %}
-                <div class="stack-sub mono">{{ c.error }}</div>
-              {% endif %}
-            {% endfor %}
-          </div>
-        </div>
-      {% else %}
-        <div class="muted" style="margin-top:10px;">暂无检查记录</div>
-      {% endif %}
     </div>
+    <div class="kv-grid" style="margin-top:10px;">
+      <div class="kv-item"><div class="kv-label">配置路径</div><div class="kv-value mono">{{ diag.checks.conf_path or '-' }}</div></div>
+      <div class="kv-item"><div class="kv-label">根目录</div><div class="kv-value mono">{{ site.root_path or '-' }}</div></div>
+      <div class="kv-item"><div class="kv-label">反向代理</div><div class="kv-value mono">{{ site.proxy_target or '-' }}</div></div>
+      <div class="kv-item"><div class="kv-label">HTTP 延迟</div><div class="kv-value">{{ diag.latency_ms or 0 }} ms</div></div>
+      <div class="kv-item" style="grid-column:1 / -1;"><div class="kv-label">Nginx 测试输出</div><div class="kv-value mono" style="white-space:pre-wrap;">{{ diag.checks.nginx_test_output or '-' }}</div></div>
+    </div>
+  </div>
 
-    <div class="card">
-      <div class="section-head">
-        <div>
-          <div class="section-title">变更历史</div>
-          <div class="section-sub">站点创建、删除、证书等操作记录。</div>
-        </div>
+  <div class="card">
+    <div class="section-head">
+      <div>
+        <div class="section-title">最近检查</div>
+        <div class="section-sub">健康监测结果。</div>
       </div>
-      {% if events %}
-        <div class="stack-scroll" style="margin-top:10px;">
-          <div class="stack-list">
-            {% for e in events %}
-              {% set es = (e.status or '') %}
-              {% set ecls = 'ok' if es == 'success' else ('warn' if es == 'running' else ('bad' if es in ['failed','error'] else 'ghost')) %}
-              <div class="stack-row">
-                <span class="pill xs {{ ecls }}">{{ es or 'unknown' }}</span>
-                <div class="stack-main">
-                  <span class="mono">{{ e.created_at }}</span>
-                  <span class="muted sm">{{ e.action }}</span>
-                  <span class="muted sm">{{ e.actor or '-' }}</span>
-                </div>
-              </div>
-              {% if e.error %}
-                <div class="stack-sub mono">{{ e.error }}</div>
-              {% endif %}
-            {% endfor %}
-          </div>
-        </div>
-      {% else %}
-        <div class="muted" style="margin-top:10px;">暂无变更记录</div>
-      {% endif %}
     </div>
+    {% if checks %}
+    <div class="table-wrap" style="margin-top:10px;">
+      <table class="table no-sticky">
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>状态</th>
+            <th>HTTP</th>
+            <th>延迟</th>
+            <th>错误</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for c in checks %}
+          {% set ok = (c.ok or 0) %}
+          <tr>
+            <td class="mono">{{ c.checked_at }}</td>
+            <td><span class="pill xs {{ 'ok' if ok else 'bad' }}">{{ 'ok' if ok else 'fail' }}</span></td>
+            <td>{{ c.status_code or '-' }}</td>
+            <td>{{ c.latency_ms or 0 }} ms</td>
+            <td class="mono">{{ c.error or '-' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+      <div class="muted" style="margin-top:10px;">暂无检查记录</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="section-head">
+      <div>
+        <div class="section-title">变更历史</div>
+        <div class="section-sub">站点创建、删除、证书等操作记录。</div>
+      </div>
+    </div>
+    {% if events %}
+      <div class="table-wrap" style="margin-top:10px;">
+        <table class="table no-sticky">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>动作</th>
+              <th>状态</th>
+              <th>操作者</th>
+              <th>错误</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for e in events %}
+            {% set es = (e.status or '') %}
+            {% set ecls = 'ok' if es == 'success' else ('warn' if es == 'running' else ('bad' if es in ['failed','error'] else 'ghost')) %}
+            <tr>
+              <td class="mono">{{ e.created_at }}</td>
+              <td>{{ e.action }}</td>
+              <td><span class="pill xs {{ ecls }}">{{ es }}</span></td>
+              <td>{{ e.actor or '-' }}</td>
+              <td class="mono">{{ e.error or '-' }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <div class="muted" style="margin-top:10px;">暂无变更记录</div>
+    {% endif %}
   </div>
 </div>
 {% endblock %}
