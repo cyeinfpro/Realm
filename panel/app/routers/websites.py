@@ -1003,7 +1003,9 @@ async def website_files_upload(
     request: Request,
     site_id: int,
     path: str = Form(""),
-    file: UploadFile = File(...),
+    files: Optional[List[UploadFile]] = File(None),
+    folder: Optional[List[UploadFile]] = File(None),
+    file: Optional[UploadFile] = File(None),
     user: str = Depends(require_login_page),
 ):
     site = get_site(int(site_id))
@@ -1017,17 +1019,35 @@ async def website_files_upload(
         set_flash(request, "该站点没有可管理的根目录")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
-    try:
-        filename = os.path.basename(file.filename or "upload.bin")
+    def _split_upload_name(raw: str) -> Tuple[str, str]:
+        clean = (raw or "").replace("\\", "/").lstrip("/")
+        if not clean:
+            return "", ""
+        parts = [p for p in clean.split("/") if p and p != "."]
+        if any(p == ".." for p in parts):
+            raise ValueError("非法路径")
+        if not parts:
+            return "", ""
+        return "/".join(parts[:-1]), parts[-1]
+
+    def _join_rel(a: str, b: str) -> str:
+        aa = (a or "").strip().strip("/")
+        bb = (b or "").strip().strip("/")
+        if not aa:
+            return bb
+        if not bb:
+            return aa
+        return f"{aa}/{bb}"
+
+    async def _upload_one(upload: UploadFile, target_path: str, filename: str) -> None:
         upload_id = uuid.uuid4().hex
         offset = 0
         total = 0
-        chunk = await file.read(UPLOAD_CHUNK_SIZE)
+        chunk = await upload.read(UPLOAD_CHUNK_SIZE)
         if not chunk:
-            # allow empty file
             payload = {
                 "root": root,
-                "path": path,
+                "path": target_path,
                 "filename": filename,
                 "upload_id": upload_id,
                 "offset": 0,
@@ -1045,17 +1065,16 @@ async def website_files_upload(
             )
             if not resp.get("ok", True):
                 raise AgentError(str(resp.get("error") or "上传失败"))
-            set_flash(request, "上传成功")
-            return RedirectResponse(url=f"/websites/{site_id}/files?path={path}", status_code=303)
+            return
         while True:
-            next_chunk = await file.read(UPLOAD_CHUNK_SIZE)
+            next_chunk = await upload.read(UPLOAD_CHUNK_SIZE)
             done = not next_chunk
             total += len(chunk)
             if total > UPLOAD_MAX_BYTES:
-                raise RuntimeError("文件过大（当前限制 200MB）")
+                raise RuntimeError(f"文件过大（当前限制 {_format_bytes(UPLOAD_MAX_BYTES)}）")
             payload = {
                 "root": root,
-                "path": path,
+                "path": target_path,
                 "filename": filename,
                 "upload_id": upload_id,
                 "offset": offset,
@@ -1078,9 +1097,43 @@ async def website_files_upload(
             if done:
                 break
             chunk = next_chunk
-        set_flash(request, "上传成功")
+
+    uploads: List[UploadFile] = []
+    if files:
+        uploads.extend(files)
+    if folder:
+        uploads.extend(folder)
+    if file:
+        uploads.append(file)
+
+    if not uploads:
+        set_flash(request, "请选择文件或文件夹")
+        return RedirectResponse(url=f"/websites/{site_id}/files?path={path}", status_code=303)
+
+    ok_count = 0
+    try:
+        for upload in uploads:
+            name_raw = str(upload.filename or "").strip()
+            if not name_raw:
+                raise RuntimeError("文件名为空")
+            rel_dir, base = _split_upload_name(name_raw)
+            if not base:
+                raise RuntimeError("文件名为空")
+            target_path = _join_rel(path, rel_dir)
+            await _upload_one(upload, target_path, os.path.basename(base))
+            ok_count += 1
+        set_flash(request, f"上传成功（{ok_count} 个文件）")
     except Exception as exc:
-        set_flash(request, f"上传失败：{exc}")
+        msg = f"上传失败：{exc}"
+        if ok_count:
+            msg = f"部分上传成功（{ok_count} 个），{msg}"
+        set_flash(request, msg)
+    finally:
+        for upload in uploads:
+            try:
+                await upload.close()
+            except Exception:
+                pass
 
     return RedirectResponse(url=f"/websites/{site_id}/files?path={path}", status_code=303)
 

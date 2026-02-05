@@ -17,30 +17,56 @@
   </div>
 {% endif %}
 
-<div class="card" style="margin-top:12px;">
-  <div class="row" style="justify-content:space-between;align-items:center;">
-    <div class="col">
-      <div class="file-path">
+<div class="card fm-card" style="margin-top:12px;">
+  <div class="fm-pathbar">
+    <div class="fm-crumbs">
+      <button class="btn xs ghost" type="button" id="fmUpBtn">上一级</button>
+      <div class="file-path fm-crumb-trail">
         {% for name, p in breadcrumbs %}
           <a href="/websites/{{ site.id }}/files?path={{ p }}">{{ name }}</a>
           {% if not loop.last %}<span class="sep">/</span>{% endif %}
         {% endfor %}
       </div>
-      <div class="help">支持选择文件夹批量上传（含子目录）；单文件上限 {{ upload_max_h }}（分片 + 断点续传）。</div>
     </div>
-    <div class="col right toolbar">
-      <form method="post" action="/websites/{{ site.id }}/files/mkdir" style="display:inline;">
+    <div class="fm-path-actions">
+      <button class="btn xs ghost" type="button" id="fmRefreshBtn">刷新</button>
+    </div>
+  </div>
+
+  <div class="fm-toolbar">
+    <div class="fm-actions">
+      <button class="btn xs" type="button" id="fmPickFiles">上传文件</button>
+      <button class="btn xs ghost" type="button" id="fmPickFolder">上传文件夹</button>
+      <form id="uploadForm" method="post" action="/websites/{{ site.id }}/files/upload" enctype="multipart/form-data" class="fm-upload-form">
         <input type="hidden" name="path" value="{{ path }}">
-        <input class="input" name="name" placeholder="新建目录">
+        <input type="file" id="uploadFileInput" name="files" class="fm-file-input" multiple>
+        <input type="file" id="uploadFolderInput" name="folder" class="fm-file-input" webkitdirectory directory mozdirectory multiple>
+        <button class="btn xs secondary" type="submit" id="uploadBtn" disabled>开始上传</button>
+        <button class="btn xs ghost" type="button" id="uploadCompatBtn" title="兼容上传（无分片/断点）">兼容上传</button>
+      </form>
+      <div class="fm-selection muted sm" id="uploadSelectionInfo">未选择文件</div>
+      <div class="fm-divider"></div>
+      <form method="post" action="/websites/{{ site.id }}/files/mkdir" class="fm-mkdir">
+        <input type="hidden" name="path" value="{{ path }}">
+        <input class="input sm" name="name" placeholder="新建目录">
         <button class="btn xs ghost" type="submit">创建</button>
       </form>
-      <form id="uploadForm" method="post" action="/websites/{{ site.id }}/files/upload" enctype="multipart/form-data" style="display:inline;">
-        <input type="hidden" name="path" value="{{ path }}">
-        <input type="file" id="uploadFileInput" name="file" class="input">
-        <input type="file" id="uploadFolderInput" name="folder" class="input" webkitdirectory directory multiple>
-        <button class="btn xs secondary" type="submit" id="uploadBtn">上传</button>
-      </form>
     </div>
+    <div class="fm-tools">
+      <div class="fm-search">
+        <input class="input sm" id="fmSearch" placeholder="搜索文件/目录">
+        <button class="btn xs ghost" type="button" id="fmSearchClear">清空</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="help" style="margin-top:6px;">
+    支持选择文件夹批量上传（含子目录）；单文件上限 {{ upload_max_h }}（分片 + 断点续传）。如文件夹上传失败，可尝试“兼容上传”或先压缩再上传。
+  </div>
+
+  <div class="fm-subbar">
+    <div class="muted sm" id="fmStats"></div>
+    <div class="muted sm" id="fmSelectInfo"></div>
   </div>
 
   <div id="uploadPanel" style="margin-top:10px;display:none;">
@@ -49,10 +75,13 @@
     <button class="btn xs ghost" type="button" id="uploadRetry" style="margin-top:8px;display:none;">重试上传</button>
   </div>
 
-  <div class="table-wrap" style="margin-top:12px;">
-    <table class="table no-sticky">
+  <div class="table-wrap fm-table-wrap" style="margin-top:12px;">
+    <table class="table no-sticky fm-table">
       <thead>
         <tr>
+          <th class="fm-sel">
+            <input type="checkbox" id="fmSelectAll" class="fm-check">
+          </th>
           <th>名称</th>
           <th>大小</th>
           <th>修改时间</th>
@@ -61,17 +90,27 @@
       </thead>
       <tbody>
         {% for it in items %}
-        <tr>
+        {% set ext = "" %}
+        {% if (not it.is_dir) and ("." in it.name) %}
+          {% set ext = it.name.rsplit(".", 1)[-1] | lower %}
+        {% endif %}
+        <tr class="fm-row" data-name="{{ it.name|lower }}" data-type="{{ 'dir' if it.is_dir else 'file' }}" data-size="{{ it.size or 0 }}">
+          <td class="fm-sel">
+            <input type="checkbox" class="fm-check fm-item-check">
+          </td>
           <td>
-            {% if it.is_dir %}
-              <a href="/websites/{{ site.id }}/files?path={{ it.path }}" style="text-decoration:none;">目录 · {{ it.name }}</a>
-            {% else %}
-              {{ it.name }}
-            {% endif %}
+            <div class="fm-name-wrap">
+              <span class="fm-badge {{ 'dir' if it.is_dir else 'file' }}">{{ '目录' if it.is_dir else (ext or '文件') }}</span>
+              {% if it.is_dir %}
+                <a href="/websites/{{ site.id }}/files?path={{ it.path }}" class="fm-link">{{ it.name }}</a>
+              {% else %}
+                <span>{{ it.name }}</span>
+              {% endif %}
+            </div>
           </td>
           <td class="mono">{{ it.size_h }}</td>
           <td class="mono">{{ it.mtime or "-" }}</td>
-          <td>
+          <td class="fm-actions-cell">
             {% if not it.is_dir %}
               <a class="btn xs ghost" href="/websites/{{ site.id }}/files/edit?path={{ it.path }}">编辑</a>
               <a class="btn xs ghost" href="/websites/{{ site.id }}/files/download?path={{ it.path }}">下载</a>
@@ -90,10 +129,15 @@
           </td>
         </tr>
         {% else %}
-        <tr>
-          <td colspan="4" class="muted">当前目录为空</td>
+        <tr id="fmEmptyRow">
+          <td colspan="5" class="muted">当前目录为空</td>
         </tr>
         {% endfor %}
+        {% if items %}
+        <tr id="fmSearchEmptyRow" style="display:none;">
+          <td colspan="5" class="muted">没有匹配的文件或目录</td>
+        </tr>
+        {% endif %}
       </tbody>
     </table>
   </div>
@@ -104,6 +148,17 @@ const uploadForm = document.getElementById('uploadForm');
 const uploadFileInput = document.getElementById('uploadFileInput');
 const uploadFolderInput = document.getElementById('uploadFolderInput');
 const uploadBtn = document.getElementById('uploadBtn');
+const uploadCompatBtn = document.getElementById('uploadCompatBtn');
+const uploadSelectionInfo = document.getElementById('uploadSelectionInfo');
+const pickFilesBtn = document.getElementById('fmPickFiles');
+const pickFolderBtn = document.getElementById('fmPickFolder');
+const fmSearch = document.getElementById('fmSearch');
+const fmSearchClear = document.getElementById('fmSearchClear');
+const fmRefreshBtn = document.getElementById('fmRefreshBtn');
+const fmUpBtn = document.getElementById('fmUpBtn');
+const fmStats = document.getElementById('fmStats');
+const fmSelectInfo = document.getElementById('fmSelectInfo');
+const fmSelectAll = document.getElementById('fmSelectAll');
 const uploadPanel = document.getElementById('uploadPanel');
 const uploadProgressFill = document.getElementById('uploadProgressFill');
 const uploadStatus = document.getElementById('uploadStatus');
@@ -113,6 +168,8 @@ const CHUNK_SIZE = 1024 * 512;
 const UPLOAD_MAX_BYTES = {{ upload_max_bytes }};
 const SITE_ID = {{ site.id }};
 const CUR_PATH = {{ path|tojson }};
+let bypassChunked = false;
+const SUPPORTS_FOLDER_PICK = !!(uploadFolderInput && (('webkitdirectory' in uploadFolderInput) || ('mozdirectory' in uploadFolderInput)));
 
 function bytesToHuman(n){
   if(!n) return '0 B';
@@ -126,6 +183,32 @@ function bytesToHuman(n){
   return v.toFixed(1) + ' ' + units[i];
 }
 
+function getPickedFiles(){
+  const folderFiles = uploadFolderInput?.files ? Array.from(uploadFolderInput.files) : [];
+  const pickFiles = uploadFileInput?.files ? Array.from(uploadFileInput.files) : [];
+  const files = folderFiles.length ? folderFiles : pickFiles;
+  return {files, folderFiles, pickFiles};
+}
+
+function updateUploadSelection(){
+  const {files} = getPickedFiles();
+  const totalBytes = files.reduce((s,f)=>s + (f.size || 0), 0) || 0;
+  if(uploadSelectionInfo){
+    if(!files.length){
+      uploadSelectionInfo.textContent = '未选择文件';
+    }else if(folderFiles.length){
+      const rel = folderFiles[0].webkitRelativePath || '';
+      const folderName = rel ? rel.split('/')[0] : '文件夹';
+      uploadSelectionInfo.textContent = `文件夹：${folderName} · ${files.length} 个文件 · ${bytesToHuman(totalBytes)}`;
+    }else{
+      uploadSelectionInfo.textContent = `已选择 ${files.length} 个文件 · ${bytesToHuman(totalBytes)}`;
+    }
+  }
+  if(uploadBtn){
+    uploadBtn.disabled = !files.length;
+  }
+}
+
 function bufToHex(buffer){
   const bytes = new Uint8Array(buffer);
   const hex = [];
@@ -135,7 +218,10 @@ function bufToHex(buffer){
   return hex.join('');
 }
 
+const HAS_SUBTLE = !!(window.crypto && window.crypto.subtle);
+
 async function sha256Hex(arrayBuffer){
+  if(!HAS_SUBTLE) return '';
   const hash = await crypto.subtle.digest('SHA-256', arrayBuffer);
   return bufToHex(hash);
 }
@@ -168,7 +254,7 @@ async function getResumeOffset(file, uploadId, path, filename){
 }
 
 function splitRelPath(rel){
-  const clean = String(rel || '').replace(/^\\/+/, '').replace(/\\\\/g, '/');
+  const clean = String(rel || '').replace(/^[/\\\\]+/, '').replace(/\\\\/g, '/');
   if(!clean) return {dir:'', name:''};
   const parts = clean.split('/').filter(Boolean);
   const name = parts.pop() || '';
@@ -176,11 +262,79 @@ function splitRelPath(rel){
 }
 
 function joinPath(a,b){
-  const aa = String(a || '').replace(/\\/+$/,'');
-  const bb = String(b || '').replace(/^\\/+/, '');
+  const aa = String(a || '').replace(/[\\\\/]+$/,'');
+  const bb = String(b || '').replace(/^[\\\\/]+/, '');
   if(!aa) return bb;
   if(!bb) return aa;
   return aa + '/' + bb;
+}
+
+let tableStats = {total:0, files:0, dirs:0, size:0};
+
+function computeTableStats(){
+  const rows = Array.from(document.querySelectorAll('.fm-row'));
+  let total = 0;
+  let files = 0;
+  let dirs = 0;
+  let size = 0;
+  for(const r of rows){
+    total += 1;
+    const type = r.dataset.type || '';
+    if(type === 'dir'){
+      dirs += 1;
+    }else{
+      files += 1;
+      size += parseInt(r.dataset.size || '0', 10) || 0;
+    }
+  }
+  tableStats = {total, files, dirs, size};
+}
+
+function renderStats(shownCount){
+  if(!fmStats) return;
+  let text = `共 ${tableStats.total} 项 · 目录 ${tableStats.dirs} · 文件 ${tableStats.files} · 大小 ${bytesToHuman(tableStats.size)}`;
+  if(typeof shownCount === 'number' && shownCount !== tableStats.total){
+    text += ` · 匹配 ${shownCount} 项`;
+  }
+  fmStats.textContent = text;
+}
+
+function updateSelectionInfo(){
+  if(!fmSelectInfo) return;
+  const checks = Array.from(document.querySelectorAll('.fm-item-check'));
+  const visibleChecks = checks.filter((c)=>{
+    const row = c.closest('.fm-row');
+    return row && row.style.display !== 'none';
+  });
+  const selected = visibleChecks.filter((c)=>c.checked);
+  if(visibleChecks.length){
+    if(fmSelectAll){
+      fmSelectAll.checked = selected.length === visibleChecks.length;
+      fmSelectAll.indeterminate = selected.length > 0 && selected.length < visibleChecks.length;
+    }
+  }else if(fmSelectAll){
+    fmSelectAll.checked = false;
+    fmSelectAll.indeterminate = false;
+  }
+  fmSelectInfo.textContent = selected.length ? `已选择 ${selected.length} 项` : '';
+}
+
+function applySearchFilter(){
+  const rows = Array.from(document.querySelectorAll('.fm-row'));
+  const q = (fmSearch?.value || '').trim().toLowerCase();
+  let shown = 0;
+  rows.forEach((r)=>{
+    const name = r.dataset.name || '';
+    const match = !q || name.includes(q);
+    r.style.display = match ? '' : 'none';
+    if(match) shown += 1;
+  });
+  const emptyRow = document.getElementById('fmSearchEmptyRow');
+  if(emptyRow){
+    emptyRow.style.display = shown ? 'none' : '';
+  }
+  renderStats(shown);
+  updateSelectionInfo();
 }
 
 function resolveUploadTarget(file){
@@ -225,18 +379,21 @@ async function uploadFile(file, uploadId, startOffset, path, filename, totalByte
     const chunkSha = await sha256Hex(buf);
     const b64 = await chunkToBase64(buf);
     const done = (offset + chunk.size) >= total;
+    const payload = {
+      path: path || CUR_PATH,
+      filename: filename || file.name,
+      upload_id: uploadId,
+      offset: offset,
+      done: done,
+      content_b64: b64
+    };
+    if(chunkSha){
+      payload.chunk_sha256 = chunkSha;
+    }
     const resp = await fetch(`/websites/${SITE_ID}/files/upload_chunk`, {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({
-        path: path || CUR_PATH,
-        filename: filename || file.name,
-        upload_id: uploadId,
-        offset: offset,
-        done: done,
-        content_b64: b64,
-        chunk_sha256: chunkSha
-      })
+      body: JSON.stringify(payload)
     });
     const data = await resp.json().catch(()=>({ok:false,error:'上传失败'}));
     if(!data.ok){
@@ -255,17 +412,99 @@ async function uploadFile(file, uploadId, startOffset, path, filename, totalByte
   uploadBtn.disabled = false;
 }
 
-uploadForm?.addEventListener('submit', async (e)=>{
-  if(!window.crypto || !window.crypto.subtle){
+pickFilesBtn?.addEventListener('click', ()=>{
+  uploadFileInput?.click();
+});
+
+pickFolderBtn?.addEventListener('click', ()=>{
+  if(!SUPPORTS_FOLDER_PICK){
+    alert('当前浏览器不支持文件夹选择，请使用 Chrome / Edge 或尝试“兼容上传”。');
     return;
   }
-  e.preventDefault();
-  const folderFiles = uploadFolderInput?.files ? Array.from(uploadFolderInput.files) : [];
-  const singleFile = uploadFileInput?.files?.[0];
-  const files = folderFiles.length ? folderFiles : (singleFile ? [singleFile] : []);
+  uploadFolderInput?.click();
+});
+
+uploadFileInput?.addEventListener('change', ()=>{
+  if(uploadFileInput?.files?.length && uploadFolderInput){
+    uploadFolderInput.value = '';
+  }
+  updateUploadSelection();
+});
+
+uploadFolderInput?.addEventListener('change', ()=>{
+  if(uploadFolderInput?.files?.length && uploadFileInput){
+    uploadFileInput.value = '';
+  }
+  updateUploadSelection();
+});
+
+uploadCompatBtn?.addEventListener('click', ()=>{
+  const {files} = getPickedFiles();
   if(!files.length){
     alert('请选择文件或文件夹');
     return;
+  }
+  bypassChunked = true;
+  if(uploadForm?.requestSubmit){
+    uploadForm.requestSubmit();
+  }else{
+    uploadForm?.submit();
+  }
+});
+
+fmSearch?.addEventListener('input', applySearchFilter);
+fmSearchClear?.addEventListener('click', ()=>{
+  if(fmSearch) fmSearch.value = '';
+  applySearchFilter();
+});
+
+fmRefreshBtn?.addEventListener('click', ()=> window.location.reload());
+fmUpBtn?.addEventListener('click', ()=>{
+  const segs = String(CUR_PATH || '').split('/').filter(Boolean);
+  if(!segs.length) return;
+  segs.pop();
+  const up = segs.join('/');
+  window.location.href = `/websites/${SITE_ID}/files?path=${encodeURIComponent(up)}`;
+});
+
+fmSelectAll?.addEventListener('change', ()=>{
+  const rows = Array.from(document.querySelectorAll('.fm-row'));
+  const checked = !!fmSelectAll.checked;
+  rows.forEach((r)=>{
+    if(r.style.display === 'none') return;
+    const box = r.querySelector('.fm-item-check');
+    if(box) box.checked = checked;
+  });
+  updateSelectionInfo();
+});
+
+document.querySelectorAll('.fm-item-check').forEach((c)=>{
+  c.addEventListener('change', updateSelectionInfo);
+});
+
+if(!SUPPORTS_FOLDER_PICK && pickFolderBtn){
+  pickFolderBtn.setAttribute('disabled', 'disabled');
+  pickFolderBtn.classList.add('disabled');
+  pickFolderBtn.title = '当前浏览器不支持文件夹选择';
+}
+
+computeTableStats();
+applySearchFilter();
+updateUploadSelection();
+
+uploadForm?.addEventListener('submit', async (e)=>{
+  if(bypassChunked){
+    bypassChunked = false;
+    return;
+  }
+  e.preventDefault();
+  const {files, folderFiles} = getPickedFiles();
+  if(!files.length){
+    alert('请选择文件或文件夹');
+    return;
+  }
+  if(!HAS_SUBTLE){
+    uploadStatus.textContent = '提示：当前环境不支持 SHA256（将跳过校验）。建议使用 HTTPS 或现代浏览器。';
   }
   for(const f of files){
     if(UPLOAD_MAX_BYTES && f.size > UPLOAD_MAX_BYTES){
@@ -315,14 +554,16 @@ uploadForm?.addEventListener('submit', async (e)=>{
   }catch(err){
     uploadStatus.textContent = String(err);
     uploadRetry.style.display = 'inline-block';
+    uploadBtn.disabled = false;
   }
 });
 
 uploadRetry?.addEventListener('click', async ()=>{
-  const folderFiles = uploadFolderInput?.files ? Array.from(uploadFolderInput.files) : [];
-  const singleFile = uploadFileInput?.files?.[0];
-  const files = folderFiles.length ? folderFiles : (singleFile ? [singleFile] : []);
+  const {files} = getPickedFiles();
   if(!files.length) return;
+  if(!HAS_SUBTLE){
+    uploadStatus.textContent = '提示：当前环境不支持 SHA256（将跳过校验）。建议使用 HTTPS 或现代浏览器。';
+  }
   for(const f of files){
     if(UPLOAD_MAX_BYTES && f.size > UPLOAD_MAX_BYTES){
       uploadStatus.textContent = `文件过大：${f.name}`;
@@ -370,6 +611,7 @@ uploadRetry?.addEventListener('click', async ()=>{
     window.location.reload();
   }catch(err){
     uploadStatus.textContent = String(err);
+    uploadBtn.disabled = false;
   }
 });
 </script>
