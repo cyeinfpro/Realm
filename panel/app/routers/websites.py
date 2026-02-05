@@ -398,6 +398,224 @@ async def website_detail(request: Request, site_id: int, user: str = Depends(req
     )
 
 
+@router.get("/websites/{site_id}/edit", response_class=HTMLResponse)
+async def website_edit(request: Request, site_id: int, user: str = Depends(require_login_page)):
+    site = get_site(int(site_id))
+    if not site:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(int(site.get("node_id") or 0))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    site["domains_text"] = ", ".join(site.get("domains") or [])
+    return templates.TemplateResponse(
+        "site_edit.html",
+        {
+            "request": request,
+            "user": user,
+            "flash": flash(request),
+            "title": f"编辑 · {site.get('name')}",
+            "site": site,
+            "node": node,
+        },
+    )
+
+
+@router.post("/websites/{site_id}/edit")
+async def website_edit_action(
+    request: Request,
+    site_id: int,
+    name: str = Form(""),
+    domains: str = Form(""),
+    site_type: str = Form("static"),
+    web_server: str = Form("nginx"),
+    root_path: str = Form(""),
+    proxy_target: str = Form(""),
+    https_redirect: Optional[str] = Form(None),
+    gzip_enabled: Optional[str] = Form(None),
+    nginx_tpl: str = Form(""),
+    user: str = Depends(require_login_page),
+):
+    site = get_site(int(site_id))
+    if not site:
+        set_flash(request, "站点不存在")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(int(site.get("node_id") or 0))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    domains_list = _parse_domains(domains)
+    if not domains_list:
+        set_flash(request, "域名不能为空")
+        return RedirectResponse(url=f"/websites/{site_id}/edit", status_code=303)
+
+    site_type = (site_type or site.get("type") or "static").strip()
+    if site_type not in ("static", "php", "reverse_proxy"):
+        site_type = str(site.get("type") or "static")
+
+    web_server = (web_server or site.get("web_server") or "nginx").strip() or "nginx"
+    if web_server != "nginx":
+        set_flash(request, "当前仅支持 nginx")
+        return RedirectResponse(url=f"/websites/{site_id}/edit", status_code=303)
+
+    existing = list_sites(node_id=int(site.get("node_id") or 0))
+    for s in existing:
+        if int(s.get("id") or 0) == int(site_id):
+            continue
+        if str(s.get("status") or "").strip().lower() == "error":
+            continue
+        s_domains = set([str(x).lower() for x in (s.get("domains") or [])])
+        if s_domains.intersection(set(domains_list)):
+            set_flash(request, "该节点已有重复域名的站点")
+            return RedirectResponse(url=f"/websites/{site_id}/edit", status_code=303)
+
+    root_path = (root_path or "").strip()
+    proxy_target = _normalize_proxy_target(proxy_target or "")
+    if not root_path:
+        root_path = str(site.get("root_path") or "").strip()
+    if not proxy_target:
+        proxy_target = _normalize_proxy_target(site.get("proxy_target") or "")
+
+    if site_type == "reverse_proxy" and not proxy_target.strip():
+        set_flash(request, "反向代理必须填写目标地址")
+        return RedirectResponse(url=f"/websites/{site_id}/edit", status_code=303)
+    if site_type != "reverse_proxy" and not root_path:
+        set_flash(request, "根目录不能为空")
+        return RedirectResponse(url=f"/websites/{site_id}/edit", status_code=303)
+
+    https_flag = bool(https_redirect)
+    gzip_flag = bool(gzip_enabled)
+    tpl = (nginx_tpl or "").strip()
+
+    display_name = (name or "").strip() or domains_list[0]
+
+    task_id = add_task(
+        node_id=int(site.get("node_id") or 0),
+        task_type="update_site",
+        payload={
+            "site_id": int(site_id),
+            "domains": domains_list,
+            "prev_domains": site.get("domains") or [],
+            "root_path": root_path,
+            "proxy_target": proxy_target,
+            "type": site_type,
+            "web_server": web_server,
+            "https_redirect": https_flag,
+            "gzip_enabled": gzip_flag,
+            "nginx_tpl": tpl,
+        },
+        status="running",
+        progress=10,
+    )
+    add_site_event(
+        int(site_id),
+        "site_update",
+        status="running",
+        actor=str(user or ""),
+        payload={
+            "domains": domains_list,
+            "root_path": root_path,
+            "proxy_target": proxy_target,
+            "type": site_type,
+        },
+    )
+
+    try:
+        payload = {
+            "domains": domains_list,
+            "prev_domains": site.get("domains") or [],
+            "root_path": root_path,
+            "proxy_target": proxy_target,
+            "type": site_type,
+            "web_server": web_server,
+            "https_redirect": https_flag,
+            "gzip_enabled": gzip_flag,
+            "nginx_tpl": tpl,
+            "root_base": _node_root_base(node),
+        }
+        data = await agent_post(
+            node["base_url"],
+            node["api_key"],
+            "/api/v1/website/site/update",
+            payload,
+            node_verify_tls(node),
+            timeout=30,
+        )
+        if not data.get("ok", True):
+            raise AgentError(str(data.get("error") or "更新站点失败"))
+
+        health_status = "unknown"
+        health_error = ""
+        health: Dict[str, Any] = {}
+        try:
+            health = await agent_post(
+                node["base_url"],
+                node["api_key"],
+                "/api/v1/website/health",
+                {
+                    "domains": domains_list,
+                    "type": site_type,
+                    "root_path": root_path,
+                    "proxy_target": proxy_target,
+                    "root_base": _node_root_base(node),
+                },
+                node_verify_tls(node),
+                timeout=10,
+            )
+            if isinstance(health, dict):
+                if health.get("ok"):
+                    health_status = "ok"
+                else:
+                    health_status = "fail"
+                    health_error = str(health.get("error") or "")
+        except Exception as exc:
+            health_status = "fail"
+            health_error = str(exc)
+
+        update_site(
+            int(site_id),
+            name=display_name,
+            domains=domains_list,
+            root_path=root_path,
+            proxy_target=proxy_target,
+            site_type=site_type,
+            web_server=web_server,
+            nginx_tpl=tpl,
+            https_redirect=https_flag,
+            gzip_enabled=gzip_flag,
+            status="running" if health_status != "fail" else "error",
+        )
+
+        try:
+            if health_status in ("ok", "fail"):
+                update_site_health(
+                    int(site_id),
+                    health_status,
+                    health_code=int(health.get("status_code") or 0) if isinstance(health, dict) else 0,
+                    health_latency_ms=int(health.get("latency_ms") or 0) if isinstance(health, dict) else 0,
+                    health_error=str(health.get("error") or "") if isinstance(health, dict) else health_error,
+                )
+        except Exception:
+            pass
+
+        update_task(task_id, status="success", progress=100, result=data)
+        add_site_event(int(site_id), "site_update", status="success", actor=str(user or ""), result=data)
+        if health_status == "fail":
+            set_flash(request, f"更新成功，但健康检查失败：{health_error or 'HTTP 探测失败'}")
+        else:
+            set_flash(request, "站点已更新")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+    except Exception as exc:
+        update_site(int(site_id), status="error")
+        update_task(task_id, status="failed", progress=100, error=str(exc))
+        add_site_event(int(site_id), "site_update", status="failed", actor=str(user or ""), error=str(exc))
+        set_flash(request, f"更新失败：{exc}")
+        return RedirectResponse(url=f"/websites/{site_id}/edit", status_code=303)
+
+
 @router.get("/websites/{site_id}/diagnose", response_class=HTMLResponse)
 async def website_diagnose(request: Request, site_id: int, user: str = Depends(require_login_page)):
     site = get_site(int(site_id))

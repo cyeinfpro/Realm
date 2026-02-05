@@ -3565,6 +3565,21 @@ def _cert_dates(cert_path: Path) -> Dict[str, str]:
     return out
 
 
+def _detect_cert_paths(domains: List[str]) -> Optional[Tuple[str, str]]:
+    if not domains:
+        return None
+    main_domain = str(domains[0])
+    if not main_domain:
+        return None
+    safe = _slugify(main_domain)
+    cert_dir = Path("/etc/ssl/nexus") / safe
+    fullchain = cert_dir / "fullchain.pem"
+    privkey = cert_dir / "privkey.pem"
+    if fullchain.exists() and privkey.exists():
+        return str(fullchain), str(privkey)
+    return None
+
+
 @app.post("/api/v1/website/env/ensure")
 def api_website_env_ensure(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
     if not isinstance(payload, dict):
@@ -3716,6 +3731,96 @@ def api_website_create(payload: Dict[str, Any], _: None = Depends(_api_key_requi
     return {"ok": True, "conf_path": str(conf_path)}
 
 
+@app.post("/api/v1/website/site/update")
+def api_website_update(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    extra_bases = _payload_root_bases(payload)
+    domains = payload.get("domains") or []
+    if not isinstance(domains, list) or not domains:
+        return {"ok": False, "error": "domains 不能为空"}
+    prev_domains = payload.get("prev_domains") or payload.get("old_domains") or []
+    if not isinstance(prev_domains, list):
+        prev_domains = []
+
+    site_type = str(payload.get("type") or "static").strip()
+    root_path = str(payload.get("root_path") or "").strip()
+    proxy_target = _normalize_proxy_target(str(payload.get("proxy_target") or ""))
+    web_server = str(payload.get("web_server") or "nginx").strip().lower()
+    https_redirect = bool(payload.get("https_redirect"))
+    gzip_enabled = bool(payload.get("gzip_enabled", True))
+    nginx_tpl = str(payload.get("nginx_tpl") or "").strip()
+
+    if web_server != "nginx":
+        return {"ok": False, "error": "当前仅支持 nginx"}
+    if shutil.which("nginx") is None:
+        return {"ok": False, "error": "未检测到 nginx"}
+
+    php_sock = None
+    if site_type == "php":
+        php_sock = _detect_php_fpm_sock()
+        if not php_sock:
+            return {"ok": False, "error": "未检测到 php-fpm socket"}
+
+    if site_type != "reverse_proxy":
+        if not root_path:
+            return {"ok": False, "error": "root_path 不能为空"}
+        try:
+            root_valid = _validate_root(root_path, extra_bases)
+            if not root_valid.exists():
+                root_valid.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+    else:
+        if not proxy_target:
+            return {"ok": False, "error": "proxy_target 不能为空"}
+        if root_path:
+            try:
+                _validate_root(root_path, extra_bases)
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
+    cert_paths = _detect_cert_paths(domains)
+    if nginx_tpl:
+        ctx = {
+            "SERVER_NAME": " ".join([str(x) for x in domains]),
+            "ROOT_PATH": root_path,
+            "PROXY_TARGET": proxy_target,
+            "SSL_CERT": cert_paths[0] if cert_paths else "",
+            "SSL_KEY": cert_paths[1] if cert_paths else "",
+            "GZIP_CONF": _gzip_snippet() if gzip_enabled else "",
+        }
+        conf = _render_custom_template(nginx_tpl, ctx)
+    else:
+        conf = _render_nginx_conf(
+            site_type,
+            domains,
+            root_path,
+            proxy_target,
+            php_sock,
+            https_redirect=https_redirect,
+            gzip_enabled=gzip_enabled,
+            cert_paths=cert_paths,
+        )
+
+    ok, conf_path, out = _apply_nginx_conf(domains[0], conf)
+    if not ok:
+        return {"ok": False, "error": out or "更新配置失败", "conf_path": str(conf_path)}
+
+    removed = 0
+    if prev_domains:
+        prev_main = str(prev_domains[0] or "")
+        if prev_main and _slugify(prev_main) != _slugify(str(domains[0])):
+            removed = _remove_nginx_conf_by_domain(prev_main)
+            if removed:
+                try:
+                    _nginx_reload()
+                except Exception:
+                    pass
+
+    return {"ok": True, "conf_path": str(conf_path), "removed": removed}
+
+
 @app.post("/api/v1/website/ssl/issue")
 def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
     if not isinstance(payload, dict):
@@ -3725,12 +3830,24 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     if not isinstance(domains, list) or not domains:
         return {"ok": False, "error": "domains 不能为空"}
     root_path = str(payload.get("root_path") or "").strip()
+    update_conf = payload.get("update_conf") if isinstance(payload, dict) else None
+    site_type = ""
+    if isinstance(update_conf, dict):
+        site_type = str(update_conf.get("type") or "").strip()
+    if not site_type:
+        site_type = str(payload.get("type") or "static").strip()
+
+    use_nginx = False
     if not root_path:
-        return {"ok": False, "error": "root_path 不能为空"}
-    try:
-        _validate_root(root_path, extra_bases)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        if site_type == "reverse_proxy":
+            use_nginx = True
+        else:
+            return {"ok": False, "error": "root_path 不能为空"}
+    if root_path:
+        try:
+            _validate_root(root_path, extra_bases)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     acme = _find_acme_sh()
     if not acme:
@@ -3739,7 +3856,10 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     cmd = [acme, "--issue"]
     for d in domains:
         cmd += ["-d", str(d)]
-    cmd += ["-w", root_path]
+    if use_nginx:
+        cmd += ["--nginx"]
+    else:
+        cmd += ["-w", root_path]
     code, out = _run_cmd(cmd)
     if code != 0:
         return {"ok": False, "error": out or "证书申请失败"}
@@ -3768,7 +3888,6 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
         return {"ok": False, "error": out or "证书安装失败"}
 
     # Optional: update nginx config to enable HTTPS
-    update_conf = payload.get("update_conf") if isinstance(payload, dict) else None
     if isinstance(update_conf, dict):
         site_type = str(update_conf.get("type") or "static").strip()
         proxy_target = _normalize_proxy_target(str(update_conf.get("proxy_target") or ""))
