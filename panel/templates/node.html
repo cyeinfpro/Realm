@@ -282,35 +282,35 @@
     </div>
 
     <div class="form" style="margin-top:10px;">
-      <div class="row" style="gap:12px;">
-        <div class="col">
-          <label class="label">节点名称（可选）</label>
-          <input class="input" id="addNodeName" placeholder="例如：香港-01 / US-Edge">
-        </div>
-        <div class="col" style="max-width:180px;">
-          <label class="label">协议</label>
-          <select class="select" id="addNodeScheme">
-            <option value="http">http</option>
-            <option value="https">https</option>
-          </select>
-        </div>
-      </div>
-
-      <label class="label">分组名称</label>
-      <input class="input" id="addNodeGroup" placeholder="例如：香港 / 美国 / 客户A" value="默认分组">
-      <div class="help">仅用于面板分类；不影响规则与转发。</div>
+      <label class="label">节点名称（可选）</label>
+      <input class="input" id="addNodeName" placeholder="例如：香港-01 / US-Edge">
 
       <label class="label">IP/域名</label>
-      <input class="input" id="addNodeIp" placeholder="例如：1.2.3.4 或 node.example.com">
+      <input class="input" id="addNodeIp" placeholder="例如：1.2.3.4 或 https://node.example.com:18700">
+      <div class="help">默认按 HTTP 接入；若填写 <span class="mono">https://</span> 前缀会自动切换 HTTPS。</div>
 
-      <div class="row" style="gap:12px;align-items:center;margin-top:6px;">
-        <div class="col">
-          <label class="help"><input type="checkbox" id="addNodeVerifyTls" style="transform:translateY(1px);"> 验证 TLS 证书（https 才需要）</label>
+      <details class="advanced-details">
+        <summary>
+          <div class="adv-summary-left">
+            <div class="adv-title">高级选项</div>
+            <div class="adv-hint">分组 / 节点角色（可选）</div>
+          </div>
+          <div class="adv-summary-right">
+            <span class="pill xs ghost">可选</span>
+          </div>
+        </summary>
+        <div class="adv-body">
+          <label class="label">分组名称</label>
+          <input class="input" id="addNodeGroup" placeholder="例如：香港 / 美国 / 客户A" value="默认分组">
+          <div class="help">仅用于面板分类；不影响规则与转发。</div>
+
+          <div class="row" style="gap:12px;align-items:center;">
+            <div class="col">
+              <label class="help"><input type="checkbox" id="addNodeIsPrivate" style="transform:translateY(1px);"> 内网机器（用于内网穿透出口）</label>
+            </div>
+          </div>
         </div>
-        <div class="col">
-          <label class="help"><input type="checkbox" id="addNodeIsPrivate" style="transform:translateY(1px);"> 内网机器（用于内网穿透出口）</label>
-        </div>
-      </div>
+      </details>
 
       <div id="addNodeError" class="muted" style="margin-top:8px;color:var(--bad);"></div>
 
@@ -796,7 +796,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=77.0"></script>
+<script src="/static/app.js?v=78.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};

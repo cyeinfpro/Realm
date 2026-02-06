@@ -5587,7 +5587,6 @@ let __AGENT_UPDATE_ID__ = '';
 let __AGENT_UPDATE_TARGET__ = '';
 
 let __AU_FILTER_STATE__ = 'all';
-let __AU_SEARCH__ = '';
 let __AU_LAST_ROWS__ = [];
 let __AU_LAST_SUMMARY__ = null;
 let __AU_BOUND__ = false;
@@ -5602,7 +5601,6 @@ function openAgentUpdateModal(){
   __AGENT_UPDATE_ID__ = '';
   __AGENT_UPDATE_TARGET__ = '';
   __AU_FILTER_STATE__ = 'all';
-  __AU_SEARCH__ = '';
   __AU_LAST_ROWS__ = [];
   __AU_LAST_SUMMARY__ = null;
 
@@ -5614,7 +5612,6 @@ function openAgentUpdateModal(){
   const list = document.getElementById('agentUpdateList');
   const pills = document.getElementById('agentUpdatePills');
   const btn = document.getElementById('agentUpdateStartBtn');
-  const search = document.getElementById('agentUpdateSearch');
 
   if(t) t.textContent = '—';
   if(id) id.textContent = '';
@@ -5624,7 +5621,6 @@ function openAgentUpdateModal(){
   if(list) list.innerHTML = '';
   if(pills) pills.innerHTML = '';
   if(btn){ btn.disabled = false; btn.textContent = '开始更新'; }
-  if(search){ search.value = ''; }
 
   // Bind handlers once
   if(!__AU_BOUND__){
@@ -5637,13 +5633,6 @@ function openAgentUpdateModal(){
         const st = String(el.getAttribute('data-state') || 'all').trim() || 'all';
         __AU_FILTER_STATE__ = st;
         _renderPills(__AU_LAST_SUMMARY__ || {});
-        _renderList(__AU_LAST_ROWS__ || []);
-      });
-    }
-
-    if(search){
-      search.addEventListener('input', ()=>{
-        __AU_SEARCH__ = String(search.value || '').trim().toLowerCase();
         _renderList(__AU_LAST_ROWS__ || []);
       });
     }
@@ -5802,23 +5791,8 @@ function _renderList(rows){
     view = view.filter(n=> String((n && n.state) || '').toLowerCase() === f);
   }
 
-  const q = String(__AU_SEARCH__ || '').trim().toLowerCase();
-  if(q){
-    view = view.filter(n=>{
-      const hay = [
-        n && n.name,
-        n && n.group_name,
-        n && n.msg,
-        n && n.agent_version,
-        n && n.desired_version,
-        n && n.last_seen_at,
-      ].map(x=>String(x || '')).join(' ').toLowerCase();
-      return hay.indexOf(q) !== -1;
-    });
-  }
-
   if(view.length === 0){
-    list.innerHTML = `<div class="au-row"><div class="au-node"><div class="au-node-name">暂无匹配节点</div><div class="au-node-meta"><span class="kv-mini mono">调整筛选条件或搜索关键词</span></div></div></div>`;
+    list.innerHTML = `<div class="au-row"><div class="au-node"><div class="au-node-name">暂无匹配节点</div><div class="au-node-meta"><span class="kv-mini mono">调整筛选条件后重试</span></div></div></div>`;
     return;
   }
 
@@ -5868,6 +5842,7 @@ async function _pollAgentUpdate(){
   const sumEl = document.getElementById('agentUpdateSummary');
   const bar = document.getElementById('agentUpdateBar');
   const id = document.getElementById('agentUpdateId');
+  const btn = document.getElementById('agentUpdateStartBtn');
 
   if(id) id.textContent = __AGENT_UPDATE_ID__ ? ('批次：' + __AGENT_UPDATE_ID__) : '';
 
@@ -5901,14 +5876,29 @@ async function _pollAgentUpdate(){
     _renderPills(s);
     _renderList(__AU_LAST_ROWS__);
 
+    // Terminal states:
+    // - no nodes to update, or
+    // - done/failed/offline only, no installing/sent/queued left.
+    if(total === 0 || (installing + sent + queued) === 0){
+      if(__AGENT_UPDATE_TIMER__){
+        clearInterval(__AGENT_UPDATE_TIMER__);
+        __AGENT_UPDATE_TIMER__ = null;
+      }
+      if(btn){
+        btn.disabled = false;
+        btn.textContent = '再次更新';
+      }
+    }
+
   }catch(_e){}
 }
 
 async function startAgentUpdateAll(){
   const btn = document.getElementById('agentUpdateStartBtn');
   const t = document.getElementById('agentUpdateTarget');
+  let started = false;
   try{
-    if(btn){ btn.disabled = true; btn.textContent = '下发中…'; }
+    if(btn){ btn.disabled = true; btn.textContent = '更新中…'; }
     const r = await fetch('/api/agents/update_all', { method: 'POST', credentials: 'include' });
     const d = await r.json().catch(()=>({ok:false}));
     if(!r.ok || !d.ok){
@@ -5922,15 +5912,19 @@ async function startAgentUpdateAll(){
     if(t) t.textContent = __AGENT_UPDATE_TARGET__ || '—';
 
     toast('已下发更新任务');
+    started = true;
 
     if(__AGENT_UPDATE_TIMER__){ clearInterval(__AGENT_UPDATE_TIMER__); }
-    __AGENT_UPDATE_TIMER__ = setInterval(_pollAgentUpdate, 1800);
+    __AGENT_UPDATE_TIMER__ = setInterval(_pollAgentUpdate, 1000);
     await _pollAgentUpdate();
 
   }catch(e){
     toast((e && e.message) ? e.message : '更新失败', true);
   }finally{
-    if(btn){ btn.disabled = false; btn.textContent = '开始更新'; }
+    if(!started && btn){
+      btn.disabled = false;
+      btn.textContent = '开始更新';
+    }
   }
 }
 
@@ -6558,6 +6552,14 @@ function closeAddNodeModal(){
   if(!m) return;
   m.style.display = "none";
 }
+
+function inferAddNodeScheme(ipOrUrl){
+  const raw = String(ipOrUrl || '').trim().toLowerCase();
+  if(raw.startsWith('https://')) return 'https';
+  if(raw.startsWith('http://')) return 'http';
+  return 'http';
+}
+
 async function createNodeFromModal(){
   const err = document.getElementById("addNodeError");
   const btn = document.getElementById("addNodeSubmit");
@@ -6566,12 +6568,12 @@ async function createNodeFromModal(){
     if(btn){ btn.disabled = true; btn.textContent = "创建中…"; }
     const name = (document.getElementById("addNodeName")?.value || "").trim();
     const ip_address = (document.getElementById("addNodeIp")?.value || "").trim();
-    const scheme = (document.getElementById("addNodeScheme")?.value || "http").trim();
-    const verify_tls = !!document.getElementById("addNodeVerifyTls")?.checked;
+    const scheme = inferAddNodeScheme(ip_address);
+    const verifyEl = document.getElementById("addNodeVerifyTls");
     const is_private = !!document.getElementById("addNodeIsPrivate")?.checked;
     const is_website = !!document.getElementById("addNodeIsWebsite")?.checked;
-    const group_name = (document.getElementById("addNodeGroup")?.value || "").trim();
-    const website_root_base = (document.getElementById("addNodeWebsiteRoot")?.value || "").trim();
+    const group_name = (document.getElementById("addNodeGroup")?.value || "默认分组").trim() || "默认分组";
+    let website_root_base = (document.getElementById("addNodeWebsiteRoot")?.value || "").trim();
 
     if(!ip_address){
       if(err) err.textContent = "节点地址不能为空";
@@ -6579,10 +6581,30 @@ async function createNodeFromModal(){
       return;
     }
 
+    if(is_website && !website_root_base){
+      website_root_base = "/www";
+    }
+    if(!is_website){
+      website_root_base = "";
+    }
+
+    const payload = {
+      name,
+      ip_address,
+      scheme,
+      is_private,
+      is_website,
+      group_name,
+      website_root_base
+    };
+    if(verifyEl){
+      payload.verify_tls = !!verifyEl.checked;
+    }
+
     const resp = await fetch("/api/nodes/create", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({name, ip_address, scheme, verify_tls, is_private, is_website, group_name, website_root_base}),
+      body: JSON.stringify(payload),
       // 需要允许后端写入 Session Cookie（用于跳转到节点页后自动弹出接入命令窗口）
       credentials: "include",
     });
