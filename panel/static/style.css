@@ -2466,6 +2466,43 @@ textarea,.textarea{min-height:90px;resize:vertical}
   .node-head-left{flex:1 1 100%;}
   .node-head-right{flex:1 1 100%; justify-content:flex-start !important;}
   .node-main .meta{flex-wrap:wrap;}
+
+  /* Mobile toolbar: no horizontal clipping; show all controls in a 2-col grid */
+  .node-tools{
+    display:grid;
+    grid-template-columns:repeat(2, minmax(0, 1fr));
+    gap:8px;
+    width:100%;
+    overflow:visible;
+    padding-bottom:0;
+    align-items:stretch;
+  }
+  .node-tools > *{
+    min-width:0;
+    width:100%;
+  }
+  .node-tools > .btn,
+  .node-tools > details.menu > summary{
+    width:100%;
+    justify-content:center;
+    text-align:center;
+  }
+  .node-tools > details.menu{width:100%;}
+  .node-tools .toolbar-main-cta{grid-column:1 / -1; order:1;}
+  .node-tools .toolbar-mini-search{order:2;}
+  .node-tools .toolbar-mini-filter{order:3;}
+  .node-tools .toolbar-command{order:4;}
+  .node-tools .toolbar-rules{order:5;}
+  .node-tools .toolbar-node{order:6;}
+  .node-tools #bulkBar{
+    grid-column:1 / -1;
+    order:7;
+    justify-content:flex-start;
+    overflow-x:auto;
+  }
+  .node-tools .toolbar-mini .menu-pop{
+    min-width:min(320px, calc(100vw - 24px));
+  }
 }
 
 

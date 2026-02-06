@@ -123,8 +123,8 @@
               <button class="btn xs ghost" type="button" title="清空选择" onclick="clearRuleSelection()">清空</button>
             </div>
             <button class="btn sm primary toolbar-main-cta" type="button" onclick="newRule()">+ 创建转发</button>
-            <button class="btn sm ghost" type="button" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">接入命令</button>
-            <details class="menu">
+            <button class="btn sm ghost toolbar-command" type="button" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">接入命令</button>
+            <details class="menu toolbar-rules">
               <summary class="btn sm ghost">规则工具 ▾</summary>
               <div class="menu-pop">
                 <a class="menu-item" href="/api/nodes/{{ node.id }}/backup">备份规则 <span class="muted sm">下载</span></a>
@@ -136,7 +136,7 @@
               </div>
             </details>
 
-            <details class="menu">
+            <details class="menu toolbar-node">
               <summary class="btn sm ghost">节点操作 ▾</summary>
               <div class="menu-pop">
                 <button class="menu-item" type="button" onclick="openEditNodeModal()">编辑节点</button>
