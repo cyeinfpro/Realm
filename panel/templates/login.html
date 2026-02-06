@@ -1,16 +1,30 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="card" style="max-width:520px;margin:40px auto;">
-  <h1 class="h1">安全登录</h1>
-  <p class="muted">使用安装时设置的面板账号进入控制台</p>
-  <form method="post" action="/login" class="form">
-    <label class="label">用户名</label>
-    <input class="input" name="username" placeholder="admin" required>
+<div class="page-head">
+  <div class="page-title">
+    <h1 class="h1">安全登录</h1>
+    <div class="meta">
+      <span class="meta-item">使用安装时设置的面板账号进入控制台。</span>
+    </div>
+  </div>
+</div>
 
-    <label class="label">密码</label>
-    <input class="input" type="password" name="password" placeholder="••••••" required>
+<div class="center-wrap sm">
+  <div class="auth-head">
+    <div class="h2">账号登录</div>
+    <div class="auth-sub">输入用户名与密码后进入控制台。</div>
+  </div>
 
-    <button class="btn" type="submit">进入控制台</button>
-  </form>
+  <div class="card center-card">
+    <form method="post" action="/login" class="form">
+      <label class="label">用户名</label>
+      <input class="input" name="username" placeholder="admin" required>
+
+      <label class="label">密码</label>
+      <input class="input" type="password" name="password" placeholder="••••••" required>
+
+      <button class="btn" type="submit">进入控制台</button>
+    </form>
+  </div>
 </div>
 {% endblock %}

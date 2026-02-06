@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0B0F14">
   <title>{% if title %}{{ title }} · Nexus Network Control Plane{% else %}Nexus Network Control Plane{% endif %}</title>
   <link rel="icon" type="image/svg+xml" href="/static/nexus.svg">
-  <link rel="stylesheet" href="/static/style.css?v=69.0">
+  <link rel="stylesheet" href="/static/style.css?v=70.0">
 </head>
 <body>
   <!-- Flowing background (fixed, no seams on scroll) -->
@@ -24,21 +24,31 @@
       </div>
     </a>
 
+    {% set p = request.url.path if request and request.url and request.url.path else '/' %}
+    {% set nav_active = '' %}
+    {% if p == '/' or p.startswith('/nodes') %}
+      {% set nav_active = 'dashboard' %}
+    {% elif p.startswith('/websites') %}
+      {% set nav_active = 'websites' %}
+    {% elif p.startswith('/netmon') %}
+      {% set nav_active = 'netmon' %}
+    {% endif %}
+
     <nav class="nav">
       {% if user %}
         <div class="nav-desktop">
-          <a href="/" class="nav-link">控制台</a>
-          <a href="/websites" class="nav-link">网站管理</a>
-          <a href="/netmon" class="nav-link">网络波动</a>
+          <a href="/" class="nav-link {{ 'active' if nav_active == 'dashboard' else '' }}">控制台</a>
+          <a href="/websites" class="nav-link {{ 'active' if nav_active == 'websites' else '' }}">网站管理</a>
+          <a href="/netmon" class="nav-link {{ 'active' if nav_active == 'netmon' else '' }}">网络波动</a>
           <a href="/logout" class="nav-link">退出</a>
         </div>
 
         <details class="menu nav-mobile">
           <summary class="btn icon xs ghost" aria-label="菜单">☰</summary>
           <div class="menu-pop">
-            <a href="/" class="menu-item">控制台</a>
-            <a href="/websites" class="menu-item">网站管理</a>
-            <a href="/netmon" class="menu-item">网络波动</a>
+            <a href="/" class="menu-item {{ 'active' if nav_active == 'dashboard' else '' }}">控制台</a>
+            <a href="/websites" class="menu-item {{ 'active' if nav_active == 'websites' else '' }}">网站管理</a>
+            <a href="/netmon" class="menu-item {{ 'active' if nav_active == 'netmon' else '' }}">网络波动</a>
             <div class="menu-sep"></div>
             <a href="/logout" class="menu-item">退出</a>
           </div>
