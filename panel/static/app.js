@@ -5806,7 +5806,286 @@ document.addEventListener('keydown', (e)=>{
 });
 
 
-// ---------------- Dashboard: Full Restore Modal ----------------
+// ---------------- Dashboard: Full Backup / Restore ----------------
+let __FULL_BACKUP_JOB_ID__ = '';
+let __FULL_BACKUP_TIMER__ = null;
+
+function _extractDownloadFilename(contentDisposition, fallback){
+  let filename = String(fallback || 'download.bin');
+  try{
+    const cd = String(contentDisposition || '');
+    const mUtf8 = /filename\*=UTF-8''([^;]+)/i.exec(cd);
+    if(mUtf8 && mUtf8[1]){
+      filename = decodeURIComponent(mUtf8[1]);
+      return filename;
+    }
+    const m = /filename="?([^";]+)"?/i.exec(cd);
+    if(m && m[1]) filename = m[1];
+  }catch(_e){}
+  return filename;
+}
+
+function _downloadBlobFile(blob, filename){
+  const blobUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = blobUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(()=>{ try{ URL.revokeObjectURL(blobUrl); }catch(_e){} }, 2000);
+}
+
+function _renderFullBackupCounts(counts){
+  const box = document.getElementById('backupFullCounts');
+  if(!box) return;
+  const c = (counts && typeof counts === 'object') ? counts : {};
+  const rows = [
+    ['nodes', '节点'],
+    ['rules', '规则快照'],
+    ['sites', '网站'],
+    ['certificates', '证书'],
+    ['netmon_monitors', '网络波动'],
+    ['files', '备份文件'],
+  ];
+  box.innerHTML = rows.map(([key, label])=>{
+    const val = Number(c[key] || 0);
+    return `<div class="backup-full-count"><span class="k">${label}</span><span class="v mono">${val}</span></div>`;
+  }).join('');
+}
+
+function _renderFullBackupSteps(steps){
+  const box = document.getElementById('backupFullSteps');
+  if(!box) return;
+  const arr = Array.isArray(steps) ? steps : [];
+  if(!arr.length){
+    box.innerHTML = '<div class="muted sm">等待任务启动…</div>';
+    return;
+  }
+  const stText = { pending: '待处理', running: '进行中', done: '已完成', failed: '失败' };
+  box.innerHTML = arr.map((s)=>{
+    const key = String(s && s.key ? s.key : '').trim();
+    const label = escapeHtml(String(s && s.label ? s.label : key || '步骤'));
+    const detail = escapeHtml(String(s && s.detail ? s.detail : ''));
+    const status = String(s && s.status ? s.status : 'pending').trim() || 'pending';
+    const cls = ['pending', 'running', 'done', 'failed'].includes(status) ? status : 'pending';
+    return (
+      `<div class="backup-full-step ${cls}">` +
+        `<div class="left">` +
+          `<span class="label">${label}</span>` +
+          (detail ? `<span class="detail mono">${detail}</span>` : '') +
+        `</div>` +
+        `<span class="status">${stText[status] || escapeHtml(status)}</span>` +
+      `</div>`
+    );
+  }).join('');
+}
+
+function _stopFullBackupPolling(){
+  if(__FULL_BACKUP_TIMER__){
+    clearInterval(__FULL_BACKUP_TIMER__);
+    __FULL_BACKUP_TIMER__ = null;
+  }
+}
+
+function _syncFullBackupView(data){
+  const stageEl = document.getElementById('backupFullStage');
+  const barEl = document.getElementById('backupFullBar');
+  const ptxEl = document.getElementById('backupFullProgressText');
+  const errEl = document.getElementById('backupFullError');
+  const dlBtn = document.getElementById('backupFullDownloadBtn');
+
+  const progress = Math.max(0, Math.min(100, Number((data && data.progress) || 0)));
+  const stage = String((data && data.stage) || '').trim() || '备份中…';
+  const status = String((data && data.status) || '').trim();
+  const canDownload = !!(data && data.can_download);
+  const errText = String((data && data.error) || '').trim();
+
+  if(stageEl) stageEl.textContent = stage;
+  if(barEl) barEl.style.width = `${progress}%`;
+  if(ptxEl) ptxEl.textContent = `进度 ${progress}%` + (status ? ` · ${status}` : '');
+
+  if(errEl){
+    if(status === 'done'){
+      errEl.style.color = 'var(--ok)';
+      errEl.textContent = '备份完成，可直接下载。';
+    }else if(status === 'failed'){
+      errEl.style.color = 'var(--bad)';
+      errEl.textContent = errText || '备份失败';
+    }else{
+      errEl.style.color = 'var(--muted)';
+      errEl.textContent = '';
+    }
+  }
+
+  if(dlBtn) dlBtn.disabled = !canDownload;
+
+  _renderFullBackupCounts((data && data.counts) || {});
+  _renderFullBackupSteps((data && data.steps) || []);
+}
+
+async function _pollFullBackupProgress(){
+  const jid = String(__FULL_BACKUP_JOB_ID__ || '').trim();
+  if(!jid) return;
+  try{
+    const r = await fetch(`/api/backup/full/progress?job_id=${encodeURIComponent(jid)}`, { credentials: 'include' });
+    const d = await r.json().catch(()=>({ ok:false, error:'接口返回异常' }));
+    if(!r.ok || !d.ok){
+      const msg = d.error || ('进度查询失败（HTTP ' + r.status + '）');
+      const errEl = document.getElementById('backupFullError');
+      if(errEl){
+        errEl.style.color = 'var(--bad)';
+        errEl.textContent = msg;
+      }
+      _stopFullBackupPolling();
+      return;
+    }
+    _syncFullBackupView(d);
+    const st = String(d.status || '').trim();
+    if(st === 'done' || st === 'failed'){
+      _stopFullBackupPolling();
+    }
+  }catch(e){
+    const msg = (e && e.message) ? e.message : String(e || '进度查询失败');
+    const errEl = document.getElementById('backupFullError');
+    if(errEl){
+      errEl.style.color = 'var(--bad)';
+      errEl.textContent = msg;
+    }
+    _stopFullBackupPolling();
+  }
+}
+
+async function _startFullBackupJob(){
+  const errEl = document.getElementById('backupFullError');
+  const dlBtn = document.getElementById('backupFullDownloadBtn');
+  try{
+    if(errEl){
+      errEl.style.color = 'var(--muted)';
+      errEl.textContent = '';
+    }
+    if(dlBtn) dlBtn.disabled = true;
+    __FULL_BACKUP_JOB_ID__ = '';
+    _stopFullBackupPolling();
+
+    const r = await fetch('/api/backup/full/start', { method: 'POST', credentials: 'include' });
+    const d = await r.json().catch(()=>({ ok:false, error:'接口返回异常' }));
+    if(!r.ok || !d.ok){
+      const msg = d.error || ('启动备份失败（HTTP ' + r.status + '）');
+      if(errEl){
+        errEl.style.color = 'var(--bad)';
+        errEl.textContent = msg;
+      }
+      toast(msg, true);
+      return;
+    }
+
+    __FULL_BACKUP_JOB_ID__ = String(d.job_id || '').trim();
+    _syncFullBackupView(d);
+
+    __FULL_BACKUP_TIMER__ = setInterval(_pollFullBackupProgress, 1200);
+    await _pollFullBackupProgress();
+  }catch(e){
+    const msg = (e && e.message) ? e.message : String(e || '启动备份失败');
+    if(errEl){
+      errEl.style.color = 'var(--bad)';
+      errEl.textContent = msg;
+    }
+    toast(msg, true);
+  }
+}
+
+function openFullBackupModal(){
+  const m = document.getElementById('backupFullModal');
+  if(!m) return;
+  m.style.display = 'flex';
+  try{
+    const menu = document.querySelector('.page-head details.menu[open]');
+    if(menu) menu.removeAttribute('open');
+  }catch(_e){}
+  _renderFullBackupCounts({});
+  _renderFullBackupSteps([]);
+  const stageEl = document.getElementById('backupFullStage');
+  const barEl = document.getElementById('backupFullBar');
+  const ptxEl = document.getElementById('backupFullProgressText');
+  const errEl = document.getElementById('backupFullError');
+  const dlBtn = document.getElementById('backupFullDownloadBtn');
+  if(stageEl) stageEl.textContent = '准备中…';
+  if(barEl) barEl.style.width = '0%';
+  if(ptxEl) ptxEl.textContent = '进度 0%';
+  if(errEl){
+    errEl.style.color = 'var(--muted)';
+    errEl.textContent = '';
+  }
+  if(dlBtn){
+    dlBtn.disabled = true;
+    dlBtn.textContent = '下载备份包';
+  }
+  _startFullBackupJob();
+}
+
+function closeFullBackupModal(){
+  const m = document.getElementById('backupFullModal');
+  if(!m) return;
+  m.style.display = 'none';
+  _stopFullBackupPolling();
+}
+
+async function downloadFullBackupResult(){
+  const jid = String(__FULL_BACKUP_JOB_ID__ || '').trim();
+  if(!jid){
+    toast('备份任务未启动', true);
+    return;
+  }
+  const btn = document.getElementById('backupFullDownloadBtn');
+  const errEl = document.getElementById('backupFullError');
+  try{
+    if(btn){
+      btn.disabled = true;
+      btn.textContent = '下载中…';
+    }
+    const r = await fetch(`/api/backup/full/download?job_id=${encodeURIComponent(jid)}`, { credentials: 'include' });
+    const blob = await r.blob();
+    if(!r.ok){
+      let msg = `下载失败（HTTP ${r.status}）`;
+      try{
+        const t = await blob.text();
+        const j = JSON.parse(t);
+        if(j && j.error) msg = j.error;
+      }catch(_e){}
+      if(errEl){
+        errEl.style.color = 'var(--bad)';
+        errEl.textContent = msg;
+      }
+      toast(msg, true);
+      return;
+    }
+    const filename = _extractDownloadFilename(r.headers.get('Content-Disposition') || '', `realm-backup-${Date.now()}.zip`);
+    _downloadBlobFile(blob, filename);
+    if(errEl){
+      errEl.style.color = 'var(--ok)';
+      errEl.textContent = '备份包已下载到本地。';
+    }
+    if(btn){
+      btn.disabled = false;
+      btn.textContent = '重新下载';
+    }
+    toast('全量备份已下载');
+  }catch(e){
+    const msg = (e && e.message) ? e.message : String(e || '下载失败');
+    if(errEl){
+      errEl.style.color = 'var(--bad)';
+      errEl.textContent = msg;
+    }
+    toast(msg, true);
+  }finally{
+    if(btn && btn.textContent === '下载中…'){
+      btn.disabled = false;
+      btn.textContent = '下载备份包';
+    }
+  }
+}
+
 function openRestoreFullModal(){
   const m = document.getElementById('restoreFullModal');
   if(!m) return;
@@ -5814,7 +6093,10 @@ function openRestoreFullModal(){
   const input = document.getElementById('restoreFullFile');
   if(input) input.value = '';
   const err = document.getElementById('restoreFullError');
-  if(err) err.textContent = '';
+  if(err){
+    err.style.color = 'var(--bad)';
+    err.textContent = '';
+  }
   const btn = document.getElementById('restoreFullSubmit');
   if(btn){ btn.disabled = false; btn.textContent = '开始恢复'; }
 }
@@ -5830,7 +6112,10 @@ async function restoreFullNow(){
   const err = document.getElementById('restoreFullError');
   const btn = document.getElementById('restoreFullSubmit');
   try{
-    if(err) err.textContent = '';
+    if(err){
+      err.style.color = 'var(--bad)';
+      err.textContent = '';
+    }
     const f = fileInput && fileInput.files ? fileInput.files[0] : null;
     if(!f){
       if(err) err.textContent = '请选择 realm-backup-*.zip 全量备份包';
@@ -5847,18 +6132,42 @@ async function restoreFullNow(){
       toast(msg, true);
       return;
     }
-    toast('全量恢复已完成');
-    closeRestoreFullModal();
-    setTimeout(()=>window.location.reload(), 600);
+    const nodes = data && data.nodes ? data.nodes : {};
+    const rules = data && data.rules ? data.rules : {};
+    const sites = data && data.sites ? data.sites : {};
+    const certs = data && data.certificates ? data.certificates : {};
+    const netmon = data && data.netmon ? data.netmon : {};
+    const summary =
+      `节点 新增 ${Number(nodes.added||0)} / 更新 ${Number(nodes.updated||0)} / 跳过 ${Number(nodes.skipped||0)}\n` +
+      `规则 恢复 ${Number(rules.restored||0)} / 未匹配 ${Number(rules.unmatched||0)} / 失败 ${Number(rules.failed||0)}\n` +
+      `站点 新增 ${Number(sites.added||0)} / 更新 ${Number(sites.updated||0)} / 跳过 ${Number(sites.skipped||0)}\n` +
+      `证书 新增 ${Number(certs.added||0)} / 更新 ${Number(certs.updated||0)} / 跳过 ${Number(certs.skipped||0)}\n` +
+      `网络波动 新增 ${Number(netmon.added||0)} / 更新 ${Number(netmon.updated||0)} / 跳过 ${Number(netmon.skipped||0)}`;
+    if(err){
+      err.style.color = 'var(--ok)';
+      err.textContent = `全量恢复成功。\n${summary}\n页面将在 2 秒后刷新。`;
+    }
+    toast('全量恢复成功');
+    if(btn){ btn.textContent = '恢复完成'; }
+    setTimeout(()=>{
+      closeRestoreFullModal();
+      window.location.reload();
+    }, 2000);
   }catch(e){
     const msg = (e && e.message) ? e.message : String(e || '恢复失败');
     if(err) err.textContent = msg;
     toast(msg, true);
   }finally{
-    if(btn){ btn.disabled = false; btn.textContent = '开始恢复'; }
+    if(btn && btn.textContent !== '恢复完成'){
+      btn.disabled = false;
+      btn.textContent = '开始恢复';
+    }
   }
 }
 
+window.openFullBackupModal = openFullBackupModal;
+window.closeFullBackupModal = closeFullBackupModal;
+window.downloadFullBackupResult = downloadFullBackupResult;
 window.openRestoreFullModal = openRestoreFullModal;
 window.closeRestoreFullModal = closeRestoreFullModal;
 window.restoreFullNow = restoreFullNow;
@@ -5927,6 +6236,12 @@ document.addEventListener("click", (e)=>{
 });
 
 document.addEventListener("click", (e)=>{
+  const m = document.getElementById("backupFullModal");
+  if(!m || m.style.display === "none") return;
+  if(e.target === m) closeFullBackupModal();
+});
+
+document.addEventListener("click", (e)=>{
   const m = document.getElementById("restoreFullModal");
   if(!m || m.style.display === "none") return;
   if(e.target === m) closeRestoreFullModal();
@@ -5937,6 +6252,8 @@ document.addEventListener("keydown", (e)=>{
   if(e.key === "Escape"){
     const m = document.getElementById("addNodeModal");
     if(m && m.style.display !== "none") closeAddNodeModal();
+    const b = document.getElementById("backupFullModal");
+    if(b && b.style.display !== "none") closeFullBackupModal();
     const r = document.getElementById("restoreFullModal");
     if(r && r.style.display !== "none") closeRestoreFullModal();
   }

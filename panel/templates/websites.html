@@ -232,29 +232,20 @@
               {% else %}
                 <div class="muted sm" style="margin-top:8px;">能力信息未上报或未安装环境。</div>
               {% endif %}
+
+              <div class="wm-node-quick">
+                <form method="post" action="/websites/nodes/{{ n.id }}/env/ensure">
+                  <input type="hidden" name="include_php" value="1">
+                  <button class="btn xs ghost" type="submit">安装环境</button>
+                </form>
+                <form method="post" action="/websites/nodes/{{ n.id }}/env/uninstall" onsubmit="return confirm('确定卸载该节点的网站环境吗？');">
+                  <button class="btn xs ghost" type="submit">卸载环境</button>
+                </form>
+              </div>
             </div>
 
             <div class="wm-node-actions">
               <a class="btn icon xs secondary" href="/nodes/{{ n.id }}" title="进入">↗</a>
-              <details class="menu">
-                <summary class="btn icon xs ghost" title="环境">⚙</summary>
-                <div class="menu-pop">
-                  <form method="post" action="/websites/nodes/{{ n.id }}/env/ensure" style="margin:0;">
-                    <input type="hidden" name="include_php" value="1">
-                    <button class="menu-item" type="submit">安装环境（含 PHP）</button>
-                  </form>
-                  <form method="post" action="/websites/nodes/{{ n.id }}/env/ensure" style="margin:0;">
-                    <input type="hidden" name="include_php" value="0">
-                    <button class="menu-item" type="submit">安装环境（仅 Nginx/ACME）</button>
-                  </form>
-                  <div class="menu-sep"></div>
-                  <form method="post" action="/websites/nodes/{{ n.id }}/env/uninstall" style="margin:0;" onsubmit="return confirm('确定卸载该节点的网站环境吗？');">
-                    <button class="menu-item" type="submit">卸载环境</button>
-                  </form>
-                  <div class="menu-sep"></div>
-                  <a class="menu-item" href="/nodes/{{ n.id }}">打开节点详情…</a>
-                </div>
-              </details>
             </div>
           </div>
         {% endfor %}

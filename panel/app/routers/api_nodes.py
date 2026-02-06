@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import io
 import json
+import threading
 import time
+import uuid
 import zipfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -15,7 +19,10 @@ from ..clients.agent import agent_get, agent_ping, agent_post
 from ..core.deps import require_login
 from ..core.settings import DEFAULT_AGENT_PORT
 from ..db import (
+    add_certificate,
+    add_netmon_monitor,
     add_node,
+    add_site,
     bump_traffic_reset_version,
     delete_node,
     get_desired_pool,
@@ -24,13 +31,20 @@ from ..db import (
     get_node,
     get_node_by_api_key,
     get_node_by_base_url,
+    list_certificates,
+    list_netmon_monitors,
     list_rule_stats_series,
+    list_sites,
     clear_rule_stats_samples,
     list_nodes,
     set_desired_pool,
     set_desired_pool_exact,
     upsert_group_order,
+    update_certificate,
+    update_netmon_monitor,
     update_node_basic,
+    update_site,
+    update_site_health,
 )
 from ..services.apply import node_verify_tls, schedule_apply_pool
 from ..services.backup import get_pool_for_backup
@@ -49,6 +63,394 @@ from ..utils.normalize import (
 from ..utils.validate import PoolValidationError, validate_pool_inplace
 
 router = APIRouter()
+
+_FULL_BACKUP_JOBS: Dict[str, Dict[str, Any]] = {}
+_FULL_BACKUP_LOCK = threading.Lock()
+_FULL_BACKUP_TTL_SEC = 1800
+
+
+def _backup_steps_template() -> List[Dict[str, Any]]:
+    return [
+        {"key": "scan", "label": "扫描数据", "status": "pending", "detail": ""},
+        {"key": "rules", "label": "规则快照", "status": "pending", "detail": ""},
+        {"key": "sites", "label": "网站配置", "status": "pending", "detail": ""},
+        {"key": "certs", "label": "证书信息", "status": "pending", "detail": ""},
+        {"key": "netmon", "label": "网络波动配置", "status": "pending", "detail": ""},
+        {"key": "package", "label": "打包压缩", "status": "pending", "detail": ""},
+    ]
+
+
+def _prune_full_backup_jobs() -> None:
+    now = time.time()
+    with _FULL_BACKUP_LOCK:
+        stale_ids: List[str] = []
+        for jid, job in _FULL_BACKUP_JOBS.items():
+            st = str(job.get("status") or "")
+            updated_at = float(job.get("updated_at") or 0.0)
+            if st in ("done", "failed") and (now - updated_at) > _FULL_BACKUP_TTL_SEC:
+                stale_ids.append(jid)
+        for jid in stale_ids:
+            _FULL_BACKUP_JOBS.pop(jid, None)
+
+
+def _backup_job_snapshot(job_id: str) -> Optional[Dict[str, Any]]:
+    with _FULL_BACKUP_LOCK:
+        job = _FULL_BACKUP_JOBS.get(job_id)
+        if not isinstance(job, dict):
+            return None
+        return {
+            "job_id": str(job_id),
+            "status": str(job.get("status") or "unknown"),
+            "progress": int(job.get("progress") or 0),
+            "stage": str(job.get("stage") or ""),
+            "error": str(job.get("error") or ""),
+            "created_at": float(job.get("created_at") or 0.0),
+            "updated_at": float(job.get("updated_at") or 0.0),
+            "size_bytes": int(job.get("size_bytes") or 0),
+            "filename": str(job.get("filename") or ""),
+            "steps": list(job.get("steps") or []),
+            "counts": dict(job.get("counts") or {}),
+            "can_download": bool(job.get("status") == "done" and bool(job.get("content"))),
+        }
+
+
+def _touch_backup_job(
+    job_id: str,
+    *,
+    status: Optional[str] = None,
+    progress: Optional[int] = None,
+    stage: Optional[str] = None,
+    error: Optional[str] = None,
+    counts: Optional[Dict[str, Any]] = None,
+    step_key: Optional[str] = None,
+    step_status: Optional[str] = None,
+    step_detail: Optional[str] = None,
+    filename: Optional[str] = None,
+    size_bytes: Optional[int] = None,
+    content: Optional[bytes] = None,
+) -> None:
+    now = time.time()
+    with _FULL_BACKUP_LOCK:
+        job = _FULL_BACKUP_JOBS.get(job_id)
+        if not isinstance(job, dict):
+            return
+        if status is not None:
+            job["status"] = str(status)
+        if progress is not None:
+            p = max(0, min(100, int(progress)))
+            job["progress"] = p
+        if stage is not None:
+            job["stage"] = str(stage)
+        if error is not None:
+            job["error"] = str(error)
+        if counts is not None:
+            job["counts"] = dict(counts)
+        if filename is not None:
+            job["filename"] = str(filename)
+        if size_bytes is not None:
+            job["size_bytes"] = int(size_bytes)
+        if content is not None:
+            job["content"] = bytes(content)
+        if step_key:
+            for s in (job.get("steps") or []):
+                if str(s.get("key") or "") == str(step_key):
+                    if step_status is not None:
+                        s["status"] = str(step_status)
+                    if step_detail is not None:
+                        s["detail"] = str(step_detail)
+                    break
+        job["updated_at"] = now
+
+
+async def _emit_backup_progress(callback: Any, payload: Dict[str, Any]) -> None:
+    if callback is None:
+        return
+    try:
+        ret = callback(payload)
+        if inspect.isawaitable(ret):
+            await ret
+    except Exception:
+        pass
+
+
+async def _build_full_backup_bundle(request: Request, progress_callback: Any = None) -> Dict[str, Any]:
+    await _emit_backup_progress(
+        progress_callback,
+        {"progress": 4, "stage": "扫描数据", "step_key": "scan", "step_status": "running", "step_detail": "读取节点与面板配置"},
+    )
+
+    nodes = list_nodes()
+    group_orders = get_group_orders()
+    node_map = {int(n.get("id") or 0): n for n in nodes}
+    sites = list_sites()
+    certs = list_certificates()
+    monitors = list_netmon_monitors()
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    await _emit_backup_progress(
+        progress_callback,
+        {
+            "progress": 12,
+            "stage": "扫描完成",
+            "step_key": "scan",
+            "step_status": "done",
+            "step_detail": f"节点 {len(nodes)} · 站点 {len(sites)} · 证书 {len(certs)} · 监控 {len(monitors)}",
+            "counts": {
+                "nodes": len(nodes),
+                "rules": len(nodes),
+                "sites": len(sites),
+                "certificates": len(certs),
+                "netmon_monitors": len(monitors),
+                "files": 6 + len(nodes),
+            },
+        },
+    )
+
+    # Build per-node rules snapshot with progress
+    rules_entries: List[tuple[str, Dict[str, Any]]] = []
+    total_nodes = len(nodes)
+    if total_nodes:
+        await _emit_backup_progress(
+            progress_callback,
+            {
+                "progress": 14,
+                "stage": "规则快照",
+                "step_key": "rules",
+                "step_status": "running",
+                "step_detail": f"0/{total_nodes}",
+            },
+        )
+
+        sem = asyncio.Semaphore(12)
+
+        async def build_one(n: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+            node_id = int(n.get("id") or 0)
+            data = await get_pool_for_backup(n)
+            data.setdefault("node", {"id": node_id, "name": n.get("name"), "base_url": n.get("base_url")})
+            safe = safe_filename_part(n.get("name") or f"node-{node_id}")
+            path = f"rules/realm-rules-{safe}-id{node_id}.json"
+            return path, data
+
+        async def guarded(n: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+            async with sem:
+                return await build_one(n)
+
+        tasks = [asyncio.create_task(guarded(n)) for n in nodes]
+        done = 0
+        for fut in asyncio.as_completed(tasks):
+            r = await fut
+            rules_entries.append(r)
+            done += 1
+            pct = 14 + int((done / max(1, total_nodes)) * 38)
+            await _emit_backup_progress(
+                progress_callback,
+                {
+                    "progress": pct,
+                    "stage": "规则快照",
+                    "step_key": "rules",
+                    "step_status": "running",
+                    "step_detail": f"{done}/{total_nodes}",
+                },
+            )
+
+    await _emit_backup_progress(
+        progress_callback,
+        {
+            "progress": 52,
+            "stage": "规则快照完成",
+            "step_key": "rules",
+            "step_status": "done",
+            "step_detail": f"{len(rules_entries)} 个规则文件",
+        },
+    )
+
+    # Payloads
+    await _emit_backup_progress(
+        progress_callback,
+        {"progress": 60, "stage": "整理网站配置", "step_key": "sites", "step_status": "running", "step_detail": f"{len(sites)} 个站点"},
+    )
+    nodes_payload = {
+        "kind": "realm_full_backup",
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "panel_public_url": panel_public_base_url(request),
+        "group_orders": [
+            {"group_name": k, "sort_order": int(v)}
+            for k, v in sorted(group_orders.items(), key=lambda kv: (kv[1], kv[0]))
+        ],
+        "nodes": [
+            {
+                "source_id": int(n.get("id") or 0),
+                "name": n.get("name"),
+                "base_url": n.get("base_url"),
+                "api_key": n.get("api_key"),
+                "verify_tls": bool(n.get("verify_tls", 0)),
+                "group_name": n.get("group_name") or "默认分组",
+                "role": n.get("role") or "normal",
+                "website_root_base": n.get("website_root_base") or "",
+            }
+            for n in nodes
+        ],
+    }
+    sites_payload = {
+        "kind": "realm_sites_backup",
+        "created_at": nodes_payload["created_at"],
+        "sites": [
+            {
+                "source_id": int(s.get("id") or 0),
+                "node_source_id": int(s.get("node_id") or 0),
+                "node_base_url": str((node_map.get(int(s.get("node_id") or 0)) or {}).get("base_url") or ""),
+                "name": str(s.get("name") or ""),
+                "domains": [str(x).strip() for x in (s.get("domains") or []) if str(x).strip()],
+                "root_path": str(s.get("root_path") or ""),
+                "proxy_target": str(s.get("proxy_target") or ""),
+                "type": str(s.get("type") or "static"),
+                "web_server": str(s.get("web_server") or "nginx"),
+                "nginx_tpl": str(s.get("nginx_tpl") or ""),
+                "https_redirect": bool(s.get("https_redirect") or False),
+                "gzip_enabled": True if s.get("gzip_enabled") is None else bool(s.get("gzip_enabled")),
+                "status": str(s.get("status") or "running"),
+                "health_status": str(s.get("health_status") or ""),
+                "health_code": int(s.get("health_code") or 0),
+                "health_latency_ms": int(s.get("health_latency_ms") or 0),
+                "health_error": str(s.get("health_error") or ""),
+                "health_checked_at": s.get("health_checked_at"),
+                "created_at": s.get("created_at"),
+                "updated_at": s.get("updated_at"),
+            }
+            for s in sites
+        ],
+    }
+    await _emit_backup_progress(
+        progress_callback,
+        {"progress": 68, "stage": "网站配置完成", "step_key": "sites", "step_status": "done", "step_detail": f"{len(sites_payload['sites'])} 条"},
+    )
+
+    await _emit_backup_progress(
+        progress_callback,
+        {"progress": 72, "stage": "整理证书信息", "step_key": "certs", "step_status": "running", "step_detail": f"{len(certs)} 条证书"},
+    )
+    certs_payload = {
+        "kind": "realm_certificates_backup",
+        "created_at": nodes_payload["created_at"],
+        "certificates": [
+            {
+                "source_id": int(c.get("id") or 0),
+                "node_source_id": int(c.get("node_id") or 0),
+                "node_base_url": str((node_map.get(int(c.get("node_id") or 0)) or {}).get("base_url") or ""),
+                "site_source_id": int(c.get("site_id") or 0) if c.get("site_id") is not None else None,
+                "domains": [str(x).strip() for x in (c.get("domains") or []) if str(x).strip()],
+                "issuer": str(c.get("issuer") or "letsencrypt"),
+                "challenge": str(c.get("challenge") or "http-01"),
+                "status": str(c.get("status") or "pending"),
+                "not_before": c.get("not_before"),
+                "not_after": c.get("not_after"),
+                "renew_at": c.get("renew_at"),
+                "last_error": str(c.get("last_error") or ""),
+                "created_at": c.get("created_at"),
+                "updated_at": c.get("updated_at"),
+            }
+            for c in certs
+        ],
+    }
+    await _emit_backup_progress(
+        progress_callback,
+        {"progress": 78, "stage": "证书信息完成", "step_key": "certs", "step_status": "done", "step_detail": f"{len(certs_payload['certificates'])} 条"},
+    )
+
+    await _emit_backup_progress(
+        progress_callback,
+        {"progress": 82, "stage": "整理网络波动配置", "step_key": "netmon", "step_status": "running", "step_detail": f"{len(monitors)} 个监控"},
+    )
+    monitors_payload = {
+        "kind": "realm_netmon_backup",
+        "created_at": nodes_payload["created_at"],
+        "monitors": [
+            {
+                "source_id": int(m.get("id") or 0),
+                "target": str(m.get("target") or ""),
+                "mode": str(m.get("mode") or "ping"),
+                "tcp_port": int(m.get("tcp_port") or 443),
+                "interval_sec": int(m.get("interval_sec") or 5),
+                "warn_ms": int(m.get("warn_ms") or 0),
+                "crit_ms": int(m.get("crit_ms") or 0),
+                "enabled": bool(m.get("enabled") or 0),
+                "node_source_ids": [int(x) for x in (m.get("node_ids") or []) if int(x) > 0],
+                "node_base_urls": [
+                    str((node_map.get(int(x) or 0) or {}).get("base_url") or "")
+                    for x in (m.get("node_ids") or [])
+                    if int(x) > 0
+                ],
+                "last_run_ts_ms": int(m.get("last_run_ts_ms") or 0),
+                "last_run_msg": str(m.get("last_run_msg") or ""),
+                "created_at": m.get("created_at"),
+                "updated_at": m.get("updated_at"),
+            }
+            for m in monitors
+        ],
+    }
+    await _emit_backup_progress(
+        progress_callback,
+        {"progress": 88, "stage": "网络波动配置完成", "step_key": "netmon", "step_status": "done", "step_detail": f"{len(monitors_payload['monitors'])} 条"},
+    )
+
+    meta_payload = {
+        "kind": "realm_backup_meta",
+        "created_at": nodes_payload["created_at"],
+        "nodes": len(nodes),
+        "sites": len(sites_payload["sites"]),
+        "certificates": len(certs_payload["certificates"]),
+        "netmon_monitors": len(monitors_payload["monitors"]),
+        "rules": len(rules_entries),
+        "files": 6 + len(rules_entries),
+    }
+
+    await _emit_backup_progress(
+        progress_callback,
+        {"progress": 92, "stage": "打包压缩", "step_key": "package", "step_status": "running", "step_detail": f"{meta_payload['files']} 个文件"},
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("backup_meta.json", json.dumps(meta_payload, ensure_ascii=False, indent=2))
+        z.writestr("nodes.json", json.dumps(nodes_payload, ensure_ascii=False, indent=2))
+        z.writestr("websites/sites.json", json.dumps(sites_payload, ensure_ascii=False, indent=2))
+        z.writestr("websites/certificates.json", json.dumps(certs_payload, ensure_ascii=False, indent=2))
+        z.writestr("netmon/monitors.json", json.dumps(monitors_payload, ensure_ascii=False, indent=2))
+        for path, data in rules_entries:
+            z.writestr(path, json.dumps(data, ensure_ascii=False, indent=2))
+        z.writestr(
+            "README.txt",
+            "Realm 全量备份说明\n\n"
+            "1) 恢复节点列表：登录面板 → 控制台 → 点击『恢复节点列表』，上传本压缩包（或解压后的 nodes.json）。\n"
+            "2) 全量恢复：控制台 → 全量恢复，自动恢复 nodes/rules/websites/certificates/netmon。\n"
+            "3) 恢复单节点规则：进入节点页面 → 更多 → 恢复规则，把 rules/ 目录下对应节点的规则文件上传/粘贴即可。\n",
+        )
+
+    filename = f"realm-backup-{ts}.zip"
+    content = buf.getvalue()
+    await _emit_backup_progress(
+        progress_callback,
+        {
+            "progress": 100,
+            "stage": "备份完成",
+            "step_key": "package",
+            "step_status": "done",
+            "step_detail": f"{len(content)} bytes",
+            "counts": {
+                "nodes": meta_payload["nodes"],
+                "rules": meta_payload["rules"],
+                "sites": meta_payload["sites"],
+                "certificates": meta_payload["certificates"],
+                "netmon_monitors": meta_payload["netmon_monitors"],
+                "files": meta_payload["files"],
+            },
+        },
+    )
+
+    return {
+        "filename": filename,
+        "content": content,
+        "meta": meta_payload,
+    }
 
 
 @router.get("/api/nodes/{node_id}/ping")
@@ -114,78 +516,130 @@ async def api_backup(request: Request, node_id: int, user: str = Depends(require
 
 @router.get("/api/backup/full")
 async def api_backup_full(request: Request, user: str = Depends(require_login)):
-    """Download a full backup zip: nodes list + per-node rules."""
-    nodes = list_nodes()
-    group_orders = get_group_orders()
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    """Direct download full backup zip (legacy one-shot behavior)."""
+    bundle = await _build_full_backup_bundle(request)
+    filename = str(bundle.get("filename") or f"realm-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip")
+    content = bytes(bundle.get("content") or b"")
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(content=content, media_type="application/zip", headers=headers)
 
-    # Build backup payloads (fetch missing pools concurrently)
-    async def build_one(n: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
-        node_id = int(n.get("id") or 0)
-        data = await get_pool_for_backup(n)
-        data.setdefault("node", {"id": node_id, "name": n.get("name"), "base_url": n.get("base_url")})
-        safe = safe_filename_part(n.get("name") or f"node-{node_id}")
-        path = f"rules/realm-rules-{safe}-id{node_id}.json"
-        return path, data
 
-    rules_entries: List[tuple[str, Dict[str, Any]]] = []
-    if nodes:
-        import asyncio
+@router.post("/api/backup/full/start")
+async def api_backup_full_start(request: Request, user: str = Depends(require_login)):
+    """Start full backup in background and return a job id for progress polling."""
+    _prune_full_backup_jobs()
+    job_id = uuid.uuid4().hex
+    now = time.time()
 
-        sem = asyncio.Semaphore(12)
+    with _FULL_BACKUP_LOCK:
+        _FULL_BACKUP_JOBS[job_id] = {
+            "status": "running",
+            "progress": 1,
+            "stage": "准备备份任务",
+            "error": "",
+            "created_at": now,
+            "updated_at": now,
+            "size_bytes": 0,
+            "filename": "",
+            "steps": _backup_steps_template(),
+            "counts": {
+                "nodes": 0,
+                "rules": 0,
+                "sites": 0,
+                "certificates": 0,
+                "netmon_monitors": 0,
+                "files": 0,
+            },
+            "content": b"",
+        }
 
-        async def guarded(n: Dict[str, Any]):
-            async with sem:
-                return await build_one(n)
-
-        rules_entries = list(await asyncio.gather(*[guarded(n) for n in nodes]))
-
-    nodes_payload = {
-        "kind": "realm_full_backup",
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "panel_public_url": panel_public_base_url(request),
-        "group_orders": [
-            {"group_name": k, "sort_order": int(v)}
-            for k, v in sorted(group_orders.items(), key=lambda kv: (kv[1], kv[0]))
-        ],
-        "nodes": [
-            {
-                "source_id": int(n.get("id") or 0),
-                "name": n.get("name"),
-                "base_url": n.get("base_url"),
-                "api_key": n.get("api_key"),
-                "verify_tls": bool(n.get("verify_tls", 0)),
-                "group_name": n.get("group_name") or "默认分组",
-                "role": n.get("role") or "normal",
-                "website_root_base": n.get("website_root_base") or "",
-            }
-            for n in nodes
-        ],
-    }
-
-    meta_payload = {
-        "kind": "realm_backup_meta",
-        "created_at": nodes_payload["created_at"],
-        "nodes": len(nodes),
-        "files": 2 + len(rules_entries),
-    }
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr("backup_meta.json", json.dumps(meta_payload, ensure_ascii=False, indent=2))
-        z.writestr("nodes.json", json.dumps(nodes_payload, ensure_ascii=False, indent=2))
-        for path, data in rules_entries:
-            z.writestr(path, json.dumps(data, ensure_ascii=False, indent=2))
-        z.writestr(
-            "README.txt",
-            "Realm 全量备份说明\n\n"
-            "1) 恢复节点列表：登录面板 → 控制台 → 点击『恢复节点列表』，上传本压缩包（或解压后的 nodes.json）。\n"
-            "2) 恢复单节点规则：进入节点页面 → 更多 → 恢复规则，把 rules/ 目录下对应节点的规则文件上传/粘贴即可。\n",
+    async def _progress_cb(payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        _touch_backup_job(
+            job_id,
+            progress=payload.get("progress"),
+            stage=payload.get("stage"),
+            counts=payload.get("counts") if isinstance(payload.get("counts"), dict) else None,
+            step_key=payload.get("step_key"),
+            step_status=payload.get("step_status"),
+            step_detail=payload.get("step_detail"),
         )
 
-    filename = f"realm-backup-{ts}.zip"
+    async def _run() -> None:
+        try:
+            bundle = await _build_full_backup_bundle(request, _progress_cb)
+            meta = bundle.get("meta") if isinstance(bundle.get("meta"), dict) else {}
+            counts = {
+                "nodes": int(meta.get("nodes") or 0),
+                "rules": int(meta.get("rules") or 0),
+                "sites": int(meta.get("sites") or 0),
+                "certificates": int(meta.get("certificates") or 0),
+                "netmon_monitors": int(meta.get("netmon_monitors") or 0),
+                "files": int(meta.get("files") or 0),
+            }
+            content = bytes(bundle.get("content") or b"")
+            _touch_backup_job(
+                job_id,
+                status="done",
+                progress=100,
+                stage="备份完成",
+                filename=str(bundle.get("filename") or ""),
+                size_bytes=len(content),
+                counts=counts,
+                content=content,
+            )
+        except Exception as exc:
+            _touch_backup_job(
+                job_id,
+                status="failed",
+                progress=100,
+                stage="备份失败",
+                error=str(exc),
+            )
+
+    asyncio.create_task(_run())
+    snap = _backup_job_snapshot(job_id)
+    if not snap:
+        return JSONResponse({"ok": False, "error": "创建备份任务失败"}, status_code=500)
+    return {"ok": True, **snap}
+
+
+@router.get("/api/backup/full/progress")
+async def api_backup_full_progress(job_id: str = "", user: str = Depends(require_login)):
+    """Get backup job progress."""
+    _prune_full_backup_jobs()
+    jid = str(job_id or "").strip()
+    if not jid:
+        return JSONResponse({"ok": False, "error": "缺少 job_id"}, status_code=400)
+    snap = _backup_job_snapshot(jid)
+    if not snap:
+        return JSONResponse({"ok": False, "error": "备份任务不存在或已过期"}, status_code=404)
+    return {"ok": True, **snap}
+
+
+@router.get("/api/backup/full/download")
+async def api_backup_full_download(job_id: str = "", user: str = Depends(require_login)):
+    """Download finished backup by job id."""
+    jid = str(job_id or "").strip()
+    if not jid:
+        return JSONResponse({"ok": False, "error": "缺少 job_id"}, status_code=400)
+
+    with _FULL_BACKUP_LOCK:
+        job = _FULL_BACKUP_JOBS.get(jid)
+        if not isinstance(job, dict):
+            return JSONResponse({"ok": False, "error": "备份任务不存在或已过期"}, status_code=404)
+        status = str(job.get("status") or "")
+        filename = str(job.get("filename") or "")
+        content = bytes(job.get("content") or b"")
+
+    if status != "done" or not content:
+        return JSONResponse({"ok": False, "error": "备份尚未完成，请稍候再试"}, status_code=409)
+
+    if not filename:
+        filename = f"realm-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
+    return Response(content=content, media_type="application/zip", headers=headers)
 
 
 @router.post("/api/restore/nodes")
@@ -345,14 +799,19 @@ async def api_restore_full(
         z = zipfile.ZipFile(io.BytesIO(raw))
     except Exception as exc:
         return JSONResponse({"ok": False, "error": f"压缩包解析失败：{exc}"}, status_code=400)
+    zip_names = z.namelist()
+    zip_table = {str(n).lower(): n for n in zip_names}
+
+    def _find_zip_path(*candidates: str) -> Optional[str]:
+        for c in candidates:
+            hit = zip_table.get(str(c).lower())
+            if hit:
+                return hit
+        return None
 
     # ---- read nodes.json ----
     nodes_payload = None
-    nodes_name = None
-    for n in z.namelist():
-        if n.lower().endswith("nodes.json"):
-            nodes_name = n
-            break
+    nodes_name = _find_zip_path("nodes.json")
     if not nodes_name:
         return JSONResponse({"ok": False, "error": "压缩包中未找到 nodes.json"}, status_code=400)
 
@@ -460,7 +919,7 @@ async def api_restore_full(
             mapping[str(source_id_i)] = node_id
 
     # ---- restore rules (batch) ----
-    rule_paths = [n for n in z.namelist() if n.lower().startswith("rules/") and n.lower().endswith(".json")]
+    rule_paths = [n for n in zip_names if n.lower().startswith("rules/") and n.lower().endswith(".json")]
 
     import re as _re
     import asyncio
@@ -577,6 +1036,399 @@ async def api_restore_full(
             else:
                 restored_rules += 1
 
+    def _as_int(v: Any, default: int = 0) -> int:
+        try:
+            return int(v)
+        except Exception:
+            return int(default)
+
+    def _as_bool(v: Any, default: bool = False) -> bool:
+        if v is None:
+            return bool(default)
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().lower()
+        if s in ("1", "true", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "no", "n", "off"):
+            return False
+        return bool(v)
+
+    def _norm_domains(val: Any) -> List[str]:
+        if not isinstance(val, list):
+            return []
+        out: List[str] = []
+        seen = set()
+        for x in val:
+            d = str(x or "").strip().lower().strip(".")
+            if not d or d in seen:
+                continue
+            seen.add(d)
+            out.append(d)
+        return out
+
+    def _primary_domain(domains: List[str]) -> str:
+        for d in domains or []:
+            dd = str(d or "").strip().lower()
+            if dd:
+                return dd
+        return ""
+
+    def _resolve_node_id(source_id: Optional[int], base_url: Optional[str]) -> Optional[int]:
+        if source_id is not None:
+            hit = mapping.get(str(source_id))
+            if hit:
+                return int(hit)
+        bu = str(base_url or "").strip().rstrip("/")
+        if bu:
+            hit2 = baseurl_to_nodeid.get(bu)
+            if hit2:
+                return int(hit2)
+            ex = get_node_by_base_url(bu)
+            if ex:
+                return int(ex.get("id") or 0)
+        if source_id is not None:
+            b2 = srcid_to_baseurl.get(str(source_id))
+            if b2:
+                hit3 = baseurl_to_nodeid.get(str(b2).rstrip("/"))
+                if hit3:
+                    return int(hit3)
+        return None
+
+    # ---- restore websites (site config) ----
+    site_added = 0
+    site_updated = 0
+    site_skipped = 0
+    site_mapping: Dict[str, int] = {}
+    site_unmatched: List[Dict[str, Any]] = []
+
+    site_primary_index: Dict[tuple[int, str], int] = {}
+    try:
+        for s in list_sites():
+            nid = _as_int(s.get("node_id"), 0)
+            sid = _as_int(s.get("id"), 0)
+            pd = _primary_domain(_norm_domains(s.get("domains") or []))
+            if nid > 0 and sid > 0 and pd:
+                site_primary_index[(nid, pd)] = sid
+    except Exception:
+        site_primary_index = {}
+
+    sites_path = _find_zip_path("websites/sites.json")
+    if sites_path:
+        try:
+            sites_payload = json.loads(z.read(sites_path).decode("utf-8"))
+            site_items = (
+                sites_payload.get("sites")
+                if isinstance(sites_payload, dict) and isinstance(sites_payload.get("sites"), list)
+                else (sites_payload if isinstance(sites_payload, list) else [])
+            )
+        except Exception as exc:
+            site_items = []
+            site_unmatched.append({"path": sites_path, "error": f"sites.json 解析失败：{exc}"})
+
+        for item in site_items:
+            if not isinstance(item, dict):
+                site_skipped += 1
+                continue
+
+            source_site_id_raw = item.get("source_id")
+            source_site_id = _as_int(source_site_id_raw, 0) if source_site_id_raw is not None else None
+
+            source_node_id_raw = item.get("node_source_id")
+            source_node_id = _as_int(source_node_id_raw, 0) if source_node_id_raw is not None else None
+            node_base_url = str(item.get("node_base_url") or "").strip().rstrip("/")
+            target_node_id = _resolve_node_id(source_node_id, node_base_url)
+            if not target_node_id:
+                site_skipped += 1
+                site_unmatched.append(
+                    {
+                        "source_site_id": source_site_id,
+                        "source_node_id": source_node_id,
+                        "node_base_url": node_base_url,
+                        "error": "站点未匹配到节点",
+                    }
+                )
+                continue
+
+            domains = _norm_domains(item.get("domains"))
+            primary = _primary_domain(domains)
+            key = (int(target_node_id), primary) if primary else None
+
+            site_name = str(item.get("name") or "").strip() or (domains[0] if domains else f"site-{int(target_node_id)}")
+            site_type = str(item.get("type") or "static").strip().lower() or "static"
+            if site_type not in ("static", "php", "reverse_proxy"):
+                site_type = "static"
+            web_server = str(item.get("web_server") or "nginx").strip() or "nginx"
+            root_path = str(item.get("root_path") or "").strip()
+            proxy_target = str(item.get("proxy_target") or "").strip()
+            nginx_tpl = str(item.get("nginx_tpl") or "")
+            https_redirect = _as_bool(item.get("https_redirect"), False)
+            gzip_enabled = _as_bool(item.get("gzip_enabled"), True)
+            status = str(item.get("status") or "running").strip() or "running"
+
+            site_id = 0
+            if key and key in site_primary_index:
+                site_id = int(site_primary_index[key] or 0)
+
+            if site_id > 0:
+                update_site(
+                    site_id,
+                    name=site_name,
+                    domains=domains,
+                    root_path=root_path,
+                    proxy_target=proxy_target,
+                    site_type=site_type,
+                    web_server=web_server,
+                    nginx_tpl=nginx_tpl,
+                    https_redirect=https_redirect,
+                    gzip_enabled=gzip_enabled,
+                    status=status,
+                )
+                site_updated += 1
+            else:
+                site_id = int(
+                    add_site(
+                        node_id=int(target_node_id),
+                        name=site_name,
+                        domains=domains,
+                        root_path=root_path,
+                        proxy_target=proxy_target,
+                        site_type=site_type,
+                        web_server=web_server,
+                        nginx_tpl=nginx_tpl,
+                        https_redirect=https_redirect,
+                        gzip_enabled=gzip_enabled,
+                        status=status,
+                    )
+                )
+                site_added += 1
+
+            update_site_health(
+                site_id,
+                str(item.get("health_status") or "").strip(),
+                health_code=_as_int(item.get("health_code"), 0),
+                health_latency_ms=_as_int(item.get("health_latency_ms"), 0),
+                health_error=str(item.get("health_error") or "").strip(),
+                health_checked_at=item.get("health_checked_at"),
+            )
+
+            if key:
+                site_primary_index[key] = int(site_id)
+            if source_site_id is not None:
+                site_mapping[str(source_site_id)] = int(site_id)
+
+    # ---- restore website certificates ----
+    cert_added = 0
+    cert_updated = 0
+    cert_skipped = 0
+    cert_unmatched: List[Dict[str, Any]] = []
+
+    cert_index: Dict[tuple[int, int, str], int] = {}
+    try:
+        for c in list_certificates():
+            nid = _as_int(c.get("node_id"), 0)
+            sid = _as_int(c.get("site_id"), 0) if c.get("site_id") is not None else 0
+            pd = _primary_domain(_norm_domains(c.get("domains") or []))
+            cid = _as_int(c.get("id"), 0)
+            if nid > 0 and cid > 0 and pd:
+                cert_index[(nid, sid, pd)] = cid
+    except Exception:
+        cert_index = {}
+
+    certs_path = _find_zip_path("websites/certificates.json")
+    if certs_path:
+        try:
+            certs_payload = json.loads(z.read(certs_path).decode("utf-8"))
+            cert_items = (
+                certs_payload.get("certificates")
+                if isinstance(certs_payload, dict) and isinstance(certs_payload.get("certificates"), list)
+                else (certs_payload if isinstance(certs_payload, list) else [])
+            )
+        except Exception as exc:
+            cert_items = []
+            cert_unmatched.append({"path": certs_path, "error": f"certificates.json 解析失败：{exc}"})
+
+        for item in cert_items:
+            if not isinstance(item, dict):
+                cert_skipped += 1
+                continue
+
+            source_node_id_raw = item.get("node_source_id")
+            source_node_id = _as_int(source_node_id_raw, 0) if source_node_id_raw is not None else None
+            node_base_url = str(item.get("node_base_url") or "").strip().rstrip("/")
+            target_node_id = _resolve_node_id(source_node_id, node_base_url)
+            if not target_node_id:
+                cert_skipped += 1
+                cert_unmatched.append(
+                    {
+                        "source_id": item.get("source_id"),
+                        "source_node_id": source_node_id,
+                        "node_base_url": node_base_url,
+                        "error": "证书未匹配到节点",
+                    }
+                )
+                continue
+
+            source_site_id_raw = item.get("site_source_id")
+            source_site_id = _as_int(source_site_id_raw, 0) if source_site_id_raw is not None else None
+            target_site_id: Optional[int] = None
+            if source_site_id is not None and str(source_site_id) in site_mapping:
+                target_site_id = _as_int(site_mapping.get(str(source_site_id)), 0) or None
+
+            domains = _norm_domains(item.get("domains"))
+            pd = _primary_domain(domains)
+            if target_site_id is None and pd:
+                sid2 = site_primary_index.get((int(target_node_id), pd))
+                if sid2:
+                    target_site_id = int(sid2)
+
+            key = (int(target_node_id), int(target_site_id or 0), pd)
+            cert_id = cert_index.get(key) if pd else None
+
+            status = str(item.get("status") or "pending").strip() or "pending"
+            not_before = item.get("not_before")
+            not_after = item.get("not_after")
+            renew_at = item.get("renew_at")
+            last_error = str(item.get("last_error") or "").strip()
+
+            if cert_id:
+                update_certificate(
+                    int(cert_id),
+                    domains=domains,
+                    status=status,
+                    not_before=not_before,
+                    not_after=not_after,
+                    renew_at=renew_at,
+                    last_error=last_error,
+                )
+                cert_updated += 1
+            else:
+                cert_id = int(
+                    add_certificate(
+                        node_id=int(target_node_id),
+                        site_id=int(target_site_id) if target_site_id is not None else None,
+                        domains=domains,
+                        issuer=str(item.get("issuer") or "letsencrypt"),
+                        challenge=str(item.get("challenge") or "http-01"),
+                        status=status,
+                        not_before=not_before,
+                        not_after=not_after,
+                        renew_at=renew_at,
+                        last_error=last_error,
+                    )
+                )
+                cert_added += 1
+
+            if pd:
+                cert_index[key] = int(cert_id)
+
+    # ---- restore netmon monitor configs ----
+    mon_added = 0
+    mon_updated = 0
+    mon_skipped = 0
+
+    def _monitor_key(target: str, mode: str, tcp_port: int, node_ids: List[int]) -> tuple[str, str, int, tuple[int, ...]]:
+        cleaned = sorted(set([int(x) for x in (node_ids or []) if int(x) > 0]))
+        return ((target or "").strip().lower(), (mode or "ping").strip().lower(), int(tcp_port or 443), tuple(cleaned))
+
+    monitor_index: Dict[tuple[str, str, int, tuple[int, ...]], int] = {}
+    try:
+        for m in list_netmon_monitors():
+            mid = _as_int(m.get("id"), 0)
+            if mid <= 0:
+                continue
+            mk = _monitor_key(
+                str(m.get("target") or ""),
+                str(m.get("mode") or "ping"),
+                _as_int(m.get("tcp_port"), 443),
+                [int(x) for x in (m.get("node_ids") or []) if _as_int(x, 0) > 0],
+            )
+            monitor_index[mk] = mid
+    except Exception:
+        monitor_index = {}
+
+    monitors_path = _find_zip_path("netmon/monitors.json")
+    if monitors_path:
+        try:
+            monitors_payload = json.loads(z.read(monitors_path).decode("utf-8"))
+            monitor_items = (
+                monitors_payload.get("monitors")
+                if isinstance(monitors_payload, dict) and isinstance(monitors_payload.get("monitors"), list)
+                else (monitors_payload if isinstance(monitors_payload, list) else [])
+            )
+        except Exception:
+            monitor_items = []
+
+        for item in monitor_items:
+            if not isinstance(item, dict):
+                mon_skipped += 1
+                continue
+
+            target = str(item.get("target") or "").strip()
+            if not target:
+                mon_skipped += 1
+                continue
+            mode = str(item.get("mode") or "ping").strip().lower() or "ping"
+            if mode not in ("ping", "tcping"):
+                mode = "ping"
+            tcp_port = _as_int(item.get("tcp_port"), 443)
+            interval_sec = _as_int(item.get("interval_sec"), 5)
+            warn_ms = _as_int(item.get("warn_ms"), 0)
+            crit_ms = _as_int(item.get("crit_ms"), 0)
+            enabled = _as_bool(item.get("enabled"), True)
+
+            src_node_ids_raw = item.get("node_source_ids")
+            src_node_ids = src_node_ids_raw if isinstance(src_node_ids_raw, list) else []
+            base_urls_raw = item.get("node_base_urls")
+            base_urls = base_urls_raw if isinstance(base_urls_raw, list) else []
+
+            resolved_ids: List[int] = []
+            for sid in src_node_ids:
+                nid = _resolve_node_id(_as_int(sid, 0), None)
+                if nid and nid > 0 and nid not in resolved_ids:
+                    resolved_ids.append(int(nid))
+            for bu in base_urls:
+                nid = _resolve_node_id(None, str(bu or "").strip().rstrip("/"))
+                if nid and nid > 0 and nid not in resolved_ids:
+                    resolved_ids.append(int(nid))
+
+            if not resolved_ids:
+                mon_skipped += 1
+                continue
+
+            mk = _monitor_key(target, mode, tcp_port, resolved_ids)
+            mid = monitor_index.get(mk)
+            if mid:
+                update_netmon_monitor(
+                    int(mid),
+                    target=target,
+                    mode=mode,
+                    tcp_port=tcp_port,
+                    interval_sec=interval_sec,
+                    node_ids=resolved_ids,
+                    warn_ms=warn_ms,
+                    crit_ms=crit_ms,
+                    enabled=enabled,
+                    last_run_ts_ms=_as_int(item.get("last_run_ts_ms"), 0),
+                    last_run_msg=str(item.get("last_run_msg") or ""),
+                )
+                mon_updated += 1
+            else:
+                new_mid = int(
+                    add_netmon_monitor(
+                        target=target,
+                        mode=mode,
+                        tcp_port=tcp_port,
+                        interval_sec=interval_sec,
+                        node_ids=resolved_ids,
+                        warn_ms=warn_ms,
+                        crit_ms=crit_ms,
+                        enabled=enabled,
+                    )
+                )
+                monitor_index[mk] = new_mid
+                mon_added += 1
+
     return {
         "ok": True,
         "nodes": {"added": added, "updated": updated, "skipped": skipped, "mapping": mapping},
@@ -586,6 +1438,24 @@ async def api_restore_full(
             "unmatched": unmatched_rules,
             "failed": failed_rules,
         },
+        "sites": {
+            "added": site_added,
+            "updated": site_updated,
+            "skipped": site_skipped,
+            "mapped": len(site_mapping),
+        },
+        "certificates": {
+            "added": cert_added,
+            "updated": cert_updated,
+            "skipped": cert_skipped,
+        },
+        "netmon": {
+            "added": mon_added,
+            "updated": mon_updated,
+            "skipped": mon_skipped,
+        },
+        "site_unmatched": site_unmatched[:50],
+        "cert_unmatched": cert_unmatched[:50],
         "rule_unmatched": rule_unmatched[:50],
         "rule_failed": rule_failed[:50],
     }
