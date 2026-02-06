@@ -2368,14 +2368,16 @@ textarea,.textarea{min-height:90px;resize:vertical}
 .node-tools::-webkit-scrollbar{height:6px}
 .node-tools > *{flex:0 0 auto}
 .node-tools .btn{white-space:nowrap}
+.node-tools > .btn,
+.node-tools > details.menu > summary{
+  min-height:34px;
+  padding:6px 12px;
+  border-radius:12px;
+  font-size:13px;
+}
 .node-tools .toolbar-main-cta{
   border-color:rgba(34,211,238,0.46);
   box-shadow:0 0 0 1px rgba(34,211,238,0.24) inset, 0 16px 30px rgba(34,211,238,0.16);
-}
-.node-tools .toolbar-mini > summary{
-  min-height:30px;
-  padding:5px 10px;
-  border-radius:11px;
 }
 .node-tools .toolbar-mini .menu-pop{min-width:280px}
 .node-tools .toolbar-mini-search .menu-pop{min-width:340px}
