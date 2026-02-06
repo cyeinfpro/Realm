@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0B0F14">
   <title>{% if title %}{{ title }} · Nexus Network Control Plane{% else %}Nexus Network Control Plane{% endif %}</title>
   <link rel="icon" type="image/svg+xml" href="/static/nexus.svg">
-  <link rel="stylesheet" href="/static/style.css?v=70.0">
+  <link rel="stylesheet" href="/static/style.css?v=72.0">
 </head>
 <body>
   <!-- Flowing background (fixed, no seams on scroll) -->
@@ -192,10 +192,12 @@
       }catch(e){ return false; }
     }
 
-    function shouldSheet(){
+    function shouldSheet(detailsEl){
+      // Default to anchored popover on mobile as well, to avoid visual "misalignment"
+      // where menus appear detached at the viewport bottom.
+      // Keep sheet mode opt-in only via data-sheet="1".
       try{
-        if(window.matchMedia && window.matchMedia('(max-width: 640px)').matches) return true;
-        if(isCoarsePointer() && window.matchMedia && window.matchMedia('(max-width: 980px)').matches) return true;
+        if(detailsEl && String(detailsEl.dataset.sheet || '') === '1') return true;
       }catch(e){}
       return false;
     }
@@ -283,7 +285,7 @@
       // Position on next tick
       setTimeout(function(){
         if(!detailsEl.open) return;
-        if(shouldSheet()) positionSheet(pop);
+        if(shouldSheet(detailsEl)) positionSheet(pop);
         else positionPopover(detailsEl, pop);
         pop.style.visibility = 'visible';
       }, 0);
@@ -293,11 +295,10 @@
 
     function repositionAll(){
       try{
-        var sheet = shouldSheet();
         document.querySelectorAll('details.menu[open]').forEach(function(d){
           var pop = d._menuPop;
           if(!pop || pop.parentElement !== portal) return;
-          if(sheet) positionSheet(pop);
+          if(shouldSheet(d)) positionSheet(pop);
           else positionPopover(d, pop);
         });
       }catch(e){}

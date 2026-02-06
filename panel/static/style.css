@@ -745,9 +745,75 @@ main.container .center-wrap > .card.center-card{
 }
 
 @media (max-width: 640px){
-  .wm-site-right{width:100%; justify-content:space-between;}
-  .wm-site-actions{margin-left:auto;}
-  .wm-kpi{padding:4px 8px;}
+  .wm-layout{gap:10px;}
+  .wm-card{padding:10px;}
+  .wm-card-head{flex-wrap:wrap;}
+  .wm-card-tools{width:100%; justify-content:flex-start;}
+  .wm-toolbar{flex-direction:column; align-items:stretch;}
+  .wm-toolbar .dash-filters{width:100%;}
+  .wm-toolbar .dash-search{width:100%;}
+
+  .wm-site-row{
+    flex-direction:column;
+    align-items:stretch;
+    gap:8px;
+    padding:10px 10px 10px 12px;
+  }
+  .wm-site-left,
+  .wm-site-right{
+    width:100%;
+    min-width:0;
+  }
+  .wm-site-line1{
+    gap:6px;
+  }
+  .wm-site-line2{
+    display:block;
+    margin-top:6px;
+    line-height:1.45;
+  }
+  .wm-site-domain{
+    display:block;
+    max-width:100%;
+    white-space:normal;
+    overflow-wrap:anywhere;
+    word-break:break-word;
+  }
+  .wm-site-hint{
+    display:inline-block;
+    margin-top:3px;
+  }
+  .wm-site-right{
+    display:grid;
+    grid-template-columns:minmax(0,1fr) auto;
+    align-items:start;
+    gap:8px;
+  }
+  .wm-site-kpis{
+    justify-content:flex-start;
+    flex-wrap:nowrap;
+    overflow-x:auto;
+    padding-bottom:2px;
+    scrollbar-width:none;
+  }
+  .wm-site-kpis::-webkit-scrollbar{display:none;}
+  .wm-kpi{
+    padding:4px 8px;
+    flex:0 0 auto;
+  }
+  .wm-site-actions{
+    margin-left:0;
+    justify-self:end;
+  }
+
+  .wm-node-row{
+    flex-direction:column;
+    align-items:stretch;
+    gap:8px;
+  }
+  .wm-node-actions{
+    justify-content:flex-end;
+  }
 }
 
 /* =========================
@@ -1126,6 +1192,7 @@ main.container .center-wrap > .card.center-card{
 .node-host{margin-top:4px;font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
 .node-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.node-right .btn.icon{flex:0 0 auto}
 .node-state{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);padding:6px 8px;border-radius:999px;border:1px solid rgba(148,163,184,0.16);background:rgba(11,15,20,0.14)}
 .node-dot{width:8px;height:8px;border-radius:999px;display:inline-block;box-shadow:0 0 0 3px rgba(148,163,184,0.10) inset}
 .node-dot.online{background:var(--ok)}
@@ -1151,10 +1218,22 @@ main.container .center-wrap > .card.center-card{
 .node-meta-sep{opacity:.55;}
 
 /* Traffic / rate in two tight rows */
-.node-metrics{display:flex;flex-direction:column;gap:6px;margin-top:8px;}
-.metric{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 8px;border-radius:12px;border:1px solid rgba(255,255,255,0.06);background:rgba(22,27,34,0.36)}
-.metric .k{font-size:11px;color:var(--muted);min-width:0}
-.metric .v{font-size:11px;color:rgba(229,231,235,0.95);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.node-metrics{display:flex;flex-direction:column;gap:6px;margin-top:8px;min-width:0;}
+.metric{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  min-width:0;
+  max-width:100%;
+  overflow:hidden;
+  padding:6px 8px;
+  border-radius:12px;
+  border:1px solid rgba(255,255,255,0.06);
+  background:rgba(22,27,34,0.36)
+}
+.metric .k{font-size:11px;color:var(--muted);flex:0 0 auto;min-width:0}
+.metric .v{font-size:11px;color:rgba(229,231,235,0.95);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1 1 auto;min-width:0;text-align:right}
 
 .node-kpis{display:flex;justify-content:space-between;gap:10px;margin-top:10px}
 .kpi{display:flex;flex-direction:column;gap:3px;min-width:0}
@@ -1189,12 +1268,11 @@ main.container .center-wrap > .card.center-card{
   /* Mobile node tile: denser */
   .node-tile{padding:8px;border-radius:14px;}
   .node-top{flex-wrap:wrap;}
-  .node-right{width:100%; justify-content:flex-end;}
-  .node-right{gap:6px;}
+  .node-right{width:100%; justify-content:flex-end; gap:6px; flex-wrap:wrap; min-width:0;}
   .node-state{padding:5px 7px;}
 
   /* Put traffic + rate side-by-side on mobile */
-  .node-metrics{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
+  .node-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;}
   .metric{padding:6px 8px;}
 
   /* CPU/MEM/DISK: show as compact inline chips (hide progress bar) */
@@ -1206,6 +1284,11 @@ main.container .center-wrap > .card.center-card{
   .node-meta{flex-wrap:wrap; white-space:normal;}
   .node-meta-sep{display:none;}
   .mbar .head .mono{max-width:none}
+}
+
+@media (max-width: 390px){
+  /* Extra-narrow phones: single-column metrics to avoid clipping */
+  .node-metrics{grid-template-columns:1fr;}
 }
 
 /* Pills */
