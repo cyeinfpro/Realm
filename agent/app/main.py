@@ -3731,6 +3731,127 @@ def _install_acme_sh() -> Tuple[bool, str]:
     return True, ""
 
 
+
+def _acme_env() -> Dict[str, str]:
+    """Return environment for running acme.sh.
+
+    systemd services sometimes run with HOME=/, which breaks acme.sh state location.
+    """
+    env = os.environ.copy()
+    if os.geteuid() == 0:
+        env.setdefault("HOME", "/root")
+    return env
+
+
+def _acme_home_dir(env: Optional[Dict[str, str]] = None) -> Path:
+    e = env or _acme_env()
+    home = (e.get("HOME") or "").strip() or str(Path.home())
+    return Path(home) / ".acme.sh"
+
+
+def _read_acme_account_email() -> Optional[str]:
+    """Try to read existing ACCOUNT_EMAIL from acme.sh account.conf."""
+    env = _acme_env()
+    acme_home = _acme_home_dir(env)
+    p = acme_home / "account.conf"
+    try:
+        if p.exists():
+            txt = p.read_text(encoding="utf-8", errors="ignore")
+            m = re.search(r"^ACCOUNT_EMAIL=['\"]?([^'\"\n]+)", txt, re.MULTILINE)
+            if m:
+                return m.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
+def _acme_domain_server(domain: str) -> Optional[str]:
+    """Try to detect the CA directory URL used by this domain from acme.sh domain conf."""
+    d = (domain or "").strip()
+    if not d:
+        return None
+    env = _acme_env()
+    acme_home = _acme_home_dir(env)
+    candidates = [
+        acme_home / d / f"{d}.conf",
+        acme_home / f"{d}_ecc" / f"{d}.conf",
+    ]
+    for p in candidates:
+        try:
+            if not p.exists():
+                continue
+            txt = p.read_text(encoding="utf-8", errors="ignore")
+            # acme.sh stores CA directory URL in Le_API for many versions.
+            m = re.search(r"^Le_API=['\"]?([^'\"\n]+)", txt, re.MULTILINE)
+            if m:
+                return m.group(1).strip()
+            m = re.search(r"^Le_Server=['\"]?([^'\"\n]+)", txt, re.MULTILINE)
+            if m:
+                return m.group(1).strip()
+        except Exception:
+            continue
+    return None
+
+
+def _acme_server_for_issue() -> str:
+    """Default ACME server for issuing new certs (configurable via env)."""
+    s = (os.getenv("REALM_ACME_SERVER") or "").strip()
+    return s or "letsencrypt"
+
+
+def _acme_server_for_domain(domain: str) -> str:
+    """Prefer the server stored by acme.sh for this domain; fallback to default."""
+    stored = _acme_domain_server(domain)
+    if stored:
+        return stored
+    return _acme_server_for_issue()
+
+
+def _acme_email_for_domains(domains: List[str]) -> str:
+    """Resolve ACME account email.
+
+    Priority:
+    1) REALM_ACME_EMAIL env
+    2) existing acme.sh account.conf ACCOUNT_EMAIL
+    3) fallback to admin@<primary-domain>
+    """
+    e = (os.getenv("REALM_ACME_EMAIL") or "").strip()
+    if e:
+        return e
+    existing = _read_acme_account_email()
+    if existing:
+        return existing
+
+    d0 = (str(domains[0]) if domains else "").strip()
+    if d0.startswith("*."):
+        d0 = d0[2:]
+    # strip :port if accidentally present (example.com:80)
+    if d0.startswith("[") and "]" in d0:
+        d0 = d0[1 : d0.index("]")]
+    elif d0.count(":") == 1:
+        d0 = d0.split(":", 1)[0]
+    if not d0:
+        d0 = "example.com"
+    return f"admin@{d0}"
+
+
+def _acme_register_account(acme: str, server: str, email: str) -> Tuple[bool, str]:
+    """Ensure ACME account is registered with an email (required by some CAs like ZeroSSL)."""
+    env = _acme_env()
+    cmd = [acme, "--register-account", "-m", email]
+    if server:
+        cmd += ["--server", server]
+    code, out = _run_cmd(cmd, timeout=120, env=env)
+    if code == 0:
+        return True, out
+    low = (out or "").lower()
+    # Some acme.sh versions may return non-zero even if account already exists/registered.
+    if "already" in low and "account" in low:
+        return True, out
+    if "account" in low and "registered" in low:
+        return True, out
+    return False, out
+
 def _cert_dates(cert_path: Path) -> Dict[str, str]:
     out: Dict[str, str] = {}
     code, txt = _run_cmd(["openssl", "x509", "-noout", "-dates", "-in", str(cert_path)])
@@ -3956,6 +4077,7 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     root_valid, err = _ensure_acme_webroot(root_path, extra_bases)
     if err:
         return {"ok": False, "error": err}
+    root_path = str(root_valid) if root_valid else root_path
 
     acme = _find_acme_sh()
     if not acme:
@@ -3966,6 +4088,14 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
         acme = _find_acme_sh()
         if not acme:
             return {"ok": False, "error": "acme.sh 安装后未找到"}
+
+    # Ensure ACME account is registered with an email address.
+    # Newer acme.sh defaults to ZeroSSL which requires an email to obtain EAB.
+    acme_server = _acme_server_for_issue()
+    acme_email = _acme_email_for_domains(domains)
+    ok_reg, reg_out = _acme_register_account(acme, acme_server, acme_email)
+    if not ok_reg:
+        return {"ok": False, "error": reg_out or "ACME 账户注册失败"}
 
     # Best-effort: ensure Nginx config has ACME location before issuing.
     # This is important for reverse_proxy sites created by older versions.
@@ -4006,11 +4136,11 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
         if not ok_conf:
             return {"ok": False, "error": f"更新 Nginx 配置失败：{msg}"}
 
-    cmd = [acme, "--issue"]
+    cmd = [acme, "--issue", "--server", acme_server]
     for d in domains:
         cmd += ["-d", str(d)]
     cmd += ["-w", root_path]
-    code, out = _run_cmd(cmd, timeout=300)
+    code, out = _run_cmd(cmd, timeout=300, env=_acme_env())
     if code != 0:
         return {"ok": False, "error": out or "证书申请失败"}
 
@@ -4033,7 +4163,7 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
         "--reloadcmd",
         "nginx -s reload",
     ]
-    code, out = _run_cmd(install_cmd, timeout=90)
+    code, out = _run_cmd(install_cmd, timeout=90, env=_acme_env())
     if code != 0:
         return {"ok": False, "error": out or "证书安装失败"}
 
@@ -4124,6 +4254,12 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
         if not acme:
             return {"ok": False, "error": "acme.sh 安装后未找到"}
 
+    acme_server = _acme_server_for_domain(str(domains[0]))
+    acme_email = _acme_email_for_domains(domains)
+    ok_reg, reg_out = _acme_register_account(acme, acme_server, acme_email)
+    if not ok_reg:
+        return {"ok": False, "error": reg_out or "ACME 账户注册失败"}
+
     # Best-effort: ensure Nginx config has ACME location before renewing.
     if isinstance(update_conf, dict):
         proxy_target = _normalize_proxy_target(str(update_conf.get("proxy_target") or ""))
@@ -4162,8 +4298,8 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
             return {"ok": False, "error": f"更新 Nginx 配置失败：{msg}"}
 
     main_domain = str(domains[0])
-    cmd = [acme, "--renew", "-d", main_domain]
-    code, out = _run_cmd(cmd, timeout=300)
+    cmd = [acme, "--renew", "-d", main_domain, "--server", acme_server]
+    code, out = _run_cmd(cmd, timeout=300, env=_acme_env())
     if code != 0:
         return {"ok": False, "error": out or "证书续期失败"}
 
@@ -4185,7 +4321,7 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
         "--reloadcmd",
         "nginx -s reload",
     ]
-    code, out = _run_cmd(install_cmd, timeout=90)
+    code, out = _run_cmd(install_cmd, timeout=90, env=_acme_env())
     if code != 0:
         return {"ok": False, "error": out or "证书安装失败"}
 
