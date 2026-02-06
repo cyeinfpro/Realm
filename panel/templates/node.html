@@ -45,15 +45,6 @@
                   <div class="muted sm">{{ n.group_name or '默认分组' }}</div>
                 </div>
               </a>
-              <details class="menu node-item-menu">
-                <summary class="btn icon xs ghost" aria-label="节点快捷操作">⋯</summary>
-                <div class="menu-pop">
-                  <button class="menu-item" type="button" onclick="openEditNodeFromSidebar(this)">编辑节点</button>
-                  <button class="menu-item" type="button" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">接入命令</button>
-                  <div class="menu-sep"></div>
-                  <button class="menu-item danger" type="button" onclick="removeNodeFromSidebar(this)">移除节点</button>
-                </div>
-              </details>
             </div>
             {% endfor %}
           </div>

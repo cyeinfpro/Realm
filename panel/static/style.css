@@ -2298,22 +2298,6 @@ textarea,.textarea{min-height:90px;resize:vertical}
   min-width:0;
 }
 
-.node-item-row .node-item-menu{
-  flex:0 0 auto;
-}
-
-.node-item-row .node-item-menu > summary{
-  width:28px;
-  min-width:28px;
-  height:28px;
-  min-height:28px;
-  padding:0;
-}
-
-.node-item-row .node-item-menu .menu-pop{
-  min-width:170px;
-}
-
 .node-item{
   display:flex;
   gap: 10px;

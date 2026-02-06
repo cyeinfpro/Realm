@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v39"
+VERSION="v40"
 REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
 DEFAULT_MODE="1"
 DEFAULT_PORT="18700"
@@ -15,6 +15,48 @@ need_root(){
   if [[ "$(id -u)" -ne 0 ]]; then
     err "请使用 root 运行（sudo -i / su -）"
     exit 1
+  fi
+}
+
+probe_python_runtime(){
+  local py="$1"
+  if [[ -z "${py}" ]]; then
+    return 1
+  fi
+  if [[ "${py}" == */* ]]; then
+    [[ -x "${py}" ]] || return 1
+  else
+    command_exists "${py}" || return 1
+  fi
+  "${py}" -c "import venv, ssl, json" >/dev/null 2>&1
+}
+
+probe_existing_agent_venv(){
+  local py="/opt/realm-agent/venv/bin/python"
+  if [[ ! -x "${py}" ]]; then
+    return 1
+  fi
+  "${py}" -c "import ssl, json, fastapi, uvicorn" >/dev/null 2>&1
+}
+
+disable_apt_listchanges_hooks(){
+  local dir="/etc/apt/apt.conf.d"
+  local f moved="0"
+  [[ -d "${dir}" ]] || return 0
+  for f in "${dir}"/*; do
+    [[ -f "${f}" ]] || continue
+    if [[ "${f}" == *.disabled-by-realm ]]; then
+      continue
+    fi
+    if grep -qi "apt-listchanges" "${f}" 2>/dev/null; then
+      if mv "${f}" "${f}.disabled-by-realm" 2>/dev/null; then
+        moved="1"
+        info "检测到 apt-listchanges hook 异常风险，已禁用：$(basename "${f}")"
+      fi
+    fi
+  done
+  if [[ "${moved}" == "1" ]]; then
+    ok "已禁用 apt-listchanges hook，避免 apt 因 Python 崩溃失败"
   fi
 }
 
@@ -35,29 +77,39 @@ apt_update_with_repair(){
 }
 
 apt_install(){
-  local ready="1"
-  local py_probe_ok="1"
-  command_exists curl || ready="0"
-  command_exists unzip || ready="0"
-  command_exists jq || ready="0"
-  command_exists python3 || ready="0"
-  command_exists rsync || ready="0"
-  dpkg-query -W -f='${Status}' python3-venv 2>/dev/null | grep -q "install ok installed" || ready="0"
-  dpkg-query -W -f='${Status}' python3-pip 2>/dev/null | grep -q "install ok installed" || ready="0"
-  if command_exists python3; then
-    if ! python3 -c "import venv, ssl, json" >/dev/null 2>&1; then
-      py_probe_ok="0"
-      ready="0"
-    fi
-  else
-    py_probe_ok="0"
+  local deps_ok="1"
+  local py_ok="0"
+  local reuse_existing_venv="0"
+
+  command_exists curl || deps_ok="0"
+  command_exists unzip || deps_ok="0"
+  command_exists jq || deps_ok="0"
+  command_exists python3 || deps_ok="0"
+  command_exists rsync || deps_ok="0"
+  dpkg-query -W -f='${Status}' python3-venv 2>/dev/null | grep -q "install ok installed" || deps_ok="0"
+  dpkg-query -W -f='${Status}' python3-pip 2>/dev/null | grep -q "install ok installed" || deps_ok="0"
+
+  if probe_python_runtime "python3"; then
+    py_ok="1"
   fi
-  if [[ "${ready}" == "1" ]]; then
+  if [[ "${py_ok}" != "1" ]] && probe_existing_agent_venv; then
+    reuse_existing_venv="1"
+  fi
+
+  if [[ "${deps_ok}" == "1" && ( "${py_ok}" == "1" || "${reuse_existing_venv}" == "1" ) ]]; then
+    if [[ "${reuse_existing_venv}" == "1" ]]; then
+      export REALM_AGENT_REUSE_VENV=1
+      info "系统 Python 异常，检测到可用的现有 Agent venv，将复用 venv 执行更新"
+    else
+      unset REALM_AGENT_REUSE_VENV || true
+    fi
     ok "依赖已满足，跳过 apt 安装"
     return
   fi
 
   export DEBIAN_FRONTEND=noninteractive
+  export APT_LISTCHANGES_FRONTEND=none
+  disable_apt_listchanges_hooks
   if ! apt_update_with_repair; then
     err "apt 索引修复失败，请手动执行：rm -rf /var/lib/apt/lists/* && apt-get clean && apt-get update"
     exit 1
@@ -71,14 +123,30 @@ apt_install(){
       curl ca-certificates unzip jq python3 python3-venv python3-pip rsync
   fi
 
-  if [[ "${py_probe_ok}" != "1" ]]; then
+  if ! probe_python_runtime "python3"; then
     info "检测到 Python 环境异常，尝试重装 python3/python3-venv/python3-pip..."
-    apt-get install -y --reinstall python3 python3-venv python3-pip || true
+    if ! apt-get install -y --reinstall python3 python3-venv python3-pip; then
+      err "重装 python3 失败，尝试更强修复（minimal/runtime 包）..."
+      apt-get install -y --reinstall \
+        python3-minimal python3.11 python3.11-minimal \
+        libpython3.11-minimal libpython3.11-stdlib || true
+    fi
   fi
-  if ! python3 -c "import venv, ssl, json" >/dev/null 2>&1; then
-    err "Python 运行环境仍异常，请先修复系统 Python 后再执行安装。"
-    exit 1
+
+  if probe_python_runtime "python3"; then
+    unset REALM_AGENT_REUSE_VENV || true
+    return
   fi
+  if probe_existing_agent_venv; then
+    export REALM_AGENT_REUSE_VENV=1
+    info "系统 Python 仍异常，但现有 Agent venv 可用：将复用 venv 继续更新"
+    return
+  fi
+
+  err "Python 运行环境仍异常，请先修复系统 Python 后再执行安装。"
+  err "建议先执行：mv /etc/apt/apt.conf.d/*listchanges* /tmp/ 2>/dev/null || true"
+  err "然后执行：apt-get update && apt-get install --reinstall -y python3 python3-minimal python3-venv python3-pip"
+  exit 1
 }
 
 command_exists(){
@@ -449,6 +517,7 @@ atomic_update_agent(){
   local base="/opt/realm-agent"
   local stage="${base}/.staging"
   local bak="${base}/.bak.$(date +%s)"
+  local reuse_venv="${REALM_AGENT_REUSE_VENV:-0}"
 
   rm -rf "${stage}" || true
   mkdir -p "${stage}"
@@ -458,22 +527,30 @@ atomic_update_agent(){
   # 用 rsync 强制覆盖 + 删除旧文件，保证“全量更新到最新”
   rsync -a --delete "${src_agent_dir%/}/" "${stage}/agent/"
 
-  info "创建虚拟环境（staging）..."
-  python3 -m venv "${stage}/venv"
-  export PIP_DISABLE_PIP_VERSION_CHECK=1
-  export PIP_ROOT_USER_ACTION=ignore
-  if [[ "${REALM_AGENT_UPGRADE_PIP:-0}" == "1" ]]; then
-    "${stage}/venv/bin/pip" install -U pip wheel setuptools >/dev/null
-  fi
-  # 先装 requirements（仓库内）
-  "${stage}/venv/bin/pip" install \
-    --no-input --prefer-binary --timeout 60 --retries 2 \
-    -r "${stage}/agent/requirements.txt" >/dev/null || true
-  # 兜底确保核心依赖一定存在（避免 requirements 缺失/变更导致服务无法启动）
-  "${stage}/venv/bin/python" -c "import fastapi,uvicorn" >/dev/null 2>&1 || \
+  if [[ "${reuse_venv}" == "1" ]]; then
+    if [[ ! -x "${base}/venv/bin/python" ]]; then
+      err "系统 Python 异常且未找到可复用 venv，无法继续更新"
+      exit 1
+    fi
+    info "复用现有 venv，仅更新 Agent 代码（跳过重建 venv）"
+  else
+    info "创建虚拟环境（staging）..."
+    python3 -m venv "${stage}/venv"
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+    export PIP_ROOT_USER_ACTION=ignore
+    if [[ "${REALM_AGENT_UPGRADE_PIP:-0}" == "1" ]]; then
+      "${stage}/venv/bin/pip" install -U pip wheel setuptools >/dev/null
+    fi
+    # 先装 requirements（仓库内）
     "${stage}/venv/bin/pip" install \
       --no-input --prefer-binary --timeout 60 --retries 2 \
-      -U "fastapi" "uvicorn[standard]" "requests" >/dev/null
+      -r "${stage}/agent/requirements.txt" >/dev/null || true
+    # 兜底确保核心依赖一定存在（避免 requirements 缺失/变更导致服务无法启动）
+    "${stage}/venv/bin/python" -c "import fastapi,uvicorn" >/dev/null 2>&1 || \
+      "${stage}/venv/bin/pip" install \
+        --no-input --prefer-binary --timeout 60 --retries 2 \
+        -U "fastapi" "uvicorn[standard]" "requests" >/dev/null
+  fi
 
   # 生成 API Key（持久化不变）
   install -d -m 700 /etc/realm-agent
@@ -528,11 +605,15 @@ EOF
   info "切换到最新版本（原子替换）..."
   mkdir -p "${bak}"
   if [[ -d "${base}/agent" ]]; then mv "${base}/agent" "${bak}/agent"; fi
-  if [[ -d "${base}/venv" ]]; then mv "${base}/venv" "${bak}/venv"; fi
+  if [[ "${reuse_venv}" != "1" ]] && [[ -d "${base}/venv" ]]; then
+    mv "${base}/venv" "${bak}/venv"
+  fi
 
   mkdir -p "${base}"
   mv "${stage}/agent" "${base}/agent"
-  mv "${stage}/venv" "${base}/venv"
+  if [[ "${reuse_venv}" != "1" ]]; then
+    mv "${stage}/venv" "${base}/venv"
+  fi
   rm -rf "${stage}" || true
 
   # 写入标记，方便你一眼知道“是否已更新到这次执行”
@@ -544,6 +625,10 @@ EOF
   # 最终兜底：若启动失败，自动重建 venv 并改用 python -m uvicorn 再拉起
   if command_exists systemctl; then
     if ! systemctl is-active --quiet realm-agent.service 2>/dev/null; then
+      if [[ "${reuse_venv}" == "1" ]]; then
+        err "Agent 服务启动失败：当前处于复用 venv 模式且系统 Python 不可用，无法自动重建 venv。"
+        exit 1
+      fi
       err "Agent 服务启动失败，尝试自动修复（重建 venv + 重新安装核心依赖）..."
       systemctl stop realm-agent.service >/dev/null 2>&1 || true
       rm -rf "${base}/venv" || true

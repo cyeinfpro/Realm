@@ -430,8 +430,16 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
     # ✅ 一键接入 / 卸载命令（短命令，避免超长）
     # 说明：使用 node.api_key 作为 join token，脚本由面板返回并带参数执行。
     token = node["api_key"]
-    install_cmd = f"curl -fsSL -H \"X-Join-Token: {token}\" {base_url}/join | bash"
-    uninstall_cmd = f"curl -fsSL -H \"X-Join-Token: {token}\" {base_url}/uninstall | bash"
+    install_cmd = (
+        f"curl -fL --retry 5 --retry-all-errors --connect-timeout 10 "
+        f"-H \"X-Join-Token: {token}\" -o /tmp/realm-join.sh {base_url}/join "
+        f"&& bash /tmp/realm-join.sh && rm -f /tmp/realm-join.sh"
+    )
+    uninstall_cmd = (
+        f"curl -fL --retry 5 --retry-all-errors --connect-timeout 10 "
+        f"-H \"X-Join-Token: {token}\" -o /tmp/realm-uninstall.sh {base_url}/uninstall "
+        f"&& bash /tmp/realm-uninstall.sh && rm -f /tmp/realm-uninstall.sh"
+    )
 
     # 兼容旧字段（模板里可能还引用 node_port）
     agent_port = DEFAULT_AGENT_PORT

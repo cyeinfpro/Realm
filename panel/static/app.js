@@ -5243,59 +5243,6 @@ function openEditNodeModalFromCard(btn){
 }
 window.openEditNodeModalFromCard = openEditNodeModalFromCard;
 
-function closeClosestMenu(el){
-  try{
-    const det = el && el.closest ? el.closest('details.menu') : null;
-    if(det) det.open = false;
-  }catch(_e){}
-}
-
-function getSidebarNodeObjFromButton(btn){
-  const row = btn && btn.closest ? btn.closest('.node-item-row') : null;
-  if(!row) return null;
-  const ds = row.dataset || {};
-  const id = ds.nodeId || row.getAttribute('data-node-id');
-  if(id === undefined || id === null || String(id).trim() === '') return null;
-  return {
-    id: String(id),
-    name: ds.nodeName || '',
-    display_ip: ds.nodeDisplayIp || '',
-    base_url: ds.nodeBaseUrl || '',
-    group_name: ds.nodeGroup || '默认分组',
-    verify_tls: String(ds.nodeVerifyTls || '0') === '1',
-    is_private: String(ds.nodeIsPrivate || '0') === '1',
-    role: ds.nodeRole || 'normal',
-    website_root_base: ds.nodeWebsiteRoot || ''
-  };
-}
-
-function openEditNodeFromSidebar(btn){
-  const nodeObj = getSidebarNodeObjFromButton(btn);
-  closeClosestMenu(btn);
-  if(!nodeObj){
-    toast('节点信息缺失', true);
-    return;
-  }
-  openEditNodeModal(nodeObj);
-}
-
-function removeNodeFromSidebar(btn){
-  const nodeObj = getSidebarNodeObjFromButton(btn);
-  closeClosestMenu(btn);
-  if(!nodeObj){
-    toast('节点信息缺失', true);
-    return;
-  }
-  const label = (String(nodeObj.name || '').trim()) || (String(nodeObj.display_ip || '').trim()) || ('节点-' + String(nodeObj.id));
-  confirmAndRemoveNode(nodeObj.id, label);
-}
-
-window.openEditNodeFromSidebar = openEditNodeFromSidebar;
-window.removeNodeFromSidebar = removeNodeFromSidebar;
-
-
-
-
 // ---------------- Node: Edit Node Modal ----------------
 function openEditNodeModal(nodeObj){
   const m = document.getElementById('editNodeModal');

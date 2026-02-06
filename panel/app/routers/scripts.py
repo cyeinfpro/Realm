@@ -67,7 +67,7 @@ exit 1
     api_key = str(node.get("api_key"))
     agent_port = int(node.get("agent_port") or DEFAULT_AGENT_PORT)
     agent_sh_url, repo_zip_url, github_only = agent_asset_urls(base_url)
-    gh_only_env = "  REALM_AGENT_GITHUB_ONLY=1 \\\n" if github_only else ""
+    gh_only_export = "export REALM_AGENT_GITHUB_ONLY=1\n" if github_only else ""
 
     script = f"""#!/usr/bin/env bash
 set -euo pipefail
@@ -79,7 +79,7 @@ API_KEY=\"{api_key}\"
 if [[ \"$(id -u)\" -ne 0 ]]; then
   if command -v sudo >/dev/null 2>&1; then
     echo \"[提示] 需要 root，自动尝试 sudo...\" >&2
-    exec sudo -E bash -c \"curl -fL --retry 2 --retry-all-errors --connect-timeout 8 -H \\\"X-Join-Token: {api_key}\\\" \\\"$PANEL_URL/join\\\" | bash\"
+    exec sudo -E bash -c \"curl -fL --retry 5 --retry-all-errors --connect-timeout 10 -H \\\"X-Join-Token: {api_key}\\\" \\\"$PANEL_URL/join\\\" -o /tmp/realm-join.sh && bash /tmp/realm-join.sh && rm -f /tmp/realm-join.sh\"
   fi
   echo \"[错误] 需要 root 权限运行，但系统未安装 sudo。请切换到 root 后重试（sudo -i / su -）。\" >&2
   exit 1
@@ -92,16 +92,19 @@ echo \"$API_KEY\" > /etc/realm-agent/api.key
 chmod 600 /etc/realm-agent/api.key 2>/dev/null || true
 
 echo \"[提示] 正在安装/更新 Realm Agent…\" >&2
-curl -fL --retry 2 --retry-all-errors --connect-timeout 8 \"{agent_sh_url}\" | \
-{gh_only_env}  REALM_AGENT_REPO_ZIP_URL=\"{repo_zip_url}\" \
-  REALM_AGENT_FORCE_UPDATE=1 \
-  REALM_AGENT_MODE=1 \
-  REALM_AGENT_PORT={agent_port} \
-  REALM_AGENT_ASSUME_YES=1 \
-  REALM_PANEL_URL=\"$PANEL_URL\" \
-  REALM_AGENT_ID=\"$NODE_ID\" \
-  REALM_AGENT_HEARTBEAT_INTERVAL=3 \
-  bash
+INSTALLER_PATH=\"/tmp/realm-agent-installer-${{NODE_ID}}.sh\"
+curl -fL --retry 5 --retry-all-errors --connect-timeout 10 \"{agent_sh_url}\" -o \"$INSTALLER_PATH\"
+chmod 700 \"$INSTALLER_PATH\" 2>/dev/null || true
+{gh_only_export}export REALM_AGENT_REPO_ZIP_URL=\"{repo_zip_url}\"
+export REALM_AGENT_FORCE_UPDATE=1
+export REALM_AGENT_MODE=1
+export REALM_AGENT_PORT={agent_port}
+export REALM_AGENT_ASSUME_YES=1
+export REALM_PANEL_URL=\"$PANEL_URL\"
+export REALM_AGENT_ID=\"$NODE_ID\"
+export REALM_AGENT_HEARTBEAT_INTERVAL=3
+bash \"$INSTALLER_PATH\"
+rm -f \"$INSTALLER_PATH\" || true
 """
     return PlainTextResponse(script, media_type="text/plain; charset=utf-8")
 
@@ -130,7 +133,7 @@ PANEL_URL=\"{base_url}\"
 if [[ \"$(id -u)\" -ne 0 ]]; then
   if command -v sudo >/dev/null 2>&1; then
     echo \"[提示] 需要 root，自动尝试 sudo...\" >&2
-    exec sudo -E bash -c \"curl -fL --retry 2 --retry-all-errors --connect-timeout 8 -H \\\"X-Join-Token: {api_key}\\\" \\\"$PANEL_URL/uninstall\\\" | bash\"
+    exec sudo -E bash -c \"curl -fL --retry 5 --retry-all-errors --connect-timeout 10 -H \\\"X-Join-Token: {api_key}\\\" \\\"$PANEL_URL/uninstall\\\" -o /tmp/realm-uninstall.sh && bash /tmp/realm-uninstall.sh && rm -f /tmp/realm-uninstall.sh\"
   fi
   echo \"[错误] 需要 root 权限运行，但系统未安装 sudo。请切换到 root 后重试（sudo -i / su -）。\" >&2
   exit 1
