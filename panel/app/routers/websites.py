@@ -127,6 +127,138 @@ def _node_root_base(node: Dict[str, Any]) -> str:
     return str(node.get("website_root_base") or "").strip()
 
 
+def _default_nginx_template(site_type: str) -> str:
+    st = str(site_type or "static").strip().lower()
+    if st == "reverse_proxy":
+        return """server {
+  listen 80;
+  server_name {{SERVER_NAME}};
+  {{GZIP_CONF}}
+
+  location ^~ /.well-known/acme-challenge/ {
+    root {{ACME_ROOT}};
+    default_type "text/plain";
+    try_files $uri =404;
+  }
+
+  location / {
+    proxy_pass {{PROXY_TARGET}};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}
+
+# Optional: enable 443 block after certificate is ready.
+# server {
+#   listen 443 ssl http2;
+#   server_name {{SERVER_NAME}};
+#   ssl_certificate {{SSL_CERT}};
+#   ssl_certificate_key {{SSL_KEY}};
+#   {{GZIP_CONF}}
+#   location ^~ /.well-known/acme-challenge/ {
+#     root {{ACME_ROOT}};
+#     default_type "text/plain";
+#     try_files $uri =404;
+#   }
+#   location / {
+#     proxy_pass {{PROXY_TARGET}};
+#     proxy_set_header Host $host;
+#     proxy_set_header X-Real-IP $remote_addr;
+#     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+#     proxy_set_header X-Forwarded-Proto $scheme;
+#   }
+# }
+"""
+    if st == "php":
+        return """server {
+  listen 80;
+  server_name {{SERVER_NAME}};
+  root {{ROOT_PATH}};
+  index index.php index.html index.htm;
+  {{GZIP_CONF}}
+
+  location ^~ /.well-known/acme-challenge/ {
+    root {{ACME_ROOT}};
+    default_type "text/plain";
+    try_files $uri =404;
+  }
+
+  location / {
+    try_files $uri $uri/ /index.php?$args;
+  }
+
+  location ~ \\.php$ {
+    include fastcgi_params;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    fastcgi_pass unix:/run/php/php-fpm.sock;
+  }
+}
+
+# Optional: enable 443 block after certificate is ready.
+# server {
+#   listen 443 ssl http2;
+#   server_name {{SERVER_NAME}};
+#   root {{ROOT_PATH}};
+#   ssl_certificate {{SSL_CERT}};
+#   ssl_certificate_key {{SSL_KEY}};
+#   index index.php index.html index.htm;
+#   {{GZIP_CONF}}
+#   location ^~ /.well-known/acme-challenge/ {
+#     root {{ACME_ROOT}};
+#     default_type "text/plain";
+#     try_files $uri =404;
+#   }
+#   location / {
+#     try_files $uri $uri/ /index.php?$args;
+#   }
+#   location ~ \\.php$ {
+#     include fastcgi_params;
+#     fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+#     fastcgi_pass unix:/run/php/php-fpm.sock;
+#   }
+# }
+"""
+    return """server {
+  listen 80;
+  server_name {{SERVER_NAME}};
+  root {{ROOT_PATH}};
+  index index.html index.htm;
+  {{GZIP_CONF}}
+
+  location ^~ /.well-known/acme-challenge/ {
+    root {{ACME_ROOT}};
+    default_type "text/plain";
+    try_files $uri =404;
+  }
+
+  location / {
+    try_files $uri $uri/ =404;
+  }
+}
+
+# Optional: enable 443 block after certificate is ready.
+# server {
+#   listen 443 ssl http2;
+#   server_name {{SERVER_NAME}};
+#   root {{ROOT_PATH}};
+#   ssl_certificate {{SSL_CERT}};
+#   ssl_certificate_key {{SSL_KEY}};
+#   index index.html index.htm;
+#   {{GZIP_CONF}}
+#   location ^~ /.well-known/acme-challenge/ {
+#     root {{ACME_ROOT}};
+#     default_type "text/plain";
+#     try_files $uri =404;
+#   }
+#   location / {
+#     try_files $uri $uri/ =404;
+#   }
+# }
+"""
+
+
 @router.get("/websites", response_class=HTMLResponse)
 async def websites_index(request: Request, user: str = Depends(require_login_page)):
     nodes = [n for n in list_nodes() if str(n.get("role") or "") == "website"]
@@ -419,6 +551,7 @@ async def website_edit(request: Request, site_id: int, user: str = Depends(requi
             "title": f"编辑 · {site.get('name') or (site.get('domains') or ['站点'])[0]}",
             "site": site_view,
             "node": node,
+            "default_nginx_tpl": _default_nginx_template(site.get("type") or "static"),
         },
     )
 

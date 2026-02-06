@@ -32,18 +32,7 @@
     <span class="pill xs ghost">ID #{{ site.id }}</span>
   </div>
 
-  <details class="advanced-details" style="margin-top:12px;">
-    <summary>改动影响与提示</summary>
-    <div class="advanced-body">
-      <ul class="muted" style="margin:0;padding-left:18px;line-height:1.6;">
-        <li>域名变更后，旧证书可能不再匹配；请到 “SSL” 重新申请/续期。</li>
-        <li>反向代理模式下，系统会自动放行 <span class="mono">/.well-known/acme-challenge/</span> 以保证证书校验。</li>
-        <li>若使用自定义模板，请自行保证 challenge 可访问，否则 SSL 申请会失败。</li>
-      </ul>
-    </div>
-  </details>
-
-  <form method="post" action="/websites/{{ site.id }}/edit" class="form" style="margin-top:12px;">
+  <form method="post" action="/websites/{{ site.id }}/edit" class="form" style="margin-top:12px;" id="siteEditForm">
       <div class="form-section">
         <div class="section-head">
           <div>
@@ -118,7 +107,7 @@
               <span class="mono">{{'{{'}}SSL_CERT{{'}}'}}</span>、<span class="mono">{{'{{'}}SSL_KEY{{'}}'}}</span>、<span class="mono">{{'{{'}}GZIP_CONF{{'}}'}}</span>、
               <span class="mono">{{'{{'}}ACME_ROOT{{'}}'}}</span>
             </div>
-            <textarea class="textarea mono" name="nginx_tpl" rows="12" placeholder="# 留空则使用内置模板">{{ site.nginx_tpl or '' }}</textarea>
+            <textarea class="textarea mono" name="nginx_tpl" id="nginxTplInput" rows="16" placeholder="# 留空则使用内置模板">{{ site.nginx_tpl or default_nginx_tpl }}</textarea>
             <div class="help">提示：请确保 <span class="mono">/.well-known/acme-challenge/</span> 可被访问，否则 SSL 申请会失败。</div>
           </div>
         </details>
@@ -141,6 +130,10 @@
   const sel = document.getElementById('site_type');
   const rootRow = document.getElementById('root_row');
   const proxyRow = document.getElementById('proxy_row');
+  const formEl = document.getElementById('siteEditForm');
+  const tplEl = document.getElementById('nginxTplInput');
+  const hadCustomTpl = {{ 'true' if site.nginx_tpl else 'false' }};
+  const defaultTpl = {{ default_nginx_tpl|tojson }};
 
   function toggle(){
     const t = (sel && sel.value) || 'static';
@@ -154,6 +147,15 @@
   }
   if(sel){
     sel.addEventListener('change', toggle);
+  }
+  if(formEl && tplEl){
+    formEl.addEventListener('submit', function(){
+      // If this site originally had no custom template and user didn't modify
+      // the prefilled default reference, keep it empty to continue using built-in behavior.
+      if(!hadCustomTpl && tplEl.value === defaultTpl){
+        tplEl.value = '';
+      }
+    });
   }
   toggle();
 })();

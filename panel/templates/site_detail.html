@@ -23,7 +23,7 @@
 
 {% include "site_nav.html" %}
 
-<div class="site-layout">
+<div class="site-layout site-layout-detail">
   <div class="site-stack">
     <div class="card compact">
       <div class="section-head">
@@ -98,20 +98,20 @@
         <div class="muted" style="margin-top:10px;">暂无证书，可点击上方“申请 SSL”。</div>
       {% endif %}
     </div>
-  </div>
-</div>
 
-<div class="card compact" id="danger" style="margin-top:12px;">
-  <div class="section-head">
-    <div>
-      <div class="section-title">风险操作</div>
-      <div class="section-sub">删除站点会移除面板记录，可选清理节点文件与证书。</div>
+    <div class="card compact site-danger-card" id="danger">
+      <div class="section-head">
+        <div>
+          <div class="section-title">风险操作</div>
+          <div class="section-sub">删除站点会移除面板记录，可选清理节点文件与证书。</div>
+        </div>
+      </div>
+      <form method="post" action="/websites/{{ site.id }}/delete" class="form" onsubmit="return confirm('确定删除该站点吗？');">
+        <label class="help"><input type="checkbox" name="delete_files" style="transform:translateY(1px);"> 删除站点目录数据</label>
+        <label class="help"><input type="checkbox" name="delete_cert" style="transform:translateY(1px);"> 删除证书文件</label>
+        <button class="btn sm danger" type="submit">删除站点</button>
+      </form>
     </div>
   </div>
-  <form method="post" action="/websites/{{ site.id }}/delete" class="form" onsubmit="return confirm('确定删除该站点吗？');">
-    <label class="help"><input type="checkbox" name="delete_files" style="transform:translateY(1px);"> 删除站点目录数据</label>
-    <label class="help"><input type="checkbox" name="delete_cert" style="transform:translateY(1px);"> 删除证书文件</label>
-    <button class="btn sm danger" type="submit" style="margin-top:8px;">删除站点</button>
-  </form>
 </div>
 {% endblock %}
