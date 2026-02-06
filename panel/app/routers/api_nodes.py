@@ -716,14 +716,14 @@ async def _build_full_backup_bundle(request: Request, progress_callback: Any = N
         z.writestr("backup_meta.json", json.dumps(meta_payload, ensure_ascii=False, indent=2))
         z.writestr(
             "README.txt",
-            "Realm 全量备份说明\n\n"
+            "Nexus 全量备份说明\n\n"
             "1) 恢复节点列表：登录面板 → 控制台 → 点击『恢复节点列表』，上传本压缩包（或解压后的 nodes.json）。\n"
             "2) 全量恢复：控制台 → 全量恢复，自动恢复 nodes/rules/websites/certificates/netmon。\n"
             "3) 网站文件已打包在 websites/files/ 目录，恢复时会按站点映射自动回传到节点。\n"
             "4) 恢复单节点规则：进入节点页面 → 更多 → 恢复规则，把 rules/ 目录下对应节点的规则文件上传/粘贴即可。\n",
         )
 
-    filename = f"realm-backup-{ts}.zip"
+    filename = f"nexus-backup-{ts}.zip"
     content = buf.getvalue()
     await _emit_backup_progress(
         progress_callback,
@@ -817,7 +817,7 @@ async def api_backup(request: Request, node_id: int, user: str = Depends(require
 async def api_backup_full(request: Request, user: str = Depends(require_login)):
     """Direct download full backup zip (legacy one-shot behavior)."""
     bundle = await _build_full_backup_bundle(request)
-    filename = str(bundle.get("filename") or f"realm-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip")
+    filename = str(bundle.get("filename") or f"nexus-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip")
     content = bytes(bundle.get("content") or b"")
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return Response(content=content, media_type="application/zip", headers=headers)
@@ -938,7 +938,7 @@ async def api_backup_full_download(job_id: str = "", user: str = Depends(require
         return JSONResponse({"ok": False, "error": "备份尚未完成，请稍候再试"}, status_code=409)
 
     if not filename:
-        filename = f"realm-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+        filename = f"nexus-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return Response(content=content, media_type="application/zip", headers=headers)
 
@@ -1094,7 +1094,7 @@ async def api_restore_full(
         return JSONResponse({"ok": False, "error": f"读取文件失败：{exc}"}, status_code=400)
 
     if not raw or raw[:2] != b"PK":
-        return JSONResponse({"ok": False, "error": "请上传 realm-backup-*.zip（全量备份包）"}, status_code=400)
+        return JSONResponse({"ok": False, "error": "请上传 nexus-backup-*.zip（兼容旧版备份包）"}, status_code=400)
 
     try:
         z = zipfile.ZipFile(io.BytesIO(raw))

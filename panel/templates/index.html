@@ -331,26 +331,49 @@
 </div>
 
 <div id="restoreFullModal" class="modal" style="display:none;">
-  <div class="modal-inner" style="max-width:560px;">
-    <div class="row" style="align-items:center;">
-      <div class="col"><div class="h2">全量恢复（节点 + 规则 + 站点）</div></div>
-      <div class="col right"><button class="btn xs ghost" type="button" onclick="closeRestoreFullModal()">关闭</button></div>
+  <div class="modal-inner modal-pro restore-full-modal">
+    <div class="modal-head">
+      <div class="title-wrap">
+        <div class="h2">全量恢复</div>
+        <div class="muted sm">恢复节点、规则、网站配置与网站文件、证书、网络波动配置。</div>
+      </div>
+      <button class="btn xs ghost" type="button" onclick="closeRestoreFullModal()">关闭</button>
     </div>
 
-    <p class="muted" style="margin-top:8px;">
-      上传 <span class="mono">realm-backup-*.zip</span>（全量备份包）。系统将自动：
-      <span class="mono">1)</span> 恢复节点列表；<span class="mono">2)</span> 按节点恢复 <span class="mono">rules/</span> 规则；
-      <span class="mono">3)</span> 恢复网站配置与网站文件；<span class="mono">4)</span> 恢复证书与网络波动配置。
-      若节点暂时离线，将先写入面板期望配置，待 Agent 上报后自动生效。
-    </p>
+    <div class="modal-body">
+      <div class="card compact">
+        <label class="label">选择全量备份包（zip）</label>
+        <input class="input" type="file" id="restoreFullFile" accept=".zip,application/zip">
+        <div class="muted sm" style="margin-top:8px;">
+          推荐上传 <span class="mono">nexus-backup-*.zip</span>（兼容旧版备份包）。
+        </div>
+        <div id="restoreFullError" class="restore-full-error"></div>
+        <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
+          <button class="btn xs ghost" type="button" onclick="closeRestoreFullModal()">取消</button>
+          <button class="btn xs" id="restoreFullSubmit" type="button" onclick="restoreFullNow()">开始恢复</button>
+        </div>
+      </div>
 
-    <div class="form" style="margin-top:10px;">
-      <label class="label">选择全量备份包（zip）</label>
-      <input class="input" type="file" id="restoreFullFile" accept=".zip,application/zip">
-      <div id="restoreFullError" class="muted" style="margin-top:8px;color:var(--bad);white-space:pre-wrap;"></div>
-      <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
-        <button class="btn xs ghost" type="button" onclick="closeRestoreFullModal()">取消</button>
-        <button class="btn xs" id="restoreFullSubmit" type="button" onclick="restoreFullNow()">开始恢复</button>
+      <div class="card compact" style="margin-top:10px;">
+        <div class="row" style="align-items:center;gap:10px;">
+          <div class="col">
+            <div class="h2" id="restoreFullStage">等待开始</div>
+            <div class="muted sm" id="restoreFullProgressText">进度 0%</div>
+          </div>
+        </div>
+        <div class="au-progress" style="margin-top:10px;">
+          <div class="au-progress-fill" id="restoreFullBar" style="width:0%"></div>
+        </div>
+      </div>
+
+      <div class="card compact" style="margin-top:10px;">
+        <div class="h2">执行步骤</div>
+        <div class="backup-full-steps" id="restoreFullSteps"></div>
+      </div>
+
+      <div class="card compact" style="margin-top:10px;">
+        <div class="h2">恢复结果</div>
+        <pre class="restore-full-summary mono" id="restoreFullSummary">等待恢复完成…</pre>
       </div>
     </div>
   </div>
@@ -359,5 +382,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=74.0"></script>
+<script src="/static/app.js?v=75.0"></script>
 {% endblock %}

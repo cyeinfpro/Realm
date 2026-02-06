@@ -6061,7 +6061,7 @@ async function downloadFullBackupResult(){
       toast(msg, true);
       return;
     }
-    const filename = _extractDownloadFilename(r.headers.get('Content-Disposition') || '', `realm-backup-${Date.now()}.zip`);
+    const filename = _extractDownloadFilename(r.headers.get('Content-Disposition') || '', `nexus-backup-${Date.now()}.zip`);
     _downloadBlobFile(blob, filename);
     if(errEl){
       errEl.style.color = 'var(--ok)';
@@ -6087,17 +6087,122 @@ async function downloadFullBackupResult(){
   }
 }
 
+let __RESTORE_FULL_TIMER__ = null;
+let __RESTORE_FULL_PROGRESS__ = 0;
+let __RESTORE_FULL_STEPS__ = [];
+
+function _restoreFullStepsTemplate(){
+  return [
+    { key: 'upload', label: '上传备份包', status: 'pending', detail: '' },
+    { key: 'parse', label: '解析备份包', status: 'pending', detail: '' },
+    { key: 'rules', label: '恢复节点与规则', status: 'pending', detail: '' },
+    { key: 'sites_files', label: '恢复网站与文件', status: 'pending', detail: '' },
+    { key: 'certs_netmon', label: '恢复证书与网络波动', status: 'pending', detail: '' },
+    { key: 'finalize', label: '收尾与校验', status: 'pending', detail: '' },
+  ];
+}
+
+function _renderRestoreFullSteps(){
+  const box = document.getElementById('restoreFullSteps');
+  if(!box) return;
+  const stText = { pending: '待处理', running: '进行中', done: '已完成', failed: '失败' };
+  const arr = Array.isArray(__RESTORE_FULL_STEPS__) ? __RESTORE_FULL_STEPS__ : [];
+  box.innerHTML = arr.map((s)=>{
+    const key = String(s && s.key ? s.key : '').trim();
+    const label = escapeHtml(String(s && s.label ? s.label : key || '步骤'));
+    const detail = escapeHtml(String(s && s.detail ? s.detail : ''));
+    const status = String(s && s.status ? s.status : 'pending').trim() || 'pending';
+    const cls = ['pending', 'running', 'done', 'failed'].includes(status) ? status : 'pending';
+    return (
+      `<div class="backup-full-step ${cls}">` +
+        `<div class="left">` +
+          `<span class="label">${label}</span>` +
+          (detail ? `<span class="detail mono">${detail}</span>` : '') +
+        `</div>` +
+        `<span class="status">${stText[status] || escapeHtml(status)}</span>` +
+      `</div>`
+    );
+  }).join('');
+}
+
+function _setRestoreFullStep(key, status, detail){
+  const arr = Array.isArray(__RESTORE_FULL_STEPS__) ? __RESTORE_FULL_STEPS__ : [];
+  for(const s of arr){
+    if(String(s.key || '') === String(key || '')){
+      if(status) s.status = String(status);
+      if(detail !== undefined) s.detail = String(detail || '');
+      break;
+    }
+  }
+}
+
+function _syncRestoreFullProgress(progress, stage){
+  const p = Math.max(0, Math.min(100, Number(progress || 0)));
+  __RESTORE_FULL_PROGRESS__ = p;
+  const bar = document.getElementById('restoreFullBar');
+  const ptx = document.getElementById('restoreFullProgressText');
+  const stg = document.getElementById('restoreFullStage');
+  if(bar) bar.style.width = `${p}%`;
+  if(ptx) ptx.textContent = `进度 ${Math.round(p)}%`;
+  if(stg && stage) stg.textContent = String(stage);
+}
+
+function _restorePseudoStepFromProgress(p){
+  if(p < 15) return { key: 'upload', stage: '上传备份包中…' };
+  if(p < 30) return { key: 'parse', stage: '解析备份包…' };
+  if(p < 50) return { key: 'rules', stage: '恢复节点与规则…' };
+  if(p < 72) return { key: 'sites_files', stage: '恢复网站配置与文件…' };
+  if(p < 88) return { key: 'certs_netmon', stage: '恢复证书与网络波动…' };
+  return { key: 'finalize', stage: '收尾与校验…' };
+}
+
+function _tickRestoreFullProgress(){
+  if(__RESTORE_FULL_PROGRESS__ >= 94) return;
+  const base = __RESTORE_FULL_PROGRESS__;
+  const bump = base < 50 ? (1 + Math.random() * 2.2) : (0.6 + Math.random() * 1.4);
+  const next = Math.min(94, base + bump);
+  const now = _restorePseudoStepFromProgress(next);
+  const order = ['upload', 'parse', 'rules', 'sites_files', 'certs_netmon', 'finalize'];
+  const idx = order.indexOf(now.key);
+  for(let i=0; i<order.length; i++){
+    const k = order[i];
+    if(i < idx) _setRestoreFullStep(k, 'done');
+    else if(i === idx) _setRestoreFullStep(k, 'running');
+    else _setRestoreFullStep(k, 'pending');
+  }
+  _syncRestoreFullProgress(next, now.stage);
+  _renderRestoreFullSteps();
+}
+
+function _stopRestoreFullTimer(){
+  if(__RESTORE_FULL_TIMER__){
+    clearInterval(__RESTORE_FULL_TIMER__);
+    __RESTORE_FULL_TIMER__ = null;
+  }
+}
+
+function _resetRestoreFullUI(){
+  __RESTORE_FULL_PROGRESS__ = 0;
+  __RESTORE_FULL_STEPS__ = _restoreFullStepsTemplate();
+  _renderRestoreFullSteps();
+  _syncRestoreFullProgress(0, '等待开始');
+  const summary = document.getElementById('restoreFullSummary');
+  if(summary) summary.textContent = '等待恢复完成…';
+  const err = document.getElementById('restoreFullError');
+  if(err){
+    err.style.color = 'var(--bad)';
+    err.textContent = '';
+  }
+}
+
 function openRestoreFullModal(){
   const m = document.getElementById('restoreFullModal');
   if(!m) return;
   m.style.display = 'flex';
   const input = document.getElementById('restoreFullFile');
   if(input) input.value = '';
-  const err = document.getElementById('restoreFullError');
-  if(err){
-    err.style.color = 'var(--bad)';
-    err.textContent = '';
-  }
+  _stopRestoreFullTimer();
+  _resetRestoreFullUI();
   const btn = document.getElementById('restoreFullSubmit');
   if(btn){ btn.disabled = false; btn.textContent = '开始恢复'; }
 }
@@ -6106,12 +6211,14 @@ function closeRestoreFullModal(){
   const m = document.getElementById('restoreFullModal');
   if(!m) return;
   m.style.display = 'none';
+  _stopRestoreFullTimer();
 }
 
 async function restoreFullNow(){
   const fileInput = document.getElementById('restoreFullFile');
   const err = document.getElementById('restoreFullError');
   const btn = document.getElementById('restoreFullSubmit');
+  const summaryEl = document.getElementById('restoreFullSummary');
   try{
     if(err){
       err.style.color = 'var(--bad)';
@@ -6119,27 +6226,45 @@ async function restoreFullNow(){
     }
     const f = fileInput && fileInput.files ? fileInput.files[0] : null;
     if(!f){
-      if(err) err.textContent = '请选择 realm-backup-*.zip 全量备份包';
+      if(err) err.textContent = '请选择 nexus-backup-*.zip 全量备份包';
       return;
     }
+    _stopRestoreFullTimer();
+    _resetRestoreFullUI();
+    _setRestoreFullStep('upload', 'running', '上传中');
+    _renderRestoreFullSteps();
+    _syncRestoreFullProgress(6, '上传备份包中…');
     if(btn){ btn.disabled = true; btn.textContent = '恢复中…'; }
+    __RESTORE_FULL_TIMER__ = setInterval(_tickRestoreFullProgress, 480);
     const fd = new FormData();
     fd.append('file', f);
     const resp = await fetch('/api/restore/full', { method: 'POST', body: fd, credentials: 'include' });
     const data = await resp.json().catch(()=>({ ok:false, error: '接口返回异常' }));
     if(!resp.ok || !data.ok){
+      _stopRestoreFullTimer();
+      const now = _restorePseudoStepFromProgress(__RESTORE_FULL_PROGRESS__);
+      _setRestoreFullStep(now.key, 'failed', '执行失败');
+      _renderRestoreFullSteps();
       const msg = data.error || ('恢复失败（HTTP ' + resp.status + '）');
       if(err) err.textContent = msg;
+      if(summaryEl) summaryEl.textContent = `恢复失败：${msg}`;
       toast(msg, true);
       return;
     }
+    _stopRestoreFullTimer();
+    const order = ['upload', 'parse', 'rules', 'sites_files', 'certs_netmon', 'finalize'];
+    for(const k of order) _setRestoreFullStep(k, 'done');
+    _setRestoreFullStep('finalize', 'done', '恢复完成');
+    _renderRestoreFullSteps();
+    _syncRestoreFullProgress(100, '恢复完成');
+
     const nodes = data && data.nodes ? data.nodes : {};
     const rules = data && data.rules ? data.rules : {};
     const sites = data && data.sites ? data.sites : {};
     const siteFiles = data && data.site_files ? data.site_files : {};
     const certs = data && data.certificates ? data.certificates : {};
     const netmon = data && data.netmon ? data.netmon : {};
-    const summary =
+    const summaryText =
       `节点 新增 ${Number(nodes.added||0)} / 更新 ${Number(nodes.updated||0)} / 跳过 ${Number(nodes.skipped||0)}\n` +
       `规则 恢复 ${Number(rules.restored||0)} / 未匹配 ${Number(rules.unmatched||0)} / 失败 ${Number(rules.failed||0)}\n` +
       `站点 新增 ${Number(sites.added||0)} / 更新 ${Number(sites.updated||0)} / 跳过 ${Number(sites.skipped||0)}\n` +
@@ -6148,8 +6273,9 @@ async function restoreFullNow(){
       `网络波动 新增 ${Number(netmon.added||0)} / 更新 ${Number(netmon.updated||0)} / 跳过 ${Number(netmon.skipped||0)}`;
     if(err){
       err.style.color = 'var(--ok)';
-      err.textContent = `全量恢复成功。\n${summary}\n页面将在 2 秒后刷新。`;
+      err.textContent = '全量恢复成功，页面将在 2 秒后刷新。';
     }
+    if(summaryEl) summaryEl.textContent = summaryText;
     toast('全量恢复成功');
     if(btn){ btn.textContent = '恢复完成'; }
     setTimeout(()=>{
@@ -6157,8 +6283,13 @@ async function restoreFullNow(){
       window.location.reload();
     }, 2000);
   }catch(e){
+    _stopRestoreFullTimer();
+    const now = _restorePseudoStepFromProgress(__RESTORE_FULL_PROGRESS__);
+    _setRestoreFullStep(now.key, 'failed', '执行异常');
+    _renderRestoreFullSteps();
     const msg = (e && e.message) ? e.message : String(e || '恢复失败');
     if(err) err.textContent = msg;
+    if(summaryEl) summaryEl.textContent = `恢复失败：${msg}`;
     toast(msg, true);
   }finally{
     if(btn && btn.textContent !== '恢复完成'){
