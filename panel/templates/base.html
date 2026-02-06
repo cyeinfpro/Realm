@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0B0F14">
   <title>{% if title %}{{ title }} · Nexus Network Control Plane{% else %}Nexus Network Control Plane{% endif %}</title>
   <link rel="icon" type="image/svg+xml" href="/static/nexus.svg">
-  <link rel="stylesheet" href="/static/style.css?v=66.0">
+  <link rel="stylesheet" href="/static/style.css?v=67.0">
 </head>
 <body>
   <!-- Flowing background (fixed, no seams on scroll) -->
@@ -82,6 +82,156 @@
       </div>
     </div>
   </div>
+
+  <!-- Unified menu positioning (prevents popovers from going off-screen) -->
+  <script>
+  (function(){
+    function pxVar(name){
+      try{
+        var v = getComputedStyle(document.documentElement).getPropertyValue(name || '').trim();
+        if(!v) return 0;
+        if(v.endsWith('px')) return parseFloat(v) || 0;
+        var n = parseFloat(v);
+        return Number.isFinite(n) ? n : 0;
+      }catch(e){
+        return 0;
+      }
+    }
+
+    function resetMenuInlineStyle(d){
+      try{
+        if(!d) return;
+        var pop = d.querySelector && d.querySelector('.menu-pop');
+        if(!pop) return;
+        pop.style.left = '';
+        pop.style.top = '';
+        pop.style.right = '';
+        pop.style.bottom = '';
+        pop.style.maxHeight = '';
+      }catch(_e){}
+    }
+
+    function closeAllMenus(except){
+      try{
+        document.querySelectorAll('details.menu[open]').forEach(function(d){
+          if(except && d === except) return;
+          d.removeAttribute('open');
+          d.classList.remove('menu-float','menu-sheet');
+          resetMenuInlineStyle(d);
+        });
+      }catch(_e){}
+    }
+
+    function shouldUseSheet(){
+      try{
+        var mq = window.matchMedia;
+        if(mq && mq('(max-width: 640px)').matches) return true;
+        // Landscape phones / small-height viewports
+        if(mq && mq('(max-height: 560px)').matches) return true;
+        // Touch devices (e.g., tablets) benefit from a bottom sheet
+        if(mq && mq('(pointer: coarse)').matches && mq('(max-width: 980px)').matches) return true;
+      }catch(_e){}
+      return false;
+    }
+
+    function positionMenu(detailsEl){
+      try{
+        if(!detailsEl || !detailsEl.open) return;
+        var pop = detailsEl.querySelector && detailsEl.querySelector('.menu-pop');
+        // `:scope` is not supported in some very old browsers; fallback to the first <summary>
+        var sum = (detailsEl.querySelector && (detailsEl.querySelector(':scope > summary') || detailsEl.querySelector('summary')));
+        if(!pop || !sum) return;
+
+        var vw = Math.max(320, window.innerWidth || document.documentElement.clientWidth || 0);
+        var vh = Math.max(320, window.innerHeight || document.documentElement.clientHeight || 0);
+        var margin = 10;
+        var safeTop = pxVar('--safe-top');
+        var safeBottom = pxVar('--safe-bottom');
+
+        // Measure after open (offset sizes are stable regardless of current position)
+        resetMenuInlineStyle(detailsEl);
+        var popW = pop.offsetWidth || 200;
+        var popH = pop.offsetHeight || 120;
+        var r = sum.getBoundingClientRect();
+
+        var spaceDown = (vh - safeBottom) - (r.bottom + margin);
+        var spaceUp = (r.top - safeTop) - margin;
+
+        // If viewport is too tight, force sheet mode (never off-screen)
+        var tooTight = Math.max(spaceDown, spaceUp) < 180;
+        if(shouldUseSheet() || tooTight){
+          detailsEl.classList.remove('menu-float');
+          detailsEl.classList.add('menu-sheet');
+          resetMenuInlineStyle(detailsEl);
+          return;
+        }
+
+        detailsEl.classList.remove('menu-sheet');
+        detailsEl.classList.add('menu-float');
+
+        var openUp = (spaceDown < popH + 12) && (spaceUp > spaceDown);
+        var top = openUp ? (r.top - popH - 8) : (r.bottom + 8);
+        var maxH = openUp ? spaceUp : spaceDown;
+        maxH = Math.max(140, Math.min(maxH, vh - safeTop - safeBottom - 24));
+
+        // Align right edge with summary button by default
+        var left = r.right - popW;
+        left = Math.max(margin, Math.min(left, vw - popW - margin));
+
+        // Clamp vertical position
+        top = Math.max(safeTop + margin, Math.min(top, vh - safeBottom - 140));
+
+        pop.style.left = left + 'px';
+        pop.style.top = top + 'px';
+        pop.style.right = 'auto';
+        pop.style.bottom = 'auto';
+        pop.style.maxHeight = maxH + 'px';
+      }catch(_e){}
+    }
+
+    var raf = null;
+    function requestReposition(){
+      if(raf) return;
+      raf = requestAnimationFrame(function(){
+        raf = null;
+        try{
+          document.querySelectorAll('details.menu[open]').forEach(function(d){ positionMenu(d); });
+        }catch(_e){}
+      });
+    }
+
+    // When a menu opens, close others and position it within viewport
+    document.addEventListener('toggle', function(e){
+      var t = e.target;
+      if(!(t instanceof HTMLElement)) return;
+      if(t.matches && t.matches('details.menu') && t.open){
+        closeAllMenus(t);
+        setTimeout(function(){ positionMenu(t); }, 0);
+      }
+      if(t.matches && t.matches('details.menu') && !t.open){
+        try{ t.classList.remove('menu-float','menu-sheet'); }catch(_e){}
+        resetMenuInlineStyle(t);
+      }
+    }, true);
+
+    // Click outside to close menus
+    document.addEventListener('click', function(e){
+      var inPop = e.target && e.target.closest && e.target.closest('details.menu .menu-pop');
+      var inSummary = e.target && e.target.closest && e.target.closest('details.menu > summary');
+      if(inPop || inSummary) return;
+      closeAllMenus(null);
+    }, true);
+
+    // ESC to close
+    document.addEventListener('keydown', function(e){
+      if(e && e.key === 'Escape') closeAllMenus(null);
+    }, true);
+
+    // Keep popovers inside viewport on resize/scroll
+    window.addEventListener('resize', requestReposition, true);
+    window.addEventListener('scroll', requestReposition, true);
+  })();
+  </script>
 
   {% block scripts %}{% endblock %}
 </body>

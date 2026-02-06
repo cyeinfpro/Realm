@@ -5986,43 +5986,8 @@ document.addEventListener('click', (e)=>{
   }
 });
 
-// ---------------- Details Menu UX ----------------
-// 目标：
-// 1) 点击页面空白处自动收起所有“更多/操作”菜单
-// 2) 打开一个菜单时，自动关闭其他菜单（避免多个同时展开）
-function closeAllMenus(except){
-  try{
-    document.querySelectorAll('details.menu[open]').forEach((d)=>{
-      if(except && d === except) return;
-      d.removeAttribute('open');
-    });
-  }catch(_e){}
-}
-
-// 当某个 menu 打开时，关掉其它 menu
-document.addEventListener('toggle', (e)=>{
-  const t = e.target;
-  if(!(t instanceof HTMLElement)) return;
-  if(t.matches && t.matches('details.menu') && t.open){
-    closeAllMenus(t);
-  }
-}, true);
-
-// 点击空白区域，关闭所有 menu
-document.addEventListener('click', (e)=>{
-  // NOTE: mobile bottom-sheet menu uses a full-screen overlay via ::before.
-  // Clicking that overlay should close the menu. In that case the event target
-  // is often the <details> itself (because pseudo-elements can't be targeted).
-  const inPop = e.target && e.target.closest && e.target.closest('details.menu .menu-pop');
-  const inSummary = e.target && e.target.closest && e.target.closest('details.menu > summary');
-  if(inPop || inSummary) return;
-  closeAllMenus(null);
-}, true);
-
-// ESC to close any open menus
-document.addEventListener('keydown', (e)=>{
-  if(e && e.key === 'Escape') closeAllMenus(null);
-}, true);
+// NOTE: details.menu UX (close on outside click / prevent off-screen popovers)
+// is implemented globally in base.html so all pages behave consistently.
 
 // Auto-init dashboard mini system info (safe no-op on non-dashboard pages)
 try{ initDashboardMiniSys(); }catch(_e){}

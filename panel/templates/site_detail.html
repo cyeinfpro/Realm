@@ -10,19 +10,21 @@
   {% endif %}
 {% endfor %}
 
-<div class="hero-card">
-  <div class="hero-left">
-    <span class="pill xs ghost">Site</span>
-    <div class="hero-title">{{ site.name }}</div>
-    <div class="hero-sub">节点：{{ node.name if node else "-" }} · 域名：<span class="mono">{{ (site.domains or [])|join(', ') }}</span></div>
-    <div class="hero-metrics">
+<div class="page-head">
+  <div class="page-title">
+    <h1 class="h1">{{ site.name }}</h1>
+    <div class="meta">
+      <span class="meta-item">节点：{{ node.name if node else "-" }}</span>
+      <span class="meta-item">类型：{{ type_map.get(site.type, site.type) }} · {{ site.web_server }}</span>
+    </div>
+    <div class="meta" style="margin-top:8px;flex-wrap:wrap;gap:8px;align-items:flex-start;">
       <span class="pill xs {{ st_class }}">{{ st or 'unknown' }}</span>
-      <span class="pill xs ghost">{{ type_map.get(site.type, site.type) }}</span>
-      <span class="pill xs ghost">{{ site.web_server }}</span>
+      <span class="meta-item">域名：<span class="mono" style="overflow-wrap:anywhere;">{{ (site.domains or [])|join(', ') }}</span></span>
     </div>
   </div>
-  <div class="hero-right">
-    <a class="btn sm primary" href="/websites/{{ site.id }}/edit">编辑站点</a>
+  <div class="right">
+    <a class="btn sm ghost" href="/websites">返回列表</a>
+    <a class="btn sm" href="/websites/{{ site.id }}/edit">编辑</a>
     <details class="menu">
       <summary class="btn sm ghost">操作 ▾</summary>
       <div class="menu-pop">

@@ -3,18 +3,20 @@
 {% set ok = diag.ok if diag is defined else None %}
 {% set okcls = 'ok' if ok else ('bad' if ok is not none else 'ghost') %}
 
-<div class="hero-card">
-  <div class="hero-left">
-    <span class="pill xs ghost">Diagnose</span>
-    <div class="hero-title">站点诊断 · {{ site.name }}</div>
-    <div class="hero-sub">节点：{{ node.name if node else '-' }} · 域名：<span class="mono">{{ (site.domains or [])|join(', ') }}</span></div>
-    <div class="hero-metrics">
+<div class="page-head">
+  <div class="page-title">
+    <h1 class="h1">诊断 · {{ site.name }}</h1>
+    <div class="meta">
+      <span class="meta-item">节点：{{ node.name if node else '-' }}</span>
+      <span class="meta-item">域名：<span class="mono" style="overflow-wrap:anywhere;">{{ (site.domains or [])|join(', ') }}</span></span>
+    </div>
+    <div class="meta" style="margin-top:8px;">
       <span class="pill xs {{ okcls }}">{{ 'ok' if ok else 'fail' if ok is not none else 'unknown' }}</span>
       <span class="pill xs ghost">HTTP {{ diag.status_code or '-' }}</span>
       <span class="pill xs ghost">{{ diag.latency_ms or 0 }} ms</span>
     </div>
   </div>
-  <div class="hero-right">
+  <div class="right">
     <a class="btn sm ghost" href="/websites/{{ site.id }}">返回站点</a>
   </div>
 </div>

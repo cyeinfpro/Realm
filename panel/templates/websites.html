@@ -1,5 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
+
+{# ---- Stats ---- #}
 {% set stats = namespace(running=0, creating=0, error=0, health_fail=0) %}
 {% for s in sites %}
   {% if (s.status or '') == 'running' %}
@@ -14,273 +16,274 @@
   {% endif %}
 {% endfor %}
 
-<div class="hero-card">
-  <div class="hero-left">
-    <span class="pill xs ghost">Website Ops</span>
-    <div class="hero-title">网站管理中心</div>
-    <div class="hero-sub">统一管理站点部署、节点环境、SSL 与文件系统。提供更清晰的入口与更适配移动端的布局。</div>
-    <div class="hero-metrics">
-      <span class="pill">网站机 {{ nodes|length }}</span>
-      <span class="pill">站点 {{ sites|length }}</span>
-      <span class="pill ok">运行中 {{ stats.running }}</span>
-      <span class="pill warn">创建中 {{ stats.creating }}</span>
-      <span class="pill bad">异常 {{ stats.error }}</span>
-      <span class="pill bad">健康异常 {{ stats.health_fail }}</span>
+<div class="page-head">
+  <div class="page-title">
+    <h1 class="h1">网站管理</h1>
+    <div class="meta">
+      <span class="meta-item">站点部署 / SSL / 监测 / 文件，一处集中管理。</span>
+    </div>
+    <div class="meta" style="margin-top:8px;">
+      <span class="pill xs ghost">网站机 <strong>{{ nodes|length }}</strong></span>
+      <span class="pill xs ghost">站点 <strong>{{ sites|length }}</strong></span>
+      <span class="pill xs ok">运行 <strong>{{ stats.running }}</strong></span>
+      <span class="pill xs warn">创建 <strong>{{ stats.creating }}</strong></span>
+      <span class="pill xs bad">异常 <strong>{{ stats.error }}</strong></span>
+      <span class="pill xs bad">健康异常 <strong>{{ stats.health_fail }}</strong></span>
     </div>
   </div>
-  <div class="hero-right">
+  <div class="right">
     <a class="btn sm" href="/websites/new">新建站点</a>
-    <a class="btn sm ghost" href="/nodes">节点管理</a>
+    <details class="menu">
+      <summary class="btn sm ghost" aria-label="更多">更多 ▾</summary>
+      <div class="menu-pop">
+        <a class="menu-item" href="/nodes">节点管理</a>
+        <a class="menu-item" href="/netmon">网络波动监测</a>
+      </div>
+    </details>
   </div>
 </div>
 
-<div class="websites-layout">
-  <!-- Left: website nodes -->
-  <aside class="card websites-side">
-    <div class="section-head">
-      <div>
-        <div class="section-title">网站机节点</div>
-        <div class="section-sub">环境安装/卸载、能力信息与根目录基准。</div>
-      </div>
-      <div class="muted sm">{{ nodes|length }} 台</div>
+{# ---- Sites ---- #}
+{% if sites %}
+  <div class="dashboard-toolbar" id="wmToolbar">
+    <div class="dash-filters" id="wmSiteFilters" role="tablist" aria-label="站点筛选">
+      <button class="chip active" type="button" data-status="all" aria-selected="true">全部 <strong>{{ sites|length }}</strong></button>
+      <button class="chip" type="button" data-status="running">运行 <strong>{{ stats.running }}</strong></button>
+      <button class="chip" type="button" data-status="creating">创建 <strong>{{ stats.creating }}</strong></button>
+      <button class="chip" type="button" data-status="error">异常 <strong>{{ stats.error }}</strong></button>
+      <button class="chip" type="button" id="wmHealthFailChip" data-health="fail">健康异常 <strong>{{ stats.health_fail }}</strong></button>
     </div>
 
-    {% if nodes %}
-      <div style="margin-top:10px;">
-        {% for n in nodes %}
-          <details class="node-acc" {% if loop.first and nodes|length == 1 %}open{% endif %}>
-            <summary>
-              <div class="col">
-                <div class="node-acc-title">{{ n.name }}</div>
-                <div class="node-acc-sub mono">{{ n.base_url }}</div>
-                <div class="node-acc-sub">根目录基准：<span class="mono">{{ n.website_root_base or '/www' }}</span></div>
-              </div>
-              <div class="node-acc-right">
-                <span class="pill xs ghost">{{ (n.capabilities or {})|length }} 项能力</span>
-                <a class="btn xs ghost" href="/nodes/{{ n.id }}" onclick="event.stopPropagation();">详情</a>
-                <span class="pill xs ghost" aria-hidden="true">▾</span>
-              </div>
-            </summary>
-            <div class="node-acc-body">
-              {% if n.capabilities %}
-                <div class="panel-actions" style="margin-top:10px;">
-                  {% for k, v in n.capabilities.items() %}
-                    {% if v %}
-                      <span class="pill xs ghost">{{ k }}</span>
-                    {% endif %}
-                  {% endfor %}
-                </div>
-              {% endif %}
+    <div class="dash-search" role="search">
+      <span class="dash-search-ico" aria-hidden="true">⌕</span>
+      <input id="wmSiteSearch" class="dash-search-input" placeholder="搜索站点 / 域名 / 节点" autocomplete="off" />
+      <button id="wmSiteSearchClear" class="dash-search-clear" type="button" title="清空">×</button>
+    </div>
+  </div>
 
-              <div class="node-actions">
-                <div class="action-box">
-                  <div class="action-head">
-                    <div>
-                      <div class="action-title">一键安装环境</div>
-                      <div class="action-sub">安装 Nginx / ACME（可选 PHP-FPM）。</div>
-                    </div>
-                  </div>
-                  <form method="post" action="/websites/nodes/{{ n.id }}/env/ensure" class="action-form">
-                    <label class="help"><input type="checkbox" name="include_php" checked style="transform:translateY(1px);"> 含 PHP</label>
-                    <button class="btn xs secondary" type="submit">开始安装</button>
-                  </form>
-                </div>
+  <div class="muted sm" style="margin-top:6px;">
+    显示 <strong><span id="wmSiteCount">{{ sites|length }}</span></strong> / <strong>{{ sites|length }}</strong>
+  </div>
 
-                <div class="action-box">
-                  <div class="action-head">
-                    <div>
-                      <div class="action-title">卸载环境</div>
-                      <div class="action-sub">可选清理网站数据；谨慎操作。</div>
-                    </div>
-                  </div>
-                  <form method="post" action="/websites/nodes/{{ n.id }}/env/uninstall" class="action-form" onsubmit="return confirm('确定卸载该节点的网站环境吗？');">
-                    <label class="help"><input type="checkbox" name="purge_data" style="transform:translateY(1px);"> 删除网站数据</label>
-                    <label class="help"><input type="checkbox" name="deep_uninstall" style="transform:translateY(1px);"> 深度卸载</label>
-                    <button class="btn xs ghost" type="submit">卸载</button>
-                  </form>
-                </div>
-              </div>
+  <div class="site-grid" id="wmSiteGrid" style="margin-top:10px;">
+    {% for s in sites %}
+      {% set st = (s.status or '') %}
+      {% set st_norm = 'creating' if st in ['creating','pending'] else st %}
+      {% set st_class = 'ok' if st == 'running' else ('warn' if st in ['creating','pending'] else ('bad' if st == 'error' else 'ghost')) %}
+      {% set type_map = {'static':'静态', 'php':'PHP', 'reverse_proxy':'反向代理'} %}
+      {% set h = (s.health_status or '') %}
+      {% set hcls = 'ok' if h == 'ok' else ('bad' if h == 'fail' else 'ghost') %}
+      {% set domains = s.domains or [] %}
+      {% set primary_domain = domains[0] if domains else '-' %}
+      {% set extra = (domains|length - 1) %}
+
+      <div class="card site-tile"
+           data-name="{{ (s.name or '')|lower }}"
+           data-domains="{{ (s.domains_text or '')|lower }}"
+           data-node="{{ (s.node.name if s.node else '-')|lower }}"
+           data-status="{{ st_norm }}"
+           data-health="{{ h }}">
+        <div class="site-top">
+          <div class="site-left">
+            <div class="site-name" title="{{ s.name }}">{{ s.name }}</div>
+            <div class="site-domain mono" title="{{ s.domains_text }}">
+              {{ primary_domain }}{% if extra > 0 %}<span class="muted"> · +{{ extra }}</span>{% endif %}
             </div>
-          </details>
-        {% endfor %}
-      </div>
-    {% else %}
-      <div class="muted" style="margin-top:10px;">暂无网站机节点，请先在接入节点时勾选“网站机”。</div>
-    {% endif %}
-  </aside>
-
-  <!-- Right: sites -->
-  <section class="card">
-    <div class="section-head">
-      <div>
-        <div class="section-title">站点</div>
-        <div class="section-sub">更清晰的入口：进入 / 编辑 / 诊断 / 文件（按需显示）。</div>
-      </div>
-      <div class="muted sm"><span id="siteCount">{{ sites|length }}</span> 个</div>
-    </div>
-
-    {% if sites %}
-      <div class="sites-toolbar">
-        <div class="sites-toolbar-left">
-          <div class="site-search" role="search">
-            <span class="ico">⌕</span>
-            <input id="siteSearchInput" placeholder="搜索站点/域名/节点" autocomplete="off" />
-            <button class="clear" id="siteSearchClear" type="button" aria-label="清空">×</button>
+          </div>
+          <div class="site-right">
+            <span class="pill xs {{ st_class }}" title="运行状态">{{ st or 'unknown' }}</span>
+            <a class="btn icon xs secondary" href="/websites/{{ s.id }}" title="进入">↗</a>
+            <details class="menu">
+              <summary class="btn icon xs ghost" title="更多">⋯</summary>
+              <div class="menu-pop">
+                <a class="menu-item" href="/websites/{{ s.id }}/edit">编辑</a>
+                <a class="menu-item" href="/websites/{{ s.id }}/diagnose">诊断</a>
+                {% if s.type != 'reverse_proxy' and s.root_path %}
+                  <a class="menu-item" href="/websites/{{ s.id }}/files">文件管理</a>
+                {% endif %}
+              </div>
+            </details>
           </div>
         </div>
-        <div class="sites-toolbar-right">
-          <button class="chip active" type="button" data-status="all" aria-selected="true">全部 <strong>{{ sites|length }}</strong></button>
-          <button class="chip" type="button" data-status="running">运行 <strong>{{ stats.running }}</strong></button>
-          <button class="chip" type="button" data-status="creating">创建 <strong>{{ stats.creating }}</strong></button>
-          <button class="chip" type="button" data-status="error">异常 <strong>{{ stats.error }}</strong></button>
-          <button class="chip" type="button" id="healthFailChip" data-health="fail">健康异常 <strong>{{ stats.health_fail }}</strong></button>
+
+        <div class="site-meta">
+          <span class="pill xs {{ hcls }}" title="健康状态">{{ h or 'unknown' }}</span>
+          <span class="pill xs ghost" title="站点类型">{{ type_map.get(s.type, s.type) }}</span>
+          {% if s.node %}<span class="pill xs ghost" title="节点">{{ s.node.name }}</span>{% endif %}
+        </div>
+
+        <div class="site-kpis">
+          <div class="site-kpi" title="HTTP 状态">
+            <span class="k">HTTP</span>
+            <span class="v mono">{{ s.health_code or '-' }}</span>
+          </div>
+          <div class="site-kpi" title="延迟">
+            <span class="k">延迟</span>
+            <span class="v mono">{{ s.health_latency_ms or 0 }}ms</span>
+          </div>
+          <div class="site-kpi" title="最近检查">
+            <span class="k">检查</span>
+            <span class="v mono">{{ s.health_checked_at or '-' }}</span>
+          </div>
         </div>
       </div>
+    {% endfor %}
+  </div>
 
-      <div class="site-cards" id="siteCards">
-        {% for s in sites %}
-          {% set st = (s.status or '') %}
-          {% set st_norm = 'creating' if st in ['creating','pending'] else st %}
-          {% set st_class = 'ok' if st == 'running' else ('warn' if st in ['creating','pending'] else ('bad' if st == 'error' else 'ghost')) %}
-          {% set type_map = {'static':'静态', 'php':'PHP', 'reverse_proxy':'反向代理'} %}
-          {% set h = (s.health_status or '') %}
-          {% set hcls = 'ok' if h == 'ok' else ('bad' if h == 'fail' else 'ghost') %}
-          {% set domains = s.domains or [] %}
-          {% set primary_domain = domains[0] if domains else '-' %}
-          {% set extra = (domains|length - 1) %}
+  <script>
+  (function(){
+    var input = document.getElementById('wmSiteSearch');
+    var clearBtn = document.getElementById('wmSiteSearchClear');
+    var grid = document.getElementById('wmSiteGrid');
+    var countEl = document.getElementById('wmSiteCount');
+    var chips = Array.from(document.querySelectorAll('#wmSiteFilters button.chip[data-status]'));
+    var healthChip = document.getElementById('wmHealthFailChip');
+    if(!grid) return;
 
-          <div class="site-card"
-               data-name="{{ (s.name or '')|lower }}"
-               data-domains="{{ (s.domains_text or '')|lower }}"
-               data-node="{{ (s.node.name if s.node else '-')|lower }}"
-               data-status="{{ st_norm }}"
-               data-health="{{ h }}">
-            <div class="site-card-head">
-              <div class="col">
-                <div class="site-card-title">{{ s.name }}</div>
-                <div class="site-card-sub mono" title="{{ s.domains_text }}">
-                  {{ primary_domain }}{% if extra > 0 %}<span class="muted"> · +{{ extra }}</span>{% endif %}
-                </div>
+    var tiles = Array.from(grid.querySelectorAll('.site-tile'));
+    var state = { status: 'all', healthFail: false };
+
+    function apply(){
+      var q = (input && input.value || '').trim().toLowerCase();
+      var shown = 0;
+      tiles.forEach(function(t){
+        var hay = (t.dataset.name||'') + ' ' + (t.dataset.domains||'') + ' ' + (t.dataset.node||'');
+        var ok = (!q) || hay.indexOf(q) !== -1;
+        if(state.status && state.status !== 'all'){
+          ok = ok && (t.dataset.status === state.status);
+        }
+        if(state.healthFail){
+          ok = ok && (t.dataset.health === 'fail');
+        }
+        t.style.display = ok ? '' : 'none';
+        if(ok) shown++;
+      });
+
+      if(countEl) countEl.textContent = String(shown);
+      if(clearBtn) clearBtn.style.visibility = q ? 'visible' : 'hidden';
+    }
+
+    if(input) input.addEventListener('input', apply);
+    if(clearBtn) clearBtn.addEventListener('click', function(){ if(input) input.value=''; apply(); });
+
+    chips.forEach(function(chip){
+      chip.addEventListener('click', function(){
+        var st = chip.getAttribute('data-status') || 'all';
+        state.status = st;
+        chips.forEach(function(c){
+          var on = (c.getAttribute('data-status') || 'all') === st;
+          c.classList.toggle('active', on);
+          c.setAttribute('aria-selected', on ? 'true' : 'false');
+        });
+        apply();
+      });
+    });
+
+    if(healthChip){
+      healthChip.addEventListener('click', function(){
+        state.healthFail = !state.healthFail;
+        healthChip.classList.toggle('active', state.healthFail);
+        healthChip.setAttribute('aria-selected', state.healthFail ? 'true' : 'false');
+        apply();
+      });
+    }
+
+    apply();
+  })();
+  </script>
+
+{% else %}
+  <div class="card" style="margin-top:12px;">
+    <div class="section-head">
+      <div>
+        <div class="section-title">还没有站点</div>
+        <div class="section-sub">点击右上角“新建站点”，即可开始部署。</div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:12px;">
+      <a class="btn" href="/websites/new">新建站点</a>
+    </div>
+  </div>
+{% endif %}
+
+{# ---- Website nodes ---- #}
+<details class="card wm-acc" style="margin-top:12px;" {% if nodes|length <= 1 %}open{% endif %}>
+  <summary class="wm-acc-summary">
+    <div class="wm-acc-left">
+      <div class="wm-acc-title">网站机节点</div>
+      <div class="wm-acc-sub">环境信息与快速操作（更完整能力可在节点详情页处理）。</div>
+    </div>
+    <div class="wm-acc-right">
+      <span class="pill xs ghost">{{ nodes|length }} 台</span>
+      <span class="pill xs ghost" aria-hidden="true">▾</span>
+    </div>
+  </summary>
+
+  <div class="wm-acc-body">
+    {% if nodes %}
+      <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin-top:0;">
+        {% for n in nodes %}
+          {% set caps = namespace(list=[]) %}
+          {% if n.capabilities %}
+            {% for k, v in n.capabilities.items() %}
+              {% if v %}{% set caps.list = caps.list + [k] %}{% endif %}
+            {% endfor %}
+          {% endif %}
+
+          <div class="card node-lite">
+            <div class="node-lite-head">
+              <div class="node-lite-left">
+                <div class="node-lite-name">{{ n.name }}</div>
+                <div class="node-lite-url mono" title="{{ n.base_url }}">{{ n.base_url }}</div>
               </div>
-              <div class="site-card-actions">
-                <a class="btn xs ghost" href="/websites/{{ s.id }}">进入</a>
+              <div class="node-lite-actions">
+                <a class="btn icon xs secondary" href="/nodes/{{ n.id }}" title="进入">↗</a>
                 <details class="menu">
-                  <summary class="btn xs icon" title="更多">⋯</summary>
+                  <summary class="btn icon xs ghost" title="环境">⚙</summary>
                   <div class="menu-pop">
-                    <a class="menu-item" href="/websites/{{ s.id }}/edit">编辑</a>
-                    <a class="menu-item" href="/websites/{{ s.id }}/diagnose">诊断</a>
-                    {% if s.type != 'reverse_proxy' and s.root_path %}
-                      <a class="menu-item" href="/websites/{{ s.id }}/files">文件管理</a>
-                    {% endif %}
+                    <form method="post" action="/websites/nodes/{{ n.id }}/env/ensure" style="margin:0;">
+                      <input type="hidden" name="include_php" value="1">
+                      <button class="menu-item" type="submit">安装环境（含 PHP）</button>
+                    </form>
+                    <form method="post" action="/websites/nodes/{{ n.id }}/env/ensure" style="margin:0;">
+                      <input type="hidden" name="include_php" value="0">
+                      <button class="menu-item" type="submit">安装环境（仅 Nginx/ACME）</button>
+                    </form>
+                    <div class="menu-sep"></div>
+                    <form method="post" action="/websites/nodes/{{ n.id }}/env/uninstall" style="margin:0;" onsubmit="return confirm('确定卸载该节点的网站环境吗？');">
+                      <button class="menu-item" type="submit">卸载环境</button>
+                    </form>
+                    <div class="menu-sep"></div>
+                    <a class="menu-item" href="/nodes/{{ n.id }}">打开节点详情…</a>
                   </div>
                 </details>
               </div>
             </div>
 
-            <div class="site-card-badges">
-              <span class="pill xs {{ st_class }}">{{ st or 'unknown' }}</span>
-              <span class="pill xs {{ hcls }}">{{ h or 'unknown' }}</span>
-              <span class="pill xs ghost">{{ type_map.get(s.type, s.type) }}</span>
-              {% if s.node %}<span class="pill xs ghost">{{ s.node.name }}</span>{% endif %}
+            <div class="node-lite-meta" style="margin-top:10px;">
+              <span class="muted sm">根目录基准：</span>
+              <span class="mono">{{ n.website_root_base or '/www' }}</span>
             </div>
 
-            <div class="site-card-kv">
-              <div class="kv">
-                <div class="k">HTTP</div>
-                <div class="v">{{ s.health_code or '-' }} · {{ s.health_latency_ms or 0 }}ms</div>
+            {% if caps.list %}
+              <div class="node-lite-badges">
+                {% for c in caps.list[:4] %}
+                  <span class="pill xs ghost">{{ c }}</span>
+                {% endfor %}
+                {% if (caps.list|length) > 4 %}
+                  <span class="pill xs ghost">+{{ (caps.list|length) - 4 }}</span>
+                {% endif %}
               </div>
-              <div class="kv">
-                <div class="k">最近检查</div>
-                <div class="v">{{ s.health_checked_at or '-' }}</div>
-              </div>
-            </div>
+            {% else %}
+              <div class="muted sm" style="margin-top:10px;">能力信息未上报或未安装环境。</div>
+            {% endif %}
           </div>
         {% endfor %}
       </div>
     {% else %}
-      <div class="panel" style="margin-top:12px;">
-        <div class="panel-head">
-          <div class="col">
-            <div class="panel-title">还没有站点</div>
-            <div class="panel-sub">点击右上角“新建站点”，即可开始部署。</div>
-          </div>
-          <div class="right">
-            <a class="btn xs" href="/websites/new">新建站点</a>
-          </div>
-        </div>
-      </div>
+      <div class="muted">暂无网站机节点。请先在“节点管理”中接入并设置为网站机角色。</div>
     {% endif %}
-  </section>
-</div>
+  </div>
+</details>
 
-<script>
-(function(){
-  const input = document.getElementById('siteSearchInput');
-  const clearBtn = document.getElementById('siteSearchClear');
-  const cardsBox = document.getElementById('siteCards');
-  const countEl = document.getElementById('siteCount');
-  const chips = Array.from(document.querySelectorAll('button.chip[data-status]'));
-  const healthChip = document.getElementById('healthFailChip');
-
-  if(!cardsBox) return;
-  const cards = Array.from(cardsBox.querySelectorAll('.site-card'));
-
-  const state = { status: 'all', healthFail: false };
-
-  function apply(){
-    const q = (input && input.value || '').trim().toLowerCase();
-    let shown = 0;
-    cards.forEach((c)=>{
-      const hay = `${c.dataset.name||''} ${c.dataset.domains||''} ${c.dataset.node||''}`;
-      let ok = !q || hay.includes(q);
-      if(state.status && state.status !== 'all'){
-        ok = ok && (c.dataset.status === state.status);
-      }
-      if(state.healthFail){
-        ok = ok && (c.dataset.health === 'fail');
-      }
-      c.style.display = ok ? '' : 'none';
-      if(ok) shown++;
-    });
-    if(countEl) countEl.textContent = String(shown);
-    if(clearBtn){
-      clearBtn.style.visibility = q ? 'visible' : 'hidden';
-    }
-  }
-
-  if(input){
-    input.addEventListener('input', apply);
-  }
-  if(clearBtn){
-    clearBtn.addEventListener('click', ()=>{
-      if(input) input.value = '';
-      apply();
-    });
-  }
-
-  chips.forEach((chip)=>{
-    chip.addEventListener('click', ()=>{
-      const st = chip.getAttribute('data-status') || 'all';
-      state.status = st;
-      chips.forEach((c)=>{
-        const on = (c.getAttribute('data-status') || 'all') === st;
-        c.classList.toggle('active', on);
-        c.setAttribute('aria-selected', on ? 'true' : 'false');
-      });
-      apply();
-    });
-  });
-
-  if(healthChip){
-    healthChip.addEventListener('click', ()=>{
-      state.healthFail = !state.healthFail;
-      healthChip.classList.toggle('active', state.healthFail);
-      healthChip.setAttribute('aria-selected', state.healthFail ? 'true' : 'false');
-      apply();
-    });
-  }
-
-  apply();
-})();
-</script>
 {% endblock %}
