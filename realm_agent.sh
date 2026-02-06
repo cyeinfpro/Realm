@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v35"
+VERSION="v37"
 REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
 DEFAULT_MODE="1"
 DEFAULT_PORT="18700"
@@ -18,25 +18,67 @@ need_root(){
   fi
 }
 
+apt_update_with_repair(){
+  local i
+  for i in 1 2 3; do
+    if apt-get -o Acquire::Languages=none update -y; then
+      return 0
+    fi
+    err "apt 索引异常，尝试修复后重试（${i}/3）..."
+    rm -rf /var/lib/apt/lists/* || true
+    mkdir -p /var/lib/apt/lists/partial || true
+    apt-get clean || true
+    dpkg --configure -a >/dev/null 2>&1 || true
+    sleep 1
+  done
+  return 1
+}
+
 apt_install(){
   local ready="1"
+  local py_probe_ok="1"
   command_exists curl || ready="0"
   command_exists unzip || ready="0"
   command_exists jq || ready="0"
   command_exists python3 || ready="0"
   command_exists rsync || ready="0"
-  python3 -m venv --help >/dev/null 2>&1 || ready="0"
-  python3 -m pip --version >/dev/null 2>&1 || ready="0"
+  dpkg-query -W -f='${Status}' python3-venv 2>/dev/null | grep -q "install ok installed" || ready="0"
+  dpkg-query -W -f='${Status}' python3-pip 2>/dev/null | grep -q "install ok installed" || ready="0"
+  if command_exists python3; then
+    if ! python3 -c "import venv, ssl, json" >/dev/null 2>&1; then
+      py_probe_ok="0"
+      ready="0"
+    fi
+  else
+    py_probe_ok="0"
+  fi
   if [[ "${ready}" == "1" ]]; then
     ok "依赖已满足，跳过 apt 安装"
     return
   fi
 
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
+  if ! apt_update_with_repair; then
+    err "apt 索引修复失败，请手动执行：rm -rf /var/lib/apt/lists/* && apt-get clean && apt-get update"
+    exit 1
+  fi
   # rsync 用于更稳的覆盖更新（避免部分文件未更新）
-  apt-get install -y --no-install-recommends \
-    curl ca-certificates unzip jq python3 python3-venv python3-pip rsync
+  if ! apt-get install -y --no-install-recommends \
+    curl ca-certificates unzip jq python3 python3-venv python3-pip rsync; then
+    err "依赖安装失败，尝试自动修复后重试..."
+    apt-get -f install -y || true
+    apt-get install -y --no-install-recommends \
+      curl ca-certificates unzip jq python3 python3-venv python3-pip rsync
+  fi
+
+  if [[ "${py_probe_ok}" != "1" ]]; then
+    info "检测到 Python 环境异常，尝试重装 python3/python3-venv/python3-pip..."
+    apt-get install -y --reinstall python3 python3-venv python3-pip || true
+  fi
+  if ! python3 -c "import venv, ssl, json" >/dev/null 2>&1; then
+    err "Python 运行环境仍异常，请先修复系统 Python 后再执行安装。"
+    exit 1
+  fi
 }
 
 command_exists(){
@@ -222,26 +264,47 @@ fetch_repo(){
     info "使用离线 ZIP：${zip_path}"
     unzip -q "${zip_path}" -d "${tmpdir}"
   else
-    local url
-    # ✅ 自定义 ZIP 地址（例如从面板 /static/realm-agent.zip 拉取）永远优先
-    #    这样即便机器无法连接 GitHub，也能稳定更新。
+    local url panel_base panel_zip
+    local -a candidates=()
+    local fetched="0"
+
+    # ✅ 显式传入地址时优先级最高（比如 join 脚本注入）
     url="${REALM_AGENT_REPO_ZIP_URL:-}"
-    if [[ -z "${url}" ]]; then
-      url="${REPO_ZIP_URL_DEFAULT}"
-      info "未指定仓库 ZIP 地址，使用默认：${url}"
-    else
+    if [[ -n "${url}" ]]; then
+      candidates+=("${url}")
       info "使用自定义仓库 ZIP 地址：${url}"
+    else
+      panel_base="$(normalize_panel_url "${REALM_PANEL_URL:-}")"
+      if [[ -n "${panel_base}" && "${REALM_AGENT_GITHUB_ONLY:-}" != "1" ]]; then
+        panel_zip="${panel_base}/static/realm-agent.zip"
+        candidates+=("${panel_zip}")
+      fi
+      candidates+=("${REPO_ZIP_URL_DEFAULT}")
+      info "未指定仓库 ZIP 地址，将按优先级尝试：${candidates[*]}"
     fi
 
-    local bust
+    local bust candidate
     bust="ts=$(date +%s)"
-    info "正在下载仓库（强制不走缓存）..."
-    if ! curl -fsSL \
-      -H 'Cache-Control: no-cache' \
-      -H 'Pragma: no-cache' \
-      "${url}?${bust}" -o "${tmpdir}/repo.zip"; then
-      # 兜底：不带 query 重新拉一次
-      curl -fsSL "${url}" -o "${tmpdir}/repo.zip"
+    info "正在下载仓库（优先面板静态文件，失败自动回退）..."
+    for candidate in "${candidates[@]}"; do
+      if curl -fsSL \
+        -H 'Cache-Control: no-cache' \
+        -H 'Pragma: no-cache' \
+        "${candidate}?${bust}" -o "${tmpdir}/repo.zip"; then
+        fetched="1"
+        info "下载成功：${candidate}"
+        break
+      fi
+      if curl -fsSL "${candidate}" -o "${tmpdir}/repo.zip"; then
+        fetched="1"
+        info "下载成功：${candidate}"
+        break
+      fi
+      err "下载失败，尝试下一个源：${candidate}"
+    done
+    if [[ "${fetched}" != "1" ]]; then
+      err "仓库 ZIP 下载失败（面板与 GitHub 均不可达）"
+      exit 1
     fi
     info "解压中..."
     unzip -q "${tmpdir}/repo.zip" -d "${tmpdir}"
