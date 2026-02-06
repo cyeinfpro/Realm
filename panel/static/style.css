@@ -821,6 +821,92 @@ main.container .center-wrap > .card.center-card{
   }
 }
 
+/* Websites: create-site modal */
+.wm-create-modal{
+  z-index: 70;
+}
+
+.wm-create-inner{
+  width: min(980px, calc(100vw - 40px));
+}
+
+.wm-create-head .title-wrap{
+  min-width: 0;
+  max-width: min(72ch, 100%);
+}
+
+.wm-create-body{
+  padding: 12px 14px 14px;
+}
+
+.wm-create-section{
+  background: rgba(2,6,23,0.24);
+}
+
+.wm-create-grid{
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+#wmCreateProxyRow{
+  display: none;
+}
+
+.wm-create-actions{
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 900px){
+  .wm-create-inner{
+    width: min(980px, calc(100vw - 24px));
+  }
+}
+
+@media (max-width: 720px){
+  .wm-create-modal{
+    padding: 10px;
+    align-items: flex-end;
+  }
+
+  .wm-create-inner{
+    width: 100%;
+    max-height: calc(100vh - 10px);
+    border-radius: 16px;
+  }
+
+  .wm-create-body{
+    padding: 10px 12px 14px;
+  }
+
+  .wm-create-grid{
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .wm-create-actions{
+    position: sticky;
+    bottom: 0;
+    padding-top: 10px;
+    padding-bottom: max(0px, var(--safe-bottom));
+    background: linear-gradient(180deg, rgba(17,24,39,0), rgba(17,24,39,0.92) 38%, rgba(17,24,39,0.96));
+  }
+
+  .wm-create-actions .btn{
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+}
+
+@media (max-width: 420px){
+  .wm-create-head .h2{
+    font-size: 15px;
+  }
+}
+
 /* =========================
    Site subpages (detail / diagnose / files)
    - Compact two-column layout

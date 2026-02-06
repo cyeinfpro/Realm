@@ -17,6 +17,7 @@ from ..core.templates import templates
 from ..db import (
     add_certificate,
     add_site,
+    add_site_check,
     add_site_event,
     add_task,
     delete_certificates_by_node,
@@ -305,6 +306,12 @@ async def websites_index(request: Request, user: str = Depends(require_login_pag
     nodes = [n for n in list_nodes() if str(n.get("role") or "") == "website"]
     sites = list_sites()
     node_map = {int(n["id"]): n for n in nodes}
+    open_create = str(request.query_params.get("create") or request.query_params.get("new") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
     for s in sites:
         nid = int(s.get("node_id") or 0)
@@ -320,23 +327,14 @@ async def websites_index(request: Request, user: str = Depends(require_login_pag
             "title": "网站管理",
             "nodes": nodes,
             "sites": sites,
+            "open_create": open_create,
         },
     )
 
 
 @router.get("/websites/new", response_class=HTMLResponse)
 async def websites_new(request: Request, user: str = Depends(require_login_page)):
-    nodes = [n for n in list_nodes() if str(n.get("role") or "") == "website"]
-    return templates.TemplateResponse(
-        "site_new.html",
-        {
-            "request": request,
-            "user": user,
-            "flash": flash(request),
-            "title": "新建网站",
-            "nodes": nodes,
-        },
-    )
+    return RedirectResponse(url="/websites?create=1", status_code=303)
 
 
 @router.post("/websites/new")
@@ -357,12 +355,12 @@ async def websites_new_action(
     node = get_node(int(node_id))
     if not node or str(node.get("role") or "") != "website":
         set_flash(request, "请选择网站机节点")
-        return RedirectResponse(url="/websites/new", status_code=303)
+        return RedirectResponse(url="/websites?create=1", status_code=303)
 
     domains_list = _parse_domains(domains)
     if not domains_list:
         set_flash(request, "域名不能为空")
-        return RedirectResponse(url="/websites/new", status_code=303)
+        return RedirectResponse(url="/websites?create=1", status_code=303)
 
     site_type = (site_type or "static").strip()
     if site_type not in ("static", "php", "reverse_proxy"):
@@ -371,7 +369,7 @@ async def websites_new_action(
     web_server = (web_server or "nginx").strip() or "nginx"
     if web_server != "nginx":
         set_flash(request, "当前仅支持 nginx")
-        return RedirectResponse(url="/websites/new", status_code=303)
+        return RedirectResponse(url="/websites?create=1", status_code=303)
 
     # prevent duplicate domains on same node
     existing = list_sites(node_id=int(node_id))
@@ -381,7 +379,7 @@ async def websites_new_action(
         s_domains = set([str(x).lower() for x in (s.get("domains") or [])])
         if s_domains.intersection(set(domains_list)):
             set_flash(request, "该节点已有重复域名的站点")
-            return RedirectResponse(url="/websites/new", status_code=303)
+            return RedirectResponse(url="/websites?create=1", status_code=303)
 
     root_base = str(node.get("website_root_base") or "").strip() or "/www"
     root_path = (root_path or "").strip()
@@ -390,7 +388,7 @@ async def websites_new_action(
     proxy_target = _normalize_proxy_target(proxy_target or "")
     if site_type == "reverse_proxy" and not proxy_target.strip():
         set_flash(request, "反向代理必须填写目标地址")
-        return RedirectResponse(url="/websites/new", status_code=303)
+        return RedirectResponse(url="/websites?create=1", status_code=303)
 
     https_flag = bool(https_redirect)
     gzip_flag = bool(gzip_enabled)
@@ -415,7 +413,7 @@ async def websites_new_action(
             raise AgentError(str(data.get("error") or "环境安装失败"))
     except Exception as exc:
         set_flash(request, f"环境安装失败：{exc}")
-        return RedirectResponse(url="/websites/new", status_code=303)
+        return RedirectResponse(url="/websites?create=1", status_code=303)
 
     display_name = (name or "").strip() or domains_list[0]
 

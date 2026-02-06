@@ -20,13 +20,18 @@
   <div class="page-title">
     <h1 class="h1">网站管理</h1>
     <div class="meta">
-      <span class="meta-item">站点部署 / SSL / 监测 / 文件，一处集中管理。</span>
+      <span class="meta-item">统一编排站点生命周期：部署、证书、健康诊断与文件管理。</span>
       <span class="meta-item">· 站点 <strong>{{ sites|length }}</strong></span>
       <span class="meta-item">· 网站机 <strong>{{ nodes|length }}</strong></span>
     </div>
   </div>
   <div class="right">
-    <a class="btn sm" href="/websites/new">新建站点</a>
+    <button
+      class="btn sm"
+      type="button"
+      data-action="open-site-create"
+      {% if not nodes %}disabled title="请先接入并设置网站机节点"{% endif %}
+    >新建站点</button>
   </div>
 </div>
 
@@ -36,8 +41,8 @@
   <section class="card wm-card">
     <div class="wm-card-head">
       <div>
-        <div class="wm-card-title">站点</div>
-        <div class="wm-card-sub">管理部署 / SSL / 监测与文件。</div>
+        <div class="wm-card-title">站点列表</div>
+        <div class="wm-card-sub">按状态快速筛选，集中处理发布、诊断、文件与证书操作。</div>
       </div>
       <div class="wm-card-tools">
         <span class="pill xs ghost">共 {{ sites|length }} 个</span>
@@ -107,12 +112,12 @@
               </div>
 
               <div class="wm-site-actions">
-                <a class="btn icon xs secondary" href="/websites/{{ s.id }}" title="进入">↗</a>
+                <a class="btn icon xs secondary" href="/websites/{{ s.id }}" title="详情">↗</a>
                 <details class="menu">
                   <summary class="btn icon xs ghost" title="更多">⋯</summary>
                   <div class="menu-pop">
-                    <a class="menu-item" href="/websites/{{ s.id }}/edit">编辑</a>
-                    <a class="menu-item" href="/websites/{{ s.id }}/diagnose">诊断</a>
+                    <a class="menu-item" href="/websites/{{ s.id }}/edit">编辑配置</a>
+                    <a class="menu-item" href="/websites/{{ s.id }}/diagnose">健康诊断</a>
                     {% if s.type != 'reverse_proxy' and s.root_path %}
                       <a class="menu-item" href="/websites/{{ s.id }}/files">文件管理</a>
                     {% endif %}
@@ -186,9 +191,14 @@
   })();
       </script>
     {% else %}
-      <div class="muted" style="margin-top:10px;">还没有站点。点击右上角“新建站点”开始部署。</div>
+      <div class="muted" style="margin-top:10px;">还没有站点。建议先创建业务入口，再逐步配置 SSL 与健康巡检。</div>
       <div class="row" style="margin-top:12px;">
-        <a class="btn" href="/websites/new">新建站点</a>
+        <button
+          class="btn"
+          type="button"
+          data-action="open-site-create"
+          {% if not nodes %}disabled title="请先接入并设置网站机节点"{% endif %}
+        >新建站点</button>
       </div>
     {% endif %}
   </section>
@@ -197,7 +207,7 @@
     <div class="wm-card-head">
       <div>
         <div class="wm-card-title">网站机节点</div>
-        <div class="wm-card-sub">环境信息与快速操作（更完整能力可在节点详情页处理）。</div>
+        <div class="wm-card-sub">查看环境能力并执行安装/卸载等运维操作。</div>
       </div>
       <div class="wm-card-tools">
         <span class="pill xs ghost">{{ nodes|length }} 台</span>
@@ -230,7 +240,7 @@
                   {% endif %}
                 </div>
               {% else %}
-                <div class="muted sm" style="margin-top:8px;">能力信息未上报或未安装环境。</div>
+                <div class="muted sm" style="margin-top:8px;">能力信息未上报或环境尚未安装完成。</div>
               {% endif %}
 
               <div class="wm-node-quick">
@@ -251,10 +261,203 @@
         {% endfor %}
       </div>
     {% else %}
-      <div class="muted" style="margin-top:10px;">暂无网站机节点。请先在“节点管理”中接入并设置为网站机角色。</div>
+      <div class="muted" style="margin-top:10px;">暂无网站机节点。请先在“节点管理”中接入节点并设置为网站机角色。</div>
     {% endif %}
   </aside>
 
 </div>
+
+<div id="wmCreateModal" class="modal wm-create-modal" style="display:none;" data-auto-open="{{ 1 if open_create else 0 }}">
+  <div class="modal-inner modal-pro wm-create-inner">
+    <div class="modal-head wm-create-head">
+      <div class="title-wrap">
+        <div class="h2">新建站点</div>
+        <div class="muted sm">完成节点选择、入口定义与发布参数配置，提交后自动执行环境校验与健康探测。</div>
+      </div>
+      <button class="btn xs ghost" type="button" data-action="close-site-create">关闭</button>
+    </div>
+
+    <div class="modal-body wm-create-body">
+      <form method="post" action="/websites/new" class="form" id="wmCreateForm">
+        <div class="form-section wm-create-section">
+          <div class="section-head">
+            <div>
+              <div class="section-title">基础信息</div>
+              <div class="section-sub">站点名称仅用于面板展示，部署策略由下方入口配置决定。</div>
+            </div>
+          </div>
+
+          <div class="form-grid wm-create-grid">
+            <div class="col">
+              <label class="label">网站机节点</label>
+              <select class="select" name="node_id" required>
+                {% for n in nodes %}
+                  <option value="{{ n.id }}">{{ n.name }} · {{ n.base_url }}</option>
+                {% endfor %}
+              </select>
+              {% if not nodes %}
+                <div class="help" style="color:var(--bad);">暂无网站机节点，请先在节点管理中启用网站机角色。</div>
+              {% endif %}
+            </div>
+
+            <div class="col">
+              <label class="label">站点名称（可选）</label>
+              <input class="input" name="name" placeholder="例如：官网 / 商城 / 客户A" />
+              <div class="help">留空时默认使用主域名作为站点名称。</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-section wm-create-section">
+          <div class="section-head">
+            <div>
+              <div class="section-title">入口与类型</div>
+              <div class="section-sub">先定义访问入口（域名）与服务模式，反向代理目标按类型自动显隐。</div>
+            </div>
+          </div>
+
+          <div class="form-grid wm-create-grid">
+            <div class="col" style="grid-column:1 / -1;">
+              <label class="label">域名（支持多个）</label>
+              <input class="input" name="domains" placeholder="example.com, www.example.com" required />
+              <div class="help">多个域名可用逗号、分号或空格分隔，建议将主域名放在第一位。</div>
+            </div>
+
+            <div class="col">
+              <label class="label">站点类型</label>
+              <select class="select" name="site_type" id="wmCreateType">
+                <option value="static">静态站点</option>
+                <option value="php">PHP 站点</option>
+                <option value="reverse_proxy">反向代理</option>
+              </select>
+            </div>
+
+            <div class="col" id="wmCreateProxyRow">
+              <label class="label">反向代理目标</label>
+              <input class="input" id="wmCreateProxyInput" name="proxy_target" placeholder="127.0.0.1:8080 或 https://upstream.example.com" />
+              <div class="help">仅反向代理模式需要填写，支持主机端口或完整 URL。</div>
+            </div>
+          </div>
+        </div>
+
+        <details class="advanced-details" id="wmCreateAdvanced">
+          <summary>
+            <div class="adv-summary-left">
+              <div class="adv-title">高级选项</div>
+              <div class="adv-hint">运行配置与 Nginx 模板扩展</div>
+            </div>
+            <div class="adv-summary-right">
+              <span class="pill xs ghost">可选</span>
+            </div>
+          </summary>
+
+          <div class="adv-body">
+            <div class="adv-grid">
+              <div class="col">
+                <label class="label">Web 服务栈</label>
+                <select class="select" name="web_server">
+                  <option value="nginx">nginx</option>
+                </select>
+                <div class="help">当前发布链路已针对 nginx 做稳定性优化。</div>
+              </div>
+
+              <div class="col" id="wmCreateRootRow">
+                <label class="label">站点根目录</label>
+                <input class="input" name="root_path" placeholder="默认：/www/wwwroot/<domain>" />
+                <div class="help">静态/PHP 推荐显式指定；反向代理留空也可自动创建验证目录。</div>
+              </div>
+            </div>
+
+            <div class="row" style="gap:14px; flex-wrap:wrap;">
+              <label class="help"><input type="checkbox" name="https_redirect" style="transform:translateY(1px);"> 证书签发后自动强制 HTTPS</label>
+              <label class="help"><input type="checkbox" name="gzip_enabled" checked style="transform:translateY(1px);"> 启用 Gzip 压缩</label>
+            </div>
+
+            <div>
+              <label class="label">自定义 Nginx 模板（可选）</label>
+              <textarea class="textarea mono" name="nginx_tpl" rows="12" placeholder="# 留空则使用内置模板"></textarea>
+              <div class="help compact">
+                可用变量：<span class="mono">{{'{{'}}SERVER_NAME{{'}}'}}</span>、<span class="mono">{{'{{'}}ROOT_PATH{{'}}'}}</span>、<span class="mono">{{'{{'}}PROXY_TARGET{{'}}'}}</span>、<span class="mono">{{'{{'}}SSL_CERT{{'}}'}}</span>、<span class="mono">{{'{{'}}SSL_KEY{{'}}'}}</span>、<span class="mono">{{'{{'}}GZIP_CONF{{'}}'}}</span>。
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <div class="wm-create-actions">
+          <button class="btn sm ghost" type="button" data-action="close-site-create">取消</button>
+          <button class="btn sm" id="wmCreateSubmit" type="submit" {% if not nodes %}disabled{% endif %}>创建并部署</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var modal = document.getElementById('wmCreateModal');
+  if(!modal) return;
+
+  var openBtns = Array.from(document.querySelectorAll('[data-action="open-site-create"]'));
+  var closeBtns = Array.from(modal.querySelectorAll('[data-action="close-site-create"]'));
+  var siteType = document.getElementById('wmCreateType');
+  var proxyRow = document.getElementById('wmCreateProxyRow');
+  var proxyInput = document.getElementById('wmCreateProxyInput');
+
+  function isOpen(){
+    return modal.style.display !== 'none';
+  }
+
+  function syncType(){
+    var t = (siteType && siteType.value) || 'static';
+    var showProxy = t === 'reverse_proxy';
+    if(proxyRow) proxyRow.style.display = showProxy ? '' : 'none';
+    if(proxyInput) proxyInput.required = !!showProxy;
+  }
+
+  function openModal(){
+    modal.style.display = 'flex';
+    document.body.classList.add('modal-open');
+    syncType();
+    try{
+      var first = modal.querySelector('select[name="node_id"], input[name="domains"]');
+      if(first) first.focus();
+    }catch(_e){}
+  }
+
+  function closeModal(){
+    modal.style.display = 'none';
+    document.body.classList.remove('modal-open');
+  }
+
+  openBtns.forEach(function(btn){
+    btn.addEventListener('click', function(){
+      if(btn.disabled) return;
+      openModal();
+    });
+  });
+
+  closeBtns.forEach(function(btn){
+    btn.addEventListener('click', closeModal);
+  });
+
+  if(siteType){
+    siteType.addEventListener('change', syncType);
+  }
+
+  modal.addEventListener('click', function(e){
+    if(e.target === modal) closeModal();
+  });
+
+  document.addEventListener('keydown', function(e){
+    if(e.key === 'Escape' && isOpen()) closeModal();
+  });
+
+  if(String(modal.getAttribute('data-auto-open') || '') === '1'){
+    openModal();
+  }else{
+    syncType();
+  }
+})();
+</script>
 
 {% endblock %}

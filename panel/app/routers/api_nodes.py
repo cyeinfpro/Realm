@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import io
 import json
+import os
 import random
 import threading
 import time
@@ -74,6 +75,70 @@ _FULL_BACKUP_TTL_SEC = 1800
 _FULL_RESTORE_JOBS: Dict[str, Dict[str, Any]] = {}
 _FULL_RESTORE_LOCK = threading.Lock()
 _FULL_RESTORE_TTL_SEC = 1800
+_RESTORE_UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+def _parse_restore_upload_max_bytes() -> int:
+    raw_b = os.getenv("REALM_FULL_RESTORE_MAX_BYTES")
+    raw_mb = os.getenv("REALM_FULL_RESTORE_MAX_MB")
+    try:
+        if raw_b:
+            return max(1, int(float(str(raw_b).strip())))
+    except Exception:
+        pass
+    try:
+        if raw_mb:
+            return max(1, int(float(str(raw_mb).strip()))) * 1024 * 1024
+    except Exception:
+        pass
+    # default 512MB
+    return 512 * 1024 * 1024
+
+
+def _format_bytes(num: int) -> str:
+    n = float(max(0, int(num)))
+    if n < 1024:
+        return f"{int(n)} B"
+    for unit in ("KB", "MB", "GB", "TB"):
+        n /= 1024.0
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+    return f"{n:.1f} PB"
+
+
+_FULL_RESTORE_MAX_BYTES = _parse_restore_upload_max_bytes()
+
+
+async def _read_full_restore_upload(file: UploadFile) -> tuple[Optional[bytes], Optional[str], int]:
+    try:
+        await file.seek(0)
+    except Exception:
+        pass
+
+    total = 0
+    buf = bytearray()
+    try:
+        while True:
+            chunk = await file.read(_RESTORE_UPLOAD_CHUNK_SIZE)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _FULL_RESTORE_MAX_BYTES:
+                return (
+                    None,
+                    f"备份包过大（当前限制 {_format_bytes(_FULL_RESTORE_MAX_BYTES)}）",
+                    413,
+                )
+            buf.extend(chunk)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return None, f"读取文件失败：{exc}", 400
+
+    raw = bytes(buf)
+    if not raw or raw[:2] != b"PK":
+        return None, "请上传 nexus-backup-*.zip（兼容旧版备份包）", 400
+    return raw, None, 200
 
 
 def _backup_steps_template() -> List[Dict[str, Any]]:
@@ -1238,14 +1303,12 @@ async def api_restore_full_start(
     """Start full restore in background and return a job id for polling."""
     _prune_full_restore_jobs()
     try:
-        raw = await file.read()
+        raw, read_err, read_status = await _read_full_restore_upload(file)
     except asyncio.CancelledError as exc:
         msg = _restore_cancel_message(exc, "读取上传文件失败")
         return JSONResponse({"ok": False, "error": msg}, status_code=499)
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": f"读取文件失败：{exc}"}, status_code=400)
-    if not raw or raw[:2] != b"PK":
-        return JSONResponse({"ok": False, "error": "请上传 nexus-backup-*.zip（兼容旧版备份包）"}, status_code=400)
+    if raw is None:
+        return JSONResponse({"ok": False, "error": str(read_err or "上传文件无效")}, status_code=int(read_status or 400))
 
     job_id = uuid.uuid4().hex
     now = time.time()
@@ -1368,15 +1431,12 @@ async def api_restore_full(
 ):
     """Restore nodes list + per-node rules from full backup zip."""
     try:
-        raw = await file.read()
+        raw, read_err, read_status = await _read_full_restore_upload(file)
     except asyncio.CancelledError as exc:
         msg = _restore_cancel_message(exc, "读取上传文件失败")
         return JSONResponse({"ok": False, "error": msg}, status_code=499)
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": f"读取文件失败：{exc}"}, status_code=400)
-
-    if not raw or raw[:2] != b"PK":
-        return JSONResponse({"ok": False, "error": "请上传 nexus-backup-*.zip（兼容旧版备份包）"}, status_code=400)
+    if raw is None:
+        return JSONResponse({"ok": False, "error": str(read_err or "上传文件无效")}, status_code=int(read_status or 400))
 
     try:
         z = zipfile.ZipFile(io.BytesIO(raw))
@@ -1505,7 +1565,6 @@ async def api_restore_full(
     rule_paths = [n for n in zip_names if n.lower().startswith("rules/") and n.lower().endswith(".json")]
 
     import re as _re
-    import asyncio
 
     async def apply_pool_to_node(target_id: int, pool: Dict[str, Any]) -> Dict[str, Any]:
         node = get_node(int(target_id))
@@ -3016,7 +3075,6 @@ async def api_reset_all_traffic(request: Request, user: str = Depends(require_lo
       so private/unreachable nodes will reset next time they report.
     """
     nodes = list_nodes()
-    import asyncio
 
     if not nodes:
         return {"ok": True, "total": 0, "ok_count": 0, "queued_count": 0, "fail_count": 0, "results": []}
