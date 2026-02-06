@@ -17,6 +17,7 @@
     </div>
   </div>
   <div class="right">
+    <a class="btn sm" href="/websites/{{ site.id }}/diagnose?refresh=1">立即诊断</a>
     <a class="btn sm ghost" href="/websites/{{ site.id }}">返回站点</a>
   </div>
 </div>
@@ -29,6 +30,10 @@
   </div>
 {% endif %}
 
+<div class="meta" style="margin:0 0 10px;">
+  <span class="meta-item">数据来源：{{ '实时诊断' if diag_source == 'live' else '缓存结果（点击“立即诊断”刷新）' }}</span>
+</div>
+
 <div class="site-layout site-layout-diagnose">
   <div class="site-stack">
     <div class="card compact">
@@ -40,13 +45,13 @@
       </div>
 
       <div class="kv-lines">
-        <div class="kvline"><div class="k">Nginx 配置</div><div class="v"><span class="pill xs {{ 'ok' if diag.checks.nginx_test_ok else 'bad' }}">{{ 'ok' if diag.checks.nginx_test_ok else 'fail' }}</span></div></div>
+        <div class="kvline"><div class="k">Nginx 配置</div><div class="v"><span class="pill xs {{ 'ok' if diag.checks.nginx_test_ok else ('bad' if diag.checks.nginx_test_ok is not none else 'warn') }}">{{ 'ok' if diag.checks.nginx_test_ok else ('fail' if diag.checks.nginx_test_ok is not none else 'unknown') }}</span></div></div>
         <div class="kvline"><div class="k">Nginx 运行</div><div class="v"><span class="pill xs {{ 'ok' if diag.checks.nginx_active else 'warn' }}">{{ diag.checks.nginx_active if diag.checks.nginx_active is not none else 'unknown' }}</span></div></div>
-        <div class="kvline"><div class="k">配置存在</div><div class="v"><span class="pill xs {{ 'ok' if diag.checks.conf_exists else 'bad' }}">{{ 'ok' if diag.checks.conf_exists else 'missing' }}</span></div></div>
-        <div class="kvline"><div class="k">配置已加载</div><div class="v"><span class="pill xs {{ 'ok' if diag.checks.conf_included else 'warn' }}">{{ 'ok' if diag.checks.conf_included else 'unknown' }}</span></div></div>
-        <div class="kvline"><div class="k">根目录</div><div class="v"><span class="pill xs {{ 'ok' if diag.checks.root_exists else 'bad' }}">{{ 'ok' if diag.checks.root_exists else 'missing' }}</span></div></div>
-        <div class="kvline"><div class="k">PHP-FPM</div><div class="v"><span class="pill xs {{ 'ok' if diag.checks.php_ok else 'warn' }}">{{ 'ok' if diag.checks.php_ok else 'not ready' }}</span></div></div>
-        <div class="kvline"><div class="k">HTTP 探测</div><div class="v"><span class="pill xs {{ 'ok' if diag.checks.http_ok else 'bad' }}">{{ diag.checks.http_status or '-' }}</span></div></div>
+        <div class="kvline"><div class="k">配置存在</div><div class="v"><span class="pill xs {{ 'ok' if diag.checks.conf_exists else ('bad' if diag.checks.conf_exists is not none else 'warn') }}">{{ 'ok' if diag.checks.conf_exists else ('missing' if diag.checks.conf_exists is not none else 'unknown') }}</span></div></div>
+        <div class="kvline"><div class="k">配置已加载</div><div class="v"><span class="pill xs {{ 'ok' if diag.checks.conf_included else ('warn' if diag.checks.conf_included is not none else 'ghost') }}">{{ 'ok' if diag.checks.conf_included else ('unknown' if diag.checks.conf_included is not none else '-') }}</span></div></div>
+        <div class="kvline"><div class="k">根目录</div><div class="v"><span class="pill xs {{ 'ok' if diag.checks.root_exists else ('bad' if diag.checks.root_exists is not none else 'warn') }}">{{ 'ok' if diag.checks.root_exists else ('missing' if diag.checks.root_exists is not none else 'unknown') }}</span></div></div>
+        <div class="kvline"><div class="k">PHP-FPM</div><div class="v"><span class="pill xs {{ 'ok' if diag.checks.php_ok else ('warn' if diag.checks.php_ok is not none else 'ghost') }}">{{ 'ok' if diag.checks.php_ok else ('not ready' if diag.checks.php_ok is not none else '-') }}</span></div></div>
+        <div class="kvline"><div class="k">HTTP 探测</div><div class="v"><span class="pill xs {{ 'ok' if diag.checks.http_ok else ('bad' if diag.checks.http_ok is not none else 'warn') }}">{{ diag.checks.http_status or '-' }}</span></div></div>
         <div class="kvline"><div class="k">虚拟主机命中</div><div class="v"><span class="pill xs {{ 'ok' if diag.checks.vhost_match else 'warn' if diag.checks.vhost_match is none else 'bad' }}">{{ 'ok' if diag.checks.vhost_match else 'unknown' if diag.checks.vhost_match is none else 'mismatch' }}</span></div></div>
         <div class="kvline"><div class="k">错误</div><div class="v mono" title="{{ diag.error or '' }}">{{ diag.error or '-' }}</div></div>
       </div>

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
+from .clients.agent import close_agent_clients
 from .core.paths import STATIC_DIR
 from .core.session import SECRET_KEY, SESSION_COOKIE_NAME
 from .core.settings import APP_TITLE, APP_VERSION
@@ -34,6 +36,8 @@ app.add_middleware(
     secret_key=SECRET_KEY,
     session_cookie=SESSION_COOKIE_NAME,
 )
+# Compress HTML/CSS/JS/JSON payloads to speed up page/API delivery over WAN.
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
 # Static assets (CSS/JS + realm-agent.zip + install scripts)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -62,5 +66,13 @@ async def _startup() -> None:
     # Background site monitor
     try:
         await start_site_monitor_background(app)
+    except Exception:
+        pass
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    try:
+        await close_agent_clients()
     except Exception:
         pass

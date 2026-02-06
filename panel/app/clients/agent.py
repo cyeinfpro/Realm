@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import shutil
+import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
@@ -14,10 +15,115 @@ from ..core.settings import DEFAULT_AGENT_PORT
 
 DEFAULT_TIMEOUT = 6.0
 TCPING_TIMEOUT = 3.0
+_HTTP_LIMITS = httpx.Limits(max_connections=200, max_keepalive_connections=80, keepalive_expiry=20.0)
+_CLIENTS: Dict[bool, httpx.AsyncClient] = {}
+_CLIENTS_LOCK = threading.Lock()
 
 
 class AgentError(RuntimeError):
     """Raised when panel <-> agent request failed."""
+
+
+async def _get_client(verify_tls: bool) -> httpx.AsyncClient:
+    key = bool(verify_tls)
+    cli = _CLIENTS.get(key)
+    if cli is not None and not cli.is_closed:
+        return cli
+    with _CLIENTS_LOCK:
+        cli = _CLIENTS.get(key)
+        if cli is not None and not cli.is_closed:
+            return cli
+        cli = httpx.AsyncClient(
+            verify=key,
+            limits=_HTTP_LIMITS,
+            timeout=DEFAULT_TIMEOUT,
+        )
+        _CLIENTS[key] = cli
+        return cli
+
+
+async def _drop_client(verify_tls: bool) -> None:
+    key = bool(verify_tls)
+    cli: Optional[httpx.AsyncClient] = None
+    with _CLIENTS_LOCK:
+        cli = _CLIENTS.pop(key, None)
+    if cli is not None:
+        try:
+            await cli.aclose()
+        except Exception:
+            pass
+
+
+async def close_agent_clients() -> None:
+    """Close shared keep-alive clients (called at app shutdown)."""
+    with _CLIENTS_LOCK:
+        items = list(_CLIENTS.values())
+        _CLIENTS.clear()
+    for cli in items:
+        try:
+            await cli.aclose()
+        except Exception:
+            pass
+
+
+async def _agent_request(
+    method: str,
+    base_url: str,
+    api_key: str,
+    path: str,
+    verify_tls: bool,
+    data: Any = None,
+    timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    headers = {"X-API-Key": api_key}
+    url = f"{base_url.rstrip('/')}{path}"
+    req_timeout = float(timeout or DEFAULT_TIMEOUT)
+    method_u = str(method or "GET").upper()
+
+    # One fast retry for stale keep-alive connections.
+    for attempt in range(2):
+        client = await _get_client(verify_tls)
+        try:
+            if method_u == "GET":
+                r = await client.get(url, headers=headers, timeout=req_timeout)
+            else:
+                r = await client.post(url, headers=headers, json=data, timeout=req_timeout)
+        except httpx.TransportError:
+            if attempt == 0:
+                await _drop_client(verify_tls)
+                continue
+            raise
+
+        if not (200 <= r.status_code < 300):
+            raise AgentError(_format_agent_error(r))
+        return _parse_agent_json(r)
+
+    return {"ok": False, "error": "unreachable"}
+
+
+async def agent_get_raw(
+    base_url: str,
+    api_key: str,
+    path: str,
+    verify_tls: bool,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: Optional[float] = None,
+) -> httpx.Response:
+    headers = {"X-API-Key": api_key}
+    url = f"{base_url.rstrip('/')}{path}"
+    req_timeout = float(timeout or DEFAULT_TIMEOUT)
+    query = params or {}
+
+    for attempt in range(2):
+        client = await _get_client(verify_tls)
+        try:
+            return await client.get(url, params=query, headers=headers, timeout=req_timeout)
+        except httpx.TransportError:
+            if attempt == 0:
+                await _drop_client(verify_tls)
+                continue
+            raise
+    raise RuntimeError("Agent raw request failed")
 
 
 async def agent_get(
@@ -27,13 +133,14 @@ async def agent_get(
     verify_tls: bool,
     timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
-    headers = {"X-API-Key": api_key}
-    url = f"{base_url.rstrip('/')}{path}"
-    async with httpx.AsyncClient(timeout=(timeout or DEFAULT_TIMEOUT), verify=verify_tls) as client:
-        r = await client.get(url, headers=headers)
-        if not (200 <= r.status_code < 300):
-            raise AgentError(_format_agent_error(r))
-        return _parse_agent_json(r)
+    return await _agent_request(
+        "GET",
+        base_url,
+        api_key,
+        path,
+        verify_tls,
+        timeout=timeout,
+    )
 
 
 async def agent_post(
@@ -44,13 +151,15 @@ async def agent_post(
     verify_tls: bool,
     timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
-    headers = {"X-API-Key": api_key}
-    url = f"{base_url.rstrip('/')}{path}"
-    async with httpx.AsyncClient(timeout=(timeout or DEFAULT_TIMEOUT), verify=verify_tls) as client:
-        r = await client.post(url, headers=headers, json=data)
-        if not (200 <= r.status_code < 300):
-            raise AgentError(_format_agent_error(r))
-        return _parse_agent_json(r)
+    return await _agent_request(
+        "POST",
+        base_url,
+        api_key,
+        path,
+        verify_tls,
+        data=data,
+        timeout=timeout,
+    )
 
 
 async def agent_ping(base_url: str, api_key: str, verify_tls: bool) -> Dict[str, Any]:

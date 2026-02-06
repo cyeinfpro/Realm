@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from ..clients.agent import agent_get, agent_post, AgentError
+from ..clients.agent import AgentError, agent_get, agent_get_raw, agent_post
 from ..core.deps import require_login_page
 from ..core.flash import flash, set_flash
 from ..core.templates import templates
@@ -257,6 +257,47 @@ def _default_nginx_template(site_type: str) -> str:
 #   }
 # }
 """
+
+
+def _diag_base_payload(site: Dict[str, Any]) -> Dict[str, Any]:
+    hs = str(site.get("health_status") or "").strip().lower()
+    ok: Optional[bool] = None
+    if hs == "ok":
+        ok = True
+    elif hs == "fail":
+        ok = False
+
+    return {
+        "ok": ok,
+        "status_code": int(site.get("health_code") or 0),
+        "latency_ms": int(site.get("health_latency_ms") or 0),
+        "error": str(site.get("health_error") or "").strip(),
+        "checks": {
+            "nginx_test_ok": None,
+            "nginx_active": None,
+            "conf_exists": None,
+            "conf_included": None,
+            "root_exists": None,
+            "php_ok": None,
+            "http_ok": None,
+            "http_status": 0,
+            "vhost_match": None,
+            "conf_path": "",
+            "nginx_test_output": "",
+        },
+    }
+
+
+def _diag_merge(base: Dict[str, Any], live: Any) -> Dict[str, Any]:
+    out = dict(base or {})
+    if not isinstance(live, dict):
+        return out
+    out.update(live)
+    checks = dict((base or {}).get("checks") or {})
+    if isinstance(live.get("checks"), dict):
+        checks.update(live.get("checks") or {})
+    out["checks"] = checks
+    return out
 
 
 @router.get("/websites", response_class=HTMLResponse)
@@ -813,33 +854,61 @@ async def website_diagnose(request: Request, site_id: int, user: str = Depends(r
         set_flash(request, "节点不存在")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
-    payload = {
-        "domains": site.get("domains") or [],
-        "type": site.get("type") or "static",
-        "root_path": site.get("root_path") or "",
-        "proxy_target": site.get("proxy_target") or "",
-        "root_base": _node_root_base(node),
-    }
-
-    diag: Dict[str, Any] = {}
+    refresh = str(request.query_params.get("refresh") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    diag: Dict[str, Any] = _diag_base_payload(site)
     err_msg = ""
-    try:
-        data = await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/website/diagnose",
-            payload,
-            node_verify_tls(node),
-            timeout=15,
-        )
-        diag = data if isinstance(data, dict) else {}
-        if not diag.get("ok", True):
-            err_msg = str(diag.get("error") or "诊断失败")
-    except Exception as exc:
-        err_msg = str(exc)
+    diag_source = "cache"
+    live_diag_ready = False
 
-    events = list_site_events(int(site_id), limit=80)
-    checks = list_site_checks(int(site_id), limit=40)
+    if refresh:
+        payload = {
+            "domains": site.get("domains") or [],
+            "type": site.get("type") or "static",
+            "root_path": site.get("root_path") or "",
+            "proxy_target": site.get("proxy_target") or "",
+            "root_base": _node_root_base(node),
+        }
+        try:
+            data = await agent_post(
+                node["base_url"],
+                node["api_key"],
+                "/api/v1/website/diagnose",
+                payload,
+                node_verify_tls(node),
+                timeout=10,
+            )
+            diag = _diag_merge(diag, data)
+            diag_source = "live"
+            live_diag_ready = True
+            if not diag.get("ok", True):
+                err_msg = str(diag.get("error") or "诊断失败")
+        except Exception as exc:
+            err_msg = str(exc)
+
+        try:
+            if live_diag_ready and isinstance(diag.get("ok"), bool):
+                ok = bool(diag.get("ok"))
+                status_code = int(diag.get("status_code") or (diag.get("checks") or {}).get("http_status") or 0)
+                latency_ms = int(diag.get("latency_ms") or 0)
+                err = str(diag.get("error") or "").strip()
+                update_site_health(
+                    int(site_id),
+                    "ok" if ok else "fail",
+                    health_code=status_code,
+                    health_latency_ms=latency_ms,
+                    health_error=err,
+                )
+                add_site_check(int(site_id), ok=ok, status_code=status_code, latency_ms=latency_ms, error=err)
+        except Exception:
+            pass
+
+    events = list_site_events(int(site_id), limit=24)
+    checks = list_site_checks(int(site_id), limit=20)
 
     return templates.TemplateResponse(
         "site_diagnose.html",
@@ -851,6 +920,8 @@ async def website_diagnose(request: Request, site_id: int, user: str = Depends(r
             "site": site,
             "node": node,
             "diag": diag,
+            "diag_source": diag_source,
+            "diag_refreshed": bool(refresh and diag_source == "live"),
             "diag_error": err_msg,
             "events": events,
             "checks": checks,
@@ -1859,14 +1930,15 @@ async def website_files_download(
         set_flash(request, "该站点没有可管理的根目录")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
-    # Lightweight proxy: fetch file bytes from agent and return
-    import httpx
-
-    url = f"{node['base_url'].rstrip('/')}/api/v1/website/files/raw"
-    params = {"root": root, "path": path, "root_base": _node_root_base(node)}
-    headers = {"X-API-Key": node.get("api_key") or ""}
-    async with httpx.AsyncClient(timeout=20, verify=node_verify_tls(node)) as client:
-        r = await client.get(url, params=params, headers=headers)
+    # Lightweight proxy: fetch file bytes from agent and return.
+    r = await agent_get_raw(
+        node.get("base_url", ""),
+        node.get("api_key", ""),
+        "/api/v1/website/files/raw",
+        node_verify_tls(node),
+        params={"root": root, "path": path, "root_base": _node_root_base(node)},
+        timeout=20,
+    )
     if r.status_code != 200:
         set_flash(request, f"下载失败（HTTP {r.status_code}）")
         return RedirectResponse(url=f"/websites/{site_id}/files?path={'/'.join(path.split('/')[:-1])}", status_code=303)

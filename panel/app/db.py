@@ -633,8 +633,23 @@ def _parse_node_row(row: sqlite3.Row) -> Dict[str, Any]:
 
 
 def list_nodes(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    # Performance: avoid loading giant JSON columns (last_report_json / desired_pool_json)
+    # for list pages and background workers. Those payloads should be fetched on-demand
+    # via get_last_report()/get_desired_pool() by node id.
+    sql = (
+        "SELECT "
+        "id, name, base_url, api_key, verify_tls, is_private, group_name, role, "
+        "capabilities_json, website_root_base, "
+        "last_seen_at, desired_pool_version, agent_ack_version, "
+        "desired_traffic_reset_version, agent_traffic_reset_ack_version, "
+        "traffic_reset_at, traffic_reset_msg, "
+        "desired_agent_version, desired_agent_update_id, "
+        "agent_reported_version, agent_update_state, agent_update_msg, agent_update_at, "
+        "created_at "
+        "FROM nodes ORDER BY id DESC"
+    )
     with connect(db_path) as conn:
-        rows = conn.execute("SELECT * FROM nodes ORDER BY id DESC").fetchall()
+        rows = conn.execute(sql).fetchall()
     return [_parse_node_row(r) for r in rows]
 
 
