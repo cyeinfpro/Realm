@@ -41,7 +41,7 @@ download_file(){
   local url="$1"
   local out="$2"
   local tmp="${out}.tmp"
-  if curl -fL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 300 "$url" -o "$tmp"; then
+  if curl -fL --silent --show-error --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 300 "$url" -o "$tmp"; then
     mv -f "$tmp" "$out"
     return 0
   fi
