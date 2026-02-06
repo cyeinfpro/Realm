@@ -760,29 +760,66 @@ async def website_ssl_issue(request: Request, site_id: int, user: str = Depends(
     add_site_event(site_id, "ssl_issue", status="running", actor=str(user or ""), payload={"domains": domains})
 
     try:
+        req_payload = {
+            "domains": domains,
+            "root_path": site.get("root_path") or "",
+            "root_base": _node_root_base(node),
+            "update_conf": {
+                "type": site.get("type") or "static",
+                "root_path": site.get("root_path") or "",
+                "proxy_target": _normalize_proxy_target(site.get("proxy_target") or ""),
+                "https_redirect": bool(site.get("https_redirect") or False),
+                "gzip_enabled": True if site.get("gzip_enabled") is None else bool(site.get("gzip_enabled")),
+                "nginx_tpl": site.get("nginx_tpl") or "",
+            },
+        }
+
         data = await agent_post(
             node["base_url"],
             node["api_key"],
             "/api/v1/website/ssl/issue",
-            {
-                "domains": domains,
-                "root_path": site.get("root_path") or "",
-                "root_base": _node_root_base(node),
-                "update_conf": {
-                    "type": site.get("type") or "static",
-                    "root_path": site.get("root_path") or "",
-                    "proxy_target": _normalize_proxy_target(site.get("proxy_target") or ""),
-                    "https_redirect": bool(site.get("https_redirect") or False),
-                    "gzip_enabled": True if site.get("gzip_enabled") is None else bool(site.get("gzip_enabled")),
-                    "nginx_tpl": site.get("nginx_tpl") or "",
-                },
-            },
+            req_payload,
             node_verify_tls(node),
             # SSL issuance can take a while (DNS, CA validation, network).
             timeout=240,
         )
+
         if not data.get("ok", True):
-            raise AgentError(str(data.get("error") or "证书申请失败"))
+            err = str(data.get("error") or "证书申请失败")
+
+            # Common first-use failure: node doesn't have acme.sh yet.
+            # Try to auto-install website env once, then retry issuance.
+            if "未安装" in err and "acme.sh" in err:
+                update_task(task_id, progress=20)
+                env_payload = {
+                    "need_nginx": True,
+                    "need_php": bool((site.get("type") or "") == "php"),
+                    "need_acme": True,
+                }
+                env_data = await agent_post(
+                    node["base_url"],
+                    node["api_key"],
+                    "/api/v1/website/env/ensure",
+                    env_payload,
+                    node_verify_tls(node),
+                    timeout=300,
+                )
+                if not env_data.get("ok", True):
+                    raise AgentError(f"{err}；自动安装环境失败：{env_data.get('error')}")
+
+                update_task(task_id, progress=35)
+                data = await agent_post(
+                    node["base_url"],
+                    node["api_key"],
+                    "/api/v1/website/ssl/issue",
+                    req_payload,
+                    node_verify_tls(node),
+                    timeout=240,
+                )
+                if not data.get("ok", True):
+                    raise AgentError(str(data.get("error") or err))
+            else:
+                raise AgentError(err)
 
         if cert_id:
             update_certificate(
@@ -858,29 +895,61 @@ async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(
     add_site_event(site_id, "ssl_renew", status="running", actor=str(user or ""), payload={"domains": domains})
 
     try:
+        req_payload = {
+            "domains": domains,
+            "root_path": site.get("root_path") or "",
+            "root_base": _node_root_base(node),
+            "update_conf": {
+                "type": site.get("type") or "static",
+                "root_path": site.get("root_path") or "",
+                "proxy_target": _normalize_proxy_target(site.get("proxy_target") or ""),
+                "https_redirect": bool(site.get("https_redirect") or False),
+                "gzip_enabled": True if site.get("gzip_enabled") is None else bool(site.get("gzip_enabled")),
+                "nginx_tpl": site.get("nginx_tpl") or "",
+            },
+        }
+
         data = await agent_post(
             node["base_url"],
             node["api_key"],
             "/api/v1/website/ssl/renew",
-            {
-                "domains": domains,
-                "root_path": site.get("root_path") or "",
-                "root_base": _node_root_base(node),
-                "update_conf": {
-                    "type": site.get("type") or "static",
-                    "root_path": site.get("root_path") or "",
-                    "proxy_target": _normalize_proxy_target(site.get("proxy_target") or ""),
-                    "https_redirect": bool(site.get("https_redirect") or False),
-                    "gzip_enabled": True if site.get("gzip_enabled") is None else bool(site.get("gzip_enabled")),
-                    "nginx_tpl": site.get("nginx_tpl") or "",
-                },
-            },
+            req_payload,
             node_verify_tls(node),
             # SSL renewal may take time as well.
             timeout=240,
         )
         if not data.get("ok", True):
-            raise AgentError(str(data.get("error") or "证书续期失败"))
+            err = str(data.get("error") or "证书续期失败")
+            if "未安装" in err and "acme.sh" in err:
+                update_task(task_id, progress=20)
+                env_payload = {
+                    "need_nginx": True,
+                    "need_php": bool((site.get("type") or "") == "php"),
+                    "need_acme": True,
+                }
+                env_data = await agent_post(
+                    node["base_url"],
+                    node["api_key"],
+                    "/api/v1/website/env/ensure",
+                    env_payload,
+                    node_verify_tls(node),
+                    timeout=300,
+                )
+                if not env_data.get("ok", True):
+                    raise AgentError(f"{err}；自动安装环境失败：{env_data.get('error')}")
+                update_task(task_id, progress=35)
+                data = await agent_post(
+                    node["base_url"],
+                    node["api_key"],
+                    "/api/v1/website/ssl/renew",
+                    req_payload,
+                    node_verify_tls(node),
+                    timeout=240,
+                )
+                if not data.get("ok", True):
+                    raise AgentError(str(data.get("error") or err))
+            else:
+                raise AgentError(err)
 
         if cert_id:
             update_certificate(

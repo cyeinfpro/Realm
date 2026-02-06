@@ -1537,7 +1537,7 @@ def _wss_probe_entries(rule: Dict[str, Any]) -> List[Dict[str, str]]:
     return entries
 
 
-app = FastAPI(title='Realm Agent', version='42')
+app = FastAPI(title='Realm Agent', version='43')
 REALM_SERVICE_NAMES = [s for s in [CFG.realm_service, 'realm.service', 'realm'] if s]
 
 
@@ -3652,15 +3652,43 @@ def _find_acme_sh() -> Optional[str]:
     acme = shutil.which("acme.sh")
     if acme:
         return acme
-    for p in ("/root/.acme.sh/acme.sh", "/usr/local/bin/acme.sh"):
+    # Common install locations
+    for p in (
+        "/root/.acme.sh/acme.sh",
+        "/usr/local/bin/acme.sh",
+        "/usr/local/sbin/acme.sh",
+        "/opt/acme.sh/acme.sh",
+    ):
         if Path(p).exists():
             return p
+
+    # If installed under a different user's HOME (rare), try to locate it.
+    # This keeps the scan narrow and fast.
+    try:
+        home = str(Path.home())
+        hp = Path(home) / ".acme.sh" / "acme.sh"
+        if hp.exists():
+            return str(hp)
+    except Exception:
+        pass
+
+    try:
+        for hp in Path("/home").glob("*/.acme.sh/acme.sh"):
+            if hp.exists():
+                return str(hp)
+    except Exception:
+        pass
     return None
 
 
 def _install_acme_sh() -> Tuple[bool, str]:
     if _find_acme_sh():
         return True, ""
+
+    # Ensure basic dependencies that acme.sh relies on
+    if not shutil.which("openssl"):
+        _pkg_install(["openssl"])  # best-effort
+
     curl = shutil.which("curl")
     if not curl:
         ok, out = _pkg_install(["curl"])
@@ -3669,9 +3697,15 @@ def _install_acme_sh() -> Tuple[bool, str]:
         curl = shutil.which("curl")
         if not curl:
             return False, "缺少 curl"
+
+    # Run the official installer.
+    # NOTE: it installs to $HOME/.acme.sh by default.
+    env = os.environ.copy()
+    if os.geteuid() == 0:
+        env.setdefault("HOME", "/root")
     cmd = f"{curl} -fsSL https://get.acme.sh | sh"
     try:
-        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=180)
+        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=180, env=env)
     except subprocess.TimeoutExpired:
         return False, "acme.sh 安装超时"
     except Exception as exc:
@@ -3679,6 +3713,21 @@ def _install_acme_sh() -> Tuple[bool, str]:
     if r.returncode != 0:
         out = (r.stdout or "") + (r.stderr or "")
         return False, out.strip() or "acme.sh 安装失败"
+
+    # Best-effort: ensure it's callable from PATH (some environments rely on it)
+    try:
+        acme_path = _find_acme_sh()
+        if acme_path and os.geteuid() == 0:
+            dst = Path("/usr/local/bin/acme.sh")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not dst.exists():
+                try:
+                    dst.symlink_to(Path(acme_path))
+                except Exception:
+                    shutil.copy2(acme_path, str(dst))
+                    os.chmod(str(dst), 0o755)
+    except Exception:
+        pass
     return True, ""
 
 
@@ -3910,7 +3959,13 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
 
     acme = _find_acme_sh()
     if not acme:
-        return {"ok": False, "error": "未安装 acme.sh"}
+        # Auto-install acme.sh on demand (common first-use scenario)
+        ok, msg = _install_acme_sh()
+        if not ok:
+            return {"ok": False, "error": msg or "acme.sh 安装失败"}
+        acme = _find_acme_sh()
+        if not acme:
+            return {"ok": False, "error": "acme.sh 安装后未找到"}
 
     # Best-effort: ensure Nginx config has ACME location before issuing.
     # This is important for reverse_proxy sites created by older versions.
@@ -4062,7 +4117,12 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
 
     acme = _find_acme_sh()
     if not acme:
-        return {"ok": False, "error": "未安装 acme.sh"}
+        ok, msg = _install_acme_sh()
+        if not ok:
+            return {"ok": False, "error": msg or "acme.sh 安装失败"}
+        acme = _find_acme_sh()
+        if not acme:
+            return {"ok": False, "error": "acme.sh 安装后未找到"}
 
     # Best-effort: ensure Nginx config has ACME location before renewing.
     if isinstance(update_conf, dict):
