@@ -6087,9 +6087,12 @@ async function downloadFullBackupResult(){
   }
 }
 
+let __RESTORE_FULL_JOB_ID__ = '';
 let __RESTORE_FULL_TIMER__ = null;
 let __RESTORE_FULL_PROGRESS__ = 0;
 let __RESTORE_FULL_STEPS__ = [];
+let __RESTORE_FULL_POLLING__ = false;
+let __RESTORE_FULL_RELOADING__ = false;
 
 function _restoreFullStepsTemplate(){
   return [
@@ -6107,6 +6110,10 @@ function _renderRestoreFullSteps(){
   if(!box) return;
   const stText = { pending: '待处理', running: '进行中', done: '已完成', failed: '失败' };
   const arr = Array.isArray(__RESTORE_FULL_STEPS__) ? __RESTORE_FULL_STEPS__ : [];
+  if(!arr.length){
+    box.innerHTML = '<div class="muted sm">等待任务启动…</div>';
+    return;
+  }
   box.innerHTML = arr.map((s)=>{
     const key = String(s && s.key ? s.key : '').trim();
     const label = escapeHtml(String(s && s.label ? s.label : key || '步骤'));
@@ -6125,17 +6132,6 @@ function _renderRestoreFullSteps(){
   }).join('');
 }
 
-function _setRestoreFullStep(key, status, detail){
-  const arr = Array.isArray(__RESTORE_FULL_STEPS__) ? __RESTORE_FULL_STEPS__ : [];
-  for(const s of arr){
-    if(String(s.key || '') === String(key || '')){
-      if(status) s.status = String(status);
-      if(detail !== undefined) s.detail = String(detail || '');
-      break;
-    }
-  }
-}
-
 function _syncRestoreFullProgress(progress, stage){
   const p = Math.max(0, Math.min(100, Number(progress || 0)));
   __RESTORE_FULL_PROGRESS__ = p;
@@ -6144,54 +6140,167 @@ function _syncRestoreFullProgress(progress, stage){
   const stg = document.getElementById('restoreFullStage');
   if(bar) bar.style.width = `${p}%`;
   if(ptx) ptx.textContent = `进度 ${Math.round(p)}%`;
-  if(stg && stage) stg.textContent = String(stage);
+  if(stg) stg.textContent = stage ? String(stage) : '恢复中…';
 }
 
-function _restorePseudoStepFromProgress(p){
-  if(p < 15) return { key: 'upload', stage: '上传备份包中…' };
-  if(p < 30) return { key: 'parse', stage: '解析备份包…' };
-  if(p < 50) return { key: 'rules', stage: '恢复节点与规则…' };
-  if(p < 72) return { key: 'sites_files', stage: '恢复网站配置与文件…' };
-  if(p < 88) return { key: 'certs_netmon', stage: '恢复证书与网络波动…' };
-  return { key: 'finalize', stage: '收尾与校验…' };
+function _buildRestoreFullSummary(result){
+  const payload = result && typeof result === 'object' ? result : {};
+  const nodes = payload.nodes || {};
+  const rules = payload.rules || {};
+  const sites = payload.sites || {};
+  const siteFiles = payload.site_files || {};
+  const certs = payload.certificates || {};
+  const netmon = payload.netmon || {};
+  return (
+    `节点 新增 ${Number(nodes.added||0)} / 更新 ${Number(nodes.updated||0)} / 跳过 ${Number(nodes.skipped||0)}\n` +
+    `规则 恢复 ${Number(rules.restored||0)} / 未匹配 ${Number(rules.unmatched||0)} / 失败 ${Number(rules.failed||0)}\n` +
+    `站点 新增 ${Number(sites.added||0)} / 更新 ${Number(sites.updated||0)} / 跳过 ${Number(sites.skipped||0)}\n` +
+    `文件 恢复 ${Number(siteFiles.restored||0)} / 未匹配 ${Number(siteFiles.unmatched||0)} / 失败 ${Number(siteFiles.failed||0)} / 跳过 ${Number(siteFiles.skipped||0)}\n` +
+    `证书 新增 ${Number(certs.added||0)} / 更新 ${Number(certs.updated||0)} / 跳过 ${Number(certs.skipped||0)}\n` +
+    `网络波动 新增 ${Number(netmon.added||0)} / 更新 ${Number(netmon.updated||0)} / 跳过 ${Number(netmon.skipped||0)}`
+  );
 }
 
-function _tickRestoreFullProgress(){
-  if(__RESTORE_FULL_PROGRESS__ >= 94) return;
-  const base = __RESTORE_FULL_PROGRESS__;
-  const bump = base < 50 ? (1 + Math.random() * 2.2) : (0.6 + Math.random() * 1.4);
-  const next = Math.min(94, base + bump);
-  const now = _restorePseudoStepFromProgress(next);
-  const order = ['upload', 'parse', 'rules', 'sites_files', 'certs_netmon', 'finalize'];
-  const idx = order.indexOf(now.key);
-  for(let i=0; i<order.length; i++){
-    const k = order[i];
-    if(i < idx) _setRestoreFullStep(k, 'done');
-    else if(i === idx) _setRestoreFullStep(k, 'running');
-    else _setRestoreFullStep(k, 'pending');
-  }
-  _syncRestoreFullProgress(next, now.stage);
-  _renderRestoreFullSteps();
-}
-
-function _stopRestoreFullTimer(){
+function _stopRestoreFullPolling(){
   if(__RESTORE_FULL_TIMER__){
     clearInterval(__RESTORE_FULL_TIMER__);
     __RESTORE_FULL_TIMER__ = null;
   }
+  __RESTORE_FULL_POLLING__ = false;
 }
 
 function _resetRestoreFullUI(){
   __RESTORE_FULL_PROGRESS__ = 0;
   __RESTORE_FULL_STEPS__ = _restoreFullStepsTemplate();
+  __RESTORE_FULL_RELOADING__ = false;
   _renderRestoreFullSteps();
   _syncRestoreFullProgress(0, '等待开始');
   const summary = document.getElementById('restoreFullSummary');
   if(summary) summary.textContent = '等待恢复完成…';
   const err = document.getElementById('restoreFullError');
   if(err){
-    err.style.color = 'var(--bad)';
+    err.style.color = 'var(--muted)';
     err.textContent = '';
+  }
+}
+
+function _syncRestoreFullView(data){
+  const err = document.getElementById('restoreFullError');
+  const btn = document.getElementById('restoreFullSubmit');
+  const summary = document.getElementById('restoreFullSummary');
+
+  const status = String((data && data.status) || '').trim();
+  const progress = Math.max(0, Math.min(100, Number((data && data.progress) || 0)));
+  const stage = String((data && data.stage) || '').trim() || '恢复中…';
+  const errText = String((data && data.error) || '').trim();
+  const steps = Array.isArray(data && data.steps) ? data.steps : [];
+  if(steps.length){
+    __RESTORE_FULL_STEPS__ = steps;
+    _renderRestoreFullSteps();
+  }
+  _syncRestoreFullProgress(progress, stage);
+
+  const ptx = document.getElementById('restoreFullProgressText');
+  if(ptx && status){
+    ptx.textContent = `进度 ${Math.round(progress)}% · ${status}`;
+  }
+
+  if(status === 'done'){
+    if(err){
+      err.style.color = 'var(--ok)';
+      err.textContent = '全量恢复成功，页面将在 2 秒后刷新。';
+    }
+    if(summary){
+      summary.textContent = _buildRestoreFullSummary((data && data.result) || {});
+    }
+    if(btn){
+      btn.disabled = true;
+      btn.textContent = '恢复完成';
+    }
+    if(!__RESTORE_FULL_RELOADING__){
+      __RESTORE_FULL_RELOADING__ = true;
+      toast('全量恢复成功');
+      setTimeout(()=>{
+        closeRestoreFullModal();
+        window.location.reload();
+      }, 2000);
+    }
+    return;
+  }
+
+  if(status === 'failed'){
+    if(err){
+      err.style.color = 'var(--bad)';
+      err.textContent = errText || '恢复失败';
+    }
+    if(summary){
+      summary.textContent = `恢复失败：${errText || '执行失败'}`;
+    }
+    if(btn){
+      btn.disabled = false;
+      btn.textContent = '开始恢复';
+    }
+    return;
+  }
+
+  if(btn){
+    btn.disabled = true;
+    btn.textContent = '恢复中…';
+  }
+}
+
+async function _pollRestoreFullProgress(){
+  if(__RESTORE_FULL_POLLING__) return;
+  const jid = String(__RESTORE_FULL_JOB_ID__ || '').trim();
+  if(!jid) return;
+  __RESTORE_FULL_POLLING__ = true;
+  try{
+    const resp = await fetch(`/api/restore/full/progress?job_id=${encodeURIComponent(jid)}`, { credentials: 'include' });
+    const data = await resp.json().catch(()=>({ ok:false, error: '接口返回异常' }));
+    if(!resp.ok || !data.ok){
+      const msg = data.error || (`恢复进度查询失败（HTTP ${resp.status}）`);
+      _stopRestoreFullPolling();
+      const err = document.getElementById('restoreFullError');
+      const summary = document.getElementById('restoreFullSummary');
+      const btn = document.getElementById('restoreFullSubmit');
+      if(err){
+        err.style.color = 'var(--bad)';
+        err.textContent = msg;
+      }
+      if(summary) summary.textContent = `恢复失败：${msg}`;
+      if(btn){
+        btn.disabled = false;
+        btn.textContent = '开始恢复';
+      }
+      toast(msg, true);
+      return;
+    }
+    _syncRestoreFullView(data);
+    const st = String(data.status || '').trim();
+    if(st === 'done' || st === 'failed'){
+      _stopRestoreFullPolling();
+      if(st === 'failed'){
+        toast(String(data.error || '恢复失败'), true);
+      }
+    }
+  }catch(e){
+    _stopRestoreFullPolling();
+    const msg = (e && e.message) ? e.message : String(e || '恢复进度查询失败');
+    const err = document.getElementById('restoreFullError');
+    const summary = document.getElementById('restoreFullSummary');
+    const btn = document.getElementById('restoreFullSubmit');
+    if(err){
+      err.style.color = 'var(--bad)';
+      err.textContent = msg;
+    }
+    if(summary) summary.textContent = `恢复失败：${msg}`;
+    if(btn){
+      btn.disabled = false;
+      btn.textContent = '开始恢复';
+    }
+    toast(msg, true);
+  }finally{
+    __RESTORE_FULL_POLLING__ = false;
   }
 }
 
@@ -6199,19 +6308,27 @@ function openRestoreFullModal(){
   const m = document.getElementById('restoreFullModal');
   if(!m) return;
   m.style.display = 'flex';
+  try{
+    const menu = document.querySelector('.page-head details.menu[open]');
+    if(menu) menu.removeAttribute('open');
+  }catch(_e){}
   const input = document.getElementById('restoreFullFile');
   if(input) input.value = '';
-  _stopRestoreFullTimer();
+  __RESTORE_FULL_JOB_ID__ = '';
+  _stopRestoreFullPolling();
   _resetRestoreFullUI();
   const btn = document.getElementById('restoreFullSubmit');
-  if(btn){ btn.disabled = false; btn.textContent = '开始恢复'; }
+  if(btn){
+    btn.disabled = false;
+    btn.textContent = '开始恢复';
+  }
 }
 
 function closeRestoreFullModal(){
   const m = document.getElementById('restoreFullModal');
   if(!m) return;
   m.style.display = 'none';
-  _stopRestoreFullTimer();
+  _stopRestoreFullPolling();
 }
 
 async function restoreFullNow(){
@@ -6229,73 +6346,57 @@ async function restoreFullNow(){
       if(err) err.textContent = '请选择 nexus-backup-*.zip 全量备份包';
       return;
     }
-    _stopRestoreFullTimer();
+    _stopRestoreFullPolling();
     _resetRestoreFullUI();
-    _setRestoreFullStep('upload', 'running', '上传中');
+    if(btn){
+      btn.disabled = true;
+      btn.textContent = '恢复中…';
+    }
+    _syncRestoreFullProgress(3, '上传备份包中…');
+    __RESTORE_FULL_STEPS__ = _restoreFullStepsTemplate();
+    if(__RESTORE_FULL_STEPS__[0]){
+      __RESTORE_FULL_STEPS__[0].status = 'running';
+      __RESTORE_FULL_STEPS__[0].detail = '上传中';
+    }
     _renderRestoreFullSteps();
-    _syncRestoreFullProgress(6, '上传备份包中…');
-    if(btn){ btn.disabled = true; btn.textContent = '恢复中…'; }
-    __RESTORE_FULL_TIMER__ = setInterval(_tickRestoreFullProgress, 480);
+
     const fd = new FormData();
     fd.append('file', f);
-    const resp = await fetch('/api/restore/full', { method: 'POST', body: fd, credentials: 'include' });
+    const resp = await fetch('/api/restore/full/start', { method: 'POST', body: fd, credentials: 'include' });
     const data = await resp.json().catch(()=>({ ok:false, error: '接口返回异常' }));
     if(!resp.ok || !data.ok){
-      _stopRestoreFullTimer();
-      const now = _restorePseudoStepFromProgress(__RESTORE_FULL_PROGRESS__);
-      _setRestoreFullStep(now.key, 'failed', '执行失败');
-      _renderRestoreFullSteps();
-      const msg = data.error || ('恢复失败（HTTP ' + resp.status + '）');
-      if(err) err.textContent = msg;
+      const msg = data.error || ('启动恢复失败（HTTP ' + resp.status + '）');
+      if(err){
+        err.style.color = 'var(--bad)';
+        err.textContent = msg;
+      }
       if(summaryEl) summaryEl.textContent = `恢复失败：${msg}`;
+      if(btn){
+        btn.disabled = false;
+        btn.textContent = '开始恢复';
+      }
       toast(msg, true);
       return;
     }
-    _stopRestoreFullTimer();
-    const order = ['upload', 'parse', 'rules', 'sites_files', 'certs_netmon', 'finalize'];
-    for(const k of order) _setRestoreFullStep(k, 'done');
-    _setRestoreFullStep('finalize', 'done', '恢复完成');
-    _renderRestoreFullSteps();
-    _syncRestoreFullProgress(100, '恢复完成');
 
-    const nodes = data && data.nodes ? data.nodes : {};
-    const rules = data && data.rules ? data.rules : {};
-    const sites = data && data.sites ? data.sites : {};
-    const siteFiles = data && data.site_files ? data.site_files : {};
-    const certs = data && data.certificates ? data.certificates : {};
-    const netmon = data && data.netmon ? data.netmon : {};
-    const summaryText =
-      `节点 新增 ${Number(nodes.added||0)} / 更新 ${Number(nodes.updated||0)} / 跳过 ${Number(nodes.skipped||0)}\n` +
-      `规则 恢复 ${Number(rules.restored||0)} / 未匹配 ${Number(rules.unmatched||0)} / 失败 ${Number(rules.failed||0)}\n` +
-      `站点 新增 ${Number(sites.added||0)} / 更新 ${Number(sites.updated||0)} / 跳过 ${Number(sites.skipped||0)}\n` +
-      `文件 恢复 ${Number(siteFiles.restored||0)} / 未匹配 ${Number(siteFiles.unmatched||0)} / 失败 ${Number(siteFiles.failed||0)} / 跳过 ${Number(siteFiles.skipped||0)}\n` +
-      `证书 新增 ${Number(certs.added||0)} / 更新 ${Number(certs.updated||0)} / 跳过 ${Number(certs.skipped||0)}\n` +
-      `网络波动 新增 ${Number(netmon.added||0)} / 更新 ${Number(netmon.updated||0)} / 跳过 ${Number(netmon.skipped||0)}`;
-    if(err){
-      err.style.color = 'var(--ok)';
-      err.textContent = '全量恢复成功，页面将在 2 秒后刷新。';
-    }
-    if(summaryEl) summaryEl.textContent = summaryText;
-    toast('全量恢复成功');
-    if(btn){ btn.textContent = '恢复完成'; }
-    setTimeout(()=>{
-      closeRestoreFullModal();
-      window.location.reload();
-    }, 2000);
+    __RESTORE_FULL_JOB_ID__ = String(data.job_id || '').trim();
+    _syncRestoreFullView(data);
+    _stopRestoreFullPolling();
+    __RESTORE_FULL_TIMER__ = setInterval(_pollRestoreFullProgress, 1200);
+    await _pollRestoreFullProgress();
   }catch(e){
-    _stopRestoreFullTimer();
-    const now = _restorePseudoStepFromProgress(__RESTORE_FULL_PROGRESS__);
-    _setRestoreFullStep(now.key, 'failed', '执行异常');
-    _renderRestoreFullSteps();
+    _stopRestoreFullPolling();
     const msg = (e && e.message) ? e.message : String(e || '恢复失败');
-    if(err) err.textContent = msg;
+    if(err){
+      err.style.color = 'var(--bad)';
+      err.textContent = msg;
+    }
     if(summaryEl) summaryEl.textContent = `恢复失败：${msg}`;
-    toast(msg, true);
-  }finally{
-    if(btn && btn.textContent !== '恢复完成'){
+    if(btn){
       btn.disabled = false;
       btn.textContent = '开始恢复';
     }
+    toast(msg, true);
   }
 }
 

@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import io
 import json
+import random
 import threading
 import time
 import uuid
@@ -69,6 +70,10 @@ router = APIRouter()
 _FULL_BACKUP_JOBS: Dict[str, Dict[str, Any]] = {}
 _FULL_BACKUP_LOCK = threading.Lock()
 _FULL_BACKUP_TTL_SEC = 1800
+
+_FULL_RESTORE_JOBS: Dict[str, Dict[str, Any]] = {}
+_FULL_RESTORE_LOCK = threading.Lock()
+_FULL_RESTORE_TTL_SEC = 1800
 
 
 def _backup_steps_template() -> List[Dict[str, Any]]:
@@ -752,6 +757,150 @@ async def _build_full_backup_bundle(request: Request, progress_callback: Any = N
     }
 
 
+def _restore_steps_template() -> List[Dict[str, Any]]:
+    return [
+        {"key": "upload", "label": "上传备份包", "status": "pending", "detail": ""},
+        {"key": "parse", "label": "解析备份包", "status": "pending", "detail": ""},
+        {"key": "rules", "label": "恢复节点与规则", "status": "pending", "detail": ""},
+        {"key": "sites_files", "label": "恢复网站与文件", "status": "pending", "detail": ""},
+        {"key": "certs_netmon", "label": "恢复证书与网络波动", "status": "pending", "detail": ""},
+        {"key": "finalize", "label": "收尾与校验", "status": "pending", "detail": ""},
+    ]
+
+
+def _prune_full_restore_jobs() -> None:
+    now = time.time()
+    with _FULL_RESTORE_LOCK:
+        stale_ids: List[str] = []
+        for jid, job in _FULL_RESTORE_JOBS.items():
+            st = str(job.get("status") or "")
+            updated_at = float(job.get("updated_at") or 0.0)
+            if st in ("done", "failed") and (now - updated_at) > _FULL_RESTORE_TTL_SEC:
+                stale_ids.append(jid)
+        for jid in stale_ids:
+            _FULL_RESTORE_JOBS.pop(jid, None)
+
+
+def _restore_job_snapshot(job_id: str) -> Optional[Dict[str, Any]]:
+    with _FULL_RESTORE_LOCK:
+        job = _FULL_RESTORE_JOBS.get(job_id)
+        if not isinstance(job, dict):
+            return None
+        return {
+            "job_id": str(job_id),
+            "status": str(job.get("status") or "unknown"),
+            "progress": int(job.get("progress") or 0),
+            "stage": str(job.get("stage") or ""),
+            "error": str(job.get("error") or ""),
+            "created_at": float(job.get("created_at") or 0.0),
+            "updated_at": float(job.get("updated_at") or 0.0),
+            "steps": list(job.get("steps") or []),
+            "result": dict(job.get("result") or {}),
+        }
+
+
+def _touch_restore_job(
+    job_id: str,
+    *,
+    status: Optional[str] = None,
+    progress: Optional[int] = None,
+    stage: Optional[str] = None,
+    error: Optional[str] = None,
+    result: Optional[Dict[str, Any]] = None,
+    step_key: Optional[str] = None,
+    step_status: Optional[str] = None,
+    step_detail: Optional[str] = None,
+) -> None:
+    now = time.time()
+    with _FULL_RESTORE_LOCK:
+        job = _FULL_RESTORE_JOBS.get(job_id)
+        if not isinstance(job, dict):
+            return
+        if status is not None:
+            job["status"] = str(status)
+        if progress is not None:
+            p = max(0, min(100, int(progress)))
+            job["progress"] = p
+        if stage is not None:
+            job["stage"] = str(stage)
+        if error is not None:
+            job["error"] = str(error)
+        if result is not None:
+            job["result"] = dict(result)
+        if step_key:
+            for s in (job.get("steps") or []):
+                if str(s.get("key") or "") == str(step_key):
+                    if step_status is not None:
+                        s["status"] = str(step_status)
+                    if step_detail is not None:
+                        s["detail"] = str(step_detail)
+                    break
+        job["updated_at"] = now
+
+
+def _restore_stage_by_progress(progress: int) -> Dict[str, str]:
+    p = int(progress)
+    if p < 15:
+        return {"key": "upload", "stage": "上传备份包中…"}
+    if p < 30:
+        return {"key": "parse", "stage": "解析备份包…"}
+    if p < 50:
+        return {"key": "rules", "stage": "恢复节点与规则…"}
+    if p < 72:
+        return {"key": "sites_files", "stage": "恢复网站配置与文件…"}
+    if p < 88:
+        return {"key": "certs_netmon", "stage": "恢复证书与网络波动…"}
+    return {"key": "finalize", "stage": "收尾与校验…"}
+
+
+async def _restore_progress_ticker(job_id: str) -> None:
+    order = ["upload", "parse", "rules", "sites_files", "certs_netmon", "finalize"]
+    while True:
+        await asyncio.sleep(0.6)
+        with _FULL_RESTORE_LOCK:
+            job = _FULL_RESTORE_JOBS.get(job_id)
+            if not isinstance(job, dict):
+                return
+            if str(job.get("status") or "") != "running":
+                return
+            cur = int(job.get("progress") or 6)
+        if cur >= 95:
+            continue
+        bump = random.randint(1, 3) if cur < 60 else random.randint(1, 2)
+        nxt = min(95, cur + bump)
+        pos = _restore_stage_by_progress(nxt)
+        cur_key = str(pos.get("key") or "")
+        idx = order.index(cur_key) if cur_key in order else 0
+        _touch_restore_job(job_id, progress=nxt, stage=pos.get("stage"), step_key=cur_key, step_status="running")
+        for i, k in enumerate(order):
+            if i < idx:
+                _touch_restore_job(job_id, step_key=k, step_status="done")
+            elif i > idx:
+                _touch_restore_job(job_id, step_key=k, step_status="pending")
+
+
+def _parse_json_response_obj(resp: JSONResponse) -> Dict[str, Any]:
+    try:
+        body = getattr(resp, "body", b"") or b""
+        if isinstance(body, bytes):
+            return json.loads(body.decode("utf-8"))
+        return json.loads(str(body))
+    except Exception:
+        return {"ok": False, "error": "接口返回异常"}
+
+
+def _restore_cancel_message(exc: BaseException, fallback: str) -> str:
+    cls_name = str(exc.__class__.__name__ or "").strip()
+    msg = str(exc or "").strip()
+    if isinstance(exc, asyncio.CancelledError):
+        return f"{fallback}（请求断开或任务取消）"
+    if "disconnect" in cls_name.lower():
+        return f"{fallback}（请求连接已断开）"
+    if msg:
+        return msg
+    return fallback
+
+
 @router.get("/api/nodes/{node_id}/ping")
 async def api_ping(request: Request, node_id: int, user: str = Depends(require_login)):
     node = get_node(node_id)
@@ -1081,15 +1230,148 @@ async def api_restore_nodes(
     }
 
 
+@router.post("/api/restore/full/start")
+async def api_restore_full_start(
+    file: UploadFile = File(...),
+    user: str = Depends(require_login),
+):
+    """Start full restore in background and return a job id for polling."""
+    _prune_full_restore_jobs()
+    try:
+        raw = await file.read()
+    except asyncio.CancelledError as exc:
+        msg = _restore_cancel_message(exc, "读取上传文件失败")
+        return JSONResponse({"ok": False, "error": msg}, status_code=499)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"读取文件失败：{exc}"}, status_code=400)
+    if not raw or raw[:2] != b"PK":
+        return JSONResponse({"ok": False, "error": "请上传 nexus-backup-*.zip（兼容旧版备份包）"}, status_code=400)
+
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    with _FULL_RESTORE_LOCK:
+        _FULL_RESTORE_JOBS[job_id] = {
+            "status": "running",
+            "progress": 8,
+            "stage": "上传完成，准备恢复",
+            "error": "",
+            "created_at": now,
+            "updated_at": now,
+            "steps": _restore_steps_template(),
+            "result": {},
+        }
+    _touch_restore_job(job_id, step_key="upload", step_status="done", step_detail="上传完成")
+    _touch_restore_job(job_id, step_key="parse", step_status="running", step_detail="准备解析")
+
+    async def _run() -> None:
+        ticker: Optional[asyncio.Task] = None
+        upf: Optional[UploadFile] = None
+        try:
+            ticker = asyncio.create_task(_restore_progress_ticker(job_id))
+            upf = UploadFile(filename=str(file.filename or "restore.zip"), file=io.BytesIO(raw))
+            restore_resp = await api_restore_full(file=upf, user=user)
+            if isinstance(restore_resp, JSONResponse):
+                payload = _parse_json_response_obj(restore_resp)
+            elif isinstance(restore_resp, dict):
+                payload = dict(restore_resp)
+            else:
+                payload = {"ok": False, "error": "恢复返回异常"}
+
+            if not bool(payload.get("ok")):
+                msg = str(payload.get("error") or "恢复失败")
+                pos = _restore_stage_by_progress(int((_restore_job_snapshot(job_id) or {}).get("progress") or 0))
+                _touch_restore_job(
+                    job_id,
+                    status="failed",
+                    progress=min(99, int((_restore_job_snapshot(job_id) or {}).get("progress") or 90)),
+                    stage=msg,
+                    error=msg,
+                    result=payload,
+                    step_key=pos.get("key"),
+                    step_status="failed",
+                    step_detail="执行失败",
+                )
+                return
+
+            for k in ("upload", "parse", "rules", "sites_files", "certs_netmon", "finalize"):
+                _touch_restore_job(job_id, step_key=k, step_status="done")
+            _touch_restore_job(
+                job_id,
+                status="done",
+                progress=100,
+                stage="恢复完成",
+                result=payload,
+                step_key="finalize",
+                step_status="done",
+                step_detail="恢复完成",
+            )
+        except asyncio.CancelledError as exc:
+            pos = _restore_stage_by_progress(int((_restore_job_snapshot(job_id) or {}).get("progress") or 0))
+            _touch_restore_job(
+                job_id,
+                status="failed",
+                progress=min(99, int((_restore_job_snapshot(job_id) or {}).get("progress") or 90)),
+                stage="恢复已取消",
+                error=_restore_cancel_message(exc, "恢复任务被取消"),
+                step_key=pos.get("key"),
+                step_status="failed",
+                step_detail="任务取消",
+            )
+        except Exception as exc:
+            pos = _restore_stage_by_progress(int((_restore_job_snapshot(job_id) or {}).get("progress") or 0))
+            _touch_restore_job(
+                job_id,
+                status="failed",
+                progress=min(99, int((_restore_job_snapshot(job_id) or {}).get("progress") or 90)),
+                stage="恢复失败",
+                error=str(exc),
+                step_key=pos.get("key"),
+                step_status="failed",
+                step_detail="执行异常",
+            )
+        finally:
+            if ticker:
+                ticker.cancel()
+                try:
+                    await ticker
+                except BaseException:
+                    pass
+            if upf:
+                try:
+                    await upf.close()
+                except Exception:
+                    pass
+
+    asyncio.create_task(_run())
+    snap = _restore_job_snapshot(job_id)
+    if not snap:
+        return JSONResponse({"ok": False, "error": "创建恢复任务失败"}, status_code=500)
+    return {"ok": True, **snap}
+
+
+@router.get("/api/restore/full/progress")
+async def api_restore_full_progress(job_id: str = "", user: str = Depends(require_login)):
+    _prune_full_restore_jobs()
+    jid = str(job_id or "").strip()
+    if not jid:
+        return JSONResponse({"ok": False, "error": "缺少 job_id"}, status_code=400)
+    snap = _restore_job_snapshot(jid)
+    if not snap:
+        return JSONResponse({"ok": False, "error": "恢复任务不存在或已过期"}, status_code=404)
+    return {"ok": True, **snap}
+
+
 @router.post("/api/restore/full")
 async def api_restore_full(
-    request: Request,
     file: UploadFile = File(...),
     user: str = Depends(require_login),
 ):
     """Restore nodes list + per-node rules from full backup zip."""
     try:
         raw = await file.read()
+    except asyncio.CancelledError as exc:
+        msg = _restore_cancel_message(exc, "读取上传文件失败")
+        return JSONResponse({"ok": False, "error": msg}, status_code=499)
     except Exception as exc:
         return JSONResponse({"ok": False, "error": f"读取文件失败：{exc}"}, status_code=400)
 
