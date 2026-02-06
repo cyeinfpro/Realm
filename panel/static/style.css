@@ -2356,59 +2356,36 @@ textarea,.textarea{min-height:90px;resize:vertical}
 /* Node header title: keep compact, avoid long names breaking layout */
 .node-head .card-title{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .node-title{max-width:360px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:inline-block}
-.node-tools .search-pill{
+.node-tools{
   display:flex;
   align-items:center;
-  gap: 8px;
-  padding: 0 10px;
-  border-radius: 999px;
-  border:1px solid rgba(148,163,184,0.18);
-  background: rgba(11,15,20,0.20);
-  min-height: 34px;
-  flex: 1 1 320px;
-  max-width: 420px;
+  gap:8px;
+  flex-wrap:nowrap;
+  overflow-x:auto;
+  scrollbar-width:thin;
+  padding-bottom:2px;
 }
-
-.node-tools .filter-pill{
+.node-tools::-webkit-scrollbar{height:6px}
+.node-tools > *{flex:0 0 auto}
+.node-tools .btn{white-space:nowrap}
+.node-tools .toolbar-main-cta{
+  border-color:rgba(34,211,238,0.46);
+  box-shadow:0 0 0 1px rgba(34,211,238,0.24) inset, 0 16px 30px rgba(34,211,238,0.16);
+}
+.node-tools .toolbar-mini > summary{
+  min-height:30px;
+  padding:5px 10px;
+  border-radius:11px;
+}
+.node-tools .toolbar-mini .menu-pop{min-width:280px}
+.node-tools .toolbar-mini-search .menu-pop{min-width:340px}
+.toolbar-mini-form{
   display:flex;
-  align-items:center;
-  gap: 8px;
-  padding: 0 10px;
-  border-radius: 999px;
-  border:1px solid rgba(148,163,184,0.18);
-  background: rgba(11,15,20,0.20);
-  min-height: 34px;
-  flex: 0 0 auto;
+  flex-direction:column;
+  gap:8px;
 }
-
-.node-tools .filter-pill .filter-select{
-  appearance:none;
-  border:none;
-  outline:none;
-  background:transparent;
-  color: var(--text);
-  font-size: 12px;
-  padding: 0;
-  margin: 0;
-  width: auto;
-  min-width: 170px;
-}
-
-.node-tools .filter-pill .filter-select option{
-  color: initial;
-}
-
-.node-tools .search-pill input{
-  border:none;
-  outline:none;
-  background:transparent;
-  padding: 0;
-  flex: 1 1 auto;
-  width: 220px;
-  min-width: 0;
-  color: var(--text);
-  font-size: 12px;
-}
+.toolbar-mini-search-input{min-width:300px}
+.toolbar-mini-filter-select{min-width:220px}
 
 .summary-bar{
   margin: 0 14px 12px;
@@ -2463,18 +2440,17 @@ textarea,.textarea{min-height:90px;resize:vertical}
   .node-item-row{min-width:238px; flex:0 0 auto; scroll-snap-align:start;}
   .node-item{min-width:0; flex:1 1 auto; scroll-snap-align:none;}
   .sidebar-foot{display:none;}
-  .node-tools .search-pill input{min-width: 140px;}
+  .node-tools .toolbar-mini-search .menu-pop{min-width:300px;}
+  .toolbar-mini-search-input{min-width:240px;}
 }
 
 @media (max-width: 520px){
   .node-tools{gap:8px}
-  .node-tools .search-pill{min-height:34px}
   .node-tools{width:100%;}
-  .node-tools .btn{flex:1 1 48%;}
-  /* Make the dropdown menu occupy full row on very small screens.
-     Otherwise, the popover may overflow the viewport when the button sits in the left column. */
-  .node-tools details.menu{flex:1 1 100%;}
-  .node-tools details.menu summary{width:100%; text-align:center;}
+  .node-tools .btn{flex:0 0 auto;}
+  .node-tools details.menu{flex:0 0 auto;}
+  .node-tools .toolbar-mini .menu-pop{min-width:min(300px, calc(100vw - 24px));}
+  .toolbar-mini-search-input,.toolbar-mini-filter-select{min-width:0; width:100%;}
   .node-item-row{min-width:206px;}
   .node-item{min-width:0; padding: 9px; border-radius: 12px;}
   .node-group-divider{height:40px;}
@@ -2488,10 +2464,6 @@ textarea,.textarea{min-height:90px;resize:vertical}
   .node-head-left{flex:1 1 100%;}
   .node-head-right{flex:1 1 100%; justify-content:flex-start !important;}
   .node-main .meta{flex-wrap:wrap;}
-  .node-tools .search-pill{flex:1 1 100%; width:100%;}
-  .node-tools .search-pill input{min-width:0 !important; width:100%;}
-  .node-tools .filter-pill{flex:1 1 100%; width:100%;}
-  .node-tools .filter-pill .filter-select{min-width:0; width:100%;}
 }
 
 

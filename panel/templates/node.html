@@ -82,41 +82,35 @@
               <span class="meta-item">分组 <span id="nodeGroupPill" class="pill xs ghost">{{ node.group_name or '默认分组' }}</span></span>
             </div>
             <div class="card-sub" style="margin-top:8px;">支持 TCP/UDP/WSS · WSS 自动同步（生成规则锁定）</div>
-            <div class="row node-head-shortcuts" style="margin-top:10px; gap:8px; flex-wrap:wrap;">
-              <button class="btn xs ghost" type="button" onclick="openEditNodeModal()">编辑节点</button>
-              <button class="btn xs ghost" type="button" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">接入命令</button>
-            </div>
           </div>
-          <div class="right node-tools node-head-right" style="gap:10px; flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end;">
-            <div class="search-pill">
-              <span class="muted">🔎</span>
-              <input class="input sm" id="ruleSearch" placeholder="搜索监听/目标/备注…（支持 type:wss status:running fav）" oninput="setRuleFilter(this.value)">
-            </div>
-
-            <div class="filter-pill" title="快速筛选">
-              <span class="muted">⛭</span>
-              <select id="ruleQuickFilter" class="filter-select" onchange="setRuleQuickFilter(this.value)">
-                <option value="">全部规则</option>
-                <option value="fav">仅收藏 ★</option>
-                <option value="running">运行中</option>
-                <option value="disabled">已暂停</option>
-                <option value="tcp">TCP/UDP</option>
-                <option value="wss">WSS 隧道</option>
-                <option value="intranet">内网穿透</option>
-                <option value="lb">负载均衡（多目标）</option>
-                <option value="remark">有备注</option>
-              </select>
-            </div>
-
-            <details class="menu">
-              <summary class="btn sm ghost">规则工具 ▾</summary>
+          <div class="right node-tools node-head-right" style="gap:8px; flex:0 0 auto; flex-wrap:nowrap; justify-content:flex-end;">
+            <details class="menu toolbar-mini toolbar-mini-search">
+              <summary class="btn xs ghost">🔎 搜索</summary>
               <div class="menu-pop">
-                <a class="menu-item" href="/api/nodes/{{ node.id }}/backup">备份规则 <span class="muted sm">下载</span></a>
-                <button class="menu-item" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则 <span class="muted sm">粘贴</span></button>
-                <div class="menu-sep"></div>
-                <button class="menu-item danger" type="button" onclick="purgeAllRules()">
-                  清空所有规则 <span class="muted sm">危险</span>
-                </button>
+                <div class="toolbar-mini-form">
+                  <label class="label">搜索规则</label>
+                  <input class="input sm toolbar-mini-search-input" id="ruleSearch" placeholder="监听/目标/备注…（支持 type:wss status:running fav）" oninput="setRuleFilter(this.value)">
+                </div>
+              </div>
+            </details>
+
+            <details class="menu toolbar-mini toolbar-mini-filter" title="快速筛选">
+              <summary class="btn xs ghost">⛭ 筛选</summary>
+              <div class="menu-pop">
+                <div class="toolbar-mini-form">
+                  <label class="label">规则筛选</label>
+                  <select id="ruleQuickFilter" class="select toolbar-mini-filter-select" onchange="setRuleQuickFilter(this.value)">
+                    <option value="">全部规则</option>
+                    <option value="fav">仅收藏 ★</option>
+                    <option value="running">运行中</option>
+                    <option value="disabled">已暂停</option>
+                    <option value="tcp">TCP/UDP</option>
+                    <option value="wss">WSS 隧道</option>
+                    <option value="intranet">内网穿透</option>
+                    <option value="lb">负载均衡（多目标）</option>
+                    <option value="remark">有备注</option>
+                  </select>
+                </div>
               </div>
             </details>
 
@@ -128,8 +122,21 @@
               <button class="btn xs ghost" type="button" title="批量删除" onclick="bulkDeleteSelected()" style="color:var(--bad);">🗑 删除</button>
               <button class="btn xs ghost" type="button" title="清空选择" onclick="clearRuleSelection()">清空</button>
             </div>
-            <button class="btn sm" type="button" onclick="newRule()">+ 创建转发</button>
+            <button class="btn sm primary toolbar-main-cta" type="button" onclick="newRule()">+ 创建转发</button>
+            <button class="btn xs ghost" type="button" onclick="openEditNodeModal()">编辑节点</button>
+            <button class="btn xs ghost" type="button" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">接入命令</button>
             <button class="btn sm ghost" type="button" id="autoRefreshBtn" onclick="toggleAutoRefresh()">⟳ 自动刷新：开</button>
+            <details class="menu">
+              <summary class="btn sm ghost">规则工具 ▾</summary>
+              <div class="menu-pop">
+                <a class="menu-item" href="/api/nodes/{{ node.id }}/backup">备份规则 <span class="muted sm">下载</span></a>
+                <button class="menu-item" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则 <span class="muted sm">粘贴</span></button>
+                <div class="menu-sep"></div>
+                <button class="menu-item danger" type="button" onclick="purgeAllRules()">
+                  清空所有规则 <span class="muted sm">危险</span>
+                </button>
+              </div>
+            </details>
 
             <details class="menu">
               <summary class="btn sm ghost">节点操作 ▾</summary>
