@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="v34"
+VERSION="v35"
 REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
 DEFAULT_MODE="1"
 DEFAULT_PORT="18700"
@@ -19,10 +19,24 @@ need_root(){
 }
 
 apt_install(){
+  local ready="1"
+  command_exists curl || ready="0"
+  command_exists unzip || ready="0"
+  command_exists jq || ready="0"
+  command_exists python3 || ready="0"
+  command_exists rsync || ready="0"
+  python3 -m venv --help >/dev/null 2>&1 || ready="0"
+  python3 -m pip --version >/dev/null 2>&1 || ready="0"
+  if [[ "${ready}" == "1" ]]; then
+    ok "依赖已满足，跳过 apt 安装"
+    return
+  fi
+
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
   # rsync 用于更稳的覆盖更新（避免部分文件未更新）
-  apt-get install -y curl ca-certificates unzip jq python3 python3-venv python3-pip rsync
+  apt-get install -y --no-install-recommends \
+    curl ca-certificates unzip jq python3 python3-venv python3-pip rsync
 }
 
 command_exists(){
@@ -73,7 +87,9 @@ install_realm(){
   local urls=()
   local panel_base
   panel_base="$(normalize_panel_url "${REALM_PANEL_URL:-}")"
-  if [[ -n "${panel_base}" ]]; then
+  # 当面板机器非公网可达时，可通过 REALM_AGENT_GITHUB_ONLY=1 强制所有安装资产走 GitHub，
+  # 避免依赖面板提供 /static 下载（例如 realm 二进制）。
+  if [[ -n "${panel_base}" && "${REALM_AGENT_GITHUB_ONLY:-}" != "1" ]]; then
     urls+=(
       "${panel_base}/static/realm/realm-${arch}-unknown-linux-gnu.tar.gz"
       "${panel_base}/static/realm/realm-${arch}-unknown-linux-musl.tar.gz"
@@ -192,20 +208,6 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 }
 
-ask(){
-  local prompt="$1" default="$2" var
-  if [[ "${REALM_AGENT_ASSUME_YES:-}" == "1" ]]; then
-    echo "${default}"
-    return
-  fi
-  if [[ ! -t 0 ]]; then
-    echo "${default}"
-    return
-  fi
-  read -r -p "$prompt" var || true
-  if [[ -z "${var}" ]]; then echo "${default}"; else echo "$var"; fi
-}
-
 fetch_repo(){
   local mode="$1"
   local tmpdir="$2"
@@ -213,11 +215,8 @@ fetch_repo(){
 
   if [[ "${mode}" == "2" ]]; then
     zip_path="${REALM_AGENT_ZIP_PATH:-}"
-    if [[ -z "${zip_path}" ]]; then
-      zip_path=$(ask "请输入 ZIP 文件路径（例如 /root/Realm-main.zip）: " "")
-    fi
     if [[ -z "${zip_path}" || ! -f "${zip_path}" ]]; then
-      err "ZIP 文件不存在：${zip_path}"
+      err "离线模式需要设置 REALM_AGENT_ZIP_PATH=/path/to/Realm-main.zip"
       exit 1
     fi
     info "使用离线 ZIP：${zip_path}"
@@ -227,17 +226,9 @@ fetch_repo(){
     # ✅ 自定义 ZIP 地址（例如从面板 /static/realm-agent.zip 拉取）永远优先
     #    这样即便机器无法连接 GitHub，也能稳定更新。
     url="${REALM_AGENT_REPO_ZIP_URL:-}"
-
-    # 如果没有指定自定义 URL：
-    # - 已安装或强制更新时：默认拉取官方 main.zip（GitHub）
-    # - 否则：询问用户（回车=默认）
     if [[ -z "${url}" ]]; then
-      if [[ -d /opt/realm-agent/agent || "${REALM_AGENT_FORCE_UPDATE:-}" == "1" ]]; then
-        url="${REPO_ZIP_URL_DEFAULT}"
-        info "检测到已安装 Agent，将自动更新到最新版本：${url}"
-      else
-        url=$(ask "仓库 ZIP 下载地址（回车=默认）: " "${REPO_ZIP_URL_DEFAULT}")
-      fi
+      url="${REPO_ZIP_URL_DEFAULT}"
+      info "未指定仓库 ZIP 地址，使用默认：${url}"
     else
       info "使用自定义仓库 ZIP 地址：${url}"
     fi
@@ -286,12 +277,20 @@ atomic_update_agent(){
 
   info "创建虚拟环境（staging）..."
   python3 -m venv "${stage}/venv"
-  "${stage}/venv/bin/pip" install -U pip wheel setuptools >/dev/null
+  export PIP_DISABLE_PIP_VERSION_CHECK=1
+  export PIP_ROOT_USER_ACTION=ignore
+  if [[ "${REALM_AGENT_UPGRADE_PIP:-0}" == "1" ]]; then
+    "${stage}/venv/bin/pip" install -U pip wheel setuptools >/dev/null
+  fi
   # 先装 requirements（仓库内）
-  "${stage}/venv/bin/pip" install -r "${stage}/agent/requirements.txt" >/dev/null || true
+  "${stage}/venv/bin/pip" install \
+    --no-input --prefer-binary --timeout 60 --retries 2 \
+    -r "${stage}/agent/requirements.txt" >/dev/null || true
   # 兜底确保核心依赖一定存在（避免 requirements 缺失/变更导致服务无法启动）
   "${stage}/venv/bin/python" -c "import fastapi,uvicorn" >/dev/null 2>&1 || \
-    "${stage}/venv/bin/pip" install -U "fastapi" "uvicorn[standard]" "requests" >/dev/null
+    "${stage}/venv/bin/pip" install \
+      --no-input --prefer-binary --timeout 60 --retries 2 \
+      -U "fastapi" "uvicorn[standard]" "requests" >/dev/null
 
   # 生成 API Key（持久化不变）
   install -d -m 700 /etc/realm-agent
@@ -366,11 +365,19 @@ EOF
       systemctl stop realm-agent.service >/dev/null 2>&1 || true
       rm -rf "${base}/venv" || true
       python3 -m venv "${base}/venv"
-      "${base}/venv/bin/pip" install -U pip wheel setuptools >/dev/null
-      "${base}/venv/bin/pip" install -U "fastapi" "uvicorn[standard]" "requests" >/dev/null
+      export PIP_DISABLE_PIP_VERSION_CHECK=1
+      export PIP_ROOT_USER_ACTION=ignore
+      if [[ "${REALM_AGENT_UPGRADE_PIP:-0}" == "1" ]]; then
+        "${base}/venv/bin/pip" install -U pip wheel setuptools >/dev/null
+      fi
+      "${base}/venv/bin/pip" install \
+        --no-input --prefer-binary --timeout 60 --retries 2 \
+        -U "fastapi" "uvicorn[standard]" "requests" >/dev/null
       # 尝试安装 requirements（若存在）
       if [[ -f "${base}/agent/requirements.txt" ]]; then
-        "${base}/venv/bin/pip" install -r "${base}/agent/requirements.txt" >/dev/null || true
+        "${base}/venv/bin/pip" install \
+          --no-input --prefer-binary --timeout 60 --retries 2 \
+          -r "${base}/agent/requirements.txt" >/dev/null || true
       fi
       systemctl daemon-reload
       systemctl restart realm-agent.service >/dev/null 2>&1 || true
@@ -427,18 +434,18 @@ main(){
 
   echo "Realm Pro Agent Installer ${VERSION}"
   echo "------------------------------------------------------------"
-  echo "1) 在线安装（推荐）"
-  echo "2) 离线安装（手动下载）"
   local mode
-  mode="${REALM_AGENT_MODE:-}"
-  if [[ -z "${mode}" ]]; then
-    mode=$(ask "请选择安装模式 [1-2] (默认 1): " "${DEFAULT_MODE}")
+  mode="${REALM_AGENT_MODE:-${DEFAULT_MODE}}"
+  if [[ "${mode}" != "1" && "${mode}" != "2" ]]; then
+    err "安装模式仅支持 1(在线) 或 2(离线)"
+    exit 1
   fi
 
   local port
-  port="${REALM_AGENT_PORT:-}"
-  if [[ -z "${port}" ]]; then
-    port=$(ask "Agent 端口 (默认 18700): " "${DEFAULT_PORT}")
+  port="${REALM_AGENT_PORT:-${DEFAULT_PORT}}"
+  if [[ ! "${port}" =~ ^[0-9]+$ || "${port}" -lt 1 || "${port}" -gt 65535 ]]; then
+    err "Agent 端口无效：${port}"
+    exit 1
   fi
   local host
   host="${REALM_AGENT_HOST:-}"
@@ -456,7 +463,11 @@ main(){
 
   info "安装依赖..."
   apt_install
-  install_tcping
+  if [[ "${REALM_AGENT_INSTALL_TCPING:-0}" == "1" ]]; then
+    install_tcping
+  else
+    info "跳过 tcping 安装（设置 REALM_AGENT_INSTALL_TCPING=1 可启用）"
+  fi
   # 仅更新 Agent（不更新 Realm 转发）
   if [[ "${REALM_AGENT_ONLY:-0}" != "1" ]]; then
     install_realm

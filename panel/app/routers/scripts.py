@@ -79,7 +79,7 @@ API_KEY=\"{api_key}\"
 if [[ \"$(id -u)\" -ne 0 ]]; then
   if command -v sudo >/dev/null 2>&1; then
     echo \"[提示] 需要 root，自动尝试 sudo...\" >&2
-    exec sudo -E bash -c \"curl -fsSL -H \\\"X-Join-Token: {api_key}\\\" \\\"$PANEL_URL/join\\\" | bash\"
+    exec sudo -E bash -c \"curl -fL --retry 2 --retry-all-errors --connect-timeout 8 -H \\\"X-Join-Token: {api_key}\\\" \\\"$PANEL_URL/join\\\" | bash\"
   fi
   echo \"[错误] 需要 root 权限运行，但系统未安装 sudo。请切换到 root 后重试（sudo -i / su -）。\" >&2
   exit 1
@@ -92,7 +92,7 @@ echo \"$API_KEY\" > /etc/realm-agent/api.key
 chmod 600 /etc/realm-agent/api.key 2>/dev/null || true
 
 echo \"[提示] 正在安装/更新 Realm Agent…\" >&2
-curl -fsSL \"{agent_sh_url}\" | \
+curl -fL --retry 2 --retry-all-errors --connect-timeout 8 \"{agent_sh_url}\" | \
 {gh_only_env}  REALM_AGENT_REPO_ZIP_URL=\"{repo_zip_url}\" \
   REALM_AGENT_FORCE_UPDATE=1 \
   REALM_AGENT_MODE=1 \
@@ -130,7 +130,7 @@ PANEL_URL=\"{base_url}\"
 if [[ \"$(id -u)\" -ne 0 ]]; then
   if command -v sudo >/dev/null 2>&1; then
     echo \"[提示] 需要 root，自动尝试 sudo...\" >&2
-    exec sudo -E bash -c \"curl -fsSL -H \\\"X-Join-Token: {api_key}\\\" \\\"$PANEL_URL/uninstall\\\" | bash\"
+    exec sudo -E bash -c \"curl -fL --retry 2 --retry-all-errors --connect-timeout 8 -H \\\"X-Join-Token: {api_key}\\\" \\\"$PANEL_URL/uninstall\\\" | bash\"
   fi
   echo \"[错误] 需要 root 权限运行，但系统未安装 sudo。请切换到 root 后重试（sudo -i / su -）。\" >&2
   exit 1
