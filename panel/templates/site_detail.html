@@ -18,19 +18,6 @@
   </div>
   <div class="right">
     <a class="btn sm ghost" href="/websites">返回列表</a>
-    <a class="btn sm" href="/websites/{{ site.id }}/edit">编辑</a>
-    <details class="menu">
-      <summary class="btn sm ghost">操作 ▾</summary>
-      <div class="menu-pop">
-        {% if site.type != 'reverse_proxy' and site.root_path %}
-          <a class="menu-item" href="/websites/{{ site.id }}/files">文件管理</a>
-        {% endif %}
-        <a class="menu-item" href="/websites/{{ site.id }}/diagnose">诊断</a>
-
-        <div class="menu-sep"></div>
-        <a class="menu-item danger" href="#danger">删除站点…</a>
-      </div>
-    </details>
   </div>
 </div>
 
@@ -57,56 +44,6 @@
         <div class="kvline"><div class="k">自定义模板</div><div class="v">{{ "已配置" if site.nginx_tpl else "未配置" }}</div></div>
         <div class="kvline"><div class="k">创建时间</div><div class="v mono">{{ site.created_at }}</div></div>
       </div>
-    </div>
-
-    <div class="card compact">
-      <div class="section-head">
-        <div>
-          <div class="section-title">健康状态</div>
-          <div class="section-sub">实时监测与最近检查（异常会在此处聚合）。</div>
-        </div>
-      </div>
-
-      {% set h = site.health_status or '' %}
-      {% set hclass = 'ok' if h == 'ok' else ('bad' if h == 'fail' else 'ghost') %}
-      <div class="kv-lines">
-        <div class="kvline"><div class="k">当前状态</div><div class="v"><span class="pill xs {{ hclass }}">{{ h or 'unknown' }}</span></div></div>
-        <div class="kvline"><div class="k">HTTP</div><div class="v mono">{{ site.health_code or '-' }}</div></div>
-        <div class="kvline"><div class="k">延迟</div><div class="v mono">{{ site.health_latency_ms or 0 }} ms</div></div>
-        <div class="kvline"><div class="k">最近检查</div><div class="v mono">{{ site.health_checked_at or '-' }}</div></div>
-        <div class="kvline"><div class="k">错误</div><div class="v mono" title="{{ site.health_error or '' }}">{{ site.health_error or '-' }}</div></div>
-      </div>
-
-      {% if checks %}
-        <details style="margin-top:10px;">
-          <summary class="btn xs ghost">查看最近检查（{{ checks|length }}）</summary>
-          <div class="table-wrap" style="margin-top:10px;">
-            <table class="table no-sticky dense">
-              <thead>
-                <tr>
-                  <th>时间</th>
-                  <th>状态</th>
-                  <th>HTTP</th>
-                  <th>延迟</th>
-                  <th>错误</th>
-                </tr>
-              </thead>
-              <tbody>
-                {% for c in checks %}
-                {% set ok = (c.ok or 0) %}
-                <tr>
-                  <td class="mono">{{ c.checked_at }}</td>
-                  <td><span class="pill xs {{ 'ok' if ok else 'bad' }}">{{ 'ok' if ok else 'fail' }}</span></td>
-                  <td class="mono">{{ c.status_code or '-' }}</td>
-                  <td class="mono">{{ c.latency_ms or 0 }} ms</td>
-                  <td><div class="mono truncate" title="{{ c.error or '' }}">{{ c.error or '-' }}</div></td>
-                </tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-        </details>
-      {% endif %}
     </div>
   </div>
 
@@ -159,77 +96,6 @@
       </div>
       {% else %}
         <div class="muted" style="margin-top:10px;">暂无证书，可点击上方“申请 SSL”。</div>
-      {% endif %}
-    </div>
-
-    <div class="card compact">
-      <div class="section-head">
-        <div>
-          <div class="section-title">变更历史</div>
-          <div class="section-sub">创建/删除/证书等操作记录（默认显示最近）。</div>
-        </div>
-      </div>
-
-      {% if events %}
-        <div class="table-wrap" style="margin-top:10px;">
-          <table class="table no-sticky dense">
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>动作</th>
-                <th>状态</th>
-                <th>操作者</th>
-                <th>错误</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for e in events[:8] %}
-              {% set es = (e.status or '') %}
-              {% set ecls = 'ok' if es == 'success' else ('warn' if es == 'running' else ('bad' if es in ['failed','error'] else 'ghost')) %}
-              <tr>
-                <td class="mono">{{ e.created_at }}</td>
-                <td>{{ e.action }}</td>
-                <td><span class="pill xs {{ ecls }}">{{ es }}</span></td>
-                <td>{{ e.actor or '-' }}</td>
-                <td><div class="mono truncate" title="{{ e.error or '' }}">{{ e.error or '-' }}</div></td>
-              </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-        {% if events|length > 8 %}
-          <details style="margin-top:10px;">
-            <summary class="btn xs ghost">查看更多（{{ events|length }}）</summary>
-            <div class="table-wrap" style="margin-top:10px;">
-              <table class="table no-sticky dense">
-                <thead>
-                  <tr>
-                    <th>时间</th>
-                    <th>动作</th>
-                    <th>状态</th>
-                    <th>操作者</th>
-                    <th>错误</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {% for e in events %}
-                  {% set es = (e.status or '') %}
-                  {% set ecls = 'ok' if es == 'success' else ('warn' if es == 'running' else ('bad' if es in ['failed','error'] else 'ghost')) %}
-                  <tr>
-                    <td class="mono">{{ e.created_at }}</td>
-                    <td>{{ e.action }}</td>
-                    <td><span class="pill xs {{ ecls }}">{{ es }}</span></td>
-                    <td>{{ e.actor or '-' }}</td>
-                    <td><div class="mono truncate" title="{{ e.error or '' }}">{{ e.error or '-' }}</div></td>
-                  </tr>
-                  {% endfor %}
-                </tbody>
-              </table>
-            </div>
-          </details>
-        {% endif %}
-      {% else %}
-        <div class="muted" style="margin-top:10px;">暂无变更记录</div>
       {% endif %}
     </div>
   </div>

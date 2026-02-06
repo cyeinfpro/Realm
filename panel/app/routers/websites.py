@@ -380,8 +380,6 @@ async def website_detail(request: Request, site_id: int, user: str = Depends(req
     certs = list_certificates(site_id=int(site_id))
     for c in certs:
         c["domains_text"] = ", ".join(c.get("domains") or [])
-    events = list_site_events(int(site_id), limit=60)
-    checks = list_site_checks(int(site_id), limit=30)
     return templates.TemplateResponse(
         "site_detail.html",
         {
@@ -392,8 +390,6 @@ async def website_detail(request: Request, site_id: int, user: str = Depends(req
             "site": site,
             "node": node,
             "certs": certs,
-            "events": events,
-            "checks": checks,
         },
     )
 

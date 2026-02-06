@@ -7,7 +7,7 @@
 <div class="subnav-bar">
   <div class="subnav" aria-label="站点导航">
     <a href="/websites/{{ sid }}" class="{{ 'active' if p == '/websites/' ~ sid else '' }}">概览</a>
-    <a href="/websites/{{ sid }}/edit" class="{{ 'active' if p.endswith('/edit') else '' }}">设置</a>
+    <a href="/websites/{{ sid }}/edit" class="{{ 'active' if p.endswith('/edit') else '' }}">编辑</a>
     <a href="/websites/{{ sid }}/diagnose" class="{{ 'active' if p.endswith('/diagnose') else '' }}">诊断</a>
     {% if site.type != 'reverse_proxy' and site.root_path %}
       <a href="/websites/{{ sid }}/files" class="{{ 'active' if '/files' in p else '' }}">文件</a>
