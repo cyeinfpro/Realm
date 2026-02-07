@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import datetime
 import hashlib
@@ -78,6 +79,20 @@ def _parse_upload_max_bytes() -> int:
 
 
 UPLOAD_MAX_BYTES = _parse_upload_max_bytes()
+
+
+def _parse_upload_compat_concurrency() -> int:
+    raw = os.getenv("REALM_WEBSITE_UPLOAD_COMPAT_CONCURRENCY")
+    try:
+        if raw:
+            v = int(float(str(raw).strip()))
+            return max(1, min(8, v))
+    except Exception:
+        pass
+    return 3
+
+
+UPLOAD_COMPAT_CONCURRENCY = _parse_upload_compat_concurrency()
 
 
 def _parse_int_env(name: str, default: int) -> int:
@@ -2079,6 +2094,7 @@ async def website_files_upload(
 
     ok_count = 0
     try:
+        prepared: List[Tuple[UploadFile, str, str]] = []
         for upload in uploads:
             name_raw = str(upload.filename or "").strip()
             if not name_raw:
@@ -2087,8 +2103,38 @@ async def website_files_upload(
             if not base:
                 raise RuntimeError("文件名为空")
             target_path = _join_rel(path, rel_dir)
-            await _upload_one(upload, target_path, os.path.basename(base))
-            ok_count += 1
+            prepared.append((upload, target_path, os.path.basename(base)))
+
+        if not prepared:
+            raise RuntimeError("请选择文件或文件夹")
+
+        first_error: Optional[Exception] = None
+        cursor = 0
+        state_lock = asyncio.Lock()
+
+        async def _worker() -> None:
+            nonlocal ok_count, first_error, cursor
+            while True:
+                async with state_lock:
+                    if first_error is not None or cursor >= len(prepared):
+                        return
+                    upload, target_path, base_name = prepared[cursor]
+                    cursor += 1
+                try:
+                    await _upload_one(upload, target_path, base_name)
+                    async with state_lock:
+                        ok_count += 1
+                except Exception as exc:
+                    async with state_lock:
+                        if first_error is None:
+                            first_error = exc
+                    return
+
+        worker_count = min(max(1, UPLOAD_COMPAT_CONCURRENCY), len(prepared))
+        await asyncio.gather(*[_worker() for _ in range(worker_count)])
+        if first_error is not None:
+            raise first_error
+
         set_flash(request, f"上传成功（{ok_count} 个文件）")
     except Exception as exc:
         msg = f"上传失败：{exc}"

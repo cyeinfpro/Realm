@@ -171,6 +171,11 @@
         <input type="file" id="fmModalFolderInput" class="fm-file-input" webkitdirectory directory mozdirectory multiple>
         <div class="muted sm" id="fmModalHint">未选择</div>
       </div>
+      <div class="fm-upload-row">
+        <span class="muted sm">并发上传</span>
+        <select class="select sm" id="fmModalConcurrency"></select>
+        <span class="muted sm">建议 2-6，文件越多可适当调高</span>
+      </div>
       <div class="fm-upload-list" id="fmModalFileList">未选择</div>
       <div class="fm-upload-stats muted sm" id="fmModalStats"></div>
       <div id="fmModalProgress" style="margin-top:10px;display:none;">
@@ -246,6 +251,7 @@ const fmModalPick = document.getElementById('fmModalPick');
 const fmModalFilesInput = document.getElementById('fmModalFilesInput');
 const fmModalFolderInput = document.getElementById('fmModalFolderInput');
 const fmModalHint = document.getElementById('fmModalHint');
+const fmModalConcurrency = document.getElementById('fmModalConcurrency');
 const fmModalFileList = document.getElementById('fmModalFileList');
 const fmModalStats = document.getElementById('fmModalStats');
 const fmModalStart = document.getElementById('fmModalStart');
@@ -271,7 +277,7 @@ const fmShareCloseTop = document.getElementById('fmShareCloseTop');
 const fmShareGen = document.getElementById('fmShareGen');
 const fmShareRevoke = document.getElementById('fmShareRevoke');
 
-const CHUNK_SIZE = 1024 * 512;
+const CHUNK_SIZE = 1024 * 1024;
 const UPLOAD_MAX_BYTES = {{ upload_max_bytes }};
 const SITE_ID = {{ site.id }};
 const CUR_PATH = {{ path|tojson }};
@@ -288,6 +294,10 @@ const modalUI = {
   retry: fmModalRetry,
   button: fmModalStart
 };
+const MAX_UPLOAD_CONCURRENCY = 8;
+const MIN_UPLOAD_CONCURRENCY = 1;
+const PROGRESS_UPDATE_INTERVAL_MS = 100;
+const UPLOAD_CONCURRENCY_KEY = `nexus_upload_concurrency_${SITE_ID}`;
 let modalFiles = [];
 let lastUploadMethod = 'chunked';
 let shareItems = [];
@@ -304,6 +314,39 @@ function bytesToHuman(n){
     i++;
   }
   return v.toFixed(1) + ' ' + units[i];
+}
+
+function clampUploadConcurrency(raw){
+  const n = parseInt(raw, 10) || 0;
+  if(n < MIN_UPLOAD_CONCURRENCY) return MIN_UPLOAD_CONCURRENCY;
+  if(n > MAX_UPLOAD_CONCURRENCY) return MAX_UPLOAD_CONCURRENCY;
+  return n;
+}
+
+function defaultUploadConcurrency(){
+  const cores = parseInt(navigator.hardwareConcurrency || '0', 10) || 4;
+  if(cores <= 2) return 2;
+  if(cores <= 4) return 3;
+  if(cores <= 8) return 4;
+  return 6;
+}
+
+function selectedUploadConcurrency(){
+  if(!fmModalConcurrency) return clampUploadConcurrency(defaultUploadConcurrency());
+  return clampUploadConcurrency(fmModalConcurrency.value);
+}
+
+function initUploadConcurrency(){
+  if(!fmModalConcurrency) return;
+  fmModalConcurrency.innerHTML = '';
+  for(let i=MIN_UPLOAD_CONCURRENCY;i<=MAX_UPLOAD_CONCURRENCY;i++){
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = `${i} 并发`;
+    fmModalConcurrency.appendChild(opt);
+  }
+  const saved = clampUploadConcurrency(localStorage.getItem(UPLOAD_CONCURRENCY_KEY) || defaultUploadConcurrency());
+  fmModalConcurrency.value = String(saved);
 }
 
 function updateBodyModalState(){
@@ -736,14 +779,17 @@ async function sha256Hex(arrayBuffer){
   return bufToHex(hash);
 }
 
-async function chunkToBase64(arrayBuffer){
-  let binary = '';
-  const bytes = new Uint8Array(arrayBuffer);
-  const len = bytes.byteLength;
-  for(let i=0;i<len;i++){
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
+async function blobToBase64(blob){
+  return await new Promise((resolve, reject)=>{
+    const reader = new FileReader();
+    reader.onload = ()=>{
+      const text = String(reader.result || '');
+      const i = text.indexOf(',');
+      resolve(i >= 0 ? text.slice(i + 1) : text);
+    };
+    reader.onerror = ()=> reject(new Error('分片编码失败'));
+    reader.readAsDataURL(blob);
+  });
 }
 
 function uploadKey(file, path, filename){
@@ -897,9 +943,15 @@ async function uploadFile(file, uploadId, startOffset, path, filename, totalByte
   }
   while(offset < total){
     const chunk = file.slice(offset, offset + CHUNK_SIZE);
-    const buf = await chunk.arrayBuffer();
-    const chunkSha = await sha256Hex(buf);
-    const b64 = await chunkToBase64(buf);
+    if(chunk.size <= 0){
+      break;
+    }
+    let chunkSha = '';
+    if(HAS_SUBTLE){
+      const buf = await chunk.arrayBuffer();
+      chunkSha = await sha256Hex(buf);
+    }
+    const b64 = await blobToBase64(chunk);
     const done = (offset + chunk.size) >= total;
     const payload = {
       path: path || CUR_PATH,
@@ -952,44 +1004,82 @@ async function startChunkedUpload(files, ui, resumeOnly){
   if(ui?.button) ui.button.disabled = true;
   if(fmModalCompat) fmModalCompat.disabled = true;
   const totalBytes = files.reduce((s,f)=>s + (f.size || 0), 0) || 0;
+  const total = totalBytes || 0;
   let uploadedBytes = 0;
+  let cursor = 0;
+  let lastUiTs = 0;
+  let lastName = '';
   try{
-    const tasks = [];
-    for(let i=0;i<files.length;i++){
-      const file = files[i];
-      const target = resolveUploadTarget(file);
-      const key = uploadKey(file, target.path, target.filename);
-      let uploadId = localStorage.getItem(key) || '';
-      if(!uploadId){
-        if(resumeOnly){
+    if(resumeOnly){
+      for(const file of files){
+        const target = resolveUploadTarget(file);
+        const key = uploadKey(file, target.path, target.filename);
+        if(!localStorage.getItem(key)){
           throw new Error('找不到可恢复的上传');
         }
-        uploadId = Math.random().toString(16).slice(2) + Date.now().toString(16);
       }
-      const offset = await getResumeOffset(file, uploadId, target.path, target.filename);
-      uploadedBytes += offset;
-      tasks.push({file, target, uploadId, offset});
     }
-    const total = totalBytes || 0;
-    const updateProgress = (delta, name)=>{
-      uploadedBytes += delta;
-      const pct = total > 0 ? Math.min(100, Math.round((uploadedBytes / total) * 100)) : 100;
+    const flushProgress = (name, force)=>{
+      const now = Date.now();
+      if(!force && (now - lastUiTs) < PROGRESS_UPDATE_INTERVAL_MS){
+        return;
+      }
+      if(name){
+        lastName = name;
+      }
+      lastUiTs = now;
+      const doneBytes = Math.max(0, Math.min(total, uploadedBytes));
+      const pct = total > 0 ? Math.min(100, Math.round((doneBytes / total) * 100)) : 100;
       if(ui?.progressFill) ui.progressFill.style.width = pct + '%';
       if(ui?.status){
-        ui.status.textContent = `上传中：${name} · ${bytesToHuman(uploadedBytes)} / ${bytesToHuman(total)} (${pct}%)`;
+        ui.status.textContent = `上传中：${lastName || '-'} · ${bytesToHuman(doneBytes)} / ${bytesToHuman(total)} (${pct}%)`;
       }
     };
-    const concurrency = 3;
-    let cursor = 0;
+    const updateProgress = (delta, name, force)=>{
+      if(delta > 0){
+        uploadedBytes += delta;
+      }
+      flushProgress(name, force);
+    };
+    const concurrency = Math.max(1, Math.min(files.length, selectedUploadConcurrency()));
+    if(ui?.status){
+      ui.status.textContent = `准备上传：${files.length} 个文件，${concurrency} 并发`;
+    }
+    if(ui?.progressFill) ui.progressFill.style.width = '0%';
     const worker = async ()=>{
       while(true){
-        if(cursor >= tasks.length) return;
-        const t = tasks[cursor++];
-        await uploadFile(t.file, t.uploadId, t.offset, t.target.path, t.target.filename, total, (d)=>updateProgress(d, t.file.name), ui);
+        if(cursor >= files.length) return;
+        const file = files[cursor++];
+        const target = resolveUploadTarget(file);
+        const key = uploadKey(file, target.path, target.filename);
+        let uploadId = localStorage.getItem(key) || '';
+        if(!uploadId){
+          if(resumeOnly){
+            throw new Error('找不到可恢复的上传');
+          }
+          uploadId = Math.random().toString(16).slice(2) + Date.now().toString(16);
+        }
+        const offset = await getResumeOffset(file, uploadId, target.path, target.filename);
+        if(offset > 0){
+          updateProgress(offset, file.name, true);
+        }else{
+          updateProgress(0, file.name, false);
+        }
+        await uploadFile(
+          file,
+          uploadId,
+          offset,
+          target.path,
+          target.filename,
+          total,
+          (d)=>updateProgress(d, file.name, false),
+          ui
+        );
+        updateProgress(0, file.name, true);
       }
     };
     const workers = [];
-    for(let i=0;i<Math.min(concurrency, tasks.length);i++){
+    for(let i=0;i<concurrency;i++){
       workers.push(worker());
     }
     await Promise.all(workers);
@@ -1141,6 +1231,12 @@ fmModalRetry?.addEventListener('click', async ()=>{
   }else{
     await startChunkedUpload(modalFiles, modalUI, true);
   }
+});
+
+fmModalConcurrency?.addEventListener('change', ()=>{
+  const val = selectedUploadConcurrency();
+  if(fmModalConcurrency) fmModalConcurrency.value = String(val);
+  localStorage.setItem(UPLOAD_CONCURRENCY_KEY, String(val));
 });
 
 const modalClose = ()=>{
@@ -1332,6 +1428,7 @@ setShareStatus('', false);
 
 computeTableStats();
 applySearchFilter();
+initUploadConcurrency();
 setModalMode('file');
 </script>
 {% endblock %}
