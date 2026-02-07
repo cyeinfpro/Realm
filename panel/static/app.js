@@ -4733,7 +4733,19 @@ function histRender(){
 
   if(noDataEl) noDataEl.style.display = 'none';
 
-  const now = Date.now();
+  const wallNow = Date.now();
+  const lastTs = Number((s && s.lastTs) || 0);
+  // Keep a small right-side breathing room, but avoid a huge blank area when
+  // report timestamp lags behind browser time (clock skew / push delay).
+  const maxRightGapMs = 12 * 1000;
+  let now = wallNow;
+  if(lastTs > 0){
+    if(wallNow > lastTs + maxRightGapMs){
+      now = lastTs + maxRightGapMs;
+    }else if(wallNow < lastTs){
+      now = lastTs;
+    }
+  }
   const windowMs = Math.max(60 * 1000, Number(RULE_HIST_STATE.windowMs) || (10 * 60 * 1000));
   const cutoff = now - windowMs;
 
