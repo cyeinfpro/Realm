@@ -1513,12 +1513,20 @@ async def website_files_upload_chunk(
     if not root:
         return {"ok": False, "error": "该站点没有可管理的根目录"}
 
+    # offset 参数校验：避免 int(...) 转换异常导致 500
+    try:
+        offset = int(data.get("offset") or 0)
+    except Exception:
+        return {"ok": False, "error": "offset 参数无效（必须是整数）"}
+    if offset < 0:
+        return {"ok": False, "error": "offset 参数无效（不能为负数）"}
+
     payload = {
         "root": root,
         "path": str(data.get("path") or ""),
         "filename": str(data.get("filename") or "upload.bin"),
         "upload_id": str(data.get("upload_id") or ""),
-        "offset": int(data.get("offset") or 0),
+        "offset": offset,
         "done": bool(data.get("done")),
         "content_b64": str(data.get("content_b64") or ""),
         "chunk_sha256": str(data.get("chunk_sha256") or ""),

@@ -428,16 +428,32 @@ def _api_key_required(req: Request) -> None:
 
 
 def _service_is_active(name: str) -> bool:
-    r = subprocess.run(['systemctl', 'is-active', name], capture_output=True, text=True)
-    if r.returncode == 0 and r.stdout.strip() == 'active':
-        return True
+    # systemd
+    if shutil.which('systemctl'):
+        try:
+            r = subprocess.run(['systemctl', 'is-active', name], capture_output=True, text=True)
+            if r.returncode == 0 and r.stdout.strip() == 'active':
+                return True
+        except Exception:
+            # No systemctl or systemd not running in this environment
+            pass
+
+    # sysvinit style
     if shutil.which('service'):
-        r = subprocess.run(['service', name, 'status'], capture_output=True, text=True)
-        if r.returncode == 0:
-            return True
+        try:
+            r = subprocess.run(['service', name, 'status'], capture_output=True, text=True)
+            if r.returncode == 0:
+                return True
+        except Exception:
+            pass
+
+    # openrc
     if shutil.which('rc-service'):
-        r = subprocess.run(['rc-service', name, 'status'], capture_output=True, text=True)
-        return r.returncode == 0
+        try:
+            r = subprocess.run(['rc-service', name, 'status'], capture_output=True, text=True)
+            return r.returncode == 0
+        except Exception:
+            return False
     return False
 
 
@@ -460,24 +476,38 @@ def _restart_realm() -> None:
     seen = set()
     services = [s for s in candidates if s and not (s in seen or seen.add(s))]
     errors = []
-    for svc in services:
-        r = subprocess.run(['systemctl', 'restart', svc], capture_output=True, text=True)
-        if r.returncode == 0:
-            return
-        errors.append(f"systemctl {svc}: {r.stderr.strip() or r.stdout.strip()}")
+
+    if shutil.which('systemctl'):
+        for svc in services:
+            try:
+                r = subprocess.run(['systemctl', 'restart', svc], capture_output=True, text=True)
+                if r.returncode == 0:
+                    return
+                errors.append(f"systemctl {svc}: {r.stderr.strip() or r.stdout.strip()}")
+            except Exception as exc:
+                errors.append(f"systemctl {svc}: {exc}")
+
     if shutil.which('service'):
         for svc in services:
-            r = subprocess.run(['service', svc, 'restart'], capture_output=True, text=True)
-            if r.returncode == 0:
-                return
-            errors.append(f"service {svc}: {r.stderr.strip() or r.stdout.strip()}")
+            try:
+                r = subprocess.run(['service', svc, 'restart'], capture_output=True, text=True)
+                if r.returncode == 0:
+                    return
+                errors.append(f"service {svc}: {r.stderr.strip() or r.stdout.strip()}")
+            except Exception as exc:
+                errors.append(f"service {svc}: {exc}")
+
     if shutil.which('rc-service'):
         for svc in services:
-            r = subprocess.run(['rc-service', svc, 'restart'], capture_output=True, text=True)
-            if r.returncode == 0:
-                return
-            errors.append(f"rc-service {svc}: {r.stderr.strip() or r.stdout.strip()}")
-    detail = "; ".join([e for e in errors if e]) or "未知错误"
+            try:
+                r = subprocess.run(['rc-service', svc, 'restart'], capture_output=True, text=True)
+                if r.returncode == 0:
+                    return
+                errors.append(f"rc-service {svc}: {r.stderr.strip() or r.stdout.strip()}")
+            except Exception as exc:
+                errors.append(f"rc-service {svc}: {exc}")
+
+    detail = '; '.join([e for e in errors if e]) or '未知错误'
     raise RuntimeError(f'无法重启 realm 服务（尝试 {", ".join(services)} 失败）：{detail}')
 
 

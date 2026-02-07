@@ -5,9 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=REALM_AGENT_PORT=18700
 EnvironmentFile=-/etc/realm-agent/agent.env
 WorkingDirectory=/opt/realm-agent
-ExecStart=/opt/realm-agent/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port ${REALM_AGENT_PORT:-18700} --ssl-keyfile /etc/realm-agent/certs/server.key --ssl-certfile /etc/realm-agent/certs/server.crt
+ExecStart=/opt/realm-agent/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port $REALM_AGENT_PORT --ssl-keyfile /etc/realm-agent/certs/server.key --ssl-certfile /etc/realm-agent/certs/server.crt
 Restart=always
 RestartSec=2
 

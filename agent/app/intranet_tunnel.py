@@ -15,6 +15,19 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    s = str(raw).strip().lower()
+    if s in ('1', 'true', 'yes', 'y', 'on'):
+        return True
+    if s in ('0', 'false', 'no', 'n', 'off'):
+        return False
+    return bool(default)
 
 # -----------------------------
 # Intranet tunnel (A<->B)
@@ -48,10 +61,10 @@ TS_SKEW_SEC = int(os.getenv('REALM_INTRANET_TS_SKEW_SEC', '300'))
 
 # Fallback to plaintext only when the server side has no TLS (e.g. openssl missing on A).
 # Keep it enabled by default to maximize connectivity; set REALM_INTRANET_ALLOW_PLAINTEXT=0 to force TLS-only.
-ALLOW_PLAINTEXT_FALLBACK = bool(int(os.getenv('REALM_INTRANET_ALLOW_PLAINTEXT', '1') or '1'))
+ALLOW_PLAINTEXT_FALLBACK = _env_bool('REALM_INTRANET_ALLOW_PLAINTEXT', True)
 
 # Log can be disabled in extreme IO constrained env
-ENABLE_LOG = bool(int(os.getenv('REALM_INTRANET_LOG', '1') or '1'))
+ENABLE_LOG = _env_bool('REALM_INTRANET_LOG', True)
 
 
 def _now() -> float:
@@ -222,8 +235,6 @@ def _mk_server_ssl_context() -> Optional[ssl.SSLContext]:
     except Exception:
         return None
 
-
-from typing import Optional
 
 # Per-socket buffers for _recv_line (avoid 1-byte recv loop)
 _RECV_LINE_BUFS = weakref.WeakKeyDictionary()  # sock -> bytearray

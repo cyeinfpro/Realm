@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from urllib.parse import urlparse
+
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import PlainTextResponse
 
@@ -65,7 +67,14 @@ exit 1
     base_url = panel_public_base_url(request)
     node_id = int(node.get("id"))
     api_key = str(node.get("api_key"))
-    agent_port = int(node.get("agent_port") or DEFAULT_AGENT_PORT)
+    node_base_url = str(node.get("base_url") or "")
+    agent_port = DEFAULT_AGENT_PORT
+    try:
+        p = urlparse(node_base_url)
+        if p.port:
+            agent_port = int(p.port)
+    except Exception:
+        agent_port = DEFAULT_AGENT_PORT
     agent_sh_url, repo_zip_url, github_only = agent_asset_urls(base_url)
     gh_only_export = "export REALM_AGENT_GITHUB_ONLY=1\n" if github_only else ""
 
