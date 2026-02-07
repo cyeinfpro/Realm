@@ -17,12 +17,14 @@ from ..db import (
     get_node,
     list_nodes,
     set_agent_rollout_all,
+    set_desired_pool,
     set_desired_pool_exact,
     set_desired_pool_version_exact,
     update_agent_status,
     update_node_report,
 )
 from ..services.agent_commands import sign_cmd, single_rule_ops
+from ..services.adaptive_lb import suggest_adaptive_pool_patch
 from ..services.assets import agent_asset_urls, file_sha256, panel_public_base_url, parse_agent_version_from_ua, read_latest_agent_version
 from ..services.node_status import is_report_fresh
 from ..services.stats_history import ingest_stats_snapshot
@@ -170,6 +172,22 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
                 desired_ver, desired_pool = set_desired_pool_exact(node_id, rep_pool, agent_ack)
             else:
                 desired_ver = set_desired_pool_version_exact(node_id, agent_ack)
+
+    # 自适应负载均衡：基于实时探测结果自动调权（单次仅调整一条规则，优先走 pool_patch）
+    try:
+        if isinstance(desired_pool, dict) and isinstance(report, dict):
+            adaptive = suggest_adaptive_pool_patch(
+                node_id=int(node_id),
+                desired_ver=int(desired_ver),
+                agent_ack=int(agent_ack),
+                desired_pool=desired_pool,
+                report=report,
+            )
+            if isinstance(adaptive, dict) and isinstance(adaptive.get("pool"), dict):
+                desired_ver, desired_pool = set_desired_pool(node_id, adaptive["pool"])
+    except Exception:
+        # Never break agent heartbeat because of auto-LB logic.
+        pass
 
     # 下发命令：规则池同步
     cmds: List[Dict[str, Any]] = []

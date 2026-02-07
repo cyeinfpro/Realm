@@ -80,9 +80,43 @@ PROBE_CACHE_TTL = float(os.getenv('REALM_AGENT_PROBE_TTL', '5'))  # seconds
 PROBE_TIMEOUT = float(os.getenv('REALM_AGENT_PROBE_TIMEOUT', '0.45'))  # per attempt
 PROBE_RETRIES = int(os.getenv('REALM_AGENT_PROBE_RETRIES', '1'))
 PROBE_MAX_WORKERS = int(os.getenv('REALM_AGENT_PROBE_WORKERS', '32'))
+try:
+    PROBE_HISTORY_TTL = float(os.getenv('REALM_AGENT_PROBE_HISTORY_TTL', '180'))  # seconds
+except Exception:
+    PROBE_HISTORY_TTL = 180.0
+if PROBE_HISTORY_TTL < 15.0:
+    PROBE_HISTORY_TTL = 15.0
+if PROBE_HISTORY_TTL > 3600.0:
+    PROBE_HISTORY_TTL = 3600.0
+try:
+    PROBE_HISTORY_ALPHA = float(os.getenv('REALM_AGENT_PROBE_HISTORY_ALPHA', '0.35'))  # EWMA alpha
+except Exception:
+    PROBE_HISTORY_ALPHA = 0.35
+if PROBE_HISTORY_ALPHA < 0.05:
+    PROBE_HISTORY_ALPHA = 0.05
+if PROBE_HISTORY_ALPHA > 0.95:
+    PROBE_HISTORY_ALPHA = 0.95
+try:
+    PROBE_HISTORY_MIN_SAMPLES = int(os.getenv('REALM_AGENT_PROBE_HISTORY_MIN_SAMPLES', '3'))
+except Exception:
+    PROBE_HISTORY_MIN_SAMPLES = 3
+if PROBE_HISTORY_MIN_SAMPLES < 1:
+    PROBE_HISTORY_MIN_SAMPLES = 1
+if PROBE_HISTORY_MIN_SAMPLES > 100:
+    PROBE_HISTORY_MIN_SAMPLES = 100
+try:
+    PROBE_DOWN_FAILS = int(os.getenv('REALM_AGENT_PROBE_DOWN_FAILS', '3'))
+except Exception:
+    PROBE_DOWN_FAILS = 3
+if PROBE_DOWN_FAILS < 1:
+    PROBE_DOWN_FAILS = 1
+if PROBE_DOWN_FAILS > 20:
+    PROBE_DOWN_FAILS = 20
 
 _PROBE_CACHE: Dict[str, Dict[str, Any]] = {}
 _PROBE_PRUNE_TS = 0.0
+_PROBE_HISTORY: Dict[str, Dict[str, Any]] = {}
+_PROBE_HISTORY_PRUNE_TS = 0.0
 _PROBE_LOCK = threading.Lock()
 
 # ---------------- System Snapshot (CPU/Mem/Disk/Net) ----------------
@@ -1398,6 +1432,154 @@ def _cache_set(key: str, ok: bool, latency_ms: Optional[float], error: Optional[
         }
 
 
+def _probe_history_prune_locked(now_mono: float) -> None:
+    global _PROBE_HISTORY_PRUNE_TS
+    interval = min(float(PROBE_HISTORY_TTL), 30.0)
+    if interval < 5.0:
+        interval = 5.0
+    if (now_mono - float(_PROBE_HISTORY_PRUNE_TS)) <= interval:
+        return
+    for k, item in list(_PROBE_HISTORY.items()):
+        try:
+            if (now_mono - float(item.get('ts_mono', 0.0))) > float(PROBE_HISTORY_TTL):
+                _PROBE_HISTORY.pop(k, None)
+        except Exception:
+            _PROBE_HISTORY.pop(k, None)
+    _PROBE_HISTORY_PRUNE_TS = now_mono
+
+
+def _probe_history_update(key: str, ok: bool, latency_ms: Optional[float], error: Optional[str]) -> None:
+    now_mono = time.monotonic()
+    now_ms = int(time.time() * 1000)
+    ok_b = bool(ok)
+    lat_v = None
+    if latency_ms is not None:
+        try:
+            lat_v = round(float(latency_ms), 2)
+        except Exception:
+            lat_v = None
+
+    with _PROBE_LOCK:
+        _probe_history_prune_locked(now_mono)
+
+        item = _PROBE_HISTORY.get(key) or {}
+        samples = int(item.get('samples') or 0) + 1
+        successes = int(item.get('successes') or 0) + (1 if ok_b else 0)
+        failures = int(item.get('failures') or 0) + (0 if ok_b else 1)
+        prev_success_ema = item.get('success_ema')
+        try:
+            prev_success_ema_f = float(prev_success_ema)
+        except Exception:
+            prev_success_ema_f = 1.0 if ok_b else 0.0
+        success_ema = (float(PROBE_HISTORY_ALPHA) * (1.0 if ok_b else 0.0)) + (
+            (1.0 - float(PROBE_HISTORY_ALPHA)) * prev_success_ema_f
+        )
+        if success_ema < 0.0:
+            success_ema = 0.0
+        if success_ema > 1.0:
+            success_ema = 1.0
+
+        latency_ema = item.get('latency_ema_ms')
+        try:
+            latency_ema_f = float(latency_ema) if latency_ema is not None else None
+        except Exception:
+            latency_ema_f = None
+        if ok_b and lat_v is not None:
+            if latency_ema_f is None:
+                latency_ema_f = float(lat_v)
+            else:
+                latency_ema_f = (float(PROBE_HISTORY_ALPHA) * float(lat_v)) + (
+                    (1.0 - float(PROBE_HISTORY_ALPHA)) * float(latency_ema_f)
+                )
+            if latency_ema_f < 0.0:
+                latency_ema_f = 0.0
+
+        consecutive_failures = int(item.get('consecutive_failures') or 0)
+        if ok_b:
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+
+        out: Dict[str, Any] = {
+            'ts_mono': now_mono,
+            'last_probe_at_ms': now_ms,
+            'samples': samples,
+            'successes': successes,
+            'failures': failures,
+            'success_ema': success_ema,
+            'consecutive_failures': consecutive_failures,
+            'last_ok': ok_b,
+        }
+        if lat_v is not None:
+            out['last_latency_ms'] = lat_v
+        if latency_ema_f is not None:
+            out['latency_ema_ms'] = round(float(latency_ema_f), 2)
+        if error and (not ok_b):
+            out['last_error'] = str(error)
+        else:
+            out['last_error'] = ''
+
+        _PROBE_HISTORY[key] = out
+
+
+def _probe_history_snapshot(key: str) -> Dict[str, Any]:
+    now_mono = time.monotonic()
+    with _PROBE_LOCK:
+        item = _PROBE_HISTORY.get(key)
+        if not item:
+            return {}
+        try:
+            if (now_mono - float(item.get('ts_mono', 0.0))) > float(PROBE_HISTORY_TTL):
+                _PROBE_HISTORY.pop(key, None)
+                return {}
+        except Exception:
+            _PROBE_HISTORY.pop(key, None)
+            return {}
+        snap = dict(item)
+
+    samples = int(snap.get('samples') or 0)
+    successes = int(snap.get('successes') or 0)
+    failures = int(snap.get('failures') or 0)
+    try:
+        success_ema = float(snap.get('success_ema'))
+    except Exception:
+        success_ema = 1.0 if bool(snap.get('last_ok')) else 0.0
+    if success_ema < 0.0:
+        success_ema = 0.0
+    if success_ema > 1.0:
+        success_ema = 1.0
+    availability = round(success_ema * 100.0, 2)
+    error_rate = round(100.0 - availability, 2)
+
+    out: Dict[str, Any] = {
+        'samples': samples,
+        'successes': successes,
+        'failures': failures,
+        'availability': availability,
+        'error_rate': error_rate,
+        'consecutive_failures': int(snap.get('consecutive_failures') or 0),
+        'last_ok': bool(snap.get('last_ok')),
+        'last_probe_at_ms': int(snap.get('last_probe_at_ms') or 0),
+    }
+    if snap.get('latency_ema_ms') is not None:
+        try:
+            out['latency_ema_ms'] = round(float(snap.get('latency_ema_ms')), 2)
+        except Exception:
+            pass
+    if snap.get('last_latency_ms') is not None:
+        try:
+            out['last_latency_ms'] = round(float(snap.get('last_latency_ms')), 2)
+        except Exception:
+            pass
+    if snap.get('last_error'):
+        out['last_error'] = str(snap.get('last_error'))
+    out['down'] = (
+        out.get('consecutive_failures', 0) >= int(PROBE_DOWN_FAILS)
+        and int(samples) >= int(PROBE_HISTORY_MIN_SAMPLES)
+    )
+    return out
+
+
 def _tcp_probe_uncached(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> tuple[bool, Optional[float], Optional[str]]:
     """尽可能稳定的 TCP 探测：
 
@@ -1455,10 +1637,12 @@ def _tcp_probe_detail(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> D
             if latency_ms is not None:
                 best_latency = latency_ms if best_latency is None else min(best_latency, latency_ms)
             _cache_set(key, True, best_latency, None)
+            _probe_history_update(key, True, best_latency, None)
             return {'ok': True, 'latency_ms': best_latency}
         last_err = err or last_err
 
     _cache_set(key, False, None, last_err)
+    _probe_history_update(key, False, None, last_err)
     return {'ok': False, 'error': last_err}
 
 
@@ -3063,6 +3247,31 @@ def _build_stats_snapshot() -> Dict[str, Any]:
                 except Exception as exc:
                     probe_results[key] = {'ok': None, 'message': f'探测异常: {exc}'}
 
+    # 每个 remote 的历史统计（可用率/错误率/连续失败/平滑延迟）
+    probe_stats_map: Dict[str, Dict[str, Any]] = {}
+    probe_remotes: Dict[str, Dict[str, Any]] = {}
+    for key in all_probe_keys:
+        hist = _probe_history_snapshot(key)
+        if hist:
+            probe_stats_map[key] = hist
+
+        item: Dict[str, Any] = {'target': key}
+        res = probe_results.get(key)
+        if isinstance(res, dict):
+            if res.get('ok') is None:
+                item['ok'] = None
+                if res.get('message'):
+                    item['message'] = str(res.get('message'))
+            else:
+                item['ok'] = bool(res.get('ok'))
+                if res.get('latency_ms') is not None:
+                    item['latency_ms'] = res.get('latency_ms')
+                if res.get('error'):
+                    item['error'] = str(res.get('error'))
+        if hist:
+            item.update(hist)
+        probe_remotes[key] = item
+
     # 连接数/流量：一次性聚合（避免每条规则重复调用 ss）
     listen_ports: set[int] = set()
     port_sig: Dict[int, str] = {}
@@ -3085,6 +3294,27 @@ def _build_stats_snapshot() -> Dict[str, Any]:
     _apply_traffic_baseline(port_sig, conn_traffic_map)
 
     # 组装规则统计
+    def _attach_probe_meta(dst: Dict[str, Any], key: str) -> None:
+        meta = probe_stats_map.get(key)
+        if not meta:
+            return
+        for mk in (
+            'samples',
+            'successes',
+            'failures',
+            'availability',
+            'error_rate',
+            'consecutive_failures',
+            'latency_ema_ms',
+            'last_latency_ms',
+            'last_ok',
+            'last_error',
+            'last_probe_at_ms',
+            'down',
+        ):
+            if mk in meta:
+                dst[mk] = meta.get(mk)
+
     rules: List[Dict[str, Any]] = []
     for idx, e in enumerate(eps):
         listen = (e.get('listen') or '').strip()
@@ -3154,10 +3384,14 @@ def _build_stats_snapshot() -> Dict[str, Any]:
 
             res = probe_results.get(key)
             if not res:
-                health.append({'target': label, 'ok': None, 'message': '暂无检测数据'})
+                item: Dict[str, Any] = {'target': label, 'ok': None, 'message': '暂无检测数据'}
+                _attach_probe_meta(item, key)
+                health.append(item)
                 continue
             if res.get('ok') is None:
-                health.append({'target': label, 'ok': None, 'message': res.get('message', '不可检测')})
+                item = {'target': label, 'ok': None, 'message': res.get('message', '不可检测')}
+                _attach_probe_meta(item, key)
+                health.append(item)
                 continue
             payload: Dict[str, Any] = {'target': label, 'ok': bool(res.get('ok'))}
             if res.get('latency_ms') is not None:
@@ -3165,6 +3399,7 @@ def _build_stats_snapshot() -> Dict[str, Any]:
             # 离线原因（面板可展示）
             if payload['ok'] is False and res.get('error'):
                 payload['error'] = res.get('error')
+            _attach_probe_meta(payload, key)
             health.append(payload)
 
         rules.append({
@@ -3179,7 +3414,7 @@ def _build_stats_snapshot() -> Dict[str, Any]:
             'health': health,
         })
 
-    resp: Dict[str, Any] = {'ok': True, 'rules': rules}
+    resp: Dict[str, Any] = {'ok': True, 'rules': rules, 'probe_remotes': probe_remotes}
     if ss_err:
         resp['warning'] = ss_err
     return resp
