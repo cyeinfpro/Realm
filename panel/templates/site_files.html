@@ -134,6 +134,7 @@
                 <button class="btn xs ghost fm-act-btn fm-act-danger" type="submit">删除</button>
               </form>
             </div>
+            <div class="fm-row-share-links" data-path="{{ it.path }}"></div>
           </td>
         </tr>
         {% else %}
@@ -277,7 +278,7 @@ const fmShareCloseTop = document.getElementById('fmShareCloseTop');
 const fmShareGen = document.getElementById('fmShareGen');
 const fmShareRevoke = document.getElementById('fmShareRevoke');
 
-const CHUNK_SIZE = 1024 * 1024;
+const CHUNK_SIZE = 1024 * 512;
 const UPLOAD_MAX_BYTES = {{ upload_max_bytes }};
 const SITE_ID = {{ site.id }};
 const CUR_PATH = {{ path|tojson }};
@@ -297,10 +298,16 @@ const modalUI = {
 const MAX_UPLOAD_CONCURRENCY = 8;
 const MIN_UPLOAD_CONCURRENCY = 1;
 const PROGRESS_UPDATE_INTERVAL_MS = 100;
+const UPLOAD_REQUEST_TIMEOUT_MS = 120000;
+const UPLOAD_REQUEST_MAX_RETRIES = 4;
+const UPLOAD_RETRY_BASE_DELAY_MS = 400;
+const UPLOAD_RETRY_MAX_DELAY_MS = 5000;
+const COMPAT_UPLOAD_MAX_RETRIES = 2;
 const UPLOAD_CONCURRENCY_KEY = `nexus_upload_concurrency_${SITE_ID}`;
 let modalFiles = [];
 let lastUploadMethod = 'chunked';
 let shareItems = [];
+let shareHistoryRows = [];
 let currentShareUrl = '';
 let shareHistoryLoading = false;
 
@@ -314,6 +321,99 @@ function bytesToHuman(n){
     i++;
   }
   return v.toFixed(1) + ' ' + units[i];
+}
+
+function sleep(ms){
+  return new Promise((resolve)=> setTimeout(resolve, Math.max(0, ms || 0)));
+}
+
+function uploadRetryBackoffMs(attempt){
+  const a = Math.max(1, parseInt(attempt || 1, 10) || 1);
+  return Math.min(UPLOAD_RETRY_MAX_DELAY_MS, UPLOAD_RETRY_BASE_DELAY_MS * Math.pow(2, a - 1));
+}
+
+function isRetriableHttpStatus(status){
+  const s = parseInt(status || 0, 10) || 0;
+  return [408, 409, 425, 429, 500, 502, 503, 504].includes(s);
+}
+
+function isRetriableError(err){
+  const status = parseInt(err?.httpStatus || 0, 10) || 0;
+  if(status && isRetriableHttpStatus(status)){
+    return true;
+  }
+  const msg = String(err?.message || err || '').toLowerCase();
+  if(!msg){
+    return false;
+  }
+  return /load failed|failed to fetch|networkerror|network request failed|connection reset|connection aborted|timed out|timeout|econnreset|econnaborted|socket hang up|the network connection was lost/i.test(msg);
+}
+
+function normalizeUploadError(err, fallback){
+  const raw = String(err?.message || err || '').trim();
+  const base = String(fallback || '上传失败');
+  if(!raw){
+    return base;
+  }
+  if(/load failed|failed to fetch|networkerror|network request failed|the network connection was lost/i.test(raw)){
+    return `${base}：网络请求中断（可能节点离线、面板重启中或网关超时）`;
+  }
+  if(/timeout|timed out|请求超时/i.test(raw)){
+    return `${base}：请求超时，请降低并发后重试`;
+  }
+  return raw;
+}
+
+async function fetchJsonWithRetry(url, options, cfg){
+  const conf = cfg || {};
+  const maxRetries = Math.max(0, parseInt(conf.retries ?? UPLOAD_REQUEST_MAX_RETRIES, 10) || 0);
+  const timeoutMs = Math.max(5000, parseInt(conf.timeoutMs ?? UPLOAD_REQUEST_TIMEOUT_MS, 10) || UPLOAD_REQUEST_TIMEOUT_MS);
+  const onRetry = typeof conf.onRetry === 'function' ? conf.onRetry : null;
+  let attempt = 0;
+  while(true){
+    const ctrl = new AbortController();
+    const timer = setTimeout(()=> ctrl.abort(), timeoutMs);
+    try{
+      const resp = await fetch(url, {
+        credentials: 'same-origin',
+        ...(options || {}),
+        signal: ctrl.signal
+      });
+      clearTimeout(timer);
+      const data = await resp.json().catch(()=>({ok:false,error:`HTTP ${resp.status}`}));
+      if(resp.ok){
+        return data;
+      }
+      const err = new Error(String((data && data.error) || `HTTP ${resp.status}`));
+      err.httpStatus = resp.status;
+      if(attempt < maxRetries && isRetriableHttpStatus(resp.status)){
+        attempt += 1;
+        if(onRetry){
+          try{ onRetry({attempt, maxRetries, error: err, status: resp.status}); }catch(_e){}
+        }
+        await sleep(uploadRetryBackoffMs(attempt));
+        continue;
+      }
+      throw err;
+    }catch(rawErr){
+      clearTimeout(timer);
+      let err = rawErr;
+      if(rawErr && rawErr.name === 'AbortError'){
+        err = new Error(`请求超时（>${Math.round(timeoutMs / 1000)} 秒）`);
+      }else if(!(rawErr instanceof Error)){
+        err = new Error(String(rawErr || '请求失败'));
+      }
+      if(attempt < maxRetries && isRetriableError(err)){
+        attempt += 1;
+        if(onRetry){
+          try{ onRetry({attempt, maxRetries, error: err}); }catch(_e){}
+        }
+        await sleep(uploadRetryBackoffMs(attempt));
+        continue;
+      }
+      throw err;
+    }
+  }
 }
 
 function clampUploadConcurrency(raw){
@@ -517,14 +617,162 @@ async function revokeShareByUrl(url){
   return data;
 }
 
+function filteredShareHistoryRows(items){
+  const rows = Array.isArray(items) ? items : [];
+  if(!shareItems.length){
+    return rows;
+  }
+  const picked = new Set(
+    normalizeShareItems(shareItems).map((it)=>String(it.path || '').trim()).filter(Boolean)
+  );
+  if(!picked.size){
+    return rows;
+  }
+  return rows.filter((row)=>{
+    const arr = Array.isArray(row?.items) ? row.items : [];
+    for(const item of arr){
+      const p = String(item?.path || '').trim();
+      if(picked.has(p)){
+        return true;
+      }
+    }
+    return false;
+  });
+}
+
+function clearFileShareHistory(){
+  document.querySelectorAll('.fm-row-share-links').forEach((box)=>{
+    box.innerHTML = '';
+    box.classList.remove('has-links');
+  });
+}
+
+function renderFileShareHistory(items){
+  clearFileShareHistory();
+  const rows = Array.isArray(items) ? items : [];
+  if(!rows.length){
+    return;
+  }
+  const byPath = new Map();
+  rows.forEach((row)=>{
+    const arr = Array.isArray(row?.items) ? row.items : [];
+    arr.forEach((it)=>{
+      const p = String(it?.path || '').trim();
+      if(!p) return;
+      if(!byPath.has(p)){
+        byPath.set(p, []);
+      }
+      byPath.get(p).push(row);
+    });
+  });
+  document.querySelectorAll('.fm-row-share-links').forEach((box)=>{
+    const p = String(box.dataset.path || '').trim();
+    if(!p) return;
+    const links = byPath.get(p) || [];
+    if(!links.length){
+      return;
+    }
+    box.classList.add('has-links');
+    const limit = 3;
+    links.slice(0, limit).forEach((it)=>{
+      const wrap = document.createElement('div');
+      wrap.className = 'fm-row-share-link';
+
+      const main = document.createElement('div');
+      main.className = 'fm-row-share-main';
+
+      const badge = document.createElement('span');
+      const status = String(it?.status || 'invalid');
+      badge.className = `fm-share-status ${status}`;
+      badge.textContent = shareStatusText(status);
+      main.appendChild(badge);
+
+      const link = document.createElement('a');
+      link.className = 'mono fm-row-share-url';
+      link.target = '_blank';
+      link.rel = 'noopener';
+      const rowUrl = String(it?.url || '');
+      if(rowUrl){
+        link.href = rowUrl;
+        link.textContent = rowUrl;
+      }else{
+        link.href = '#';
+        link.classList.add('disabled');
+        link.textContent = `(短链丢失: ${String(it?.code || '-')})`;
+      }
+      main.appendChild(link);
+
+      const createdAt = String(it?.created_at || '');
+      const expireAt = String(it?.expire_at || '');
+      const meta = document.createElement('span');
+      meta.className = 'fm-row-share-meta';
+      meta.textContent = [createdAt ? `创建 ${createdAt}` : '', expireAt ? `过期 ${expireAt}` : ''].filter(Boolean).join(' · ') || '-';
+      main.appendChild(meta);
+
+      const actions = document.createElement('div');
+      actions.className = 'fm-row-share-actions';
+
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'btn xs ghost';
+      copyBtn.type = 'button';
+      copyBtn.textContent = '复制';
+      copyBtn.disabled = !rowUrl;
+      copyBtn.addEventListener('click', async ()=>{
+        const ok = await copyText(rowUrl);
+        setShareStatus(ok ? '链接已复制' : '复制失败，请手动复制', !ok);
+      });
+      actions.appendChild(copyBtn);
+
+      if(Boolean(it?.can_revoke) && rowUrl){
+        const revokeBtn = document.createElement('button');
+        revokeBtn.className = 'btn xs ghost fm-act-danger';
+        revokeBtn.type = 'button';
+        revokeBtn.textContent = '取消';
+        revokeBtn.addEventListener('click', async ()=>{
+          if(!confirm('确定取消该分享链接吗？取消后将立即失效。')){
+            return;
+          }
+          revokeBtn.disabled = true;
+          try{
+            await revokeShareAndRefresh(rowUrl);
+          }catch(err){
+            setShareStatus(String(err), true);
+            revokeBtn.disabled = false;
+          }
+        });
+        actions.appendChild(revokeBtn);
+      }
+
+      wrap.appendChild(main);
+      wrap.appendChild(actions);
+      box.appendChild(wrap);
+    });
+    if(links.length > limit){
+      const more = document.createElement('div');
+      more.className = 'muted sm';
+      more.textContent = `另有 ${links.length - limit} 条历史链接`;
+      box.appendChild(more);
+    }
+  });
+}
+
+async function revokeShareAndRefresh(url){
+  await revokeShareByUrl(url);
+  if(currentShareUrl === url){
+    clearCurrentShareLink();
+  }
+  setShareStatus('分享已取消，原链接已失效', false);
+  await loadShareHistory();
+}
+
 function renderShareHistory(items){
   if(!fmShareHistory) return;
-  const rows = Array.isArray(items) ? items : [];
+  const rows = filteredShareHistoryRows(items);
   fmShareHistory.innerHTML = '';
   if(!rows.length){
     const empty = document.createElement('div');
     empty.className = 'muted sm';
-    empty.textContent = '暂无历史分享链接';
+    empty.textContent = shareItems.length ? '当前选择暂无历史分享链接' : '暂无历史分享链接';
     fmShareHistory.appendChild(empty);
     return;
   }
@@ -604,12 +852,7 @@ function renderShareHistory(items){
         }
         revokeBtn.disabled = true;
         try{
-          await revokeShareByUrl(rowUrl);
-          if(currentShareUrl === rowUrl){
-            clearCurrentShareLink();
-          }
-          setShareStatus('分享已取消，原链接已失效', false);
-          await loadShareHistory();
+          await revokeShareAndRefresh(rowUrl);
         }catch(err){
           setShareStatus(String(err), true);
           revokeBtn.disabled = false;
@@ -625,23 +868,31 @@ function renderShareHistory(items){
 }
 
 async function loadShareHistory(){
-  if(!fmShareHistory || shareHistoryLoading) return;
+  if(shareHistoryLoading) return;
   shareHistoryLoading = true;
-  fmShareHistory.innerHTML = '<div class="muted sm">加载中…</div>';
+  if(fmShareHistory){
+    fmShareHistory.innerHTML = '<div class="muted sm">加载中…</div>';
+  }
   try{
     const resp = await fetch(`/websites/${SITE_ID}/files/share/list?limit=50`);
     const data = await resp.json().catch(()=>({ok:false,error:'加载历史链接失败'}));
     if(!data.ok){
       throw new Error(data.error || '加载历史链接失败');
     }
-    renderShareHistory(data.items || []);
+    shareHistoryRows = Array.isArray(data.items) ? data.items : [];
+    renderFileShareHistory(shareHistoryRows);
+    renderShareHistory(shareHistoryRows);
   }catch(err){
-    fmShareHistory.innerHTML = '';
-    const fail = document.createElement('div');
-    fail.className = 'muted sm';
-    fail.style.color = 'rgba(248,113,113,0.95)';
-    fail.textContent = String(err);
-    fmShareHistory.appendChild(fail);
+    shareHistoryRows = [];
+    clearFileShareHistory();
+    if(fmShareHistory){
+      fmShareHistory.innerHTML = '';
+      const fail = document.createElement('div');
+      fail.className = 'muted sm';
+      fail.style.color = 'rgba(248,113,113,0.95)';
+      fail.textContent = String(err);
+      fmShareHistory.appendChild(fail);
+    }
   }finally{
     shareHistoryLoading = false;
   }
@@ -677,6 +928,7 @@ function openShareForItems(items){
   clearCurrentShareLink();
   setShareStatus(`已选择 ${shareItems.length} 项`, false);
   openShareModal();
+  renderShareHistory(shareHistoryRows);
   loadShareHistory();
 }
 
@@ -799,12 +1051,18 @@ function uploadKey(file, path, filename){
 }
 
 async function getResumeOffset(file, uploadId, path, filename){
-  const resp = await fetch(`/websites/${SITE_ID}/files/upload_status`, {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ path: path || CUR_PATH, filename: filename || file.name, upload_id: uploadId })
-  });
-  const data = await resp.json().catch(()=>({ok:false}));
+  const data = await fetchJsonWithRetry(
+    `/websites/${SITE_ID}/files/upload_status`,
+    {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ path: path || CUR_PATH, filename: filename || file.name, upload_id: uploadId })
+    },
+    {
+      retries: 2,
+      timeoutMs: 30000
+    }
+  );
   if(!data.ok) return 0;
   return parseInt(data.offset || 0, 10) || 0;
 }
@@ -922,19 +1180,28 @@ async function uploadFile(file, uploadId, startOffset, path, filename, totalByte
   if(button) button.disabled = true;
   if(status) status.textContent = `准备上传 ${file.name} (${bytesToHuman(total)})…`;
   if(total === 0){
-    const resp = await fetch(`/websites/${SITE_ID}/files/upload_chunk`, {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({
-        path: path || CUR_PATH,
-        filename: filename || file.name,
-        upload_id: uploadId,
-        offset: 0,
-        done: true,
-        allow_empty: true
-      })
-    });
-    const data = await resp.json().catch(()=>({ok:false,error:'上传失败'}));
+    const data = await fetchJsonWithRetry(
+      `/websites/${SITE_ID}/files/upload_chunk`,
+      {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          path: path || CUR_PATH,
+          filename: filename || file.name,
+          upload_id: uploadId,
+          offset: 0,
+          done: true,
+          allow_empty: true
+        })
+      },
+      {
+        onRetry: ({attempt, maxRetries})=>{
+          if(status){
+            status.textContent = `网络抖动，空文件分片重试中（${attempt}/${maxRetries}）…`;
+          }
+        }
+      }
+    );
     if(!data.ok){
       throw new Error(data.error || '上传失败');
     }
@@ -964,12 +1231,21 @@ async function uploadFile(file, uploadId, startOffset, path, filename, totalByte
     if(chunkSha){
       payload.chunk_sha256 = chunkSha;
     }
-    const resp = await fetch(`/websites/${SITE_ID}/files/upload_chunk`, {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify(payload)
-    });
-    const data = await resp.json().catch(()=>({ok:false,error:'上传失败'}));
+    const data = await fetchJsonWithRetry(
+      `/websites/${SITE_ID}/files/upload_chunk`,
+      {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      },
+      {
+        onRetry: ({attempt, maxRetries})=>{
+          if(status){
+            status.textContent = `网络抖动，分片重试中：${file.name}（${attempt}/${maxRetries}）…`;
+          }
+        }
+      }
+    );
     if(!data.ok){
       if(data.expected_offset !== undefined){
         offset = parseInt(data.expected_offset || 0, 10) || 0;
@@ -1059,7 +1335,18 @@ async function startChunkedUpload(files, ui, resumeOnly){
           }
           uploadId = Math.random().toString(16).slice(2) + Date.now().toString(16);
         }
-        const offset = await getResumeOffset(file, uploadId, target.path, target.filename);
+        let offset = 0;
+        try{
+          offset = await getResumeOffset(file, uploadId, target.path, target.filename);
+        }catch(err){
+          if(resumeOnly){
+            throw err;
+          }
+          if(ui?.status){
+            ui.status.textContent = `${normalizeUploadError(err, '获取续传状态失败')}，已从头上传：${file.name}`;
+          }
+          offset = 0;
+        }
         if(offset > 0){
           updateProgress(offset, file.name, true);
         }else{
@@ -1085,11 +1372,44 @@ async function startChunkedUpload(files, ui, resumeOnly){
     await Promise.all(workers);
     window.location.reload();
   }catch(err){
-    if(ui?.status) ui.status.textContent = String(err);
+    if(ui?.status) ui.status.textContent = normalizeUploadError(err, '上传失败');
     if(ui?.retry) ui.retry.style.display = 'inline-block';
     if(ui?.button) ui.button.disabled = false;
     if(fmModalCompat) fmModalCompat.disabled = false;
   }
+}
+
+async function compatUploadOnce(files, mode, ui){
+  const form = new FormData();
+  form.append('path', CUR_PATH || '');
+  const field = mode === 'folder' ? 'folder' : 'files';
+  files.forEach((f)=>{
+    const name = f.webkitRelativePath || f.name;
+    form.append(field, f, name);
+  });
+  return await new Promise((resolve, reject)=>{
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/websites/${SITE_ID}/files/upload`);
+    xhr.upload.onprogress = (e)=>{
+      if(!e.lengthComputable) return;
+      const pct = Math.min(100, Math.round((e.loaded / e.total) * 100));
+      if(ui?.progressFill) ui.progressFill.style.width = pct + '%';
+      if(ui?.status){
+        ui.status.textContent = `兼容上传中：${bytesToHuman(e.loaded)} / ${bytesToHuman(e.total)} (${pct}%)`;
+      }
+    };
+    xhr.onload = ()=>{
+      if(xhr.status >= 200 && xhr.status < 400){
+        resolve();
+      }else{
+        const err = new Error(`上传失败（${xhr.status}）`);
+        err.httpStatus = xhr.status;
+        reject(err);
+      }
+    };
+    xhr.onerror = ()=> reject(new Error('上传失败：网络请求中断'));
+    xhr.send(form);
+  });
 }
 
 async function startCompatUpload(files, mode, ui){
@@ -1110,41 +1430,30 @@ async function startCompatUpload(files, mode, ui){
   if(fmModalCompat) fmModalCompat.disabled = true;
   if(ui?.status) ui.status.textContent = '兼容上传中…';
   if(ui?.progressFill) ui.progressFill.style.width = '0%';
-  const form = new FormData();
-  form.append('path', CUR_PATH || '');
-  const field = mode === 'folder' ? 'folder' : 'files';
-  files.forEach((f)=>{
-    const name = f.webkitRelativePath || f.name;
-    form.append(field, f, name);
-  });
-  await new Promise((resolve, reject)=>{
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/websites/${SITE_ID}/files/upload`);
-    xhr.upload.onprogress = (e)=>{
-      if(!e.lengthComputable) return;
-      const pct = Math.min(100, Math.round((e.loaded / e.total) * 100));
-      if(ui?.progressFill) ui.progressFill.style.width = pct + '%';
-      if(ui?.status){
-        ui.status.textContent = `兼容上传中：${bytesToHuman(e.loaded)} / ${bytesToHuman(e.total)} (${pct}%)`;
+  try{
+    const totalAttempts = Math.max(1, COMPAT_UPLOAD_MAX_RETRIES + 1);
+    for(let attempt=1; attempt<=totalAttempts; attempt++){
+      try{
+        await compatUploadOnce(files, mode, ui);
+        break;
+      }catch(err){
+        const canRetry = attempt < totalAttempts && isRetriableError(err);
+        if(!canRetry){
+          throw err;
+        }
+        if(ui?.status){
+          ui.status.textContent = `网络抖动，兼容上传重试中（${attempt}/${COMPAT_UPLOAD_MAX_RETRIES}）…`;
+        }
+        await sleep(uploadRetryBackoffMs(attempt));
       }
-    };
-    xhr.onload = ()=>{
-      if(xhr.status >= 200 && xhr.status < 400){
-        resolve();
-      }else{
-        reject(new Error(`上传失败（${xhr.status}）`));
-      }
-    };
-    xhr.onerror = ()=> reject(new Error('上传失败'));
-    xhr.send(form);
-  }).then(()=>{
+    }
     window.location.reload();
-  }).catch((err)=>{
-    if(ui?.status) ui.status.textContent = String(err);
+  }catch(err){
+    if(ui?.status) ui.status.textContent = normalizeUploadError(err, '上传失败');
     if(ui?.retry) ui.retry.style.display = 'inline-block';
     if(ui?.button) ui.button.disabled = false;
     if(fmModalCompat) fmModalCompat.disabled = false;
-  });
+  }
 }
 
 pickFilesBtn?.addEventListener('click', ()=>{
@@ -1352,10 +1661,7 @@ fmShareRevoke?.addEventListener('click', async ()=>{
   if(fmShareRevoke) fmShareRevoke.disabled = true;
   setShareStatus('正在取消分享…', false);
   try{
-    await revokeShareByUrl(url);
-    clearCurrentShareLink();
-    setShareStatus('分享已取消，原链接已失效', false);
-    await loadShareHistory();
+    await revokeShareAndRefresh(url);
   }catch(err){
     setShareStatus(String(err), true);
     if(fmShareRevoke) fmShareRevoke.disabled = !currentShareUrl;
@@ -1430,5 +1736,6 @@ computeTableStats();
 applySearchFilter();
 initUploadConcurrency();
 setModalMode('file');
+loadShareHistory();
 </script>
 {% endblock %}

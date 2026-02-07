@@ -18,6 +18,8 @@ TCPING_TIMEOUT = 3.0
 _HTTP_LIMITS = httpx.Limits(max_connections=200, max_keepalive_connections=80, keepalive_expiry=20.0)
 _CLIENTS: Dict[bool, httpx.AsyncClient] = {}
 _CLIENTS_LOCK = threading.Lock()
+_TRANSPORT_RETRY_COUNT = 3
+_TRANSPORT_RETRY_BACKOFF_BASE_SEC = 0.35
 
 
 class AgentError(RuntimeError):
@@ -66,6 +68,11 @@ async def close_agent_clients() -> None:
             pass
 
 
+def _retry_backoff_sec(attempt_no: int) -> float:
+    n = max(1, int(attempt_no or 1))
+    return min(2.5, _TRANSPORT_RETRY_BACKOFF_BASE_SEC * (2 ** (n - 1)))
+
+
 async def _agent_request(
     method: str,
     base_url: str,
@@ -80,8 +87,8 @@ async def _agent_request(
     req_timeout = float(timeout or DEFAULT_TIMEOUT)
     method_u = str(method or "GET").upper()
 
-    # One fast retry for stale keep-alive connections.
-    for attempt in range(2):
+    # Retry transient transport errors (stale keep-alive / short network jitter).
+    for attempt in range(_TRANSPORT_RETRY_COUNT):
         client = await _get_client(verify_tls)
         try:
             if method_u == "GET":
@@ -89,8 +96,9 @@ async def _agent_request(
             else:
                 r = await client.post(url, headers=headers, json=data, timeout=req_timeout)
         except httpx.TransportError:
-            if attempt == 0:
+            if attempt + 1 < _TRANSPORT_RETRY_COUNT:
                 await _drop_client(verify_tls)
+                await asyncio.sleep(_retry_backoff_sec(attempt + 1))
                 continue
             raise
 
@@ -114,16 +122,44 @@ async def agent_get_raw(
     req_timeout = float(timeout or DEFAULT_TIMEOUT)
     query = params or {}
 
-    for attempt in range(2):
+    for attempt in range(_TRANSPORT_RETRY_COUNT):
         client = await _get_client(verify_tls)
         try:
             return await client.get(url, params=query, headers=headers, timeout=req_timeout)
         except httpx.TransportError:
-            if attempt == 0:
+            if attempt + 1 < _TRANSPORT_RETRY_COUNT:
                 await _drop_client(verify_tls)
+                await asyncio.sleep(_retry_backoff_sec(attempt + 1))
                 continue
             raise
     raise RuntimeError("Agent raw request failed")
+
+
+async def agent_get_raw_stream(
+    base_url: str,
+    api_key: str,
+    path: str,
+    verify_tls: bool,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: Optional[float] = None,
+) -> httpx.Response:
+    headers = {"X-API-Key": api_key}
+    url = f"{base_url.rstrip('/')}{path}"
+    req_timeout = float(timeout or DEFAULT_TIMEOUT)
+    query = params or {}
+
+    for attempt in range(_TRANSPORT_RETRY_COUNT):
+        client = await _get_client(verify_tls)
+        try:
+            req = client.build_request("GET", url, params=query, headers=headers, timeout=req_timeout)
+            return await client.send(req, stream=True)
+        except httpx.TransportError:
+            if attempt + 1 < _TRANSPORT_RETRY_COUNT:
+                await _drop_client(verify_tls)
+                await asyncio.sleep(_retry_backoff_sec(attempt + 1))
+                continue
+            raise
+    raise RuntimeError("Agent raw stream request failed")
 
 
 async def agent_get(

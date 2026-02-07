@@ -11,13 +11,13 @@ import time
 import uuid
 import zipfile
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
-from ..clients.agent import AgentError, agent_get, agent_get_raw, agent_post
+from ..clients.agent import AgentError, agent_get, agent_get_raw, agent_get_raw_stream, agent_post
 from ..core.deps import require_login_page
 from ..core.flash import flash, set_flash
 from ..core.share import make_share_token, verify_share_token, verify_share_token_allow_expired
@@ -29,6 +29,7 @@ from ..db import (
     add_site_event,
     add_task,
     create_site_file_share_short_link,
+    delete_site_file_share_short_links,
     delete_certificates_by_node,
     delete_certificates_by_site,
     delete_site,
@@ -207,6 +208,70 @@ def _remove_file_quiet(path: str) -> None:
             os.remove(path)
     except Exception:
         pass
+
+
+def _download_content_disposition(filename: str) -> str:
+    raw = str(filename or "download.bin").replace("\r", "").replace("\n", "").replace('"', "")
+    if not raw:
+        raw = "download.bin"
+    ascii_name = "".join(
+        ch if (("0" <= ch <= "9") or ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ch in ("-", "_", "."))
+        else "_"
+        for ch in raw
+    ).strip("._")
+    if not ascii_name:
+        ascii_name = "download.bin"
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(raw)}"
+
+
+async def _open_agent_file_stream(
+    node: Dict[str, Any],
+    root: str,
+    rel_path: str,
+    timeout: float,
+) -> Tuple[Optional[Any], int, str]:
+    resp = await agent_get_raw_stream(
+        node.get("base_url", ""),
+        node.get("api_key", ""),
+        "/api/v1/website/files/raw",
+        node_verify_tls(node),
+        params={"root": root, "path": rel_path, "root_base": _node_root_base(node)},
+        timeout=timeout,
+    )
+    if resp.status_code == 200:
+        return resp, 200, ""
+    body_text = ""
+    try:
+        body = await resp.aread()
+        body_text = (body or b"").decode(errors="ignore").strip()
+    except Exception:
+        body_text = ""
+    try:
+        await resp.aclose()
+    except Exception:
+        pass
+    return None, int(resp.status_code or 500), body_text
+
+
+def _stream_file_download_response(upstream: Any, filename: str) -> StreamingResponse:
+    headers = {"Content-Disposition": _download_content_disposition(filename)}
+    content_len = str(upstream.headers.get("content-length") or "").strip()
+    if content_len.isdigit():
+        headers["Content-Length"] = content_len
+    media_type = str(upstream.headers.get("content-type") or "application/octet-stream")
+
+    async def _iter_bytes():
+        try:
+            async for chunk in upstream.aiter_bytes():
+                if chunk:
+                    yield chunk
+        finally:
+            try:
+                await upstream.aclose()
+            except Exception:
+                pass
+
+    return StreamingResponse(_iter_bytes(), media_type=media_type, headers=headers)
 
 
 def _share_token_sha256(token: str) -> str:
@@ -1894,7 +1959,7 @@ async def website_files_upload_chunk(
             "/api/v1/website/files/upload_chunk",
             payload,
             node_verify_tls(node),
-            timeout=30,
+            timeout=90,
         )
         return resp
     except Exception as exc:
@@ -2071,7 +2136,7 @@ async def website_files_upload(
                 "/api/v1/website/files/upload_chunk",
                 payload,
                 node_verify_tls(node),
-                timeout=30,
+                timeout=90,
             )
             if not resp.get("ok", True):
                 raise AgentError(str(resp.get("error") or "上传失败"))
@@ -2321,23 +2386,16 @@ async def website_files_download(
         set_flash(request, "该站点没有可管理的根目录")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
-    # Lightweight proxy: fetch file bytes from agent and return.
-    r = await agent_get_raw(
-        node.get("base_url", ""),
-        node.get("api_key", ""),
-        "/api/v1/website/files/raw",
-        node_verify_tls(node),
-        params={"root": root, "path": path, "root_base": _node_root_base(node)},
-        timeout=20,
-    )
-    if r.status_code != 200:
-        set_flash(request, f"下载失败（HTTP {r.status_code}）")
-        return RedirectResponse(url=f"/websites/{site_id}/files?path={'/'.join(path.split('/')[:-1])}", status_code=303)
-
     filename = path.split("/")[-1] or "download.bin"
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return Response(content=r.content, media_type="application/octet-stream", headers=headers)
-
+    try:
+        upstream, status_code, _detail = await _open_agent_file_stream(node, root, path, timeout=600)
+    except Exception as exc:
+        set_flash(request, f"下载失败：{exc}")
+        return RedirectResponse(url=f"/websites/{site_id}/files?path={'/'.join(path.split('/')[:-1])}", status_code=303)
+    if upstream is None:
+        set_flash(request, f"下载失败（HTTP {status_code}）")
+        return RedirectResponse(url=f"/websites/{site_id}/files?path={'/'.join(path.split('/')[:-1])}", status_code=303)
+    return _stream_file_download_response(upstream, filename)
 
 @router.post("/websites/{site_id}/files/share")
 async def website_files_share_link(
@@ -2408,6 +2466,12 @@ async def website_files_share_list(
     if not site:
         return {"ok": False, "error": "站点不存在"}
 
+    # Auto-clean short links that have already been revoked.
+    try:
+        delete_site_file_share_short_links(int(site_id), token_sha256="")
+    except Exception:
+        pass
+
     rows = list_site_file_share_short_links(int(site_id), limit=max(1, min(int(limit or 50), 200)))
     base = panel_public_base_url(request)
     now_ts = int(time.time())
@@ -2434,11 +2498,11 @@ async def website_files_share_list(
                 exp = 0
         expired = bool(exp and now_ts > exp)
         revoked = bool(str(row.get("revoked_at") or "").strip())
+        if revoked:
+            continue
 
         status = "invalid"
-        if revoked:
-            status = "revoked"
-        elif valid and expired:
+        if valid and expired:
             status = "expired"
         elif valid:
             status = "active"
@@ -2477,6 +2541,7 @@ async def website_files_share_list(
                 "revoked_by": str(row.get("revoked_by") or ""),
                 "item_count": item_count,
                 "first_item": first_label,
+                "items": share_items,
             }
         )
 
@@ -2523,7 +2588,12 @@ async def website_files_share_revoke(
         revoked_by=str(user or ""),
         reason=str((data or {}).get("reason") or ""),
     )
-    return {"ok": True, "revoked": True, "newly_revoked": bool(created)}
+    deleted = 0
+    try:
+        deleted = delete_site_file_share_short_links(int(site_id), digest)
+    except Exception:
+        deleted = 0
+    return {"ok": True, "revoked": True, "newly_revoked": bool(created), "deleted_short_links": int(deleted)}
 
 
 @router.get("/share/site-files/s/{code}")
@@ -2577,19 +2647,15 @@ async def website_files_share_download(request: Request, t: str = ""):
     single = share_items[0] if len(share_items) == 1 else None
     if single and not bool(single.get("is_dir")):
         rel_path = str(single.get("path") or "")
-        r = await agent_get_raw(
-            node.get("base_url", ""),
-            node.get("api_key", ""),
-            "/api/v1/website/files/raw",
-            node_verify_tls(node),
-            params={"root": root, "path": rel_path, "root_base": _node_root_base(node)},
-            timeout=60,
-        )
-        if r.status_code != 200:
+        try:
+            upstream, status_code, _detail = await _open_agent_file_stream(node, root, rel_path, timeout=600)
+        except Exception:
             return Response(content="文件不存在或无法下载", media_type="text/plain", status_code=404)
+        if upstream is None:
+            code = 404 if status_code == 404 else 502
+            return Response(content="文件不存在或无法下载", media_type="text/plain", status_code=code)
         filename = rel_path.split("/")[-1] or "download.bin"
-        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-        return Response(content=r.content, media_type="application/octet-stream", headers=headers)
+        return _stream_file_download_response(upstream, filename)
 
     try:
         zip_path, file_count = await _build_share_zip(node, root, share_items)

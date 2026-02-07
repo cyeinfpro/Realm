@@ -1743,6 +1743,29 @@ def is_site_file_share_token_revoked(site_id: int, token_sha256: str, db_path: s
     return bool(row)
 
 
+def delete_site_file_share_short_links(
+    site_id: int,
+    token_sha256: str = "",
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    digest = (token_sha256 or "").strip().lower()
+    with connect(db_path) as conn:
+        if digest:
+            cur = conn.execute(
+                "DELETE FROM site_file_share_short_links WHERE site_id=? AND token_sha256=?",
+                (int(site_id), digest),
+            )
+        else:
+            cur = conn.execute(
+                "DELETE FROM site_file_share_short_links "
+                "WHERE site_id=? "
+                "AND token_sha256 IN (SELECT token_sha256 FROM site_file_share_revocations WHERE site_id=?)",
+                (int(site_id), int(site_id)),
+            )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
 def _new_share_short_code(length: int = 8) -> str:
     n = int(length or 8)
     if n < 6:
