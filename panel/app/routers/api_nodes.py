@@ -3083,11 +3083,27 @@ async def api_stats(request: Request, node_id: int, force: int = 0, user: str = 
         if isinstance(rep, dict) and isinstance(rep.get("stats"), dict):
             out = rep["stats"]
             out["source"] = "report"
-            # Provide a stable server-side timestamp for frontend history alignment.
+            # Use report receive time as series timestamp.
+            # If we always use "now" here, repeated reads of an unchanged cached report
+            # will create artificial zero/peak alternation in rate charts.
             try:
-                out["ts_ms"] = int(time.time() * 1000)
+                ts_ms = int(out.get("ts_ms") or 0)
             except Exception:
-                pass
+                ts_ms = 0
+            if ts_ms <= 0:
+                try:
+                    seen = str(node.get("last_seen_at") or "").strip()
+                    dt = datetime.strptime(seen, "%Y-%m-%d %H:%M:%S")
+                    ts_ms = int(dt.timestamp() * 1000)
+                except Exception:
+                    ts_ms = 0
+            if ts_ms <= 0:
+                try:
+                    ts_ms = int(time.time() * 1000)
+                except Exception:
+                    ts_ms = 0
+            if ts_ms > 0:
+                out["ts_ms"] = ts_ms
             return out
 
     try:
