@@ -3137,7 +3137,7 @@ async def api_stats_history(
     node_id: int,
     key: str = "__all__",
     window_ms: int = 10 * 60 * 1000,
-    limit: int = 8000,
+    limit: int = 0,
     user: str = Depends(require_login),
 ):
     """Return persistent traffic/connection history series for a node.
@@ -3150,15 +3150,45 @@ async def api_stats_history(
     if not node:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
 
-    # Clamp window to protect DB and payload size.
+    cfg = stats_history_config() if callable(stats_history_config) else {}
+    try:
+        retention_days = int((cfg or {}).get("retention_days") or 7)
+    except Exception:
+        retention_days = 7
+    if retention_days < 1:
+        retention_days = 1
+    if retention_days > 90:
+        retention_days = 90
+    max_win_ms = retention_days * 24 * 3600 * 1000
+
+    # Clamp window to protect DB and payload size (bounded by retention days).
     try:
         win = int(window_ms)
     except Exception:
         win = 10 * 60 * 1000
     if win < 60 * 1000:
         win = 60 * 1000
-    if win > 24 * 3600 * 1000:
-        win = 24 * 3600 * 1000
+    if win > max_win_ms:
+        win = max_win_ms
+
+    # Auto-select a sensible point limit when client does not provide one.
+    try:
+        lim = int(limit)
+    except Exception:
+        lim = 0
+    if lim <= 0:
+        try:
+            sample_interval_sec = float((cfg or {}).get("sample_interval_sec") or 10.0)
+        except Exception:
+            sample_interval_sec = 10.0
+        if sample_interval_sec < 1.0:
+            sample_interval_sec = 1.0
+        # +32 to keep a small buffer and include previous-boundary sample.
+        lim = int((float(win) / 1000.0) / sample_interval_sec) + 32
+    if lim < 200:
+        lim = 200
+    if lim > 200000:
+        lim = 200000
 
     now_ms = int(time.time() * 1000)
     from_ms = now_ms - win
@@ -3173,7 +3203,7 @@ async def api_stats_history(
             rule_key=k,
             from_ts_ms=int(from_ms),
             to_ts_ms=int(now_ms),
-            limit=int(limit),
+            limit=int(lim),
             include_prev=True,
         )
     except Exception:
@@ -3215,6 +3245,8 @@ async def api_stats_history(
         "key": k,
         "from_ts_ms": int(from_ms),
         "to_ts_ms": int(now_ms),
+        "window_ms": int(win),
+        "limit": int(lim),
         "t": t,
         "rx": rx,
         "tx": tx,
