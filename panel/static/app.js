@@ -2335,7 +2335,7 @@ function renderIntranetHealthCard(statsLookup){
 
   if(!rows.length){
     card.style.display = 'none';
-    if(sourceEl) sourceEl.textContent = '—';
+    if(sourceEl) sourceEl.textContent = '自动刷新时实时更新';
     summaryEl.innerHTML = '';
     listEl.innerHTML = '';
     return;
@@ -2345,8 +2345,10 @@ function renderIntranetHealthCard(statsLookup){
 
   const sourceRaw = String((CURRENT_STATS && CURRENT_STATS.source) || '').trim();
   if(sourceEl){
-    sourceEl.textContent = sourceRaw ? `来源：${sourceRaw}` : '来源：—';
-    sourceEl.className = `pill xs ${statsError ? 'warn' : 'ghost'}`;
+    sourceEl.textContent = sourceRaw ? `来源：${sourceRaw}` : '自动刷新时实时更新';
+    if(statsError){
+      sourceEl.textContent += ' · 统计异常';
+    }
   }
 
   const okCount = rows.filter(x=>x.ok === true).length;
@@ -2378,7 +2380,6 @@ function renderIntranetHealthCard(statsLookup){
     const statusCls = row.ok === true ? 'ok' : (row.ok === false ? 'bad' : 'warn');
     const statusText = row.ok === true ? '在线' : (row.ok === false ? '未连接' : '不可检测');
     const pills = [];
-    pills.push(`<span class="pill xs ${statusCls}">${statusText}</span>`);
     if(Number.isFinite(row.latency)){
       pills.push(`<span class="pill xs ghost">${Math.round(row.latency)} ms</span>`);
     }
@@ -2394,9 +2395,12 @@ function renderIntranetHealthCard(statsLookup){
       pills.push(`<span class="pill xs ghost">心跳 ${row.pongRecv}/${row.pingSent}</span>`);
     }
 
-    return `<div class="intra-health-row">
+    return `<div class="hist-chart intra-health-row">
+      <div class="hist-chart-head">
+        <div class="name intra-health-name" title="${escapeHtml(row.title)}">${escapeHtml(row.title)}</div>
+        <span class="pill xs ${statusCls}">${statusText}</span>
+      </div>
       <div class="intra-health-main">
-        <div class="intra-health-name">${escapeHtml(row.title)}</div>
         <div class="intra-health-meta">${escapeHtml(row.meta)}</div>
       </div>
       <div class="intra-health-pills">${pills.join('')}</div>

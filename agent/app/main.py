@@ -10,6 +10,7 @@ import subprocess
 import time
 import os
 import threading
+import math
 import hashlib
 import hmac
 import ssl
@@ -82,25 +83,37 @@ PROBE_TIMEOUT = float(os.getenv('REALM_AGENT_PROBE_TIMEOUT', '0.45'))  # per att
 PROBE_RETRIES = int(os.getenv('REALM_AGENT_PROBE_RETRIES', '1'))
 PROBE_MAX_WORKERS = int(os.getenv('REALM_AGENT_PROBE_WORKERS', '32'))
 try:
-    PROBE_HISTORY_TTL = float(os.getenv('REALM_AGENT_PROBE_HISTORY_TTL', '180'))  # seconds
+    PROBE_HISTORY_TTL = float(os.getenv('REALM_AGENT_PROBE_HISTORY_TTL', '900'))  # seconds
 except Exception:
-    PROBE_HISTORY_TTL = 180.0
-if PROBE_HISTORY_TTL < 15.0:
-    PROBE_HISTORY_TTL = 15.0
-if PROBE_HISTORY_TTL > 3600.0:
-    PROBE_HISTORY_TTL = 3600.0
+    PROBE_HISTORY_TTL = 900.0
+if PROBE_HISTORY_TTL < 60.0:
+    PROBE_HISTORY_TTL = 60.0
+if PROBE_HISTORY_TTL > 86400.0:
+    PROBE_HISTORY_TTL = 86400.0
+PROBE_HISTORY_ALPHA_OVERRIDE = os.getenv('REALM_AGENT_PROBE_HISTORY_ALPHA', '').strip()
 try:
-    PROBE_HISTORY_ALPHA = float(os.getenv('REALM_AGENT_PROBE_HISTORY_ALPHA', '0.35'))  # EWMA alpha
+    PROBE_HISTORY_ALPHA = float(PROBE_HISTORY_ALPHA_OVERRIDE) if PROBE_HISTORY_ALPHA_OVERRIDE else None
 except Exception:
-    PROBE_HISTORY_ALPHA = 0.35
-if PROBE_HISTORY_ALPHA < 0.05:
-    PROBE_HISTORY_ALPHA = 0.05
-if PROBE_HISTORY_ALPHA > 0.95:
-    PROBE_HISTORY_ALPHA = 0.95
+    PROBE_HISTORY_ALPHA = None
+if PROBE_HISTORY_ALPHA is not None:
+    if PROBE_HISTORY_ALPHA < 0.01:
+        PROBE_HISTORY_ALPHA = 0.01
+    if PROBE_HISTORY_ALPHA > 0.95:
+        PROBE_HISTORY_ALPHA = 0.95
 try:
-    PROBE_HISTORY_MIN_SAMPLES = int(os.getenv('REALM_AGENT_PROBE_HISTORY_MIN_SAMPLES', '3'))
+    PROBE_HISTORY_HALFLIFE = float(
+        os.getenv('REALM_AGENT_PROBE_HISTORY_HALFLIFE', str(max(120.0, PROBE_HISTORY_TTL / 3.0)))
+    )
 except Exception:
-    PROBE_HISTORY_MIN_SAMPLES = 3
+    PROBE_HISTORY_HALFLIFE = max(120.0, PROBE_HISTORY_TTL / 3.0)
+if PROBE_HISTORY_HALFLIFE < 30.0:
+    PROBE_HISTORY_HALFLIFE = 30.0
+if PROBE_HISTORY_HALFLIFE > 86400.0:
+    PROBE_HISTORY_HALFLIFE = 86400.0
+try:
+    PROBE_HISTORY_MIN_SAMPLES = int(os.getenv('REALM_AGENT_PROBE_HISTORY_MIN_SAMPLES', '5'))
+except Exception:
+    PROBE_HISTORY_MIN_SAMPLES = 5
 if PROBE_HISTORY_MIN_SAMPLES < 1:
     PROBE_HISTORY_MIN_SAMPLES = 1
 if PROBE_HISTORY_MIN_SAMPLES > 100:
@@ -1457,6 +1470,31 @@ def _probe_history_prune_locked(now_mono: float) -> None:
     _PROBE_HISTORY_PRUNE_TS = now_mono
 
 
+def _probe_history_alpha(now_mono: float, prev_ts_mono: Optional[float]) -> float:
+    # Compatibility: explicit alpha keeps legacy behaviour for old deployments.
+    if PROBE_HISTORY_ALPHA is not None:
+        return float(PROBE_HISTORY_ALPHA)
+    dt = 1.0
+    try:
+        if prev_ts_mono is not None:
+            dt = float(now_mono) - float(prev_ts_mono)
+    except Exception:
+        dt = 1.0
+    if dt < 0.2:
+        dt = 0.2
+    if dt > float(PROBE_HISTORY_TTL):
+        dt = float(PROBE_HISTORY_TTL)
+    half_life = float(PROBE_HISTORY_HALFLIFE)
+    if half_life <= 0.0:
+        return 0.5
+    alpha = 1.0 - math.pow(0.5, dt / half_life)
+    if alpha < 0.01:
+        alpha = 0.01
+    if alpha > 0.95:
+        alpha = 0.95
+    return alpha
+
+
 def _probe_history_update(key: str, ok: bool, latency_ms: Optional[float], error: Optional[str]) -> None:
     now_mono = time.monotonic()
     now_ms = int(time.time() * 1000)
@@ -1475,13 +1513,14 @@ def _probe_history_update(key: str, ok: bool, latency_ms: Optional[float], error
         samples = int(item.get('samples') or 0) + 1
         successes = int(item.get('successes') or 0) + (1 if ok_b else 0)
         failures = int(item.get('failures') or 0) + (0 if ok_b else 1)
+        alpha = _probe_history_alpha(now_mono, item.get('ts_mono'))
         prev_success_ema = item.get('success_ema')
         try:
             prev_success_ema_f = float(prev_success_ema)
         except Exception:
             prev_success_ema_f = 1.0 if ok_b else 0.0
-        success_ema = (float(PROBE_HISTORY_ALPHA) * (1.0 if ok_b else 0.0)) + (
-            (1.0 - float(PROBE_HISTORY_ALPHA)) * prev_success_ema_f
+        success_ema = (float(alpha) * (1.0 if ok_b else 0.0)) + (
+            (1.0 - float(alpha)) * prev_success_ema_f
         )
         if success_ema < 0.0:
             success_ema = 0.0
@@ -1497,8 +1536,8 @@ def _probe_history_update(key: str, ok: bool, latency_ms: Optional[float], error
             if latency_ema_f is None:
                 latency_ema_f = float(lat_v)
             else:
-                latency_ema_f = (float(PROBE_HISTORY_ALPHA) * float(lat_v)) + (
-                    (1.0 - float(PROBE_HISTORY_ALPHA)) * float(latency_ema_f)
+                latency_ema_f = (float(alpha) * float(lat_v)) + (
+                    (1.0 - float(alpha)) * float(latency_ema_f)
                 )
             if latency_ema_f < 0.0:
                 latency_ema_f = 0.0
@@ -1518,6 +1557,7 @@ def _probe_history_update(key: str, ok: bool, latency_ms: Optional[float], error
             'success_ema': success_ema,
             'consecutive_failures': consecutive_failures,
             'last_ok': ok_b,
+            'alpha_used': round(float(alpha), 4),
         }
         if lat_v is not None:
             out['last_latency_ms'] = lat_v
@@ -3549,6 +3589,18 @@ def _build_stats_snapshot() -> Dict[str, Any]:
                 else:
                     item['ok'] = False
                     item['error'] = hh.get('error') or hh.get('message') or '未连接'
+                for mk in (
+                    'latency_ms',
+                    'dial_mode',
+                    'reconnects',
+                    'loss_pct',
+                    'jitter_ms',
+                    'token_count',
+                    'ping_sent',
+                    'pong_recv',
+                ):
+                    if hh.get(mk) is not None:
+                        item[mk] = hh.get(mk)
                 health.append(item)
 
             rules.append({

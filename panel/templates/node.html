@@ -149,18 +149,6 @@
 
         <div id="nodeSummary" class="summary-bar" style="display:none;"></div>
 
-        <div id="intranetHealthCard" class="intra-health-card" style="display:none;">
-          <div class="intra-health-head">
-            <div>
-              <div class="intra-health-title">穿透链路健康度</div>
-              <div class="intra-health-sub muted sm">控制通道质量 · 丢包/延迟/重连</div>
-            </div>
-            <div id="intranetHealthSource" class="pill xs ghost">—</div>
-          </div>
-          <div id="intranetHealthSummary" class="intra-health-summary"></div>
-          <div id="intranetHealthList" class="intra-health-list"></div>
-        </div>
-
         <!-- Node system info removed (shown only in 控制台 cards) -->
 
         <div id="rulesLoading" class="muted">正在加载规则…</div>
@@ -187,6 +175,20 @@
             <tbody id="rulesBody"></tbody>
           </table>
         </div>
+
+        <details id="intranetHealthCard" class="hist-panel intranet-health-panel" open style="display:none;">
+          <summary class="hist-head">
+            <div class="hist-head-left">
+              <div class="hist-title">穿透链路健康度</div>
+              <div class="hist-sub">控制通道质量 · 丢包/延迟/重连</div>
+            </div>
+            <div class="hist-head-right muted sm" id="intranetHealthSource">自动刷新时实时更新</div>
+          </summary>
+          <div class="hist-body">
+            <div id="intranetHealthSummary" class="hist-kpis intra-health-summary"></div>
+            <div id="intranetHealthList" class="intra-health-list"></div>
+          </div>
+        </details>
 
 
 
@@ -857,7 +859,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=88.0"></script>
+<script src="/static/app.js?v=89.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};
