@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
@@ -41,6 +41,19 @@ app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
 # Static assets (CSS/JS + realm-agent.zip + install scripts)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.middleware("http")
+async def _static_app_js_no_cache(request: Request, call_next):
+    """Prevent stale app.js / html from browser/proxy cache after hotfix releases."""
+    resp = await call_next(request)
+    path = str(request.url.path or "")
+    ct = str(resp.headers.get("content-type") or "").lower()
+    if path == "/static/app.js" or "text/html" in ct:
+        resp.headers["Cache-Control"] = "no-store, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    return resp
 
 # Routers
 app.include_router(auth.router)

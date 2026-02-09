@@ -201,19 +201,40 @@ function _syncTaskMatchKind(taskKind, tunnelKind){
 function _findSyncTaskForRule(e){
   const ident = _syncIdentityFromRule(e);
   if(!ident.kind || !ident.sync_id) return null;
-  let lastDone = null;
+  let newestActive = null;
+  let newestSuccess = null;
+  let newestError = null;
+  const _ts = (task)=>{
+    const t1 = Number((task && task.updated_at_ms) || 0);
+    if(Number.isFinite(t1) && t1 > 0) return t1;
+    const t2 = Number((task && task.created_at_ms) || 0);
+    if(Number.isFinite(t2) && t2 > 0) return t2;
+    const t3 = Number((task && task.updated_at) || 0);
+    if(Number.isFinite(t3) && t3 > 0) return t3 * 1000;
+    const t4 = Number((task && task.created_at) || 0);
+    if(Number.isFinite(t4) && t4 > 0) return t4 * 1000;
+    return 0;
+  };
   for(const task of _syncTasksOrdered()){
     if(!_syncTaskMatchKind(task && task.kind, ident.kind)) continue;
     const meta = (task && task.meta && typeof task.meta === 'object') ? task.meta : {};
     const sid = String(meta.sync_id || '').trim();
     if(sid !== ident.sync_id) continue;
     const st = String((task && task.status) || '').trim().toLowerCase();
-    if(st === 'queued' || st === 'running' || st === 'retrying' || st === 'error'){
-      return task;
+    const curTs = _ts(task);
+    if(st === 'queued' || st === 'running' || st === 'retrying'){
+      if(!newestActive || curTs >= _ts(newestActive)) newestActive = task;
+      continue;
     }
-    if(!lastDone) lastDone = task;
+    if(st === 'success'){
+      if(!newestSuccess || curTs >= _ts(newestSuccess)) newestSuccess = task;
+      continue;
+    }
+    if(st === 'error'){
+      if(!newestError || curTs >= _ts(newestError)) newestError = task;
+    }
   }
-  return lastDone;
+  return newestActive || newestSuccess || newestError;
 }
 
 function _syncPendingKey(kind, syncId){
@@ -4112,13 +4133,13 @@ async function toggleRule(idx){
 
   // Normal rule
   const draft = clonePool(CURRENT_POOL);
-  const eps = Array.isArray(draft.endpoints) ? draft.endpoints : [];
-  if(idx < 0 || idx >= eps.length || !eps[idx]){
+  const draftEps = Array.isArray(draft.endpoints) ? draft.endpoints : [];
+  if(idx < 0 || idx >= draftEps.length || !draftEps[idx]){
     toast('规则不存在或已删除', true);
     return;
   }
-  eps[idx].disabled = newDisabled;
-  draft.endpoints = eps;
+  draftEps[idx].disabled = newDisabled;
+  draft.endpoints = draftEps;
   await savePool('规则状态更新任务已提交', draft);
 }
 
