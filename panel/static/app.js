@@ -92,6 +92,400 @@ let CURRENT_STATS = null;
 let CURRENT_SYS = null;
 let PENDING_COMMAND_TEXT = '';
 let NODES_LIST = [];
+let SYNC_TASKS = new Map(); // job_id -> task status (sync + pool async jobs)
+let SYNC_PENDING_SUBMITS = new Map(); // kind:sync_id -> {kind,sync_id,created_at}
+const SYNC_TASK_DONE_KEEP_MS = 12000;
+
+function _nowTs(){
+  return Date.now();
+}
+
+function syncTaskKindLabel(kind){
+  const k = String(kind || '').trim().toLowerCase();
+  if(k === 'wss_save') return 'WSS保存';
+  if(k === 'intranet_save') return '内网保存';
+  if(k === 'wss_delete') return 'WSS删除';
+  if(k === 'intranet_delete') return '内网删除';
+  if(k === 'pool_save') return '规则保存';
+  if(k === 'rule_delete') return '规则删除';
+  return '任务';
+}
+
+function syncTaskStatusText(task){
+  const st = String((task && task.status) || '').trim().toLowerCase();
+  const n = Number((task && task.attempts) || 0);
+  const m = Number((task && task.max_attempts) || 0);
+  const nm = (n > 0 && m > 0) ? `(${n}/${m})` : '';
+  if(st === 'queued') return `排队中${nm}`;
+  if(st === 'running') return `同步中${nm}`;
+  if(st === 'retrying') return `重试中${nm}`;
+  if(st === 'success') return '已生效';
+  if(st === 'error') return '失败';
+  return st || '未知';
+}
+
+function syncTaskStatusCls(task){
+  const st = String((task && task.status) || '').trim().toLowerCase();
+  if(st === 'success') return 'ok';
+  if(st === 'error') return 'bad';
+  if(st === 'retrying' || st === 'queued' || st === 'running') return 'warn';
+  return 'ghost';
+}
+
+function _syncTaskMeta(task){
+  const meta = (task && task.meta && typeof task.meta === 'object') ? task.meta : {};
+  const listen = String(meta.listen || '').trim();
+  const sid = String(meta.sync_id || '').trim();
+  const idx = Number(meta.idx != null ? meta.idx : -1);
+  return {listen, sid, idx};
+}
+
+function _syncTaskLabel(task){
+  const {listen, sid, idx} = _syncTaskMeta(task);
+  const k = syncTaskKindLabel(task && task.kind);
+  if(listen) return `${k} ${listen}`;
+  if(Number.isFinite(idx) && idx >= 0) return `${k} #${idx + 1}`;
+  if(sid) return `${k} ${sid.slice(0, 8)}`;
+  const jid = String((task && task.job_id) || '').trim();
+  return `${k} ${jid.slice(0, 8)}`;
+}
+
+function _syncTasksOrdered(){
+  const now = _nowTs();
+  const arr = [];
+  for(const [jid, task] of Array.from(SYNC_TASKS.entries())){
+    if(!task || typeof task !== 'object'){
+      SYNC_TASKS.delete(jid);
+      continue;
+    }
+    const st = String(task.status || '').trim().toLowerCase();
+    const doneAt = Number(task.done_at_ms || 0);
+    if((st === 'success') && doneAt > 0 && (now - doneAt) > SYNC_TASK_DONE_KEEP_MS){
+      SYNC_TASKS.delete(jid);
+      continue;
+    }
+    arr.push(task);
+  }
+  arr.sort((a, b)=>{
+    const ap = (a.status === 'error') ? 0 : ((a.status === 'running' || a.status === 'retrying' || a.status === 'queued') ? 1 : 2);
+    const bp = (b.status === 'error') ? 0 : ((b.status === 'running' || b.status === 'retrying' || b.status === 'queued') ? 1 : 2);
+    if(ap !== bp) return ap - bp;
+    const at = Number(a.updated_at_ms || a.created_at_ms || 0);
+    const bt = Number(b.updated_at_ms || b.created_at_ms || 0);
+    return bt - at;
+  });
+  return arr;
+}
+
+function _syncIdentityFromRule(e){
+  const ex = (e && e.extra_config && typeof e.extra_config === 'object') ? e.extra_config : {};
+  const sid = String(ex.sync_id || '').trim();
+  if(!sid) return {kind:'', sync_id:''};
+  if(ex && (ex.intranet_role || ex.intranet_peer_node_id || ex.intranet_lock)){
+    return {kind:'intranet', sync_id:sid};
+  }
+  if(ex && (ex.sync_role || ex.sync_peer_node_id || ex.sync_lock)){
+    return {kind:'wss', sync_id:sid};
+  }
+  return {kind:'', sync_id:''};
+}
+
+function _syncTaskMatchKind(taskKind, tunnelKind){
+  const tk = String(taskKind || '').trim().toLowerCase();
+  const kk = String(tunnelKind || '').trim().toLowerCase();
+  if(kk === 'wss') return tk === 'wss_save' || tk === 'wss_delete';
+  if(kk === 'intranet') return tk === 'intranet_save' || tk === 'intranet_delete';
+  return false;
+}
+
+function _findSyncTaskForRule(e){
+  const ident = _syncIdentityFromRule(e);
+  if(!ident.kind || !ident.sync_id) return null;
+  let lastDone = null;
+  for(const task of _syncTasksOrdered()){
+    if(!_syncTaskMatchKind(task && task.kind, ident.kind)) continue;
+    const meta = (task && task.meta && typeof task.meta === 'object') ? task.meta : {};
+    const sid = String(meta.sync_id || '').trim();
+    if(sid !== ident.sync_id) continue;
+    const st = String((task && task.status) || '').trim().toLowerCase();
+    if(st === 'queued' || st === 'running' || st === 'retrying' || st === 'error'){
+      return task;
+    }
+    if(!lastDone) lastDone = task;
+  }
+  return lastDone;
+}
+
+function _syncPendingKey(kind, syncId){
+  const k = String(kind || '').trim().toLowerCase();
+  const sid = String(syncId || '').trim();
+  if(!k || !sid) return '';
+  return `${k}:${sid}`;
+}
+
+function _setSyncPendingSubmit(kind, syncId, on){
+  const key = _syncPendingKey(kind, syncId);
+  if(!key) return;
+  if(on){
+    SYNC_PENDING_SUBMITS.set(key, {kind: String(kind || ''), sync_id: String(syncId || ''), created_at: _nowTs()});
+  }else{
+    SYNC_PENDING_SUBMITS.delete(key);
+  }
+}
+
+function renderSyncTasksBar(){
+  const bar = q('nodeSummary');
+  if(!bar) return;
+  const tasks = _syncTasksOrdered();
+  if(!tasks.length){
+    bar.style.display = 'none';
+    bar.innerHTML = '';
+    return;
+  }
+  const html = tasks.slice(0, 8).map((task)=>{
+    const label = _syncTaskLabel(task);
+    const stText = syncTaskStatusText(task);
+    const stCls = syncTaskStatusCls(task);
+    const err = String(task.error || '').trim();
+    const jid = String(task.job_id || '').trim();
+    const retryBtn = (String(task.status || '').trim() === 'error')
+      ? `<button class="btn xs ghost" type="button" onclick="retrySyncTask('${escapeHtml(jid)}')">重试</button>`
+      : '';
+    return `<span class="summary-pill" title="${escapeHtml(jid)}">
+      <strong>${escapeHtml(label)}</strong>
+      <span class="pill xs ${stCls}">${escapeHtml(stText)}</span>
+      ${err ? `<span class="muted sm">${escapeHtml(err)}</span>` : ''}
+      ${retryBtn}
+    </span>`;
+  }).join('');
+  bar.innerHTML = html;
+  bar.style.display = '';
+}
+
+function _setSyncTask(task){
+  if(!task || typeof task !== 'object') return;
+  const jid = String(task.job_id || '').trim();
+  if(!jid) return;
+  const prev = SYNC_TASKS.get(jid) || {};
+  const next = Object.assign({}, prev, task);
+  if(!next.created_at_ms){
+    next.created_at_ms = _nowTs();
+  }
+  next.updated_at_ms = _nowTs();
+  SYNC_TASKS.set(jid, next);
+  renderSyncTasksBar();
+}
+
+function _markSyncTaskDone(jobId, status){
+  const jid = String(jobId || '').trim();
+  if(!jid) return;
+  const cur = SYNC_TASKS.get(jid);
+  if(!cur) return;
+  cur.status = status || cur.status;
+  cur.done_at_ms = _nowTs();
+  cur.updated_at_ms = _nowTs();
+  SYNC_TASKS.set(jid, cur);
+  renderSyncTasksBar();
+}
+
+async function _sleep(ms){
+  const n = Number(ms) || 0;
+  return await new Promise((resolve)=>setTimeout(resolve, Math.max(50, n)));
+}
+
+function _syncJobToTask(job, fallback){
+  const fb = (fallback && typeof fallback === 'object') ? fallback : {};
+  const j = (job && typeof job === 'object') ? job : {};
+  return {
+    job_id: String(j.job_id || fb.job_id || '').trim(),
+    kind: String(j.kind || fb.kind || '').trim(),
+    status: String(j.status || fb.status || '').trim(),
+    attempts: Number(j.attempts != null ? j.attempts : (fb.attempts || 0)),
+    max_attempts: Number(j.max_attempts != null ? j.max_attempts : (fb.max_attempts || 0)),
+    error: String(j.error || '').trim(),
+    status_code: Number(j.status_code || 0),
+    created_at: Number(j.created_at || 0),
+    updated_at: Number(j.updated_at || 0),
+    next_retry_at: Number(j.next_retry_at || 0),
+    result: (j.result && typeof j.result === 'object') ? j.result : {},
+    meta: (j.meta && typeof j.meta === 'object') ? j.meta : ((fb.meta && typeof fb.meta === 'object') ? fb.meta : {}),
+    ok_msg: String(fb.ok_msg || ''),
+    error_prefix: String(fb.error_prefix || '同步失败'),
+    status_url: String(j.status_url || fb.status_url || '').trim(),
+    retry_url: String(j.retry_url || fb.retry_url || '').trim(),
+    status_url_template: String(fb.status_url_template || ''),
+    retry_url_template: String(fb.retry_url_template || ''),
+    payload: (fb.payload && typeof fb.payload === 'object') ? fb.payload : {},
+  };
+}
+
+function _jobUrlWithId(template, jobId){
+  const tpl = String(template || '').trim();
+  const jid = String(jobId || '').trim();
+  if(!tpl || !jid) return '';
+  return tpl.replace('{job_id}', encodeURIComponent(jid));
+}
+
+async function pollSyncTask(jobId){
+  const jid = String(jobId || '').trim();
+  if(!jid) return;
+  for(let i=0; i<600; i++){
+    const local = SYNC_TASKS.get(jid);
+    if(!local) return;
+    const statusUrl = String(local.status_url || '').trim() || `/api/sync_jobs/${encodeURIComponent(jid)}`;
+    let data = null;
+    try{
+      data = await fetchJSON(statusUrl);
+    }catch(err){
+      const msg = formatRequestError(err, '读取任务状态失败');
+      _setSyncTask(Object.assign({}, local, {error: msg}));
+      await _sleep(1200);
+      continue;
+    }
+    if(!(data && data.ok && data.job)){
+      _setSyncTask(Object.assign({}, local, {error: (data && data.error) ? String(data.error) : '任务状态读取失败'}));
+      await _sleep(1200);
+      continue;
+    }
+    const task = _syncJobToTask(data.job, local);
+    _setSyncTask(task);
+    const st = String(task.status || '').trim().toLowerCase();
+    if(st === 'success'){
+      const result = (task.result && typeof task.result === 'object') ? task.result : {};
+      if(result.sender_pool && typeof result.sender_pool === 'object'){
+        CURRENT_POOL = result.sender_pool;
+        if(!CURRENT_POOL.endpoints) CURRENT_POOL.endpoints = [];
+      }else if(result.pool && typeof result.pool === 'object'){
+        CURRENT_POOL = result.pool;
+        if(!CURRENT_POOL.endpoints) CURRENT_POOL.endpoints = [];
+      }else{
+        try{ await loadPool(); }catch(_e){}
+      }
+      renderRules();
+      toastWithPrecheck(result, task.ok_msg || '同步完成');
+      _markSyncTaskDone(jid, 'success');
+      return;
+    }
+    if(st === 'error'){
+      const reason = String(task.error || ((task.result && task.result.error) ? task.result.error : '同步失败')).trim();
+      _setSyncTask(Object.assign({}, task, {error: reason}));
+      const k = String(task.kind || '').trim().toLowerCase();
+      if(k === 'pool_save' || k === 'rule_delete'){
+        try{
+          await loadPool();
+          renderRules();
+        }catch(_e){}
+      }
+      toast(`${String(task.error_prefix || '同步失败')}：${reason}`, true, 5200);
+      return;
+    }
+    await _sleep(900);
+  }
+}
+
+async function enqueueSyncTask(url, payload, options){
+  const opts = (options && typeof options === 'object') ? options : {};
+  const res = await fetchJSON(url, {method:'POST', body: JSON.stringify(payload || {})});
+  const job = (res && res.job && typeof res.job === 'object') ? res.job : null;
+  if(!(res && res.ok && job && job.job_id)){
+    throw new Error((res && res.error) ? String(res.error) : '提交任务失败');
+  }
+  const fallback = {
+    kind: String(opts.kind || '').trim(),
+    ok_msg: String(opts.ok_msg || '').trim(),
+    error_prefix: String(opts.error_prefix || '同步失败').trim(),
+    payload: (payload && typeof payload === 'object') ? payload : {},
+    meta: (opts.meta && typeof opts.meta === 'object') ? opts.meta : {},
+    status_url_template: String(opts.status_url_template || ''),
+    retry_url_template: String(opts.retry_url_template || ''),
+  };
+  const task = _syncJobToTask(job, fallback);
+  if(!task.status) task.status = 'queued';
+  if(!task.kind) task.kind = fallback.kind || 'task';
+  if(!task.status_url){
+    task.status_url = _jobUrlWithId(task.status_url_template, task.job_id) || `/api/sync_jobs/${encodeURIComponent(task.job_id)}`;
+  }
+  if(!task.retry_url){
+    task.retry_url = _jobUrlWithId(task.retry_url_template, task.job_id) || `/api/sync_jobs/${encodeURIComponent(task.job_id)}/retry`;
+  }
+  _setSyncTask(task);
+  pollSyncTask(task.job_id);
+  return task;
+}
+
+async function enqueueSyncSaveTask(kind, payload, okMsg){
+  const k = String(kind || '').trim().toLowerCase();
+  const url = (k === 'intranet') ? '/api/intranet_tunnel/save_async' : '/api/wss_tunnel/save_async';
+  const kk = (k === 'intranet') ? 'intranet_save' : 'wss_save';
+  return await enqueueSyncTask(url, payload || {}, {
+    kind: kk,
+    ok_msg: String(okMsg || '').trim(),
+    error_prefix: '同步失败',
+    status_url_template: '/api/sync_jobs/{job_id}',
+    retry_url_template: '/api/sync_jobs/{job_id}/retry',
+  });
+}
+
+async function enqueueSyncDeleteTask(kind, payload, okMsg){
+  const k = String(kind || '').trim().toLowerCase();
+  const url = (k === 'intranet') ? '/api/intranet_tunnel/delete_async' : '/api/wss_tunnel/delete_async';
+  const kk = (k === 'intranet') ? 'intranet_delete' : 'wss_delete';
+  return await enqueueSyncTask(url, payload || {}, {
+    kind: kk,
+    ok_msg: String(okMsg || '').trim(),
+    error_prefix: '同步删除失败',
+    status_url_template: '/api/sync_jobs/{job_id}',
+    retry_url_template: '/api/sync_jobs/{job_id}/retry',
+  });
+}
+
+async function enqueueNodePoolTask(kind, payload, okMsg){
+  const nodeId = window.__NODE_ID__;
+  const k = String(kind || '').trim().toLowerCase();
+  const url = (k === 'rule_delete')
+    ? `/api/nodes/${encodeURIComponent(nodeId)}/rule_delete_async`
+    : `/api/nodes/${encodeURIComponent(nodeId)}/pool_async`;
+  const kk = (k === 'rule_delete') ? 'rule_delete' : 'pool_save';
+  const okText = String(okMsg || (kk === 'rule_delete' ? '已删除' : '已保存')).trim();
+  const errPrefix = (kk === 'rule_delete') ? '规则删除失败' : '规则保存失败';
+  return await enqueueSyncTask(url, payload || {}, {
+    kind: kk,
+    ok_msg: okText,
+    error_prefix: errPrefix,
+    status_url_template: `/api/nodes/${encodeURIComponent(nodeId)}/pool_jobs/{job_id}`,
+    retry_url_template: `/api/nodes/${encodeURIComponent(nodeId)}/pool_jobs/{job_id}/retry`,
+  });
+}
+
+async function retrySyncTask(jobId){
+  const jid = String(jobId || '').trim();
+  if(!jid) return;
+  const cur = SYNC_TASKS.get(jid);
+  try{
+    const retryUrl = (cur && cur.retry_url)
+      ? String(cur.retry_url)
+      : (_jobUrlWithId(cur && cur.retry_url_template, jid) || `/api/sync_jobs/${encodeURIComponent(jid)}/retry`);
+    const res = await fetchJSON(retryUrl, {method:'POST', body: JSON.stringify({})});
+    if(!(res && res.ok && res.job && res.job.job_id)){
+      throw new Error((res && res.error) ? String(res.error) : '重试任务创建失败');
+    }
+    const task = _syncJobToTask(res.job, cur || {});
+    if(cur && cur.ok_msg) task.ok_msg = cur.ok_msg;
+    if(cur && cur.payload) task.payload = cur.payload;
+    if(!task.status_url){
+      task.status_url = _jobUrlWithId(task.status_url_template, task.job_id) || `/api/sync_jobs/${encodeURIComponent(task.job_id)}`;
+    }
+    if(!task.retry_url){
+      task.retry_url = _jobUrlWithId(task.retry_url_template, task.job_id) || `/api/sync_jobs/${encodeURIComponent(task.job_id)}/retry`;
+    }
+    _setSyncTask(task);
+    pollSyncTask(task.job_id);
+    toast('已提交重试任务');
+  }catch(err){
+    toast(formatRequestError(err, '创建重试任务失败'), true);
+  }
+}
+window.retrySyncTask = retrySyncTask;
 
 // Remove ?edit=1 from current URL (used for "auto open edit modal" from dashboard)
 function stripEditQueryParam(){
@@ -976,6 +1370,26 @@ function showRemoteDetail(idx){
 }
 
 function statusPill(e){
+  const ident = _syncIdentityFromRule(e);
+  if(ident.kind && ident.sync_id){
+    const pendingKey = _syncPendingKey(ident.kind, ident.sync_id);
+    if(pendingKey && SYNC_PENDING_SUBMITS.has(pendingKey)){
+      return '<span class="pill ghost">提交中</span>';
+    }
+    const task = _findSyncTaskForRule(e);
+    if(task){
+      const st = String(task.status || '').trim().toLowerCase();
+      const tk = String(task.kind || '').trim().toLowerCase();
+      if(st === 'queued' || st === 'running' || st === 'retrying'){
+        return `<span class="pill ghost">${tk.endsWith('_delete') ? '删除中' : '同步中'}</span>`;
+      }
+      if(st === 'error'){
+        const err = String(task.error || '').trim();
+        const title = err ? `同步失败：${err}` : '同步失败';
+        return `<span class="pill bad" title="${escapeHtml(title)}">同步失败</span>`;
+      }
+    }
+  }
   if(e.disabled) return '<span class="pill warn">已暂停</span>';
   return '<span class="pill ok">运行</span>';
 }
@@ -1826,6 +2240,149 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
   </div>`;
 }
 
+function renderIntranetHealthCard(statsLookup){
+  const card = q('intranetHealthCard');
+  const sourceEl = q('intranetHealthSource');
+  const summaryEl = q('intranetHealthSummary');
+  const listEl = q('intranetHealthList');
+  if(!card || !summaryEl || !listEl) return;
+
+  const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
+  const lookup = statsLookup && typeof statsLookup === 'object' ? statsLookup : {byIdx:{}, byListen:{}, error:''};
+  const byIdx = (lookup && lookup.byIdx && typeof lookup.byIdx === 'object') ? lookup.byIdx : {};
+  const byListen = (lookup && lookup.byListen && typeof lookup.byListen === 'object') ? lookup.byListen : {};
+  const statsError = String((lookup && lookup.error) || '').trim();
+
+  const rows = [];
+  for(let idx=0; idx<eps.length; idx++){
+    const e = eps[idx];
+    if(wssMode(e) !== 'intranet') continue;
+    const ex = (e && e.extra_config) ? e.extra_config : {};
+    const role = String(ex.intranet_role || '').trim();
+    const listen = String(e && e.listen || '').trim();
+    const peer = String(
+      ex.intranet_peer_node_name ||
+      ex.intranet_peer_host ||
+      ex.intranet_peer_node_id ||
+      ''
+    ).trim();
+    const roleLabel = role === 'server' ? '公网入口' : (role === 'client' ? '内网出口' : '内网穿透');
+    const stats = byIdx[idx] || (listen ? byListen[listen] : null) || {};
+    const health = Array.isArray(stats && stats.health) ? stats.health : [];
+    let hs = null;
+    for(const item of health){
+      if(item && item.kind === 'handshake'){ hs = item; break; }
+    }
+
+    let ok = null;
+    if(hs && Object.prototype.hasOwnProperty.call(hs, 'ok')){
+      ok = hs.ok;
+    }
+    const latency = hs && hs.latency_ms != null ? Number(hs.latency_ms) : null;
+    const lossPct = hs && hs.loss_pct != null ? Number(hs.loss_pct) : null;
+    const jitterMs = hs && hs.jitter_ms != null ? Number(hs.jitter_ms) : null;
+    const reconnects = hs && hs.reconnects != null ? parseInt(hs.reconnects, 10) : 0;
+    const tokenCount = hs && hs.token_count != null ? parseInt(hs.token_count, 10) : 0;
+    const pingSent = hs && hs.ping_sent != null ? parseInt(hs.ping_sent, 10) : 0;
+    const pongRecv = hs && hs.pong_recv != null ? parseInt(hs.pong_recv, 10) : 0;
+    const dialMode = hs ? String(hs.dial_mode || '').trim() : '';
+    const err = hs ? String(hs.error || '').trim() : '';
+    const msg = hs ? String(hs.message || '').trim() : '';
+
+    const title = hs && hs.target ? String(hs.target || '').trim() : `${roleLabel}${peer ? ` · ${peer}` : ''}`;
+    const meta = [];
+    if(listen && listen !== '0.0.0.0:0') meta.push(`入口 ${listen}`);
+    if(peer) meta.push(`对端 ${peer}`);
+    if(dialMode) meta.push(`模式 ${dialMode}`);
+    if(tokenCount > 0) meta.push(`Token ${tokenCount}`);
+    if(ok === false && err) meta.push(`错误 ${err}`);
+    else if(msg) meta.push(msg);
+    if(!meta.length) meta.push(roleLabel);
+
+    rows.push({
+      ok,
+      latency,
+      lossPct,
+      jitterMs,
+      reconnects: Number.isFinite(reconnects) ? reconnects : 0,
+      pingSent: Number.isFinite(pingSent) ? pingSent : 0,
+      pongRecv: Number.isFinite(pongRecv) ? pongRecv : 0,
+      title,
+      meta: meta.join(' · '),
+    });
+  }
+
+  if(!rows.length){
+    card.style.display = 'none';
+    if(sourceEl) sourceEl.textContent = '—';
+    summaryEl.innerHTML = '';
+    listEl.innerHTML = '';
+    return;
+  }
+
+  card.style.display = '';
+
+  const sourceRaw = String((CURRENT_STATS && CURRENT_STATS.source) || '').trim();
+  if(sourceEl){
+    sourceEl.textContent = sourceRaw ? `来源：${sourceRaw}` : '来源：—';
+    sourceEl.className = `pill xs ${statsError ? 'warn' : 'ghost'}`;
+  }
+
+  const okCount = rows.filter(x=>x.ok === true).length;
+  const failCount = rows.filter(x=>x.ok === false).length;
+  const unknownCount = Math.max(0, rows.length - okCount - failCount);
+  const latArr = rows.map(x=>x.latency).filter(v=>Number.isFinite(v));
+  const lossArr = rows.map(x=>x.lossPct).filter(v=>Number.isFinite(v));
+  const avgLatency = latArr.length ? Math.round(latArr.reduce((a,b)=>a + b, 0) / latArr.length) : null;
+  const avgLoss = lossArr.length ? (lossArr.reduce((a,b)=>a + b, 0) / lossArr.length) : null;
+  const reconnectTotal = rows.reduce((a,b)=>a + (Number.isFinite(b.reconnects) ? b.reconnects : 0), 0);
+
+  const summaryParts = [];
+  summaryParts.push(`<span class="pill xs ghost">链路 ${rows.length}</span>`);
+  summaryParts.push(`<span class="pill xs ok">在线 ${okCount}</span>`);
+  if(failCount > 0) summaryParts.push(`<span class="pill xs bad">异常 ${failCount}</span>`);
+  if(unknownCount > 0) summaryParts.push(`<span class="pill xs warn">未知 ${unknownCount}</span>`);
+  if(avgLatency != null) summaryParts.push(`<span class="pill xs ghost">均延迟 ${avgLatency} ms</span>`);
+  if(avgLoss != null){
+    const lossCls = avgLoss >= 5 ? 'bad' : (avgLoss >= 1 ? 'warn' : 'ok');
+    summaryParts.push(`<span class="pill xs ${lossCls}">均丢包 ${avgLoss >= 10 ? avgLoss.toFixed(0) : avgLoss.toFixed(1)}%</span>`);
+  }
+  summaryParts.push(`<span class="pill xs ghost">重连 ${reconnectTotal}</span>`);
+  if(statsError){
+    summaryParts.push(`<span class="pill xs warn" title="${escapeHtml(statsError)}">统计异常</span>`);
+  }
+  summaryEl.innerHTML = summaryParts.join('');
+
+  listEl.innerHTML = rows.map((row)=>{
+    const statusCls = row.ok === true ? 'ok' : (row.ok === false ? 'bad' : 'warn');
+    const statusText = row.ok === true ? '在线' : (row.ok === false ? '未连接' : '不可检测');
+    const pills = [];
+    pills.push(`<span class="pill xs ${statusCls}">${statusText}</span>`);
+    if(Number.isFinite(row.latency)){
+      pills.push(`<span class="pill xs ghost">${Math.round(row.latency)} ms</span>`);
+    }
+    if(Number.isFinite(row.lossPct)){
+      const lossCls = row.lossPct >= 5 ? 'bad' : (row.lossPct >= 1 ? 'warn' : 'ok');
+      pills.push(`<span class="pill xs ${lossCls}">丢包 ${row.lossPct >= 10 ? row.lossPct.toFixed(0) : row.lossPct.toFixed(1)}%</span>`);
+    }
+    if(Number.isFinite(row.jitterMs)){
+      pills.push(`<span class="pill xs ghost">抖动 ${Math.round(row.jitterMs)} ms</span>`);
+    }
+    pills.push(`<span class="pill xs ghost">重连 ${row.reconnects}</span>`);
+    if(row.pingSent > 0 || row.pongRecv > 0){
+      pills.push(`<span class="pill xs ghost">心跳 ${row.pongRecv}/${row.pingSent}</span>`);
+    }
+
+    return `<div class="intra-health-row">
+      <div class="intra-health-main">
+        <div class="intra-health-name">${escapeHtml(row.title)}</div>
+        <div class="intra-health-meta">${escapeHtml(row.meta)}</div>
+      </div>
+      <div class="intra-health-pills">${pills.join('')}</div>
+    </div>`;
+  }).join('');
+}
+
 function renderRules(){
   q('rulesLoading').style.display = 'none';
   const table = q('rulesTable');
@@ -1884,6 +2441,8 @@ function renderRules(){
     if(statsLoading){
       statsLoading.style.display = 'none';
     }
+    renderSyncTasksBar();
+    renderIntranetHealthCard(statsLookup);
     return;
   }
 
@@ -1980,6 +2539,8 @@ function renderRules(){
 
   // History curves: keep rule select options in sync
   try{ histSyncRuleSelect(); }catch(_e){}
+  renderSyncTasksBar();
+  renderIntranetHealthCard(statsLookup);
 }
 
 function openModal(){ q('modal').style.display = 'flex'; }
@@ -2278,10 +2839,55 @@ function fillIntranetFields(e){
   const peerId = ex.intranet_peer_node_id ? String(ex.intranet_peer_node_id) : '';
   const port = ex.intranet_server_port != null ? String(ex.intranet_server_port) : '18443';
   const host = ex.intranet_public_host ? String(ex.intranet_public_host) : '';
+  const acl = (ex.intranet_acl && typeof ex.intranet_acl === 'object' && !Array.isArray(ex.intranet_acl)) ? ex.intranet_acl : {};
+  const toMulti = (v)=> Array.isArray(v) ? v.map(x=>String(x || '').trim()).filter(Boolean).join('\n') : '';
   if(q('f_intranet_receiver_node')) setField('f_intranet_receiver_node', peerId);
   if(q('f_intranet_server_port')) setField('f_intranet_server_port', port);
   if(q('f_intranet_server_host')) setField('f_intranet_server_host', host);
+  if(q('f_intranet_acl_allow_sources')) setField('f_intranet_acl_allow_sources', toMulti(acl.allow_sources));
+  if(q('f_intranet_acl_deny_sources')) setField('f_intranet_acl_deny_sources', toMulti(acl.deny_sources));
+  if(q('f_intranet_acl_allow_hours')) setField('f_intranet_acl_allow_hours', toMulti(acl.allow_hours));
+  if(q('f_intranet_acl_allow_tokens')) setField('f_intranet_acl_allow_tokens', toMulti(acl.allow_tokens));
   populateIntranetReceiverSelect();
+}
+
+function readIntranetAclFields(){
+  const readList = (id, maxItems=128)=>{
+    const el = q(id);
+    const raw = el ? String(el.value || '').trim() : '';
+    if(!raw) return [];
+    const out = [];
+    const seen = new Set();
+    for(const row0 of raw.replace(/,/g, '\n').split('\n')){
+      const row = String(row0 || '').trim();
+      if(!row || seen.has(row)) continue;
+      seen.add(row);
+      out.push(row);
+      if(out.length >= maxItems) break;
+    }
+    return out;
+  };
+  const acl = {};
+  const allowSources = readList('f_intranet_acl_allow_sources', 128);
+  const denySources = readList('f_intranet_acl_deny_sources', 128);
+  const allowHours = readList('f_intranet_acl_allow_hours', 16);
+  const allowTokens = readList('f_intranet_acl_allow_tokens', 64);
+
+  for(const h of allowHours){
+    if(!/^\d{2}:\d{2}\-\d{2}:\d{2}$/.test(h)) return {ok:false, error:`ACL 时间窗格式无效：${h}`};
+    const [left, right] = h.split('-');
+    const [lh, lm] = left.split(':').map(x=>parseInt(x, 10));
+    const [rh, rm] = right.split(':').map(x=>parseInt(x, 10));
+    if(!(lh >= 0 && lh <= 23 && lm >= 0 && lm <= 59 && rh >= 0 && rh <= 23 && rm >= 0 && rm <= 59)){
+      return {ok:false, error:`ACL 时间窗超出范围：${h}`};
+    }
+  }
+
+  if(allowSources.length) acl.allow_sources = allowSources;
+  if(denySources.length) acl.deny_sources = denySources;
+  if(allowHours.length) acl.allow_hours = allowHours;
+  if(allowTokens.length) acl.allow_tokens = allowTokens;
+  return {ok:true, acl};
 }
 
 
@@ -3232,6 +3838,10 @@ function copyRule(idx){
       if(m === 'intranet'){
         if(q('f_intranet_server_port') && String(q('f_intranet_server_port').value || '').trim() && String(q('f_intranet_server_port').value).trim() !== '18443') openAdv = true;
         if(q('f_intranet_server_host') && String(q('f_intranet_server_host').value || '').trim()) openAdv = true;
+        if(q('f_intranet_acl_allow_sources') && String(q('f_intranet_acl_allow_sources').value || '').trim()) openAdv = true;
+        if(q('f_intranet_acl_deny_sources') && String(q('f_intranet_acl_deny_sources').value || '').trim()) openAdv = true;
+        if(q('f_intranet_acl_allow_hours') && String(q('f_intranet_acl_allow_hours').value || '').trim()) openAdv = true;
+        if(q('f_intranet_acl_allow_tokens') && String(q('f_intranet_acl_allow_tokens').value || '').trim()) openAdv = true;
       }else if(m === 'wss'){
         if(q('f_wss_receiver_port') && String(q('f_wss_receiver_port').value || '').trim()) openAdv = true;
         if(q('f_wss_tls') && String(q('f_wss_tls').value || '1') !== '1') openAdv = true;
@@ -3381,6 +3991,10 @@ function editRule(idx){
       if(mode === 'intranet'){
         if(q('f_intranet_server_port') && String(q('f_intranet_server_port').value || '').trim() && String(q('f_intranet_server_port').value).trim() !== '18443') openAdv = true;
         if(q('f_intranet_server_host') && String(q('f_intranet_server_host').value || '').trim()) openAdv = true;
+        if(q('f_intranet_acl_allow_sources') && String(q('f_intranet_acl_allow_sources').value || '').trim()) openAdv = true;
+        if(q('f_intranet_acl_deny_sources') && String(q('f_intranet_acl_deny_sources').value || '').trim()) openAdv = true;
+        if(q('f_intranet_acl_allow_hours') && String(q('f_intranet_acl_allow_hours').value || '').trim()) openAdv = true;
+        if(q('f_intranet_acl_allow_tokens') && String(q('f_intranet_acl_allow_tokens').value || '').trim()) openAdv = true;
       }else if(mode === 'wss'){
         if(q('f_wss_receiver_port') && String(q('f_wss_receiver_port').value || '').trim()) openAdv = true;
         if(q('f_wss_tls') && String(q('f_wss_tls').value || '1') !== '1') openAdv = true;
@@ -3414,7 +4028,12 @@ function editRule(idx){
 }
 
 async function toggleRule(idx){
-  const e = CURRENT_POOL.endpoints[idx];
+  const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
+  const e = eps[idx];
+  if(!e){
+    toast('规则不存在或已删除', true);
+    return;
+  }
   const ex = (e && e.extra_config) ? e.extra_config : {};
   const li = getRuleLockInfo(e);
   if(li && li.locked){
@@ -3450,14 +4069,8 @@ async function toggleRule(idx){
         }
       };
       if(Object.keys(qos).length > 0) payload.qos = qos;
-      const res = await fetchJSON('/api/wss_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
-      if(res && res.ok){
-        CURRENT_POOL = res.sender_pool;
-        renderRules();
-        toastWithPrecheck(res, '已同步更新（发送/接收两端）');
-      }else{
-        toast(res && res.error ? res.error : '同步更新失败，请稍后重试', true);
-      }
+      await enqueueSyncSaveTask('wss', payload, '已同步更新（发送/接收两端）');
+      toast('已提交同步任务（发送/接收两端）');
     }catch(err){
       toast(formatRequestError(err, 'WSS 隧道保存失败'), true);
     }finally{
@@ -3471,6 +4084,7 @@ async function toggleRule(idx){
     try{
       setLoading(true);
       const qos = collectQosFromEndpoint(e);
+      const acl = (ex.intranet_acl && typeof ex.intranet_acl === 'object' && !Array.isArray(ex.intranet_acl)) ? ex.intranet_acl : {};
       const payload = {
         sender_node_id: window.__NODE_ID__,
         receiver_node_id: ex.intranet_peer_node_id,
@@ -3485,14 +4099,9 @@ async function toggleRule(idx){
         sync_id: ex.sync_id
       };
       if(Object.keys(qos).length > 0) payload.qos = qos;
-      const res = await fetchJSON('/api/intranet_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
-      if(res && res.ok){
-        CURRENT_POOL = res.sender_pool;
-        renderRules();
-        toastWithPrecheck(res, '已同步更新（公网入口/内网出口两端）');
-      }else{
-        toast(res && res.error ? res.error : '同步更新失败，请稍后重试', true);
-      }
+      if(Object.keys(acl).length > 0) payload.acl = acl;
+      await enqueueSyncSaveTask('intranet', payload, '已同步更新（公网入口/内网出口两端）');
+      toast('已提交同步任务（公网入口/内网出口两端）');
     }catch(err){
       toast(formatRequestError(err, '内网穿透保存失败'), true);
     }finally{
@@ -3502,9 +4111,15 @@ async function toggleRule(idx){
   }
 
   // Normal rule
-  e.disabled = newDisabled;
-  await savePool();
-  renderRules();
+  const draft = clonePool(CURRENT_POOL);
+  const eps = Array.isArray(draft.endpoints) ? draft.endpoints : [];
+  if(idx < 0 || idx >= eps.length || !eps[idx]){
+    toast('规则不存在或已删除', true);
+    return;
+  }
+  eps[idx].disabled = newDisabled;
+  draft.endpoints = eps;
+  await savePool('规则状态更新任务已提交', draft);
 }
 
 async function toggleFavorite(idx, ev){
@@ -3520,21 +4135,24 @@ async function toggleFavorite(idx, ev){
   const e = eps[idx];
   if(!e) return;
 
+  const draft = clonePool(CURRENT_POOL);
+  const dep = (draft && Array.isArray(draft.endpoints)) ? draft.endpoints[idx] : null;
+  if(!dep){
+    toast('规则不存在或已删除', true);
+    return;
+  }
   const old = !!e.favorite;
-  if(old) delete e.favorite;
-  else e.favorite = true;
+  if(old) delete dep.favorite;
+  else dep.favorite = true;
 
   RULE_META_SAVING = true;
   try{
-    await savePool(old ? '已取消收藏' : '已收藏');
-  }catch(err){
-    // Revert on failure
-    if(old) e.favorite = true;
-    else delete e.favorite;
+    await savePool(old ? '取消收藏任务已提交' : '收藏任务已提交', draft);
+  }catch(_err){
+    // keep current view until task success refreshes from backend
   }finally{
     RULE_META_SAVING = false;
   }
-  renderRules();
 }
 
 async function editRemark(idx, ev){
@@ -3550,28 +4168,35 @@ async function editRemark(idx, ev){
   const e = eps[idx];
   if(!e) return;
 
-  const old = getRuleRemark(e);
-  const next = prompt('规则备注（用于搜索/筛选，可留空清除）：', old);
+  const next = prompt('规则备注（用于搜索/筛选，可留空清除）：', getRuleRemark(e));
   if(next === null) return;
   const v = String(next || '').trim();
-  if(v) e.remark = v;
-  else delete e.remark;
+  const draft = clonePool(CURRENT_POOL);
+  const dep = (draft && Array.isArray(draft.endpoints)) ? draft.endpoints[idx] : null;
+  if(!dep){
+    toast('规则不存在或已删除', true);
+    return;
+  }
+  if(v) dep.remark = v;
+  else delete dep.remark;
 
   RULE_META_SAVING = true;
   try{
-    await savePool('备注已保存');
-  }catch(err){
-    // Revert on failure
-    if(old) e.remark = old;
-    else delete e.remark;
+    await savePool('备注保存任务已提交', draft);
+  }catch(_err){
+    // keep current view until task success refreshes from backend
   }finally{
     RULE_META_SAVING = false;
   }
-  renderRules();
 }
 
 async function deleteRule(idx){
-  const e = CURRENT_POOL.endpoints[idx];
+  const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
+  const e = eps[idx];
+  if(!e){
+    toast('规则不存在或已删除', true);
+    return;
+  }
   const ex = (e && e.extra_config) ? e.extra_config : {};
   const li = getRuleLockInfo(e);
   if(li && li.locked){
@@ -3585,16 +4210,10 @@ async function deleteRule(idx){
     try{
       setLoading(true);
       const payload = { sender_node_id: window.__NODE_ID__, receiver_node_id: ex.sync_peer_node_id, sync_id: ex.sync_id };
-      const res = await fetchJSON('/api/wss_tunnel/delete', {method:'POST', body: JSON.stringify(payload)});
-      if(res && res.ok){
-        CURRENT_POOL = res.sender_pool;
-        renderRules();
-        toast('已同步删除（发送/接收两端）');
-      }else{
-        toast(res && res.error ? res.error : '同步删除失败，请稍后重试', true);
-      }
+      await enqueueSyncDeleteTask('wss', payload, '已删除（发送/接收两端）');
+      toast('已提交删除任务（发送/接收两端）');
     }catch(err){
-      toast(formatRequestError(err, 'WSS 隧道保存失败'), true);
+      toast(formatRequestError(err, 'WSS 隧道删除失败'), true);
     }finally{
       setLoading(false);
     }
@@ -3607,16 +4226,10 @@ async function deleteRule(idx){
     try{
       setLoading(true);
       const payload = { sender_node_id: window.__NODE_ID__, receiver_node_id: ex.intranet_peer_node_id, sync_id: ex.sync_id };
-      const res = await fetchJSON('/api/intranet_tunnel/delete', {method:'POST', body: JSON.stringify(payload)});
-      if(res && res.ok){
-        CURRENT_POOL = res.sender_pool;
-        renderRules();
-        toast('已同步删除（公网入口/内网出口两端）');
-      }else{
-        toast(res && res.error ? res.error : '同步删除失败，请稍后重试', true);
-      }
+      await enqueueSyncDeleteTask('intranet', payload, '已删除（公网入口/内网出口两端）');
+      toast('已提交删除任务（公网入口/内网出口两端）');
     }catch(err){
-      toast(formatRequestError(err, '内网穿透保存失败'), true);
+      toast(formatRequestError(err, '内网穿透删除失败'), true);
     }finally{
       setLoading(false);
     }
@@ -3626,19 +4239,17 @@ async function deleteRule(idx){
   if(!confirm('确定删除这条规则吗？（不可恢复）')) return;
   try{
     setLoading(true);
-    const id = window.__NODE_ID__;
-    const res = await fetchJSON(`/api/nodes/${id}/rule_delete`, {
-      method:'POST',
-      body: JSON.stringify({ idx, unlock_sync_ids: collectUnlockSyncIds() })
-    });
-    if(res && res.ok){
-      CURRENT_POOL = res.pool || CURRENT_POOL || { endpoints: [] };
-      if(!CURRENT_POOL.endpoints) CURRENT_POOL.endpoints = [];
-      renderRules();
-      toast('已删除');
-      return;
+    const draft = clonePool(CURRENT_POOL);
+    if(Array.isArray(draft.endpoints) && idx >= 0 && idx < draft.endpoints.length){
+      draft.endpoints.splice(idx, 1);
     }
-    toast(res && res.error ? res.error : '删除失败，请稍后重试', true);
+    await enqueueNodePoolTask(
+      'rule_delete',
+      { idx, expected_key: getRuleKey(e), unlock_sync_ids: collectUnlockSyncIds() },
+      '规则删除任务已提交'
+    );
+    CURRENT_POOL = draft;
+    toast('已提交删除任务，正在后台生效');
   }catch(err){
     toast(String((err && err.message) ? err.message : err), true);
   }finally{
@@ -3661,6 +4272,7 @@ async function bulkSetDisabled(disabled){
   let ok = 0;
   let skipped = 0;
   let failed = 0;
+  let queued = 0;
 
   // Keys for normal rules (handled in one savePool)
   const normalKeys = [];
@@ -3705,13 +4317,9 @@ async function bulkSetDisabled(disabled){
             }
           };
           if(Object.keys(qos).length > 0) payload.qos = qos;
-          const res = await fetchJSON('/api/wss_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
-          if(res && res.ok){
-            CURRENT_POOL = res.sender_pool;
-            ok += 1;
-          }else{
-            failed += 1;
-          }
+          await enqueueSyncSaveTask('wss', payload, 'WSS 批量同步已完成');
+          ok += 1;
+          queued += 1;
         }catch(err){
           failed += 1;
         }
@@ -3722,6 +4330,7 @@ async function bulkSetDisabled(disabled){
       if(ex && ex.sync_id && ex.intranet_role === 'server' && ex.intranet_peer_node_id){
         try{
           const qos = collectQosFromEndpoint(e);
+          const acl = (ex.intranet_acl && typeof ex.intranet_acl === 'object' && !Array.isArray(ex.intranet_acl)) ? ex.intranet_acl : {};
           const payload = {
             sender_node_id: window.__NODE_ID__,
             receiver_node_id: ex.intranet_peer_node_id,
@@ -3736,13 +4345,10 @@ async function bulkSetDisabled(disabled){
             sync_id: ex.sync_id
           };
           if(Object.keys(qos).length > 0) payload.qos = qos;
-          const res = await fetchJSON('/api/intranet_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
-          if(res && res.ok){
-            CURRENT_POOL = res.sender_pool;
-            ok += 1;
-          }else{
-            failed += 1;
-          }
+          if(Object.keys(acl).length > 0) payload.acl = acl;
+          await enqueueSyncSaveTask('intranet', payload, '内网穿透批量同步已完成');
+          ok += 1;
+          queued += 1;
         }catch(err){
           failed += 1;
         }
@@ -3755,7 +4361,8 @@ async function bulkSetDisabled(disabled){
 
     // 2) Apply changes to normal rules and save once
     if(normalKeys.length){
-      const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
+      const draft = clonePool(CURRENT_POOL);
+      const eps = (draft && Array.isArray(draft.endpoints)) ? draft.endpoints : [];
       for(const k of normalKeys){
         const j = eps.findIndex(x => getRuleKey(x) === k);
         if(j >= 0){
@@ -3765,12 +4372,13 @@ async function bulkSetDisabled(disabled){
           failed += 1;
         }
       }
-      await savePool();
+      draft.endpoints = eps;
+      await savePool(`批量${actionName}任务已提交`, draft);
     }
 
-    renderRules();
     updateBulkBar();
-    toast(`批量${actionName}完成：成功 ${ok}，跳过 ${skipped}${failed ? `，失败 ${failed}` : ''}`);
+    const queuedText = queued > 0 ? `，已提交同步任务 ${queued}` : '';
+    toast(`批量${actionName}已提交：成功 ${ok}，跳过 ${skipped}${failed ? `，失败 ${failed}` : ''}${queuedText}`);
   }catch(err){
     toast(`批量${actionName}失败：${(err && err.message) ? err.message : String(err)}`, true);
     try{ await loadPool(); }catch(_e){}
@@ -3832,13 +4440,8 @@ async function bulkDeleteSelected(){
       if(ex && ex.sync_id && ex.sync_role === 'sender' && ex.sync_peer_node_id){
         try{
           const payload = { sender_node_id: window.__NODE_ID__, receiver_node_id: ex.sync_peer_node_id, sync_id: ex.sync_id };
-          const res = await fetchJSON('/api/wss_tunnel/delete', {method:'POST', body: JSON.stringify(payload)});
-          if(res && res.ok){
-            CURRENT_POOL = res.sender_pool;
-            ok += 1;
-          }else{
-            failed += 1;
-          }
+          await enqueueSyncDeleteTask('wss', payload, 'WSS 批量删除已完成');
+          ok += 1;
         }catch(err){
           failed += 1;
         }
@@ -3848,13 +4451,8 @@ async function bulkDeleteSelected(){
       if(ex && ex.sync_id && ex.intranet_role === 'server' && ex.intranet_peer_node_id){
         try{
           const payload = { sender_node_id: window.__NODE_ID__, receiver_node_id: ex.intranet_peer_node_id, sync_id: ex.sync_id };
-          const res = await fetchJSON('/api/intranet_tunnel/delete', {method:'POST', body: JSON.stringify(payload)});
-          if(res && res.ok){
-            CURRENT_POOL = res.sender_pool;
-            ok += 1;
-          }else{
-            failed += 1;
-          }
+          await enqueueSyncDeleteTask('intranet', payload, '内网穿透批量删除已完成');
+          ok += 1;
         }catch(err){
           failed += 1;
         }
@@ -3868,13 +4466,14 @@ async function bulkDeleteSelected(){
     // 2) Remove normal rules locally and save once
     if(normalKeys.length){
       const keySet = new Set(normalKeys.filter(Boolean));
-      const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
+      const draft = clonePool(CURRENT_POOL);
+      const eps = (draft && Array.isArray(draft.endpoints)) ? draft.endpoints : [];
       const before = eps.length;
       const next = eps.filter(ep => !keySet.has(getRuleKey(ep)));
       const removed = before - next.length;
-      CURRENT_POOL.endpoints = next;
+      draft.endpoints = next;
       if(removed > 0){
-        await savePool();
+        await savePool('批量删除任务已提交', draft);
         ok += removed;
       }
       const missing = normalKeys.length - removed;
@@ -3883,10 +4482,9 @@ async function bulkDeleteSelected(){
 
     // Clear selection after delete
     RULE_SELECTED_KEYS = new Set();
-    renderRules();
     updateBulkBar();
 
-    toast(`批量删除完成：成功 ${ok}，跳过 ${skipped}${failed ? `，失败 ${failed}` : ''}`);
+    toast(`批量删除已提交：成功 ${ok}，跳过 ${skipped}${failed ? `，失败 ${failed}` : ''}`);
   }catch(err){
     toast(`批量删除失败：${(err && err.message) ? err.message : String(err)}`, true);
     try{ await loadPool(); }catch(_e){}
@@ -4009,9 +4607,13 @@ async function saveRule(){
 
       try{
         setLoading(true);
-        CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX] = endpoint;
-        await savePool('已保存（接收端临时解锁）');
-        renderRules();
+        const draft = clonePool(CURRENT_POOL);
+        if(!Array.isArray(draft.endpoints)) draft.endpoints = [];
+        if(CURRENT_EDIT_INDEX < 0 || CURRENT_EDIT_INDEX >= draft.endpoints.length){
+          throw new Error('规则不存在或已删除');
+        }
+        draft.endpoints[CURRENT_EDIT_INDEX] = endpoint;
+        await savePool('接收端保存任务已提交', draft);
         closeModal();
       }catch(err){
         const msg = (err && err.message) ? err.message : String(err || '保存失败');
@@ -4060,6 +4662,7 @@ async function saveRule(){
       const ex = (old && old.extra_config) ? old.extra_config : {};
       if(ex && ex.sync_id) syncId = ex.sync_id;
     }
+    if(!syncId) syncId = genLocalSyncId();
     const payload = {
       sender_node_id: window.__NODE_ID__,
       receiver_node_id: parseInt(receiverNodeId,10),
@@ -4072,26 +4675,35 @@ async function saveRule(){
       favorite,
       qos: qosRead.qos,
       receiver_port: receiverPortTxt ? parseInt(receiverPortTxt,10) : null,
-      sync_id: syncId || undefined,
+      sync_id: syncId,
       wss
     };
 
+    _setSyncPendingSubmit('wss', syncId, true);
     try{
-      setLoading(true);
-      const res = await fetchJSON('/api/wss_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
-      if(res && res.ok){
-        CURRENT_POOL = res.sender_pool;
+      upsertLocalSyncSenderRule('wss', payload);
+      renderRules();
+    }catch(_e){}
+    closeModal();
+    toast('已提交同步任务，规则正在后台同步到接收机');
+    enqueueSyncSaveTask('wss', payload, '已保存，并自动同步到接收机')
+      .then(()=>{
+        _setSyncPendingSubmit('wss', syncId, false);
         renderRules();
-        closeModal();
-        toastWithPrecheck(res, '已保存，并自动同步到接收机');
-      }else{
-        toast((res && res.error) ? res.error : '保存失败，请检查节点是否在线', true);
-      }
-    }catch(err){
-      toast(formatRequestError(err, 'WSS 隧道保存失败'), true);
-    }finally{
-      setLoading(false);
-    }
+      })
+      .catch(async (err)=>{
+        _setSyncPendingSubmit('wss', syncId, false);
+        toast(formatRequestError(err, 'WSS 隧道保存失败'), true);
+        let loaded = false;
+        try{
+          await loadPool();
+          loaded = true;
+        }catch(_e){}
+        if(!loaded){
+          try{ removeLocalSyncRuleById('wss', syncId); }catch(_e){}
+        }
+        renderRules();
+      });
     return;
   }
 
@@ -4110,12 +4722,18 @@ async function saveRule(){
       toast(qosRead.error || 'QoS 参数无效', true);
       return;
     }
+    const aclRead = readIntranetAclFields();
+    if(!aclRead.ok){
+      toast(aclRead.error || 'ACL 参数无效', true);
+      return;
+    }
     let syncId = '';
     if(CURRENT_EDIT_INDEX >= 0){
       const old = CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX];
       const ex = (old && old.extra_config) ? old.extra_config : {};
       if(ex && ex.sync_id) syncId = ex.sync_id;
     }
+    if(!syncId) syncId = genLocalSyncId();
     const payload = {
       sender_node_id: window.__NODE_ID__,
       receiver_node_id: parseInt(receiverNodeId,10),
@@ -4127,27 +4745,37 @@ async function saveRule(){
       remark,
       favorite,
       qos: qosRead.qos,
+      acl: aclRead.acl,
       server_port,
       server_host: server_host || null,
-      sync_id: syncId || undefined
+      sync_id: syncId
     };
 
+    _setSyncPendingSubmit('intranet', syncId, true);
     try{
-      setLoading(true);
-      const res = await fetchJSON('/api/intranet_tunnel/save', {method:'POST', body: JSON.stringify(payload)});
-      if(res && res.ok){
-        CURRENT_POOL = res.sender_pool;
+      upsertLocalSyncSenderRule('intranet', payload);
+      renderRules();
+    }catch(_e){}
+    closeModal();
+    toast('已提交同步任务，规则正在后台下发到内网节点');
+    enqueueSyncSaveTask('intranet', payload, '已保存，并自动下发到内网节点')
+      .then(()=>{
+        _setSyncPendingSubmit('intranet', syncId, false);
         renderRules();
-        closeModal();
-        toastWithPrecheck(res, '已保存，并自动下发到内网节点');
-      }else{
-        toast((res && res.error) ? res.error : '保存失败，请检查节点是否在线', true);
-      }
-    }catch(err){
-      toast(formatRequestError(err, '内网穿透保存失败'), true);
-    }finally{
-      setLoading(false);
-    }
+      })
+      .catch(async (err)=>{
+        _setSyncPendingSubmit('intranet', syncId, false);
+        toast(formatRequestError(err, '内网穿透保存失败'), true);
+        let loaded = false;
+        try{
+          await loadPool();
+          loaded = true;
+        }catch(_e){}
+        if(!loaded){
+          try{ removeLocalSyncRuleById('intranet', syncId); }catch(_e){}
+        }
+        renderRules();
+      });
     return;
   }
 
@@ -4185,15 +4813,18 @@ async function saveRule(){
 
   try{
     setLoading(true);
-
+    const draft = clonePool(CURRENT_POOL);
+    if(!Array.isArray(draft.endpoints)) draft.endpoints = [];
     if(CURRENT_EDIT_INDEX >= 0){
-      CURRENT_POOL.endpoints[CURRENT_EDIT_INDEX] = endpoint;
+      if(CURRENT_EDIT_INDEX >= draft.endpoints.length){
+        throw new Error('规则不存在或已删除');
+      }
+      draft.endpoints[CURRENT_EDIT_INDEX] = endpoint;
     }else{
-      CURRENT_POOL.endpoints.push(endpoint);
+      draft.endpoints.push(endpoint);
     }
 
-    await savePool('已保存');
-    renderRules();
+    await savePool('保存任务已提交', draft);
     closeModal();
 
   }catch(err){
@@ -4226,26 +4857,134 @@ function toastWithPrecheck(resp, okMsg){
   toast(`${head}（预检提示：${short}${more}）`, false, 5600);
 }
 
-async function savePool(msg){
+function clonePool(pool){
+  try{
+    const cloned = JSON.parse(JSON.stringify(pool || {}));
+    if(!Array.isArray(cloned.endpoints)) cloned.endpoints = [];
+    return cloned;
+  }catch(_e){
+    return { endpoints: [] };
+  }
+}
+
+function genLocalSyncId(){
+  try{
+    if(window.crypto && typeof window.crypto.randomUUID === 'function'){
+      return String(window.crypto.randomUUID()).replace(/-/g, '');
+    }
+  }catch(_e){}
+  return `${Date.now().toString(16)}${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function upsertLocalSyncSenderRule(kind, payload){
+  const kk = String(kind || '').trim().toLowerCase();
+  const p = (payload && typeof payload === 'object') ? payload : {};
+  const syncId = String(p.sync_id || '').trim();
+  if(!syncId) return false;
+
+  const listen = String(p.listen || '').trim();
+  if(!listen) return false;
+  const remotes = Array.isArray(p.remotes)
+    ? p.remotes.map((x)=>String(x || '').trim()).filter(Boolean)
+    : [];
+  const protocol = String(p.protocol || 'tcp+udp').trim() || 'tcp+udp';
+  const balance = String(p.balance || 'roundrobin').trim() || 'roundrobin';
+  const disabled = !!p.disabled;
+  const receiverId = parseInt(p.receiver_node_id || 0, 10) || 0;
+
+  const ep = {
+    listen,
+    remotes,
+    disabled,
+    balance,
+    protocol,
+  };
+  const nowIso = new Date().toISOString();
+  const ex = { sync_id: syncId };
+  if(kk === 'wss'){
+    ex.sync_role = 'sender';
+    if(receiverId > 0) ex.sync_peer_node_id = receiverId;
+    ex.sync_original_remotes = remotes.slice();
+    ex.sync_updated_at = nowIso;
+    const wss = (p.wss && typeof p.wss === 'object') ? p.wss : {};
+    if(wss.host != null) ex.remote_ws_host = String(wss.host || '').trim();
+    if(wss.path != null) ex.remote_ws_path = String(wss.path || '').trim();
+    if(wss.sni != null) ex.remote_tls_sni = String(wss.sni || '').trim();
+    if(wss.tls != null) ex.remote_tls_enabled = !!wss.tls;
+    if(wss.insecure != null) ex.remote_tls_insecure = !!wss.insecure;
+  }else if(kk === 'intranet'){
+    ex.intranet_role = 'server';
+    if(receiverId > 0) ex.intranet_peer_node_id = receiverId;
+    ex.intranet_server_port = parseInt(p.server_port || 18443, 10) || 18443;
+    ex.intranet_original_remotes = remotes.slice();
+    ex.intranet_updated_at = nowIso;
+    const host = String(p.server_host || '').trim();
+    if(host) ex.intranet_public_host = host;
+  }else{
+    return false;
+  }
+  ep.extra_config = ex;
+
+  const remark = String(p.remark || '').trim();
+  if(remark) ep.remark = remark;
+  if(!!p.favorite) ep.favorite = true;
+
+  const draft = clonePool(CURRENT_POOL);
+  if(!Array.isArray(draft.endpoints)) draft.endpoints = [];
+  let replaced = false;
+  for(let i=0; i<draft.endpoints.length; i++){
+    const old = draft.endpoints[i];
+    if(!(old && typeof old === 'object')) continue;
+    const oldEx = (old.extra_config && typeof old.extra_config === 'object') ? old.extra_config : {};
+    if(String(oldEx.sync_id || '').trim() !== syncId) continue;
+    if(kk === 'wss' && !(oldEx.sync_role || oldEx.sync_peer_node_id || oldEx.sync_lock)) continue;
+    if(kk === 'intranet' && !(oldEx.intranet_role || oldEx.intranet_peer_node_id || oldEx.intranet_lock)) continue;
+    draft.endpoints[i] = ep;
+    replaced = true;
+    break;
+  }
+  if(!replaced){
+    draft.endpoints.push(ep);
+  }
+  CURRENT_POOL = draft;
+  return true;
+}
+
+function removeLocalSyncRuleById(kind, syncId){
+  const kk = String(kind || '').trim().toLowerCase();
+  const sid = String(syncId || '').trim();
+  if(!sid) return false;
+  const draft = clonePool(CURRENT_POOL);
+  const eps = Array.isArray(draft.endpoints) ? draft.endpoints : [];
+  const next = eps.filter((ep)=>{
+    const ex = (ep && ep.extra_config && typeof ep.extra_config === 'object') ? ep.extra_config : {};
+    if(String(ex.sync_id || '').trim() !== sid) return true;
+    if(kk === 'wss'){
+      return !(ex.sync_role || ex.sync_peer_node_id || ex.sync_lock);
+    }
+    if(kk === 'intranet'){
+      return !(ex.intranet_role || ex.intranet_peer_node_id || ex.intranet_lock);
+    }
+    return true;
+  });
+  if(next.length === eps.length) return false;
+  draft.endpoints = next;
+  CURRENT_POOL = draft;
+  return true;
+}
+
+async function savePool(msg, poolOverride){
   q('modalMsg') && (q('modalMsg').textContent = '');
-  const id = window.__NODE_ID__;
+  const targetPool = clonePool((poolOverride && typeof poolOverride === 'object') ? poolOverride : CURRENT_POOL);
   try{
     const unlockSyncIds = collectUnlockSyncIds();
-    const res = await fetchJSON(`/api/nodes/${id}/pool`, {
-      method:'POST',
-      body: JSON.stringify({ pool: CURRENT_POOL, unlock_sync_ids: unlockSyncIds })
-    });
-    if(res && res.ok){
-      CURRENT_POOL = res.pool;
-      renderRules();
-      toastWithPrecheck(res, msg);
-      return true;
-    }
-    const err = (res && res.error) ? res.error : '保存失败';
-    q('modalMsg') && (q('modalMsg').textContent = err);
-    throw new Error(err);
+    await enqueueNodePoolTask('pool_save', { pool: targetPool, unlock_sync_ids: unlockSyncIds }, msg || '保存已生效');
+    // Update local baseline for subsequent edits while keeping UI unchanged until task success.
+    CURRENT_POOL = clonePool(targetPool);
+    toast('已提交保存任务，正在后台同步');
+    return true;
   }catch(e){
-    const m = (e && e.message) ? e.message : String(e || '保存失败');
+    const m = (e && e.message) ? e.message : String(e || '提交保存任务失败');
     q('modalMsg') && (q('modalMsg').textContent = m);
     toast(m, true);
     throw e;

@@ -149,6 +149,18 @@
 
         <div id="nodeSummary" class="summary-bar" style="display:none;"></div>
 
+        <div id="intranetHealthCard" class="intra-health-card" style="display:none;">
+          <div class="intra-health-head">
+            <div>
+              <div class="intra-health-title">穿透链路健康度</div>
+              <div class="intra-health-sub muted sm">控制通道质量 · 丢包/延迟/重连</div>
+            </div>
+            <div id="intranetHealthSource" class="pill xs ghost">—</div>
+          </div>
+          <div id="intranetHealthSummary" class="intra-health-summary"></div>
+          <div id="intranetHealthList" class="intra-health-list"></div>
+        </div>
+
         <!-- Node system info removed (shown only in 控制台 cards) -->
 
         <div id="rulesLoading" class="muted">正在加载规则…</div>
@@ -770,6 +782,29 @@
                     </div>
 
                     <div class="help" style="margin-top:6px;">提示：Remote 写 B 内网可达地址（如 192.168.x.x:port）。</div>
+
+                    <div class="adv-subtitle" style="margin-top:12px;">访问 ACL（可选）</div>
+                    <div class="row" style="gap:12px;margin-top:6px;">
+                      <div class="col">
+                        <label class="label">允许来源 IP/CIDR</label>
+                        <textarea class="textarea" id="f_intranet_acl_allow_sources" rows="3" placeholder="每行一个，例如&#10;203.0.113.10&#10;10.0.0.0/8"></textarea>
+                      </div>
+                      <div class="col">
+                        <label class="label">拒绝来源 IP/CIDR</label>
+                        <textarea class="textarea" id="f_intranet_acl_deny_sources" rows="3" placeholder="每行一个，例如&#10;0.0.0.0/0"></textarea>
+                      </div>
+                    </div>
+                    <div class="row" style="gap:12px;">
+                      <div class="col">
+                        <label class="label">允许时间窗</label>
+                        <textarea class="textarea" id="f_intranet_acl_allow_hours" rows="2" placeholder="每行一个，格式 HH:MM-HH:MM，例如&#10;09:00-18:00"></textarea>
+                        <div class="help">按节点本地时区生效；跨天可写 23:00-06:00。</div>
+                      </div>
+                      <div class="col">
+                        <label class="label">允许 Token（可选）</label>
+                        <textarea class="textarea" id="f_intranet_acl_allow_tokens" rows="2" placeholder="每行一个 token；留空=不限制"></textarea>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </details>
@@ -822,7 +857,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=79.0"></script>
+<script src="/static/app.js?v=85.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};

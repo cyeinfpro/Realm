@@ -13,7 +13,7 @@ import time
 import uuid
 import zipfile
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urlparse
 
 from fastapi import APIRouter, Depends, File, Request, UploadFile
@@ -28,7 +28,6 @@ from ..db import (
     add_node,
     add_site,
     bump_traffic_reset_version,
-    delete_node,
     get_desired_pool,
     get_group_orders,
     get_last_report,
@@ -42,7 +41,6 @@ from ..db import (
     clear_rule_stats_samples,
     list_nodes,
     set_desired_pool,
-    set_desired_pool_exact,
     upsert_group_order,
     update_certificate,
     update_netmon_monitor,
@@ -144,6 +142,261 @@ _SAVE_PRECHECK_ENABLED = _env_flag("REALM_SAVE_PRECHECK_ENABLED", True)
 _SAVE_PRECHECK_HTTP_TIMEOUT = _env_float("REALM_SAVE_PRECHECK_HTTP_TIMEOUT", 4.5, 2.0, 20.0)
 _SAVE_PRECHECK_PROBE_TIMEOUT = _env_float("REALM_SAVE_PRECHECK_PROBE_TIMEOUT", 1.2, 0.2, 6.0)
 _SAVE_PRECHECK_MAX_ISSUES = _env_int("REALM_SAVE_PRECHECK_MAX_ISSUES", 24, 5, 120)
+_POOL_JOB_TTL_SEC = _env_int("REALM_POOL_JOB_TTL_SEC", 1800, 120, 7 * 24 * 3600)
+_POOL_JOB_MAX_ATTEMPTS = _env_int("REALM_POOL_JOB_MAX_ATTEMPTS", 3, 1, 10)
+_POOL_JOB_RETRY_BASE_SEC = _env_float("REALM_POOL_JOB_RETRY_BASE_SEC", 1.2, 0.2, 30.0)
+_POOL_JOB_RETRY_MAX_SEC = _env_float("REALM_POOL_JOB_RETRY_MAX_SEC", 8.0, 1.0, 120.0)
+_POOL_JOB_ACK_TIMEOUT_SEC = _env_float("REALM_POOL_JOB_ACK_TIMEOUT_SEC", 45.0, 5.0, 600.0)
+_POOL_JOB_ACK_POLL_SEC = _env_float("REALM_POOL_JOB_ACK_POLL_SEC", 1.0, 0.2, 10.0)
+
+_POOL_JOBS: Dict[str, Dict[str, Any]] = {}
+_POOL_JOBS_LOCK = threading.Lock()
+_POOL_JOB_EXEC_LOCK = asyncio.Lock()
+
+
+def _pool_job_now() -> float:
+    return float(time.time())
+
+
+def _prune_pool_jobs_locked(now_ts: Optional[float] = None) -> None:
+    now = float(now_ts if now_ts is not None else _pool_job_now())
+    stale_ids: List[str] = []
+    for jid, job in _POOL_JOBS.items():
+        st = str(job.get("status") or "")
+        updated = float(job.get("updated_at") or 0.0)
+        if st in ("success", "error") and (now - updated) > float(_POOL_JOB_TTL_SEC):
+            stale_ids.append(jid)
+    for jid in stale_ids:
+        _POOL_JOBS.pop(jid, None)
+
+
+def _pool_job_view(job: Dict[str, Any], include_result: bool = True) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "job_id": str(job.get("job_id") or ""),
+        "node_id": int(job.get("node_id") or 0),
+        "kind": str(job.get("kind") or ""),
+        "status": str(job.get("status") or ""),
+        "created_at": float(job.get("created_at") or 0.0),
+        "updated_at": float(job.get("updated_at") or 0.0),
+        "attempts": int(job.get("attempts") or 0),
+        "max_attempts": int(job.get("max_attempts") or 0),
+        "next_retry_at": float(job.get("next_retry_at") or 0.0),
+        "status_code": int(job.get("status_code") or 0),
+        "error": str(job.get("error") or ""),
+        "meta": dict(job.get("meta") or {}),
+    }
+    if include_result:
+        res = job.get("result")
+        out["result"] = dict(res) if isinstance(res, dict) else {}
+    return out
+
+
+def _pool_job_parse_json_response(resp: JSONResponse) -> Dict[str, Any]:
+    try:
+        body = resp.body
+        if isinstance(body, (bytes, bytearray)):
+            txt = body.decode("utf-8", errors="ignore")
+        else:
+            txt = str(body or "")
+        data = json.loads(txt) if txt else {}
+        return data if isinstance(data, dict) else {"ok": False, "error": str(data)}
+    except Exception:
+        return {"ok": False, "error": "unknown_response"}
+
+
+def _pool_job_set(job_id: str, **kwargs: Any) -> None:
+    now = _pool_job_now()
+    with _POOL_JOBS_LOCK:
+        job = _POOL_JOBS.get(job_id)
+        if not isinstance(job, dict):
+            return
+        for k, v in kwargs.items():
+            job[k] = v
+        job["updated_at"] = now
+
+
+def _pool_job_get(job_id: str) -> Optional[Dict[str, Any]]:
+    with _POOL_JOBS_LOCK:
+        _prune_pool_jobs_locked()
+        job = _POOL_JOBS.get(job_id)
+        if not isinstance(job, dict):
+            return None
+        return dict(job)
+
+
+def _pool_job_error_text(data: Any, fallback: str = "任务失败") -> str:
+    if isinstance(data, dict):
+        msg = str(data.get("error") or "").strip()
+        if msg:
+            return msg
+    txt = str(data or "").strip()
+    return txt or fallback
+
+
+def _pool_job_is_retriable(status_code: int, data: Dict[str, Any]) -> bool:
+    if status_code <= 0:
+        return True
+    if status_code >= 500:
+        return True
+    if status_code == 409:
+        if isinstance(data, dict):
+            code = str(data.get("code") or "").strip().lower()
+            err = str(data.get("error") or "").strip().lower()
+            if code == "stale_index" or "索引已过期" in err:
+                return False
+        return True
+    if status_code in (408, 425, 429):
+        return True
+    if isinstance(data, dict):
+        err = str(data.get("error") or "").lower()
+        if "超时" in err or "timeout" in err:
+            return True
+        if "预检失败" in err or "precheck" in err:
+            return True
+    return False
+
+
+async def _pool_job_wait_ack(node_id: int, desired_ver: int) -> Tuple[bool, str]:
+    need = int(desired_ver or 0)
+    if need <= 0:
+        return True, ""
+    deadline = _pool_job_now() + float(_POOL_JOB_ACK_TIMEOUT_SEC)
+    last_ack = 0
+    while _pool_job_now() < deadline:
+        n = get_node(int(node_id))
+        if not n:
+            return False, "节点不存在"
+        try:
+            last_ack = int(n.get("agent_ack_version") or 0)
+        except Exception:
+            last_ack = 0
+        if last_ack >= need:
+            return True, ""
+        await asyncio.sleep(max(0.2, float(_POOL_JOB_ACK_POLL_SEC)))
+    return False, f"节点未确认配置版本（ack={last_ack}, desired={need}）"
+
+
+async def _pool_job_invoke(kind: str, node_id: int, payload: Dict[str, Any], user: str) -> Tuple[int, Dict[str, Any]]:
+    if kind == "pool_save":
+        payload2 = dict(payload or {})
+        payload2["_async_job"] = True
+        ret = await api_pool_set(None, int(node_id), payload2, user=user)
+    elif kind == "rule_delete":
+        ret = await api_rule_delete(int(node_id), payload, user=user)
+    else:
+        return 400, {"ok": False, "error": f"unsupported_job_kind:{kind}"}
+
+    if isinstance(ret, JSONResponse):
+        status = int(ret.status_code or 500)
+        data = _pool_job_parse_json_response(ret)
+        if "ok" not in data:
+            data["ok"] = status < 400
+        return status, data
+
+    if isinstance(ret, dict):
+        ok = bool(ret.get("ok", True))
+        return (200 if ok else 500), ret
+
+    return 500, {"ok": False, "error": "unknown_response_type"}
+
+
+async def _run_pool_job(job_id: str) -> None:
+    snap = _pool_job_get(job_id)
+    if not isinstance(snap, dict):
+        return
+    kind = str(snap.get("kind") or "")
+    node_id = int(snap.get("node_id") or 0)
+    payload = snap.get("_payload") if isinstance(snap.get("_payload"), dict) else {}
+    user = str(snap.get("_user") or "").strip() or "system"
+    max_attempts = max(1, int(snap.get("max_attempts") or _POOL_JOB_MAX_ATTEMPTS))
+
+    for attempt in range(1, max_attempts + 1):
+        _pool_job_set(job_id, status="running", attempts=int(attempt), next_retry_at=0.0, error="", status_code=0)
+
+        status_code = 0
+        data: Dict[str, Any] = {}
+        try:
+            async with _POOL_JOB_EXEC_LOCK:
+                status_code, data = await _pool_job_invoke(kind, node_id, payload, user)
+        except Exception as exc:
+            status_code = 599
+            data = {"ok": False, "error": f"任务执行异常：{exc}"}
+
+        ok = bool(isinstance(data, dict) and data.get("ok") is True and status_code < 400)
+        if ok:
+            desired_ver = 0
+            try:
+                desired_ver = int(data.get("desired_version") or 0)
+            except Exception:
+                desired_ver = 0
+            if desired_ver > 0:
+                ack_ok, ack_err = await _pool_job_wait_ack(node_id, desired_ver)
+                if not ack_ok:
+                    status_code = 504
+                    data = {"ok": False, "error": ack_err, "desired_version": desired_ver}
+                    ok = False
+            if ok:
+                _pool_job_set(
+                    job_id,
+                    status="success",
+                    status_code=int(status_code),
+                    result=data,
+                    error="",
+                    next_retry_at=0.0,
+                )
+                return
+
+        err = _pool_job_error_text(data, "任务失败")
+        retriable = _pool_job_is_retriable(int(status_code), data if isinstance(data, dict) else {})
+        if attempt < max_attempts and retriable:
+            delay = min(float(_POOL_JOB_RETRY_MAX_SEC), float(_POOL_JOB_RETRY_BASE_SEC) * (2 ** (attempt - 1)))
+            _pool_job_set(
+                job_id,
+                status="retrying",
+                status_code=int(status_code),
+                result=data if isinstance(data, dict) else {},
+                error=err,
+                next_retry_at=float(_pool_job_now() + delay),
+            )
+            await asyncio.sleep(max(0.2, delay))
+            continue
+
+        _pool_job_set(
+            job_id,
+            status="error",
+            status_code=int(status_code),
+            result=data if isinstance(data, dict) else {},
+            error=err,
+            next_retry_at=0.0,
+        )
+        return
+
+
+def _enqueue_pool_job(node_id: int, kind: str, payload: Dict[str, Any], user: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    now = _pool_job_now()
+    job_id = uuid.uuid4().hex
+    job = {
+        "job_id": job_id,
+        "node_id": int(node_id),
+        "kind": str(kind),
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+        "attempts": 0,
+        "max_attempts": int(_POOL_JOB_MAX_ATTEMPTS),
+        "next_retry_at": 0.0,
+        "status_code": 0,
+        "error": "",
+        "result": {},
+        "meta": dict(meta or {}),
+        "_payload": dict(payload or {}),
+        "_user": str(user or "system"),
+    }
+    with _POOL_JOBS_LOCK:
+        _prune_pool_jobs_locked(now)
+        _POOL_JOBS[job_id] = job
+    asyncio.create_task(_run_pool_job(job_id))
+    return _pool_job_view(job, include_result=False)
 
 
 async def _read_full_restore_upload(file: UploadFile) -> tuple[Optional[bytes], Optional[str], int]:
@@ -2585,6 +2838,7 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
         pool = payload
     if not isinstance(pool, dict):
         return JSONResponse({"ok": False, "error": "请求缺少 pool 字段"}, status_code=400)
+    is_async_job = bool(isinstance(payload, dict) and payload.get("_async_job") is True)
 
     unlock_sync_ids: set[str] = set()
     if isinstance(payload, dict):
@@ -2676,19 +2930,33 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     except Exception as exc:
         return JSONResponse({"ok": False, "error": f"保存失败：规则校验异常（{exc}）"}, status_code=500)
 
-    try:
-        runtime_precheck = await _run_pool_save_precheck(node, pool)
-    except Exception as exc:
+    runtime_precheck: Dict[str, Any]
+    # Async jobs should return quickly; runtime netprobe is kept for sync path only.
+    skip_runtime_precheck = bool(is_async_job)
+    if _SAVE_PRECHECK_ENABLED and (not skip_runtime_precheck):
+        try:
+            runtime_precheck = await _run_pool_save_precheck(node, pool)
+        except Exception as exc:
+            runtime_precheck = {
+                "issues": [
+                    PoolValidationIssue(
+                        path="endpoints",
+                        message=f"预检失败：保存前探测发生异常（{exc}）",
+                        severity="warning",
+                        code="precheck_exception",
+                    )
+                ],
+                "summary": {"enabled": True, "source": "save_precheck", "error": "exception"},
+            }
+    elif skip_runtime_precheck:
         runtime_precheck = {
-            "issues": [
-                PoolValidationIssue(
-                    path="endpoints",
-                    message=f"预检失败：保存前探测发生异常（{exc}）",
-                    severity="warning",
-                    code="precheck_exception",
-                )
-            ],
-            "summary": {"enabled": True, "source": "save_precheck", "error": "exception"},
+            "issues": [],
+            "summary": {"enabled": False, "source": "save_precheck_skipped_async", "skipped": True},
+        }
+    else:
+        runtime_precheck = {
+            "issues": [],
+            "summary": {"enabled": False, "source": "save_precheck_disabled"},
         }
     precheck_issues: List[PoolValidationIssue] = []
     precheck_seen: set[str] = set()
@@ -2721,6 +2989,42 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
             "summary": runtime_precheck.get("summary") if isinstance(runtime_precheck.get("summary"), dict) else {},
         },
     }
+
+
+@router.post("/api/nodes/{node_id}/pool_async")
+async def api_pool_set_async(node_id: int, payload: Dict[str, Any], user: str = Depends(require_login)):
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "payload 无效"}, status_code=400)
+
+    pool = payload.get("pool")
+    if pool is None:
+        pool = payload
+    if not isinstance(pool, dict):
+        return JSONResponse({"ok": False, "error": "请求缺少 pool 字段"}, status_code=400)
+
+    unlock_ids: List[str] = []
+    raw_unlock = payload.get("unlock_sync_ids")
+    if isinstance(raw_unlock, list):
+        for x in raw_unlock[:256]:
+            sid = str(x or "").strip()
+            if sid:
+                unlock_ids.append(sid)
+
+    job_payload: Dict[str, Any] = {"pool": pool}
+    if unlock_ids:
+        job_payload["unlock_sync_ids"] = unlock_ids
+
+    job = _enqueue_pool_job(
+        node_id=int(node_id),
+        kind="pool_save",
+        payload=job_payload,
+        user=user,
+        meta={"action": "pool_save"},
+    )
+    return {"ok": True, "job": job}
 
 
 @router.post("/api/nodes/{node_id}/rule_delete")
@@ -2758,6 +3062,29 @@ async def api_rule_delete(node_id: int, payload: Dict[str, Any], user: str = Dep
 
     ep = eps[idx] if isinstance(eps[idx], dict) else {}
     ex = ep.get("extra_config") if isinstance(ep.get("extra_config"), dict) else {}
+
+    expected_key = str((payload or {}).get("expected_key") or "").strip()
+    if expected_key:
+        sid0 = str(ex.get("sync_id") or "").strip() if isinstance(ex, dict) else ""
+        if sid0 and (ex.get("sync_role") or ex.get("sync_peer_node_id") or ex.get("sync_lock")):
+            actual_key = f"wss:{sid0}"
+        elif sid0 and (ex.get("intranet_role") or ex.get("intranet_peer_node_id") or ex.get("intranet_lock")):
+            actual_key = f"intranet:{sid0}"
+        else:
+            listen0 = str(ep.get("listen") or "").strip()
+            proto0 = str(ep.get("protocol") or "tcp+udp").strip().lower()
+            actual_key = f"tcp:{listen0}|{proto0}"
+        if actual_key != expected_key:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "规则索引已过期，请刷新后重试",
+                    "code": "stale_index",
+                    "actual_key": actual_key,
+                },
+                status_code=409,
+            )
+
     sid = str(ex.get("sync_id") or "").strip() if isinstance(ex, dict) else ""
     allow_unlock = bool(sid and sid in unlock_sync_ids)
     if isinstance(ex, dict):
@@ -2790,6 +3117,78 @@ async def api_rule_delete(node_id: int, payload: Dict[str, Any], user: str = Dep
         "queued": True,
         "note": "waiting agent report",
     }
+
+
+@router.post("/api/nodes/{node_id}/rule_delete_async")
+async def api_rule_delete_async(node_id: int, payload: Dict[str, Any], user: str = Depends(require_login)):
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "payload 无效"}, status_code=400)
+
+    idx_meta = -1
+    try:
+        idx_meta = int((payload or {}).get("idx"))
+    except Exception:
+        idx_meta = -1
+
+    job = _enqueue_pool_job(
+        node_id=int(node_id),
+        kind="rule_delete",
+        payload=dict(payload),
+        user=user,
+        meta={
+            "action": "rule_delete",
+            "idx": int(idx_meta),
+        },
+    )
+    return {"ok": True, "job": job}
+
+
+@router.get("/api/nodes/{node_id}/pool_jobs/{job_id}")
+async def api_pool_job_get(node_id: int, job_id: str, user: str = Depends(require_login)):
+    jid = str(job_id or "").strip()
+    if not jid:
+        return JSONResponse({"ok": False, "error": "job_id 不能为空"}, status_code=400)
+    with _POOL_JOBS_LOCK:
+        _prune_pool_jobs_locked()
+        job = _POOL_JOBS.get(jid)
+        if not isinstance(job, dict) or int(job.get("node_id") or 0) != int(node_id):
+            return JSONResponse({"ok": False, "error": "任务不存在或已过期"}, status_code=404)
+        return {"ok": True, "job": _pool_job_view(job, include_result=True)}
+
+
+@router.post("/api/nodes/{node_id}/pool_jobs/{job_id}/retry")
+async def api_pool_job_retry(node_id: int, job_id: str, user: str = Depends(require_login)):
+    jid = str(job_id or "").strip()
+    if not jid:
+        return JSONResponse({"ok": False, "error": "job_id 不能为空"}, status_code=400)
+
+    kind = ""
+    payload: Dict[str, Any] = {}
+    meta: Dict[str, Any] = {}
+    with _POOL_JOBS_LOCK:
+        _prune_pool_jobs_locked()
+        job = _POOL_JOBS.get(jid)
+        if not isinstance(job, dict) or int(job.get("node_id") or 0) != int(node_id):
+            return JSONResponse({"ok": False, "error": "任务不存在或已过期"}, status_code=404)
+        st = str(job.get("status") or "")
+        if st not in ("error", "success"):
+            return JSONResponse({"ok": False, "error": "任务仍在执行中，请稍后再试"}, status_code=409)
+        kind = str(job.get("kind") or "")
+        if kind not in ("pool_save", "rule_delete"):
+            return JSONResponse({"ok": False, "error": "不支持该任务类型重试"}, status_code=400)
+        payload0 = job.get("_payload")
+        if not isinstance(payload0, dict):
+            return JSONResponse({"ok": False, "error": "原任务缺少可重试参数"}, status_code=400)
+        payload = dict(payload0)
+        meta0 = job.get("meta")
+        if isinstance(meta0, dict):
+            meta = dict(meta0)
+
+    nj = _enqueue_pool_job(node_id=int(node_id), kind=kind, payload=payload, user=user, meta=meta)
+    return {"ok": True, "job": nj}
 
 
 @router.post("/api/nodes/{node_id}/purge")

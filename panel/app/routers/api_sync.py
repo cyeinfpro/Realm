@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import secrets
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,7 +16,7 @@ from fastapi.responses import JSONResponse
 from ..clients.agent import agent_get, agent_post
 from ..core.deps import require_login
 from ..db import get_node, set_desired_pool
-from ..services.apply import node_verify_tls
+from ..services.apply import node_verify_tls, schedule_apply_pool
 from ..services.pool_ops import (
     choose_receiver_port,
     find_sync_listen_port,
@@ -68,6 +71,242 @@ _SYNC_PRECHECK_MAX_ISSUES = 24
 _INTRANET_FORCE_TLS_VERIFY = _env_flag("REALM_INTRANET_FORCE_TLS_VERIFY", True)
 _INTRANET_TOKEN_GRACE_SEC = _env_int("REALM_INTRANET_TOKEN_GRACE_SEC", 900, 0, 7 * 24 * 3600)
 _INTRANET_TOKEN_GRACE_MAX = _env_int("REALM_INTRANET_TOKEN_GRACE_MAX", 4, 1, 16)
+_SYNC_JOB_TTL_SEC = _env_int("REALM_SYNC_JOB_TTL_SEC", 1800, 120, 7 * 24 * 3600)
+_SYNC_JOB_MAX_ATTEMPTS = _env_int("REALM_SYNC_JOB_MAX_ATTEMPTS", 3, 1, 10)
+_SYNC_JOB_RETRY_BASE_SEC = _env_float("REALM_SYNC_JOB_RETRY_BASE_SEC", 1.2, 0.2, 30.0)
+_SYNC_JOB_RETRY_MAX_SEC = _env_float("REALM_SYNC_JOB_RETRY_MAX_SEC", 8.0, 1.0, 120.0)
+
+_SYNC_JOBS: Dict[str, Dict[str, Any]] = {}
+_SYNC_JOBS_LOCK = threading.Lock()
+_SYNC_EXEC_LOCK = asyncio.Lock()
+
+
+def _sync_job_now() -> float:
+    return float(time.time())
+
+
+def _prune_sync_jobs_locked(now_ts: Optional[float] = None) -> None:
+    now = float(now_ts if now_ts is not None else _sync_job_now())
+    stale_ids: List[str] = []
+    for jid, job in _SYNC_JOBS.items():
+        st = str(job.get("status") or "")
+        updated = float(job.get("updated_at") or 0.0)
+        if st in ("success", "error") and (now - updated) > float(_SYNC_JOB_TTL_SEC):
+            stale_ids.append(jid)
+    for jid in stale_ids:
+        _SYNC_JOBS.pop(jid, None)
+
+
+def _sync_job_public_view(job: Dict[str, Any], include_result: bool = True) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "job_id": str(job.get("job_id") or ""),
+        "kind": str(job.get("kind") or ""),
+        "status": str(job.get("status") or ""),
+        "created_at": float(job.get("created_at") or 0.0),
+        "updated_at": float(job.get("updated_at") or 0.0),
+        "attempts": int(job.get("attempts") or 0),
+        "max_attempts": int(job.get("max_attempts") or 0),
+        "next_retry_at": float(job.get("next_retry_at") or 0.0),
+        "error": str(job.get("error") or ""),
+        "status_code": int(job.get("status_code") or 0),
+        "meta": dict(job.get("meta") or {}),
+    }
+    if include_result:
+        res = job.get("result")
+        out["result"] = dict(res) if isinstance(res, dict) else {}
+    return out
+
+
+def _sync_job_parse_json_response(resp: JSONResponse) -> Dict[str, Any]:
+    try:
+        body = resp.body
+        if isinstance(body, (bytes, bytearray)):
+            txt = body.decode("utf-8", errors="ignore")
+        else:
+            txt = str(body or "")
+        data = json.loads(txt) if txt else {}
+        return data if isinstance(data, dict) else {"ok": False, "error": str(data)}
+    except Exception:
+        return {"ok": False, "error": "unknown_response"}
+
+
+def _sync_job_error_text(data: Any, fallback: str = "同步失败") -> str:
+    if isinstance(data, dict):
+        msg = str(data.get("error") or "").strip()
+        if msg:
+            return msg
+    txt = str(data or "").strip()
+    return txt or fallback
+
+
+def _sync_job_is_retriable(status_code: int, data: Dict[str, Any]) -> bool:
+    if status_code <= 0:
+        return True
+    if status_code >= 500:
+        return True
+    if status_code in (408, 409, 425, 429):
+        return True
+    # "precheck_unreachable" is often transient network jitter.
+    if isinstance(data, dict):
+        issues = data.get("precheck", {}).get("issues") if isinstance(data.get("precheck"), dict) else []
+        if isinstance(issues, list):
+            for it in issues[:8]:
+                if not isinstance(it, dict):
+                    continue
+                if str(it.get("code") or "").strip() == "precheck_unreachable":
+                    return True
+    return False
+
+
+def _sync_job_set(job_id: str, **kwargs: Any) -> None:
+    now = _sync_job_now()
+    with _SYNC_JOBS_LOCK:
+        job = _SYNC_JOBS.get(job_id)
+        if not isinstance(job, dict):
+            return
+        for k, v in kwargs.items():
+            job[k] = v
+        job["updated_at"] = now
+
+
+def _sync_job_get(job_id: str) -> Optional[Dict[str, Any]]:
+    with _SYNC_JOBS_LOCK:
+        _prune_sync_jobs_locked()
+        job = _SYNC_JOBS.get(job_id)
+        if not isinstance(job, dict):
+            return None
+        return dict(job)
+
+
+async def _sync_job_invoke(kind: str, payload: Dict[str, Any], user: str) -> Tuple[int, Dict[str, Any]]:
+    if kind == "wss_save":
+        payload2 = dict(payload or {})
+        payload2["_async_job"] = True
+        ret = await api_wss_tunnel_save(payload2, user=user)
+    elif kind == "intranet_save":
+        payload2 = dict(payload or {})
+        payload2["_async_job"] = True
+        ret = await api_intranet_tunnel_save(payload2, user=user)
+    elif kind == "wss_delete":
+        payload2 = dict(payload or {})
+        payload2["_async_job"] = True
+        ret = await api_wss_tunnel_delete(payload2, user=user)
+    elif kind == "intranet_delete":
+        payload2 = dict(payload or {})
+        payload2["_async_job"] = True
+        ret = await api_intranet_tunnel_delete(payload2, user=user)
+    else:
+        return 400, {"ok": False, "error": f"unsupported_job_kind:{kind}"}
+
+    if isinstance(ret, JSONResponse):
+        status = int(ret.status_code or 500)
+        data = _sync_job_parse_json_response(ret)
+        if "ok" not in data:
+            data["ok"] = status < 400
+        return status, data
+
+    if isinstance(ret, dict):
+        ok = bool(ret.get("ok", True))
+        return (200 if ok else 500), ret
+
+    return 500, {"ok": False, "error": "unknown_response_type"}
+
+
+async def _sync_job_runner(job_id: str) -> None:
+    snap = _sync_job_get(job_id)
+    if not isinstance(snap, dict):
+        return
+    kind = str(snap.get("kind") or "")
+    payload = snap.get("_payload") if isinstance(snap.get("_payload"), dict) else {}
+    user = str(snap.get("_user") or "").strip() or "system"
+    max_attempts = int(snap.get("max_attempts") or _SYNC_JOB_MAX_ATTEMPTS)
+    max_attempts = max(1, max_attempts)
+
+    for attempt in range(1, max_attempts + 1):
+        _sync_job_set(job_id, status="running", attempts=int(attempt), next_retry_at=0.0, error="", status_code=0)
+        status_code = 0
+        data: Dict[str, Any] = {}
+        try:
+            async with _SYNC_EXEC_LOCK:
+                status_code, data = await _sync_job_invoke(kind, payload, user)
+        except Exception as exc:
+            status_code = 599
+            data = {"ok": False, "error": f"任务执行异常：{exc}"}
+
+        ok = bool(isinstance(data, dict) and data.get("ok") is True and status_code < 400)
+        if ok:
+            _sync_job_set(
+                job_id,
+                status="success",
+                status_code=int(status_code),
+                result=data,
+                error="",
+                next_retry_at=0.0,
+            )
+            return
+
+        err = _sync_job_error_text(data, "同步失败")
+        retriable = _sync_job_is_retriable(int(status_code), data if isinstance(data, dict) else {})
+        if attempt < max_attempts and retriable:
+            delay = min(float(_SYNC_JOB_RETRY_MAX_SEC), float(_SYNC_JOB_RETRY_BASE_SEC) * (2 ** (attempt - 1)))
+            _sync_job_set(
+                job_id,
+                status="retrying",
+                status_code=int(status_code),
+                result=data if isinstance(data, dict) else {},
+                error=err,
+                next_retry_at=float(_sync_job_now() + delay),
+            )
+            await asyncio.sleep(max(0.2, delay))
+            continue
+
+        _sync_job_set(
+            job_id,
+            status="error",
+            status_code=int(status_code),
+            result=data if isinstance(data, dict) else {},
+            error=err,
+            next_retry_at=0.0,
+        )
+        return
+
+
+def _sync_job_enqueue(kind: str, payload: Dict[str, Any], user: str) -> Dict[str, Any]:
+    def _as_int(v: Any, default: int = 0) -> int:
+        try:
+            return int(v)
+        except Exception:
+            return int(default)
+
+    now = _sync_job_now()
+    job_id = uuid.uuid4().hex
+    meta = {
+        "sender_node_id": _as_int(payload.get("sender_node_id"), 0),
+        "receiver_node_id": _as_int(payload.get("receiver_node_id"), 0),
+        "sync_id": str(payload.get("sync_id") or "").strip(),
+        "listen": str(payload.get("listen") or "").strip(),
+    }
+    job = {
+        "job_id": job_id,
+        "kind": str(kind),
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+        "attempts": 0,
+        "max_attempts": int(_SYNC_JOB_MAX_ATTEMPTS),
+        "next_retry_at": 0.0,
+        "status_code": 0,
+        "error": "",
+        "result": {},
+        "meta": meta,
+        "_payload": dict(payload or {}),
+        "_user": str(user or "system"),
+    }
+    with _SYNC_JOBS_LOCK:
+        _prune_sync_jobs_locked(now)
+        _SYNC_JOBS[job_id] = job
+    asyncio.create_task(_sync_job_runner(job_id))
+    return _sync_job_public_view(job, include_result=False)
 
 
 def random_wss_params() -> Tuple[str, str, str]:
@@ -219,6 +458,100 @@ def _find_sync_qos(pool: Dict[str, Any], sync_id: str) -> Dict[str, int]:
             qos = _extract_qos_from_endpoint(ep)
             if qos:
                 return qos
+    except Exception:
+        return {}
+    return {}
+
+
+def _split_to_list(raw: Any, max_items: int = 128, item_max_len: int = 128) -> List[str]:
+    rows: List[Any]
+    if isinstance(raw, list):
+        rows = raw
+    elif isinstance(raw, str):
+        rows = [x for x in str(raw).replace(",", "\n").splitlines()]
+    else:
+        rows = []
+    out: List[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        s = str(row or "").strip()
+        if not s:
+            continue
+        if len(s) > item_max_len:
+            s = s[:item_max_len]
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _normalize_acl_hours(raw: Any) -> Tuple[List[str], Optional[str]]:
+    rows = _split_to_list(raw, max_items=16, item_max_len=16)
+    out: List[str] = []
+    for row in rows:
+        txt = str(row or "").strip()
+        if "-" not in txt:
+            return [], f"ACL 时间窗格式无效：{txt}"
+        left, right = txt.split("-", 1)
+        left = left.strip()
+        right = right.strip()
+        if ":" not in left or ":" not in right:
+            return [], f"ACL 时间窗格式无效：{txt}"
+        lh, lm = left.split(":", 1)
+        rh, rm = right.split(":", 1)
+        if (not lh.isdigit()) or (not lm.isdigit()) or (not rh.isdigit()) or (not rm.isdigit()):
+            return [], f"ACL 时间窗格式无效：{txt}"
+        ih, im, jh, jm = int(lh), int(lm), int(rh), int(rm)
+        if ih < 0 or ih > 23 or im < 0 or im > 59 or jh < 0 or jh > 23 or jm < 0 or jm > 59:
+            return [], f"ACL 时间窗超出范围：{txt}"
+        out.append(f"{ih:02d}:{im:02d}-{jh:02d}:{jm:02d}")
+    return out, None
+
+
+def _normalize_intranet_acl_payload(raw: Any) -> Tuple[Dict[str, Any], Optional[str]]:
+    if raw is None:
+        return {}, None
+    if not isinstance(raw, dict):
+        return {}, "ACL 参数格式无效，应为对象"
+    allow_sources = _split_to_list(raw.get("allow_sources"), max_items=128, item_max_len=64)
+    deny_sources = _split_to_list(raw.get("deny_sources"), max_items=128, item_max_len=64)
+    allow_tokens = _split_to_list(raw.get("allow_tokens"), max_items=64, item_max_len=96)
+    allow_hours, hour_err = _normalize_acl_hours(raw.get("allow_hours"))
+    if hour_err:
+        return {}, hour_err
+    acl: Dict[str, Any] = {}
+    if allow_sources:
+        acl["allow_sources"] = allow_sources
+    if deny_sources:
+        acl["deny_sources"] = deny_sources
+    if allow_hours:
+        acl["allow_hours"] = allow_hours
+    if allow_tokens:
+        acl["allow_tokens"] = allow_tokens
+    return acl, None
+
+
+def _find_sync_intranet_acl(pool: Dict[str, Any], sync_id: str) -> Dict[str, Any]:
+    sid = str(sync_id or "").strip()
+    if not sid:
+        return {}
+    try:
+        for ep in (pool or {}).get("endpoints") or []:
+            if not isinstance(ep, dict):
+                continue
+            ex0 = ep.get("extra_config") or {}
+            if not isinstance(ex0, dict):
+                continue
+            if str(ex0.get("sync_id") or "") != sid:
+                continue
+            acl0 = ex0.get("intranet_acl")
+            if isinstance(acl0, dict):
+                acl, _ = _normalize_intranet_acl_payload(acl0)
+                if acl:
+                    return acl
     except Exception:
         return {}
     return {}
@@ -529,6 +862,80 @@ async def _probe_node_rules_precheck(node: Dict[str, Any], pool: Dict[str, Any],
     return issues
 
 
+@router.get("/api/sync_jobs/{job_id}")
+async def api_sync_job_get(job_id: str, user: str = Depends(require_login)):
+    jid = str(job_id or "").strip()
+    if not jid:
+        return JSONResponse({"ok": False, "error": "job_id 不能为空"}, status_code=400)
+    with _SYNC_JOBS_LOCK:
+        _prune_sync_jobs_locked()
+        job = _SYNC_JOBS.get(jid)
+        if not isinstance(job, dict):
+            return JSONResponse({"ok": False, "error": "任务不存在或已过期"}, status_code=404)
+        return {"ok": True, "job": _sync_job_public_view(job, include_result=True)}
+
+
+@router.post("/api/sync_jobs/{job_id}/retry")
+async def api_sync_job_retry(job_id: str, user: str = Depends(require_login)):
+    jid = str(job_id or "").strip()
+    if not jid:
+        return JSONResponse({"ok": False, "error": "job_id 不能为空"}, status_code=400)
+
+    kind = ""
+    payload: Dict[str, Any] = {}
+    with _SYNC_JOBS_LOCK:
+        _prune_sync_jobs_locked()
+        job = _SYNC_JOBS.get(jid)
+        if not isinstance(job, dict):
+            return JSONResponse({"ok": False, "error": "任务不存在或已过期"}, status_code=404)
+        st = str(job.get("status") or "")
+        if st not in ("error", "success"):
+            return JSONResponse({"ok": False, "error": "任务仍在执行中，请稍后再试"}, status_code=409)
+        kind = str(job.get("kind") or "")
+        payload0 = job.get("_payload")
+        if not isinstance(payload0, dict):
+            return JSONResponse({"ok": False, "error": "原任务缺少可重试参数"}, status_code=400)
+        payload = dict(payload0)
+    if payload is None:
+        return JSONResponse({"ok": False, "error": "原任务缺少可重试参数"}, status_code=400)
+    if kind not in ("wss_save", "intranet_save", "wss_delete", "intranet_delete"):
+        return JSONResponse({"ok": False, "error": "不支持该任务类型重试"}, status_code=400)
+    nj = _sync_job_enqueue(kind=kind, payload=payload, user=user)
+    return {"ok": True, "job": nj}
+
+
+@router.post("/api/wss_tunnel/save_async")
+async def api_wss_tunnel_save_async(payload: Dict[str, Any], user: str = Depends(require_login)):
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "payload 无效"}, status_code=400)
+    job = _sync_job_enqueue(kind="wss_save", payload=payload, user=user)
+    return {"ok": True, "job": job}
+
+
+@router.post("/api/intranet_tunnel/save_async")
+async def api_intranet_tunnel_save_async(payload: Dict[str, Any], user: str = Depends(require_login)):
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "payload 无效"}, status_code=400)
+    job = _sync_job_enqueue(kind="intranet_save", payload=payload, user=user)
+    return {"ok": True, "job": job}
+
+
+@router.post("/api/wss_tunnel/delete_async")
+async def api_wss_tunnel_delete_async(payload: Dict[str, Any], user: str = Depends(require_login)):
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "payload 无效"}, status_code=400)
+    job = _sync_job_enqueue(kind="wss_delete", payload=payload, user=user)
+    return {"ok": True, "job": job}
+
+
+@router.post("/api/intranet_tunnel/delete_async")
+async def api_intranet_tunnel_delete_async(payload: Dict[str, Any], user: str = Depends(require_login)):
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "payload 无效"}, status_code=400)
+    job = _sync_job_enqueue(kind="intranet_delete", payload=payload, user=user)
+    return {"ok": True, "job": job}
+
+
 @router.post("/api/wss_tunnel/save")
 async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(require_login)):
     try:
@@ -540,6 +947,7 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
 
     if sender_id <= 0 or receiver_id <= 0 or sender_id == receiver_id:
         return JSONResponse({"ok": False, "error": "sender_node_id / receiver_node_id 无效"}, status_code=400)
+    is_async_job = bool(isinstance(payload, dict) and payload.get("_async_job") is True)
 
     sender = get_node(sender_id)
     receiver = get_node(receiver_id)
@@ -808,9 +1216,15 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         return JSONResponse({"ok": False, "error": f"WSS 保存失败：规则校验异常（{exc}）"}, status_code=500)
 
     runtime_issues: List[Dict[str, Any]] = []
-    if _SYNC_PRECHECK_ENABLED:
-        runtime_issues += await _probe_node_rules_precheck(sender, sender_pool, "发送机")
-        runtime_issues += await _probe_node_rules_precheck(receiver, receiver_pool, "接收机")
+    # Async jobs should return quickly; runtime netprobe is kept for sync path only.
+    skip_runtime_precheck = bool(is_async_job)
+    if _SYNC_PRECHECK_ENABLED and (not skip_runtime_precheck):
+        i1, i2 = await asyncio.gather(
+            _probe_node_rules_precheck(sender, sender_pool, "发送机"),
+            _probe_node_rules_precheck(receiver, receiver_pool, "接收机"),
+        )
+        runtime_issues += list(i1 or [])
+        runtime_issues += list(i2 or [])
 
     precheck_issues: List[Dict[str, Any]] = []
     precheck_seen: set[str] = set()
@@ -819,8 +1233,13 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
             _append_issue(precheck_issues, precheck_seen, it)
 
     precheck_summary = {
-        "enabled": bool(_SYNC_PRECHECK_ENABLED),
-        "source": "static_validate+agent_netprobe_rules" if _SYNC_PRECHECK_ENABLED else "static_validate",
+        "enabled": bool(_SYNC_PRECHECK_ENABLED and (not skip_runtime_precheck)),
+        "source": (
+            "static_validate+agent_netprobe_rules"
+            if (_SYNC_PRECHECK_ENABLED and (not skip_runtime_precheck))
+            else ("static_validate+runtime_skipped_async" if skip_runtime_precheck else "static_validate")
+        ),
+        "runtime_skipped_async": bool(skip_runtime_precheck),
         "issues": len(precheck_issues),
     }
 
@@ -830,7 +1249,14 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
     apply_items: List[Tuple[Dict[str, Any], Dict[str, Any]]] = [(sender, sender_pool), (receiver, receiver_pool)]
     if old_receiver and isinstance(old_receiver_pool, dict):
         apply_items.append((old_receiver, old_receiver_pool))
-    await _apply_pools_best_effort(apply_items)
+    if is_async_job:
+        for n, p in apply_items:
+            try:
+                schedule_apply_pool(n, p)
+            except Exception:
+                continue
+    else:
+        await _apply_pools_best_effort(apply_items)
 
     return {
         "ok": True,
@@ -852,6 +1278,7 @@ async def api_wss_tunnel_delete(payload: Dict[str, Any], user: str = Depends(req
     sync_id = str(payload.get("sync_id") or "").strip()
     if not sync_id:
         return JSONResponse({"ok": False, "error": "sync_id 不能为空"}, status_code=400)
+    is_async_job = bool(isinstance(payload, dict) and payload.get("_async_job") is True)
 
     try:
         sender_id = int(payload.get("sender_node_id") or 0)
@@ -877,7 +1304,17 @@ async def api_wss_tunnel_delete(payload: Dict[str, Any], user: str = Depends(req
     s_ver, _ = set_desired_pool(sender_id, sender_pool)
     r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
 
-    await _apply_pools_best_effort([(sender, sender_pool), (receiver, receiver_pool)])
+    if is_async_job:
+        try:
+            schedule_apply_pool(sender, sender_pool)
+        except Exception:
+            pass
+        try:
+            schedule_apply_pool(receiver, receiver_pool)
+        except Exception:
+            pass
+    else:
+        await _apply_pools_best_effort([(sender, sender_pool), (receiver, receiver_pool)])
 
     return {
         "ok": True,
@@ -900,6 +1337,7 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
 
     if sender_id <= 0 or receiver_id <= 0 or sender_id == receiver_id:
         return JSONResponse({"ok": False, "error": "sender_node_id / receiver_node_id 无效"}, status_code=400)
+    is_async_job = bool(isinstance(payload, dict) and payload.get("_async_job") is True)
 
     sender = get_node(sender_id)
     receiver = get_node(receiver_id)
@@ -1083,6 +1521,16 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         qos_receiver = _find_sync_qos(receiver_pool, sync_id)
         qos = qos_sender or qos_receiver
 
+    has_acl = "acl" in payload
+    if has_acl:
+        intranet_acl, acl_err = _normalize_intranet_acl_payload(payload.get("acl"))
+        if acl_err:
+            return JSONResponse({"ok": False, "error": acl_err}, status_code=400)
+    else:
+        acl_sender = _find_sync_intranet_acl(sender_pool, sync_id)
+        acl_receiver = _find_sync_intranet_acl(receiver_pool, sync_id)
+        intranet_acl = acl_sender or acl_receiver
+
     sender_extra: Dict[str, Any] = {
         "intranet_role": "server",
         "intranet_peer_node_id": receiver_id,
@@ -1099,6 +1547,8 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         sender_extra["intranet_token_grace"] = token_grace
     if qos:
         sender_extra["qos"] = dict(qos)
+    if intranet_acl:
+        sender_extra["intranet_acl"] = dict(intranet_acl)
 
     sender_ep = {
         "listen": listen,
@@ -1136,6 +1586,8 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         receiver_extra["intranet_token_grace"] = token_grace
     if qos:
         receiver_extra["qos"] = dict(qos)
+    if intranet_acl:
+        receiver_extra["intranet_acl"] = dict(intranet_acl)
 
     receiver_ep = {
         "listen": format_addr("0.0.0.0", 0),
@@ -1168,9 +1620,15 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         return JSONResponse({"ok": False, "error": f"内网穿透保存失败：规则校验异常（{exc}）"}, status_code=500)
 
     runtime_issues: List[Dict[str, Any]] = []
-    if _SYNC_PRECHECK_ENABLED:
-        runtime_issues += await _probe_node_rules_precheck(sender, sender_pool, "公网入口")
-        runtime_issues += await _probe_node_rules_precheck(receiver, receiver_pool, "内网出口")
+    # Async jobs should return quickly; runtime netprobe is kept for sync path only.
+    skip_runtime_precheck = bool(is_async_job)
+    if _SYNC_PRECHECK_ENABLED and (not skip_runtime_precheck):
+        i1, i2 = await asyncio.gather(
+            _probe_node_rules_precheck(sender, sender_pool, "公网入口"),
+            _probe_node_rules_precheck(receiver, receiver_pool, "内网出口"),
+        )
+        runtime_issues += list(i1 or [])
+        runtime_issues += list(i2 or [])
 
     precheck_issues: List[Dict[str, Any]] = []
     precheck_seen: set[str] = set()
@@ -1179,8 +1637,13 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
             _append_issue(precheck_issues, precheck_seen, it)
 
     precheck_summary = {
-        "enabled": bool(_SYNC_PRECHECK_ENABLED),
-        "source": "static_validate+agent_netprobe_rules" if _SYNC_PRECHECK_ENABLED else "static_validate",
+        "enabled": bool(_SYNC_PRECHECK_ENABLED and (not skip_runtime_precheck)),
+        "source": (
+            "static_validate+agent_netprobe_rules"
+            if (_SYNC_PRECHECK_ENABLED and (not skip_runtime_precheck))
+            else ("static_validate+runtime_skipped_async" if skip_runtime_precheck else "static_validate")
+        ),
+        "runtime_skipped_async": bool(skip_runtime_precheck),
         "issues": len(precheck_issues),
     }
 
@@ -1190,7 +1653,14 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     apply_items: List[Tuple[Dict[str, Any], Dict[str, Any]]] = [(sender, sender_pool), (receiver, receiver_pool)]
     if old_receiver and isinstance(old_receiver_pool, dict):
         apply_items.append((old_receiver, old_receiver_pool))
-    await _apply_pools_best_effort(apply_items)
+    if is_async_job:
+        for n, p in apply_items:
+            try:
+                schedule_apply_pool(n, p)
+            except Exception:
+                continue
+    else:
+        await _apply_pools_best_effort(apply_items)
 
     return {
         "ok": True,
@@ -1211,6 +1681,7 @@ async def api_intranet_tunnel_delete(payload: Dict[str, Any], user: str = Depend
     sync_id = str(payload.get("sync_id") or "").strip()
     if not sync_id:
         return JSONResponse({"ok": False, "error": "sync_id 不能为空"}, status_code=400)
+    is_async_job = bool(isinstance(payload, dict) and payload.get("_async_job") is True)
 
     try:
         sender_id = int(payload.get("sender_node_id") or 0)
@@ -1236,7 +1707,17 @@ async def api_intranet_tunnel_delete(payload: Dict[str, Any], user: str = Depend
     s_ver, _ = set_desired_pool(sender_id, sender_pool)
     r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
 
-    await _apply_pools_best_effort([(sender, sender_pool), (receiver, receiver_pool)])
+    if is_async_job:
+        try:
+            schedule_apply_pool(sender, sender_pool)
+        except Exception:
+            pass
+        try:
+            schedule_apply_pool(receiver, receiver_pool)
+        except Exception:
+            pass
+    else:
+        await _apply_pools_best_effort([(sender, sender_pool), (receiver, receiver_pool)])
 
     return {
         "ok": True,
