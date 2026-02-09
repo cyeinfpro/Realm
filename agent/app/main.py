@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import re
 import shutil
@@ -2458,6 +2459,8 @@ def _push_loop() -> None:
     headers = {
         'X-API-Key': api_key,
         'User-Agent': f"realm-agent/{app.version} push-report",
+        'Content-Type': 'application/json',
+        'Content-Encoding': 'gzip',
     }
 
     # If we just restarted into a newer agent, flip update state.
@@ -2482,7 +2485,9 @@ def _push_loop() -> None:
                 'agent_update': _load_update_state(),
                 'report': _build_push_report(),
             }
-            r = sess.post(url, json=payload, headers=headers, timeout=3)
+            raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+            zipped = gzip.compress(raw, compresslevel=5)
+            r = sess.post(url, data=zipped, headers=headers, timeout=3)
             if r.status_code == 200:
                 data = r.json() if r.content else {}
                 _handle_panel_commands(data.get('commands'))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import time
 import uuid
@@ -36,7 +37,7 @@ router = APIRouter()
 
 
 @router.post("/api/agent/report")
-async def api_agent_report(request: Request, payload: Dict[str, Any]):
+async def api_agent_report(request: Request):
     """Agent 主动上报接口。
 
     认证：HTTP Header `X-API-Key: <node.api_key>`。
@@ -44,6 +45,23 @@ async def api_agent_report(request: Request, payload: Dict[str, Any]):
 
     返回：commands（例如同步规则池 / 自更新）。
     """
+
+    # Agent may gzip-compress report payload to reduce panel ingress traffic.
+    try:
+        content_encoding = str(request.headers.get("content-encoding") or "").strip().lower()
+        if "gzip" in content_encoding:
+            raw = await request.body()
+            raw = gzip.decompress(raw or b"")
+            parsed = json.loads(raw.decode("utf-8"))
+        else:
+            parsed = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "请求体解析失败"}, status_code=400)
+
+    if not isinstance(parsed, dict):
+        return JSONResponse({"ok": False, "error": "请求体必须是 JSON 对象"}, status_code=400)
+
+    payload: Dict[str, Any] = parsed
 
     api_key = (request.headers.get("x-api-key") or request.headers.get("X-API-Key") or "").strip()
     node_id_raw = payload.get("node_id")
