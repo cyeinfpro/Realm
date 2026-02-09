@@ -5,8 +5,23 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0B0F14">
   <title>{% if title %}{{ title }} · Nexus Network Control Plane{% else %}Nexus Network Control Plane{% endif %}</title>
+  <script>
+    (function(){
+      var key = 'nexus_theme';
+      var theme = 'dark';
+      try{
+        var saved = (localStorage.getItem(key) || '').trim().toLowerCase();
+        if(saved === 'light' || saved === 'dark') theme = saved;
+      }catch(_e){}
+      var root = document.documentElement;
+      root.setAttribute('data-theme', theme);
+      root.style.colorScheme = theme;
+      var meta = document.querySelector('meta[name="theme-color"]');
+      if(meta) meta.setAttribute('content', theme === 'light' ? '#f4f7fc' : '#0B0F14');
+    })();
+  </script>
   <link rel="icon" type="image/svg+xml" href="/static/nexus.svg">
-  <link rel="stylesheet" href="/static/style.css?v=78.0">
+  <link rel="stylesheet" href="/static/style.css?v=79.0">
 </head>
 <body>
   <!-- Flowing background (fixed, no seams on scroll) -->
@@ -34,27 +49,33 @@
       {% set nav_active = 'netmon' %}
     {% endif %}
 
-    <nav class="nav">
-      {% if user %}
-        <div class="nav-desktop">
-          <a href="/" class="nav-link {{ 'active' if nav_active == 'dashboard' else '' }}">控制台</a>
-          <a href="/websites" class="nav-link {{ 'active' if nav_active == 'websites' else '' }}">网站管理</a>
-          <a href="/netmon" class="nav-link {{ 'active' if nav_active == 'netmon' else '' }}">网络波动</a>
-          <a href="/logout" class="nav-link">退出</a>
-        </div>
-
-        <details class="menu nav-mobile">
-          <summary class="btn icon xs ghost" aria-label="菜单">☰</summary>
-          <div class="menu-pop">
-            <a href="/" class="menu-item {{ 'active' if nav_active == 'dashboard' else '' }}">控制台</a>
-            <a href="/websites" class="menu-item {{ 'active' if nav_active == 'websites' else '' }}">网站管理</a>
-            <a href="/netmon" class="menu-item {{ 'active' if nav_active == 'netmon' else '' }}">网络波动</a>
-            <div class="menu-sep"></div>
-            <a href="/logout" class="menu-item">退出</a>
+    <div class="top-actions">
+      <nav class="nav">
+        {% if user %}
+          <div class="nav-desktop">
+            <a href="/" class="nav-link {{ 'active' if nav_active == 'dashboard' else '' }}">控制台</a>
+            <a href="/websites" class="nav-link {{ 'active' if nav_active == 'websites' else '' }}">网站管理</a>
+            <a href="/netmon" class="nav-link {{ 'active' if nav_active == 'netmon' else '' }}">网络波动</a>
+            <a href="/logout" class="nav-link">退出</a>
           </div>
-        </details>
-      {% endif %}
-    </nav>
+
+          <details class="menu nav-mobile">
+            <summary class="btn icon xs ghost" aria-label="菜单">☰</summary>
+            <div class="menu-pop">
+              <a href="/" class="menu-item {{ 'active' if nav_active == 'dashboard' else '' }}">控制台</a>
+              <a href="/websites" class="menu-item {{ 'active' if nav_active == 'websites' else '' }}">网站管理</a>
+              <a href="/netmon" class="menu-item {{ 'active' if nav_active == 'netmon' else '' }}">网络波动</a>
+              <div class="menu-sep"></div>
+              <a href="/logout" class="menu-item">退出</a>
+            </div>
+          </details>
+        {% endif %}
+      </nav>
+      <button class="btn xs ghost theme-toggle" type="button" id="themeToggleBtn" aria-label="切换浅色或深色主题" aria-pressed="false" title="切换浅色/深色模式">
+        <span class="theme-toggle-ico" aria-hidden="true">☀</span>
+        <span class="theme-toggle-text">浅色模式</span>
+      </button>
+    </div>
   </header>
 
   <main class="container">
@@ -343,6 +364,43 @@
     }
     window.addEventListener('resize', requestReposition, true);
     document.addEventListener('scroll', requestReposition, true);
+  })();
+  </script>
+  <script>
+  (function(){
+    var KEY = 'nexus_theme';
+    var root = document.documentElement;
+    var btn = document.getElementById('themeToggleBtn');
+    var meta = document.querySelector('meta[name="theme-color"]');
+
+    function getTheme(){
+      var t = (root.getAttribute('data-theme') || '').trim().toLowerCase();
+      return t === 'light' ? 'light' : 'dark';
+    }
+
+    function setTheme(theme, persist){
+      var t = theme === 'light' ? 'light' : 'dark';
+      root.setAttribute('data-theme', t);
+      root.style.colorScheme = t;
+      if(meta) meta.setAttribute('content', t === 'light' ? '#f4f7fc' : '#0B0F14');
+      if(btn){
+        var ico = btn.querySelector('.theme-toggle-ico');
+        var text = btn.querySelector('.theme-toggle-text');
+        if(ico) ico.textContent = (t === 'light') ? '☾' : '☀';
+        if(text) text.textContent = (t === 'light') ? '深色模式' : '浅色模式';
+        btn.setAttribute('aria-pressed', t === 'light' ? 'true' : 'false');
+      }
+      if(persist){
+        try{ localStorage.setItem(KEY, t); }catch(_e){}
+      }
+    }
+
+    setTheme(getTheme(), false);
+    if(btn){
+      btn.addEventListener('click', function(){
+        setTheme(getTheme() === 'light' ? 'dark' : 'light', true);
+      });
+    }
   })();
   </script>
 {% block scripts %}{% endblock %}
