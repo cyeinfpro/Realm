@@ -13,9 +13,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
+from ..auth import can_access_rule_endpoint, check_tunnel_access, get_user_by_username, is_rule_owner_scoped, stamp_endpoint_owner
 from ..clients.agent import agent_get, agent_post
 from ..core.deps import require_login
-from ..db import get_node, set_desired_pool
+from ..db import get_node, set_desired_pool, upsert_rule_owner_map
 from ..services.apply import node_verify_tls, schedule_apply_pool
 from ..services.pool_ops import (
     choose_receiver_port,
@@ -30,6 +31,86 @@ from ..utils.normalize import format_addr, normalize_host_input, split_host_port
 from ..utils.validate import PoolValidationError, validate_pool_inplace
 
 router = APIRouter()
+
+
+def _check_sync_policy(
+    user: str,
+    tunnel_type: str,
+    action: str,
+    sender_id: int,
+    receiver_id: int,
+) -> Optional[JSONResponse]:
+    ok, msg, detail = check_tunnel_access(
+        username=str(user or ""),
+        tunnel_type=str(tunnel_type or ""),
+        action=str(action or ""),
+        sender_node_id=int(sender_id or 0),
+        receiver_node_id=int(receiver_id or 0),
+    )
+    if ok:
+        return None
+    status = 429 if str(detail.get("code") or "") == "traffic_quota_exceeded" else 403
+    body: Dict[str, Any] = {"ok": False, "error": str(msg or "权限不足")}
+    if isinstance(detail, dict) and detail:
+        body["policy"] = detail
+    return JSONResponse(body, status_code=status)
+
+
+def _resolve_rule_user(user_or_name: Any) -> Any:
+    if isinstance(user_or_name, str):
+        try:
+            u = get_user_by_username(user_or_name)
+            if u is not None:
+                return u
+        except Exception:
+            return user_or_name
+    return user_or_name
+
+
+def _filter_pool_for_user(user: str, pool: Any) -> Dict[str, Any]:
+    user_ref = _resolve_rule_user(user)
+    if not isinstance(pool, dict):
+        return {"endpoints": []}
+    out = dict(pool)
+    eps = out.get("endpoints")
+    if not isinstance(eps, list):
+        out["endpoints"] = []
+        return out
+    if not is_rule_owner_scoped(user_ref):
+        return out
+    out["endpoints"] = [ep for ep in eps if isinstance(ep, dict) and can_access_rule_endpoint(user_ref, ep)]
+    return out
+
+
+def _find_sync_endpoint(pool: Dict[str, Any], sync_id: str) -> Optional[Dict[str, Any]]:
+    sid = str(sync_id or "").strip()
+    if not sid or not isinstance(pool, dict):
+        return None
+    for ep in (pool.get("endpoints") or []):
+        if not isinstance(ep, dict):
+            continue
+        ex = ep.get("extra_config")
+        if not isinstance(ex, dict):
+            continue
+        if str(ex.get("sync_id") or "").strip() == sid:
+            return ep
+    return None
+
+
+def _deny_if_sync_not_owned(user: str, sync_id: str, *pools: Dict[str, Any]) -> Optional[JSONResponse]:
+    user_ref = _resolve_rule_user(user)
+    if not is_rule_owner_scoped(user_ref):
+        return None
+    sid = str(sync_id or "").strip()
+    if not sid:
+        return None
+    for pool in pools:
+        ep = _find_sync_endpoint(pool, sid)
+        if ep is None:
+            continue
+        if not can_access_rule_endpoint(user_ref, ep):
+            return JSONResponse({"ok": False, "error": "仅可操作自己创建的规则"}, status_code=403)
+    return None
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -386,11 +467,19 @@ def _normalize_qos_from_sources(sources: List[Dict[str, Any]], strict: bool) -> 
     conn_rate_raw = _pick_qos_raw(
         sources, ("conn_rate", "conn_per_sec", "new_conn_per_sec", "new_connections_per_sec", "qos_conn_rate")
     )
+    traffic_bytes_raw = _pick_qos_raw(
+        sources, ("traffic_total_bytes", "traffic_bytes", "traffic_limit_bytes", "qos_traffic_total_bytes")
+    )
+    traffic_gb_raw = _pick_qos_raw(
+        sources, ("traffic_total_gb", "traffic_gb", "traffic_limit_gb", "qos_traffic_total_gb")
+    )
 
     bw_kbps = _coerce_nonneg_int(bw_kbps_raw)
     bw_mbps = _coerce_nonneg_int(bw_mbps_raw)
     max_conns = _coerce_nonneg_int(max_conns_raw)
     conn_rate = _coerce_nonneg_int(conn_rate_raw)
+    traffic_bytes = _coerce_nonneg_int(traffic_bytes_raw)
+    traffic_gb = _coerce_nonneg_int(traffic_gb_raw)
 
     if strict:
         if bw_kbps is None and _qos_has_value(bw_kbps_raw):
@@ -401,9 +490,15 @@ def _normalize_qos_from_sources(sources: List[Dict[str, Any]], strict: bool) -> 
             return {}, "qos.max_conns 必须是非负整数"
         if conn_rate is None and _qos_has_value(conn_rate_raw):
             return {}, "qos.conn_rate 必须是非负整数"
+        if traffic_bytes is None and _qos_has_value(traffic_bytes_raw):
+            return {}, "qos.traffic_total_bytes 必须是非负整数"
+        if traffic_gb is None and _qos_has_value(traffic_gb_raw):
+            return {}, "qos.traffic_total_gb 必须是非负整数"
 
     if bw_kbps is None and bw_mbps is not None:
         bw_kbps = int(bw_mbps) * 1024
+    if traffic_bytes is None and traffic_gb is not None:
+        traffic_bytes = int(traffic_gb) * 1024 * 1024 * 1024
 
     qos: Dict[str, int] = {}
     if bw_kbps is not None and bw_kbps > 0:
@@ -412,6 +507,8 @@ def _normalize_qos_from_sources(sources: List[Dict[str, Any]], strict: bool) -> 
         qos["max_conns"] = int(max_conns)
     if conn_rate is not None and conn_rate > 0:
         qos["conn_rate"] = int(conn_rate)
+    if traffic_bytes is not None and traffic_bytes > 0:
+        qos["traffic_total_bytes"] = int(traffic_bytes)
     return qos, None
 
 
@@ -872,6 +969,9 @@ async def api_sync_job_get(job_id: str, user: str = Depends(require_login)):
         job = _SYNC_JOBS.get(jid)
         if not isinstance(job, dict):
             return JSONResponse({"ok": False, "error": "任务不存在或已过期"}, status_code=404)
+        owner = str(job.get("_user") or "").strip()
+        if owner and owner != str(user or "").strip():
+            return JSONResponse({"ok": False, "error": "任务不存在或已过期"}, status_code=404)
         return {"ok": True, "job": _sync_job_public_view(job, include_result=True)}
 
 
@@ -887,6 +987,9 @@ async def api_sync_job_retry(job_id: str, user: str = Depends(require_login)):
         _prune_sync_jobs_locked()
         job = _SYNC_JOBS.get(jid)
         if not isinstance(job, dict):
+            return JSONResponse({"ok": False, "error": "任务不存在或已过期"}, status_code=404)
+        owner = str(job.get("_user") or "").strip()
+        if owner and owner != str(user or "").strip():
             return JSONResponse({"ok": False, "error": "任务不存在或已过期"}, status_code=404)
         st = str(job.get("status") or "")
         if st not in ("error", "success"):
@@ -908,6 +1011,16 @@ async def api_sync_job_retry(job_id: str, user: str = Depends(require_login)):
 async def api_wss_tunnel_save_async(payload: Dict[str, Any], user: str = Depends(require_login)):
     if not isinstance(payload, dict):
         return JSONResponse({"ok": False, "error": "payload 无效"}, status_code=400)
+    try:
+        sender_id = int(payload.get("sender_node_id") or 0)
+        receiver_id = int(payload.get("receiver_node_id") or 0)
+    except Exception:
+        sender_id = 0
+        receiver_id = 0
+    if sender_id > 0 and receiver_id > 0 and sender_id != receiver_id:
+        denied = _check_sync_policy(user, "wss", "save", sender_id, receiver_id)
+        if isinstance(denied, JSONResponse):
+            return denied
     job = _sync_job_enqueue(kind="wss_save", payload=payload, user=user)
     return {"ok": True, "job": job}
 
@@ -916,6 +1029,16 @@ async def api_wss_tunnel_save_async(payload: Dict[str, Any], user: str = Depends
 async def api_intranet_tunnel_save_async(payload: Dict[str, Any], user: str = Depends(require_login)):
     if not isinstance(payload, dict):
         return JSONResponse({"ok": False, "error": "payload 无效"}, status_code=400)
+    try:
+        sender_id = int(payload.get("sender_node_id") or 0)
+        receiver_id = int(payload.get("receiver_node_id") or 0)
+    except Exception:
+        sender_id = 0
+        receiver_id = 0
+    if sender_id > 0 and receiver_id > 0 and sender_id != receiver_id:
+        denied = _check_sync_policy(user, "intranet", "save", sender_id, receiver_id)
+        if isinstance(denied, JSONResponse):
+            return denied
     job = _sync_job_enqueue(kind="intranet_save", payload=payload, user=user)
     return {"ok": True, "job": job}
 
@@ -924,6 +1047,16 @@ async def api_intranet_tunnel_save_async(payload: Dict[str, Any], user: str = De
 async def api_wss_tunnel_delete_async(payload: Dict[str, Any], user: str = Depends(require_login)):
     if not isinstance(payload, dict):
         return JSONResponse({"ok": False, "error": "payload 无效"}, status_code=400)
+    try:
+        sender_id = int(payload.get("sender_node_id") or 0)
+        receiver_id = int(payload.get("receiver_node_id") or 0)
+    except Exception:
+        sender_id = 0
+        receiver_id = 0
+    if sender_id > 0 and receiver_id > 0 and sender_id != receiver_id:
+        denied = _check_sync_policy(user, "wss", "delete", sender_id, receiver_id)
+        if isinstance(denied, JSONResponse):
+            return denied
     job = _sync_job_enqueue(kind="wss_delete", payload=payload, user=user)
     return {"ok": True, "job": job}
 
@@ -932,12 +1065,23 @@ async def api_wss_tunnel_delete_async(payload: Dict[str, Any], user: str = Depen
 async def api_intranet_tunnel_delete_async(payload: Dict[str, Any], user: str = Depends(require_login)):
     if not isinstance(payload, dict):
         return JSONResponse({"ok": False, "error": "payload 无效"}, status_code=400)
+    try:
+        sender_id = int(payload.get("sender_node_id") or 0)
+        receiver_id = int(payload.get("receiver_node_id") or 0)
+    except Exception:
+        sender_id = 0
+        receiver_id = 0
+    if sender_id > 0 and receiver_id > 0 and sender_id != receiver_id:
+        denied = _check_sync_policy(user, "intranet", "delete", sender_id, receiver_id)
+        if isinstance(denied, JSONResponse):
+            return denied
     job = _sync_job_enqueue(kind="intranet_delete", payload=payload, user=user)
     return {"ok": True, "job": job}
 
 
 @router.post("/api/wss_tunnel/save")
 async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(require_login)):
+    rule_user_ref = _resolve_rule_user(user)
     try:
         sender_id = int(payload.get("sender_node_id") or 0)
         receiver_id = int(payload.get("receiver_node_id") or 0)
@@ -948,6 +1092,9 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
     if sender_id <= 0 or receiver_id <= 0 or sender_id == receiver_id:
         return JSONResponse({"ok": False, "error": "sender_node_id / receiver_node_id 无效"}, status_code=400)
     is_async_job = bool(isinstance(payload, dict) and payload.get("_async_job") is True)
+    denied = _check_sync_policy(user, "wss", "save", sender_id, receiver_id)
+    if isinstance(denied, JSONResponse):
+        return denied
 
     sender = get_node(sender_id)
     receiver = get_node(receiver_id)
@@ -1002,6 +1149,9 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
 
     # If editing an existing synced rule and switching receiver node, remove old receiver-side rule.
     sender_pool = await load_pool_for_node(sender)
+    denied_owner = _deny_if_sync_not_owned(user, sync_id, sender_pool)
+    if isinstance(denied_owner, JSONResponse):
+        return denied_owner
     old_receiver_id: int = 0
     try:
         for ep in sender_pool.get("endpoints") or []:
@@ -1026,6 +1176,9 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         if old_receiver:
             try:
                 old_receiver_pool = await load_pool_for_node(old_receiver)
+                denied_owner = _deny_if_sync_not_owned(user, sync_id, old_receiver_pool)
+                if isinstance(denied_owner, JSONResponse):
+                    return denied_owner
                 remove_endpoints_by_sync_id(old_receiver_pool, sync_id)
                 set_desired_pool(old_receiver_id, old_receiver_pool)
             except Exception:
@@ -1034,6 +1187,9 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
 
     # Receiver port policy:
     receiver_pool = await load_pool_for_node(receiver)
+    denied_owner = _deny_if_sync_not_owned(user, sync_id, receiver_pool)
+    if isinstance(denied_owner, JSONResponse):
+        return denied_owner
     existing_receiver_port = find_sync_listen_port(receiver_pool, sync_id, role="receiver")
 
     raw_receiver_port = payload.get("receiver_port")
@@ -1164,6 +1320,7 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         sender_ep["remark"] = remark
     if favorite:
         sender_ep["favorite"] = True
+    stamp_endpoint_owner(sender_ep, rule_user_ref)
 
     receiver_extra: Dict[str, Any] = {
         "listen_transport": "ws",
@@ -1200,6 +1357,7 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         receiver_ep["remark"] = remark
     if favorite:
         receiver_ep["favorite"] = True
+    stamp_endpoint_owner(receiver_ep, rule_user_ref)
 
     upsert_endpoint_by_sync_id(sender_pool, sync_id, sender_ep)
     upsert_endpoint_by_sync_id(receiver_pool, sync_id, receiver_ep)
@@ -1242,6 +1400,12 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
         "runtime_skipped_async": bool(skip_runtime_precheck),
         "issues": len(precheck_issues),
     }
+
+    try:
+        upsert_rule_owner_map(node_id=sender_id, pool=sender_pool)
+        upsert_rule_owner_map(node_id=receiver_id, pool=receiver_pool)
+    except Exception:
+        pass
 
     s_ver, _ = set_desired_pool(sender_id, sender_pool)
     r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
@@ -1289,6 +1453,9 @@ async def api_wss_tunnel_delete(payload: Dict[str, Any], user: str = Depends(req
 
     if sender_id <= 0 or receiver_id <= 0 or sender_id == receiver_id:
         return JSONResponse({"ok": False, "error": "sender_node_id / receiver_node_id 无效"}, status_code=400)
+    denied = _check_sync_policy(user, "wss", "delete", sender_id, receiver_id)
+    if isinstance(denied, JSONResponse):
+        return denied
 
     sender = get_node(sender_id)
     receiver = get_node(receiver_id)
@@ -1297,6 +1464,9 @@ async def api_wss_tunnel_delete(payload: Dict[str, Any], user: str = Depends(req
 
     sender_pool = await load_pool_for_node(sender)
     receiver_pool = await load_pool_for_node(receiver)
+    denied_owner = _deny_if_sync_not_owned(user, sync_id, sender_pool, receiver_pool)
+    if isinstance(denied_owner, JSONResponse):
+        return denied_owner
 
     remove_endpoints_by_sync_id(sender_pool, sync_id)
     remove_endpoints_by_sync_id(receiver_pool, sync_id)
@@ -1319,8 +1489,8 @@ async def api_wss_tunnel_delete(payload: Dict[str, Any], user: str = Depends(req
     return {
         "ok": True,
         "sync_id": sync_id,
-        "sender_pool": sender_pool,
-        "receiver_pool": receiver_pool,
+        "sender_pool": _filter_pool_for_user(user, sender_pool),
+        "receiver_pool": _filter_pool_for_user(user, receiver_pool),
         "sender_desired_version": s_ver,
         "receiver_desired_version": r_ver,
     }
@@ -1328,6 +1498,7 @@ async def api_wss_tunnel_delete(payload: Dict[str, Any], user: str = Depends(req
 
 @router.post("/api/intranet_tunnel/save")
 async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(require_login)):
+    rule_user_ref = _resolve_rule_user(user)
     try:
         sender_id = int(payload.get("sender_node_id") or 0)
         receiver_id = int(payload.get("receiver_node_id") or 0)
@@ -1338,6 +1509,9 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     if sender_id <= 0 or receiver_id <= 0 or sender_id == receiver_id:
         return JSONResponse({"ok": False, "error": "sender_node_id / receiver_node_id 无效"}, status_code=400)
     is_async_job = bool(isinstance(payload, dict) and payload.get("_async_job") is True)
+    denied = _check_sync_policy(user, "intranet", "save", sender_id, receiver_id)
+    if isinstance(denied, JSONResponse):
+        return denied
 
     sender = get_node(sender_id)
     receiver = get_node(receiver_id)
@@ -1376,6 +1550,9 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     sync_id = str(payload.get("sync_id") or "").strip() or uuid.uuid4().hex
 
     sender_pool = await load_pool_for_node(sender)
+    denied_owner = _deny_if_sync_not_owned(user, sync_id, sender_pool)
+    if isinstance(denied_owner, JSONResponse):
+        return denied_owner
     now_ts = int(datetime.now(timezone.utc).timestamp())
     existing_token, existing_token_grace = _extract_intranet_token_meta(sender_pool, sync_id, now_ts)
     req_token = str(payload.get("token") or "").strip()
@@ -1404,6 +1581,9 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         if old_receiver:
             try:
                 old_receiver_pool = await load_pool_for_node(old_receiver)
+                denied_owner = _deny_if_sync_not_owned(user, sync_id, old_receiver_pool)
+                if isinstance(denied_owner, JSONResponse):
+                    return denied_owner
                 remove_endpoints_by_sync_id(old_receiver_pool, sync_id)
                 set_desired_pool(old_receiver_id, old_receiver_pool)
             except Exception:
@@ -1440,6 +1620,9 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         cert_fetch_err = "cert_fetch_failed"
 
     receiver_pool = await load_pool_for_node(receiver)
+    denied_owner = _deny_if_sync_not_owned(user, sync_id, receiver_pool)
+    if isinstance(denied_owner, JSONResponse):
+        return denied_owner
 
     now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -1565,6 +1748,7 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         sender_ep["remark"] = remark
     if favorite:
         sender_ep["favorite"] = True
+    stamp_endpoint_owner(sender_ep, rule_user_ref)
 
     receiver_extra: Dict[str, Any] = {
         "intranet_role": "client",
@@ -1604,6 +1788,7 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         receiver_ep["remark"] = remark
     if favorite:
         receiver_ep["favorite"] = True
+    stamp_endpoint_owner(receiver_ep, rule_user_ref)
 
     upsert_endpoint_by_sync_id(sender_pool, sync_id, sender_ep)
     upsert_endpoint_by_sync_id(receiver_pool, sync_id, receiver_ep)
@@ -1647,6 +1832,12 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         "issues": len(precheck_issues),
     }
 
+    try:
+        upsert_rule_owner_map(node_id=sender_id, pool=sender_pool)
+        upsert_rule_owner_map(node_id=receiver_id, pool=receiver_pool)
+    except Exception:
+        pass
+
     s_ver, _ = set_desired_pool(sender_id, sender_pool)
     r_ver, _ = set_desired_pool(receiver_id, receiver_pool)
 
@@ -1665,8 +1856,8 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     return {
         "ok": True,
         "sync_id": sync_id,
-        "sender_pool": sender_pool,
-        "receiver_pool": receiver_pool,
+        "sender_pool": _filter_pool_for_user(user, sender_pool),
+        "receiver_pool": _filter_pool_for_user(user, receiver_pool),
         "sender_desired_version": s_ver,
         "receiver_desired_version": r_ver,
         "precheck": {
@@ -1692,6 +1883,9 @@ async def api_intranet_tunnel_delete(payload: Dict[str, Any], user: str = Depend
 
     if sender_id <= 0 or receiver_id <= 0 or sender_id == receiver_id:
         return JSONResponse({"ok": False, "error": "sender_node_id / receiver_node_id 无效"}, status_code=400)
+    denied = _check_sync_policy(user, "intranet", "delete", sender_id, receiver_id)
+    if isinstance(denied, JSONResponse):
+        return denied
 
     sender = get_node(sender_id)
     receiver = get_node(receiver_id)
@@ -1700,6 +1894,9 @@ async def api_intranet_tunnel_delete(payload: Dict[str, Any], user: str = Depend
 
     sender_pool = await load_pool_for_node(sender)
     receiver_pool = await load_pool_for_node(receiver)
+    denied_owner = _deny_if_sync_not_owned(user, sync_id, sender_pool, receiver_pool)
+    if isinstance(denied_owner, JSONResponse):
+        return denied_owner
 
     remove_endpoints_by_sync_id(sender_pool, sync_id)
     remove_endpoints_by_sync_id(receiver_pool, sync_id)
@@ -1722,8 +1919,8 @@ async def api_intranet_tunnel_delete(payload: Dict[str, Any], user: str = Depend
     return {
         "ok": True,
         "sync_id": sync_id,
-        "sender_pool": sender_pool,
-        "receiver_pool": receiver_pool,
+        "sender_pool": _filter_pool_for_user(user, sender_pool),
+        "receiver_pool": _filter_pool_for_user(user, receiver_pool),
         "sender_desired_version": s_ver,
         "receiver_desired_version": r_ver,
     }

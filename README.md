@@ -1,383 +1,315 @@
-# Realm Pro Suite v34（优化版）
+# Nexus Network Control Plane
 
-面向 **转发吞吐 / 低延迟 / 稳定可靠** 的一套“面板 + Agent”管理套件，用来集中管理多台机器上的 **realm** 转发规则。
+面向多节点网络转发与网站运维的一体化控制平面，包含：
+- `Panel`：集中编排、监控、备份与可视化管理
+- `Agent`：节点侧执行器，负责规则落地、状态上报与站点操作
 
-- **Panel（面板）**：集中管理节点（Agent），可视化编辑规则、备份/恢复、连接图、负载均衡展示。
-- **Agent（被控机）**：部署在每台需要转发的机器上，提供 API（保存/应用规则、探测连通、上报状态），并将规则落地到 `/etc/realm/config.json` 后重启 `realm.service`。
-
-本优化版的目标场景：**TCP 为主、少量 UDP、包含 ws/wss**（有隧道/伪装需求），同时尽可能提升吞吐、降低抖动，并保证大规模规则/节点下依然稳定。
-
----
-
-## 目录
-
-- [1. 组件与工作方式](#1-组件与工作方式)
-- [2. 环境与端口](#2-环境与端口)
-- [3. 一键安装流程（推荐）](#3-一键安装流程推荐)
-  - [3.1 安装 Panel](#31-安装-panel)
-  - [3.2 在 Panel 添加节点并“一键接入”](#32-在-panel-添加节点并一键接入)
-  - [3.3 验证节点在线与服务状态](#33-验证节点在线与服务状态)
-- [4. 创建与维护转发规则（面板操作）](#4-创建与维护转发规则面板操作)
-  - [4.1 普通 TCP/UDP 转发](#41-普通-tcpudp-转发)
-  - [4.2 多目标负载均衡（Round-robin / IP-hash / 权重）](#42-多目标负载均衡round-robin--ip-hash--权重)
-  - [4.3 WSS 隧道（发送机/接收机自动同步）](#43-wss-隧道发送机接收机自动同步)
-  - [4.4 应用配置（真正让 realm 生效）](#44-应用配置真正让-realm-生效)
-- [5. 性能/稳定性优化说明（本版本新增）](#5-性能稳定性优化说明本版本新增)
-  - [5.1 systemd：提升并发上限（nofile/tasks）](#51-systemd提升并发上限nofiletasks)
-  - [5.2 sysctl：网络栈稳态参数](#52-sysctl网络栈稳态参数)
-  - [5.3 pool 级 network：给所有旧规则“一键加优化参数”](#53-pool-级-network给所有旧规则一键加优化参数)
-  - [5.4 TCP 主、少量 UDP、含 ws/wss 的推荐策略](#54-tcp-主少量-udp含-wswss-的推荐策略)
-- [6. 备份 / 恢复 / 迁移 / 升级](#6-备份--恢复--迁移--升级)
-- [7. 常用运维命令](#7-常用运维命令)
-- [8. 常见问题排查](#8-常见问题排查)
+> 当前仓库代码对应：`Panel v34`（`panel/app/core/settings.py`）与 `Agent v43`（`agent/app/main.py`）。
 
 ---
 
-## 1) 组件与工作方式
+## 1. Nexus 是什么
 
-整体链路（简化示意）：
+Nexus 用来统一管理多台机器上的转发规则与站点运维能力，重点解决：
+- 多节点转发规则配置分散、发布不一致
+- WSS / 内网穿透双端规则易错、难同步
+- 规则健康、流量、连接、系统指标缺少统一视图
+- 网站部署、证书、文件管理、分享链路碎片化
 
-```
-浏览器
-  │
-  │  http://<panel_ip>:6080
-  ▼
-Panel（/opt/realm-panel）
-  │ ① 保存规则（desired pool）
-  │ ② 节点上报 / 下发命令（push-report）
-  ▼
-Agent（/opt/realm-agent）
-  │ ③ 写入 /etc/realm/pool_full.json
-  │ ④ 生成 /etc/realm/config.json
-  │ ⑤ systemctl restart realm.service
-  ▼
-realm（/usr/local/bin/realm）
+Nexus 的核心模式是 **Agent 主动上报（push-report）**：
+- Panel 不必持续直连 Agent 才能感知状态
+- 面板侧保存 desired 配置，Agent 拉取并执行
+- 适合 NAT、内网、弱连通场景
+
+---
+
+## 2. 架构与数据流
+
+```text
+Browser
+  -> Panel (FastAPI + SQLite)
+      1) 保存 desired pool / 网站配置 / 监控配置
+      2) 展示实时状态、历史曲线、拓扑与运维页面
+      3) 在 Agent 上报时下发签名命令（sync_pool/pool_patch/update/reset）
+  <- Agent (FastAPI)
+      4) 周期上报 report/stats/sys（gzip）
+      5) 执行命令并 ACK 版本
+      6) 将规则写入 /etc/realm/pool_full.json -> 生成 /etc/realm/config.json -> 重启 realm
 ```
 
-**关键点：**
-- Panel 与 Agent 通信优先走 **“Agent 主动上报（push-report）”**：只要 Agent 能访问 Panel 的 `http(s)://panel/api/agent/report`，即使 Panel 不能直连 Agent，也能同步规则并显示状态。
-- Agent 会把面板规则保存到：
-  - `/etc/realm/pool_full.json`（完整规则，包含 disabled 等）
-  - `/etc/realm/pool.json`（运行规则：自动过滤 disabled）
-  - `/etc/realm/config.json`（给 realm 的最终配置）
+关键设计：
+- **版本对齐**：`desired_pool_version` / `agent_ack_version` 防止错配
+- **命令签名**：关键命令使用 HMAC + ts + nonce，防重放
+- **回退路径**：Panel 直连 Agent 失败时，尽量改为排队等待 Agent 上报执行
 
 ---
 
-## 2) 环境与端口
+## 3. 全功能总览
 
-### 2.1 支持系统
-安装脚本使用 `apt-get`，推荐：
-- Debian 10/11/12
-- Ubuntu 20.04/22.04/24.04
+### 3.1 控制台与节点管理
+- 节点接入、编辑、删除
+- 分组管理与分组排序
+- 在线/离线状态、心跳时间、Agent 版本展示
+- 一键接入命令与一键卸载命令
+- 节点角色：普通节点 / 网站机节点；可标记内网节点
+- 一键更新全部 Agent（强制重装流程）
+- 全量备份 / 全量恢复（异步进度）
+- 全局一键重置规则流量统计
 
-需 root 权限（脚本会写 systemd、/etc、/opt 等目录）。
+### 3.2 转发规则编排（节点页）
+- 规则类型：
+  - 普通转发（TCP/UDP/TCP+UDP）
+  - WSS 隧道（发送机/接收机自动同步）
+  - 内网穿透（公网入口/内网出口自动同步）
+- 规则操作：新增、编辑、删除、批量启停、批量删除、收藏、搜索、筛选
+- 规则保护：同步生成的接收侧规则默认锁定，避免误改
+- 负载策略：RoundRobin / IPHash + 权重
+- 自适应负载均衡（基于可用性/延迟/错误率自动调权）
+- QoS（端口防护）：
+  - 带宽上限
+  - 最大并发连接
+  - 每秒新建连接速率
+- 高级网络参数：
+  - `through` / `interface` / `listen_interface`
+  - `network` 覆盖（tcp_timeout、udp_timeout、keepalive 等）
+  - PROXY protocol / MPTCP / listen_transport / remote_transport
+- WSS 高级参数：host/path/sni/tls/insecure、接收端端口自动避让
+- 内网穿透高级参数：
+  - 隧道端口 / 公网入口地址
+  - ACL（allow/deny source、时间窗、token）
 
-### 2.2 默认端口
-- **Panel**：`6080/tcp`（可安装时自定义）
-- **Agent**：`18700/tcp`（可安装时自定义）
-- **realm**：由你的规则决定（listen 端口）
+### 3.3 规则发布与校验
+- 保存时校验：
+  - 静态结构校验（listen/remote/权重/端口冲突等）
+  - 运行时预检（Agent `/api/v1/netprobe` rules 模式）
+- 同步策略：
+  - 全量 `sync_pool`
+  - 单规则增量 `pool_patch`（条件满足时）
+- 发布方式：
+  - 同步接口
+  - 异步任务（可轮询状态、失败重试）
 
-### 2.3 目录与文件
-- Panel 程序目录：`/opt/realm-panel/panel`
-- Panel 数据库：`/etc/realm-panel/panel.db`
-- Panel 登录信息：`/etc/realm-panel/credentials.json`
-- Agent 程序目录：`/opt/realm-agent/agent`
-- Agent API Key：`/etc/realm-agent/api.key`
-- 节点规则池：`/etc/realm/pool_full.json`
-- realm 配置：`/etc/realm/config.json`
+### 3.4 观测与历史
+- 规则级实时指标：
+  - 流量（上/下行）
+  - 活跃连接 / 总连接
+  - 目标健康探测
+- 节点系统指标：CPU / 内存 / 磁盘 / 网络速率 / uptime
+- 历史曲线（持久化到 Panel DB）：
+  - 流量速率与连接历史
+  - 支持按规则/汇总窗口查看
+  - 支持清空历史
+
+### 3.5 网络波动监控（NetMon）
+- 多监控项，支持 `ping` / `tcping`
+- 单监控支持多节点并行探测
+- 阈值：Warn/Crit
+- 时间窗口 + 分层聚合（rollup）
+- 只读分享页 / 大屏墙（签名 Token + TTL）
+- 支持分享固定时间段或跟随窗口
+
+### 3.6 网站管理（Website Ops）
+- 站点类型：`static` / `php` / `reverse_proxy`（当前 Web Server 为 nginx）
+- 站点生命周期：创建、编辑、删除
+- 节点环境一键确保/卸载：nginx、php-fpm、acme.sh
+- SSL 证书：申请/续期（HTTP-01，自动回写 nginx）
+- HTTPS 强制跳转开关
+- 健康检查与诊断：
+  - 后台周期健康巡检
+  - 站点诊断页（live + 历史事件 + 检查记录）
+- 文件管理：
+  - 列表、读取、编辑、保存、删除、解压
+  - 分片上传、文件夹上传、上传状态查询
+  - 文件/目录下载（目录流式打包 ZIP）
+- 文件分享：
+  - 短链分享、过期控制、撤销
+  - 单文件直链下载 / 多文件打包下载
+  - 大包异步打包任务与进度查询
+
+### 3.7 备份与恢复
+- 单节点规则备份/恢复
+- 全量备份（ZIP）：
+  - 节点
+  - 规则
+  - 站点配置
+  - 站点文件
+  - 证书元数据
+  - NetMon 监控配置
+- 全量恢复（异步任务、步骤进度）
 
 ---
 
-## 3) 一键安装流程（推荐）
+## 4. 安装与接入
 
-### 3.1 安装 Panel
-
-在“面板机”执行（root）：
+### 4.1 一键安装 Panel（推荐）
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/cyeinfpro/Realm/main/realm_panel.sh)
+bash <(curl -fsSL https://nexus.infpro.me/nexus/realm_panel.sh)
 ```
 
-根据提示输入：
-- 面板登录用户名（默认 `admin`）
-- 面板登录密码（必填）
-- 面板端口（默认 `6080`）
+脚本支持：
+- 在线拉取（自动探测仓库 ZIP / manifest）
+- 离线 ZIP 安装
+- 更新 / 重启 / 卸载
 
-安装完成后，浏览器打开：
+默认安装目录：
+- `/opt/realm-panel`
+- `/etc/realm-panel`
 
-```
-http://<你的面板IP>:6080
-```
+默认面板端口（脚本安装）：`6080`
 
-> 离线安装：把仓库 ZIP 放到面板机，然后运行脚本选择“离线模式”，输入 ZIP 路径即可。
+### 4.2 节点接入 Agent
 
-### 3.2 在 Panel 添加节点并“一键接入”
+在 Panel 创建节点后，进入节点页执行“接入命令”。
+该命令会：
+- 写入 `/etc/realm-agent/api.key`
+- 安装/更新 Agent
+- 安装/更新 realm 二进制
+- 写入上报配置并启动服务
 
-1）登录 Panel 后，点击「添加机器 / 接入」
-- 填“节点 IP/域名”（默认不需要写端口；如 Agent 非 18700 可写 `ip:port`）
-- 保存后会进入该节点详情页
-
-2）在节点详情页里复制「接入命令」，到目标机器执行（root）：
-
-```bash
-curl -fsSL http://<panel_ip>:6080/join/<token> | bash
-```
-
-这条命令会自动完成：
-- 写入节点专属 API Key：`/etc/realm-agent/api.key`
-- 安装/更新 Agent（从面板的 `/static/realm-agent.zip` 拉取离线包，避免 GitHub 不通）
-- 安装 realm 二进制（优先从面板缓存下载）
-- 安装 `realm.service`（并做性能相关的 systemd 配置）
-- 写入 Agent 上报配置 `/etc/realm-agent/panel.env`，让 Agent 开始主动上报
-
-### 3.3 验证节点在线与服务状态
-
-在节点机执行：
-
-```bash
-systemctl status realm-agent --no-pager
-systemctl status realm --no-pager
-```
-
-在面板节点列表里：
-- “上报时间”持续更新 = 节点在线
-- 规则页能看到“连通/流量/活跃连接” = Agent 数据正常
+默认 Agent 端口：`18700`
 
 ---
 
-## 4) 创建与维护转发规则（面板操作）
+## 5. 关键目录与文件
 
-进入某节点后，点击「+ 创建转发」或「+ 新增规则」。
+### 5.1 Panel
+- 程序目录：`/opt/realm-panel/panel`
+- 数据库：`/etc/realm-panel/panel.db`
+- 凭据：`/etc/realm-panel/credentials.json`
+- Secret：`/etc/realm-panel/secret.key`
+- 环境变量文件：`/etc/realm-panel/panel.env`
 
-> 规则保存后只是写进“规则池”，**需要点一次「应用配置」** 才会让 realm 立即生效。
-
-### 4.1 普通 TCP/UDP 转发
-
-适合：端口转发、四层代理。
-
-表单字段说明（常用）：
-- **Listen**：本地监听，例如 `0.0.0.0:443`
-- **目标（Remotes）**：一行一个目标，例如：
-  ```
-  1.2.3.4:443
-  5.6.7.8:443
-  ```
-- **协议（Protocol）**：
-  - `tcp`：只转发 TCP（推荐用于“TCP 为主”的绝大多数规则）
-  - `udp`：只转发 UDP
-  - `tcp+udp`：同时支持 TCP + UDP（仅在确实需要 UDP 时再用）
-- **暂停**：可随时暂停某条规则（不会删除）
-
-### 4.2 多目标负载均衡（Round-robin / IP-hash / 权重）
-
-当你填了多个 remotes：
-- 可选 **round-robin**（轮询）或 **ip-hash**（同一来源 IP 尽量落同一目标）
-- round-robin 可填写权重：例如 `2,1,1`（对应 remote1/2/3）
-
-适用：多后端、多出口分流、容灾。
-
-### 4.3 WSS 隧道（发送机/接收机自动同步）
-
-适合：需要 ws/wss 外层伪装 / 隧道传输。
-
-本面板的 WSS 隧道采用“**选择接收机自动同步**”模式：
-- **发送机（Sender）**：你在这里配置 listen + remotes，并选择一个“接收机节点”。
-- **接收机（Receiver）**：面板会自动在接收机创建对应规则（并锁定），你无需手工配置。
-
-操作流程：
-1. 在发送机节点，创建规则时把“类型”切到 **WSS**
-2. 选择 **接收机节点**（下拉选择）
-3. 填写接收机端口（可选；为空则自动选择）
-4. 填写 WSS 参数：
-   - **Host**：伪装域名（例如 `cdn.jsdelivr.net`）
-   - **Path**：伪装路径（例如 `/ws/xxxxx`）
-   - **SNI**：一般等于 Host
-   - **TLS**：通常开启
-   - **Insecure**：如证书校验有问题可勾选（会降低安全性）
-
-保存后：
-- 发送机规则会保留“原始目标 remotes”
-- 接收机会自动生成“对等规则”，并显示为锁定/不可手动编辑（避免两端不一致）
-- 以后修改/暂停/删除，请都在“发送机节点”操作，面板会自动同步两端
-
-### 4.4 应用配置（真正让 realm 生效）
-
-在节点规则页点击「应用配置」会触发：
-- Agent 把 pool_full.json → 生成 `/etc/realm/config.json`
-- `systemctl restart realm.service`
-
-你也可以在节点机手动触发（需要 API Key）：
-
-```bash
-curl -sS -H "X-API-Key: $(cat /etc/realm-agent/api.key)" \
-  http://127.0.0.1:18700/api/v1/apply
-echo
-```
+### 5.2 Agent
+- 程序目录：`/opt/realm-agent/agent`
+- API Key：`/etc/realm-agent/api.key`
+- 上报配置：`/etc/realm-agent/panel.env`（或 agent.env）
+- 规则池（完整）：`/etc/realm/pool_full.json`
+- 规则池（运行）：`/etc/realm/pool.json`
+- realm 最终配置：`/etc/realm/config.json`
+- ACK 版本：`/etc/realm-agent/panel_ack.version`
+- 更新状态：`/etc/realm-agent/agent_update.json`
 
 ---
 
-## 5) 性能/稳定性优化说明（本版本新增）
+## 6. 核心 API 速览
 
-### 5.1 systemd：提升并发上限（nofile/tasks）
+### 6.1 Panel 侧（节选）
+- Agent 上报：`POST /api/agent/report`
+- 节点规则：
+  - `GET /api/nodes/{id}/pool`
+  - `POST /api/nodes/{id}/pool`
+  - `POST /api/nodes/{id}/pool_async`
+  - `POST /api/nodes/{id}/rule_delete_async`
+- 节点状态：
+  - `GET /api/nodes/{id}/stats`
+  - `GET /api/nodes/{id}/sys`
+  - `GET /api/nodes/{id}/stats_history`
+- 隧道同步：
+  - `POST /api/wss_tunnel/save_async`
+  - `POST /api/intranet_tunnel/save_async`
+- 网络波动：
+  - `GET /api/netmon/snapshot`
+  - `POST /api/netmon/monitors`
+  - `POST /api/netmon/share`
+- 网站管理：`/websites/*`（创建、SSL、诊断、文件、分享）
+- 全量备份恢复：`/api/backup/full/*`、`/api/restore/full/*`
 
-安装 Agent 时会：
-- 创建/保留 `/etc/systemd/system/realm.service`
-- 写入 drop-in：`/etc/systemd/system/realm.service.d/override.conf`
-  - `LimitNOFILE=1048576`
-  - `TasksMax=infinity`
-- 同时 `ExecStart` 默认带 `-n 1048576`（realm 自身 nofile 设置）
-
-> 如果你之前已经手工改过 realm.service，本版本不会强行覆盖你的 ExecStart，只会补充 drop-in 限制。
-
-### 5.2 sysctl：网络栈稳态参数
-
-安装 Agent 时若发现不存在 `/etc/sysctl.d/99-realm.conf`，会写入一份“稳态网络调优”并 `sysctl --system`（best-effort）：
-- backlog / buffer 提升（高并发更稳）
-- keepalive 参数（配合 realm 侧 keepalive 更好回收半死连接）
-- fq + bbr（旧内核不支持会忽略，不影响安装）
-
-你可以查看内容：
-
-```bash
-cat /etc/sysctl.d/99-realm.conf
-```
-
-### 5.3 pool 级 network：给所有旧规则“一键加优化参数”
-
-**重点：**这版支持在规则池顶层增加 `network`，作为全局默认值；每条 endpoint 仍可用自身 `network` 覆盖。
-
-你可以通过“备份 → 编辑 JSON → 恢复”来设置：
-
-1）在面板节点页点「更多 → 备份规则（下载）」
-2）打开下载的 JSON，加入/修改顶层 `network`（示例）：
-
-```json
-{
-  "network": {
-    "tcp_timeout": 8,
-    "udp_timeout": 60,
-    "tcp_keepalive": 15,
-    "tcp_keepalive_probe": 3
-  },
-  "endpoints": [
-    {"listen":"0.0.0.0:443","remotes":["1.2.3.4:443"],"protocol":"tcp+udp"}
-  ]
-}
-```
-
-3）回到面板节点页点「更多 → 恢复规则（粘贴）」把 JSON 粘进去恢复
-4）最后点一次「应用配置」
-
-> 说明：`tcp_timeout/udp_timeout/tcp_keepalive/...` 的具体可用字段取决于你安装的 realm 版本；不识别的字段通常会被 realm 忽略或报错。若应用后 realm 启动失败，请在节点机 `journalctl -u realm -e` 查看错误并调整字段。
-
-### 5.4 TCP 主、少量 UDP、含 ws/wss 的推荐策略
-
-为了“吞吐 + 低延迟 + 稳定”：
-
-1）**默认规则尽量用 `tcp`**
-- 只有确实需要 UDP（例如游戏/语音/特定协议）才用 `udp` 或 `tcp+udp`
-
-2）**WSS 只用在必须的链路**
-- ws/wss 会引入额外封装与 TLS 开销，吞吐与延迟波动都会更明显
-- 业务链路能不用 wss 就别用
-
-3）全局 network 推荐起步值（可按你的网络环境调整）：
-- `tcp_timeout: 8`（连接建立卡死的保护）
-- `tcp_keepalive: 15` + `tcp_keepalive_probe: 3`（更快清理半死连接，降低抖动）
-- `udp_timeout: 60`（UDP 映射不要太大，避免资源长期占用）
-
-4）大规模规则/高并发时，优先排查：
-- FD 是否够：`ulimit -n` / `systemctl show realm.service -p LimitNOFILE`
-- 软中断是否过高：`top` 看 `%si`
-- 内核队列是否打满：`ss -s` / `nstat`
+### 6.2 Agent 侧（节选）
+- 基础：
+  - `GET /api/v1/info`
+  - `GET /api/v1/pool`
+  - `POST /api/v1/pool`
+  - `POST /api/v1/apply`
+  - `GET /api/v1/stats`
+  - `GET /api/v1/sys`
+  - `POST /api/v1/netprobe`
+  - `POST /api/v1/traffic/reset`
+- 内网穿透：
+  - `GET /api/v1/intranet/cert`
+  - `GET /api/v1/intranet/status`
+- 网站：
+  - `/api/v1/website/env/*`
+  - `/api/v1/website/site/*`
+  - `/api/v1/website/ssl/*`
+  - `/api/v1/website/diagnose`
+  - `/api/v1/website/files/*`
 
 ---
 
-## 6) 备份 / 恢复 / 迁移 / 升级
+## 7. 安全机制
 
-### 6.1 备份规则
-面板节点页：「更多 → 备份规则（下载）」
-
-节点机也可手动备份：
-
-```bash
-cp /etc/realm/pool_full.json /root/pool_full.json.bak.$(date +%s)
-```
-
-### 6.2 恢复规则
-面板节点页：「更多 → 恢复规则（粘贴）」
-
-恢复后记得点「应用配置」。
-
-### 6.3 升级到本优化版后，旧规则会不会自动修改？
-- **如果你一直用面板/Agent 管理规则：**
-  - 旧规则在 `pool_full.json` / 面板 DB 里，升级不会丢。
-  - Agent 会用新的生成逻辑重新生成 `config.json`，旧规则会“自动按新逻辑落地”。
-- **如果你以前手工改 `/etc/realm/config.json`：**
-  - 一旦你在面板点“应用配置”，`config.json` 会被覆盖。
-  - 建议先把手工规则整理成面板规则（或写入 pool_full/备份恢复）。
-
-### 6.4 更新面板 / 更新 Agent
-- 更新 Panel：在面板机重新运行 `realm_panel.sh` 选择“更新面板”。
-- 更新 Agent：最稳的方法是在面板节点页复制「接入命令」再跑一次（会强制更新 Agent）。
+- Panel 登录密码：PBKDF2-SHA256（含 salt）
+- Panel 会话与分享 Token：同一 `SECRET_KEY` 签名
+- Agent API：`X-API-Key` 强校验
+- 关键下发命令：HMAC 签名 + 时间窗 + nonce 防重放
+- 支持按节点配置 Agent TLS 证书校验（`verify_tls`）
+- 同步接收侧规则默认锁定，减少误操作
 
 ---
 
-## 7) 常用运维命令
+## 8. 常用运维命令
 
-### 面板机
+### 8.1 Panel 机器
+
 ```bash
 systemctl status realm-panel --no-pager
 journalctl -u realm-panel -f
-
-# 面板 DB
-ls -l /etc/realm-panel/panel.db
 ```
 
-### 节点机
+### 8.2 Agent 节点
+
 ```bash
 systemctl status realm-agent --no-pager
 journalctl -u realm-agent -f
 
 systemctl status realm --no-pager
 journalctl -u realm -e
+```
 
-# 查看最终 realm 配置
-cat /etc/realm/config.json | head
+### 8.3 本地快速检查
 
-# 手动应用（需要 API key）
-curl -sS -H "X-API-Key: $(cat /etc/realm-agent/api.key)" http://127.0.0.1:18700/api/v1/apply && echo
+```bash
+# 检查 Agent 可读 pool
+curl -sS -H "X-API-Key: $(cat /etc/realm-agent/api.key)" \
+  http://127.0.0.1:18700/api/v1/pool
+
+# 触发 apply
+curl -sS -H "X-API-Key: $(cat /etc/realm-agent/api.key)" \
+  http://127.0.0.1:18700/api/v1/apply
 ```
 
 ---
 
-## 8) 常见问题排查
+## 9. 本地开发运行（可选）
 
-### 8.1 节点显示离线
-- 节点机是否能访问面板：`curl -I http://<panel_ip>:6080/`
-- 节点机 `systemctl status realm-agent` 是否 active
-- `cat /etc/realm-agent/panel.env` 是否存在且包含 `REALM_PANEL_URL/REALM_AGENT_ID`
+```bash
+# Panel
+cd panel
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 6080
 
-### 8.2 点了“应用配置”但不生效
-- 看 `realm` 是否重启成功：`systemctl status realm`
-- 看日志：`journalctl -u realm -e`
-- 检查 `/etc/realm/config.json` 是否生成：
-  ```bash
-  test -s /etc/realm/config.json && echo OK
-  ```
-
-### 8.3 应用后 realm 启动失败
-- 多半是 `config.json` 某字段不被当前 realm 支持或格式错误
-- 在节点机查看错误：`journalctl -u realm -e`
-- 回滚方式：用备份恢复旧 pool，再点应用
-
-### 8.4 WSS 隧道不通
-- 确认发送机与接收机都在线
-- Host/Path/SNI 是否一致、是否为空
-- TLS/Insecure 勾选是否符合你的证书与环境
-- 先用纯 TCP 规则验证链路，排除基础网络问题
+# Agent
+cd agent
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 18700
+```
 
 ---
 
-### License / 免责声明
-本套件仅提供规则管理与部署便利，实际使用请遵守当地法律法规与服务商条款。对因错误配置造成的中断/损失需自行承担。
+## 10. 兼容与建议
+
+- 推荐系统：Debian / Ubuntu（安装脚本使用 `apt`）
+- 建议在生产环境用 systemd 托管服务
+- WSS/内网穿透场景建议优先验证基础 TCP 规则再切换高级模式
+- 大规模规则建议开启并观察预检、历史曲线与 NetMon，逐步放量
+
+---
+
+## 11. 免责声明
+
+本项目提供网络转发与站点运维编排能力。请在合法合规前提下使用，并自行承担配置与运维风险。

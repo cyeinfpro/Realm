@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import HTTPException, Request
 
+from ..auth import get_session_user, has_permission
 from .session import SECRET_KEY
 
 
@@ -107,9 +108,10 @@ def verify_share_token_allow_expired(token: str) -> Optional[Dict[str, Any]]:
 def require_login_or_share_page(request: Request, allow_page: str) -> str:
     """Allow either a logged-in session OR a valid share token for a given page."""
 
-    user = request.session.get("user")
-    if user:
-        return str(user)
+    auth_user = get_session_user(request.session)
+    if auth_user and has_permission(auth_user, "netmon.read"):
+        request.state.auth_user = auth_user
+        return str(auth_user.username)
 
     if not _NETMON_SHARE_PUBLIC:
         raise HTTPException(status_code=302, headers={"Location": "/login"})
@@ -133,9 +135,10 @@ def require_login_or_share_wall_page(request: Request) -> str:
 def require_login_or_share_api(request: Request) -> str:
     """Allow either a logged-in session OR a valid share token for API calls."""
 
-    user = request.session.get("user")
-    if user:
-        return str(user)
+    auth_user = get_session_user(request.session)
+    if auth_user and has_permission(auth_user, "netmon.read"):
+        request.state.auth_user = auth_user
+        return str(auth_user.username)
 
     if not _NETMON_SHARE_PUBLIC:
         raise HTTPException(status_code=401, detail="Not logged in")

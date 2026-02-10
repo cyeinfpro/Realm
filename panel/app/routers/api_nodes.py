@@ -19,6 +19,13 @@ from urllib.parse import urlencode, urlparse
 from fastapi import APIRouter, Depends, File, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
+from ..auth import (
+    can_access_rule_endpoint,
+    filter_nodes_for_user,
+    get_user_by_username,
+    is_rule_owner_scoped,
+    stamp_endpoint_owner,
+)
 from ..clients.agent import agent_get, agent_get_raw, agent_ping, agent_post
 from ..core.deps import require_login
 from ..core.settings import DEFAULT_AGENT_PORT
@@ -41,6 +48,7 @@ from ..db import (
     clear_rule_stats_samples,
     list_nodes,
     set_desired_pool,
+    upsert_rule_owner_map,
     upsert_group_order,
     update_certificate,
     update_netmon_monitor,
@@ -148,6 +156,7 @@ _POOL_JOB_RETRY_BASE_SEC = _env_float("REALM_POOL_JOB_RETRY_BASE_SEC", 1.2, 0.2,
 _POOL_JOB_RETRY_MAX_SEC = _env_float("REALM_POOL_JOB_RETRY_MAX_SEC", 8.0, 1.0, 120.0)
 _POOL_JOB_ACK_TIMEOUT_SEC = _env_float("REALM_POOL_JOB_ACK_TIMEOUT_SEC", 45.0, 5.0, 600.0)
 _POOL_JOB_ACK_POLL_SEC = _env_float("REALM_POOL_JOB_ACK_POLL_SEC", 1.0, 0.2, 10.0)
+_POOL_JOB_REQUIRE_ACK = _env_flag("REALM_POOL_JOB_REQUIRE_ACK", True)
 
 _POOL_JOBS: Dict[str, Dict[str, Any]] = {}
 _POOL_JOBS_LOCK = threading.Lock()
@@ -256,12 +265,206 @@ def _pool_job_is_retriable(status_code: int, data: Dict[str, Any]) -> bool:
     return False
 
 
+def _json_deep_clone(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value))
+    except Exception:
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, list):
+            return list(value)
+        return value
+
+
+def _normalize_pool_dict(pool: Any) -> Dict[str, Any]:
+    out = pool if isinstance(pool, dict) else {}
+    if not isinstance(out.get("endpoints"), list):
+        out["endpoints"] = []
+    return out
+
+
+def _resolve_rule_user(user_or_name: Any) -> Any:
+    if isinstance(user_or_name, str):
+        try:
+            u = get_user_by_username(user_or_name)
+            if u is not None:
+                return u
+        except Exception:
+            return user_or_name
+    return user_or_name
+
+
+def _rule_key_for_endpoint(endpoint: Dict[str, Any]) -> str:
+    ex = endpoint.get("extra_config")
+    if not isinstance(ex, dict):
+        ex = {}
+    sid = str(ex.get("sync_id") or "").strip()
+    if sid and (ex.get("sync_role") or ex.get("sync_peer_node_id") or ex.get("sync_lock")):
+        return f"wss:{sid}"
+    if sid and (ex.get("intranet_role") or ex.get("intranet_peer_node_id") or ex.get("intranet_lock")):
+        return f"intranet:{sid}"
+    listen = str(endpoint.get("listen") or "").strip()
+    proto = str(endpoint.get("protocol") or "tcp+udp").strip().lower()
+    return f"tcp:{listen}|{proto}"
+
+
+def _visible_endpoint_tuples(user: str, pool: Dict[str, Any]) -> List[Tuple[int, Dict[str, Any]]]:
+    eps = pool.get("endpoints") if isinstance(pool.get("endpoints"), list) else []
+    out: List[Tuple[int, Dict[str, Any]]] = []
+    user_ref = _resolve_rule_user(user)
+    scoped = is_rule_owner_scoped(user_ref)
+    for idx, ep in enumerate(eps):
+        if not isinstance(ep, dict):
+            continue
+        if scoped and (not can_access_rule_endpoint(user_ref, ep)):
+            continue
+        out.append((idx, ep))
+    return out
+
+
+def _filter_pool_for_user(user: str, pool: Any) -> Dict[str, Any]:
+    user_ref = _resolve_rule_user(user)
+    full = _normalize_pool_dict(_json_deep_clone(pool if isinstance(pool, dict) else {}))
+    if not is_rule_owner_scoped(user_ref):
+        return full
+    full["endpoints"] = [ep for _idx, ep in _visible_endpoint_tuples(user_ref, full)]
+    return full
+
+
+def _merge_submitted_pool_for_user(user: str, existing_pool: Dict[str, Any], submitted_pool: Dict[str, Any]) -> Dict[str, Any]:
+    user_ref = _resolve_rule_user(user)
+    existing = _normalize_pool_dict(_json_deep_clone(existing_pool if isinstance(existing_pool, dict) else {}))
+    submitted = _normalize_pool_dict(_json_deep_clone(submitted_pool if isinstance(submitted_pool, dict) else {}))
+    if not is_rule_owner_scoped(user_ref):
+        return submitted
+
+    posted_eps_raw = submitted.get("endpoints") if isinstance(submitted.get("endpoints"), list) else []
+    posted_eps: List[Dict[str, Any]] = []
+    for ep in posted_eps_raw:
+        if not isinstance(ep, dict):
+            continue
+        stamp_endpoint_owner(ep, user_ref)
+        posted_eps.append(ep)
+
+    merged_eps: List[Dict[str, Any]] = []
+    take = 0
+    existing_eps = existing.get("endpoints") if isinstance(existing.get("endpoints"), list) else []
+    for old_ep in existing_eps:
+        if not isinstance(old_ep, dict):
+            continue
+        if can_access_rule_endpoint(user_ref, old_ep):
+            if take < len(posted_eps):
+                merged_eps.append(posted_eps[take])
+                take += 1
+            continue
+        merged_eps.append(old_ep)
+
+    while take < len(posted_eps):
+        merged_eps.append(posted_eps[take])
+        take += 1
+
+    if not isinstance(submitted, dict):
+        submitted = {}
+    for k, v in existing.items():
+        if k == "endpoints":
+            continue
+        if k not in submitted:
+            submitted[k] = v
+    submitted["endpoints"] = merged_eps
+    return submitted
+
+
+def _filter_stats_payload_for_user(user: str, pool: Dict[str, Any], stats_payload: Dict[str, Any]) -> Dict[str, Any]:
+    user_ref = _resolve_rule_user(user)
+    if not isinstance(stats_payload, dict):
+        return {}
+    data = dict(stats_payload)
+    rules = data.get("rules")
+    if not isinstance(rules, list):
+        data["rules"] = []
+        return data
+    if not is_rule_owner_scoped(user_ref):
+        return data
+
+    visible = _visible_endpoint_tuples(user_ref, pool)
+    idx_map: Dict[int, int] = {int(actual_idx): int(v_idx) for v_idx, (actual_idx, _ep) in enumerate(visible)}
+    listen_map: Dict[str, int] = {}
+    rule_keys: set[str] = set()
+    for v_idx, (_actual_idx, ep) in enumerate(visible):
+        listen = str(ep.get("listen") or "").strip()
+        if listen and listen not in listen_map:
+            listen_map[listen] = int(v_idx)
+        try:
+            rule_keys.add(_rule_key_for_endpoint(ep))
+        except Exception:
+            continue
+
+    out_rules: List[Dict[str, Any]] = []
+    for r in rules:
+        if not isinstance(r, dict):
+            continue
+        nr = dict(r)
+        keep = False
+        idx_raw = r.get("idx")
+        idx_val: Optional[int] = None
+        try:
+            idx_val = int(idx_raw)
+        except Exception:
+            idx_val = None
+        if idx_val is not None and idx_val in idx_map:
+            nr["idx"] = int(idx_map[idx_val])
+            keep = True
+        if not keep:
+            listen = str(r.get("listen") or "").strip()
+            if listen and listen in listen_map:
+                nr["idx"] = int(listen_map[listen])
+                keep = True
+        if not keep:
+            rkey = str(r.get("key") or r.get("rule_key") or "").strip()
+            if rkey and rkey in rule_keys:
+                keep = True
+        if keep:
+            out_rules.append(nr)
+    data["rules"] = out_rules
+    return data
+
+
+def _visible_rule_history_keys(user: str, pool: Dict[str, Any]) -> set[str]:
+    user_ref = _resolve_rule_user(user)
+    out: set[str] = set()
+    for _idx, ep in _visible_endpoint_tuples(user_ref, pool):
+        if not isinstance(ep, dict):
+            continue
+        listen = str(ep.get("listen") or "").strip()
+        if listen:
+            out.add(listen)
+        try:
+            out.add(_rule_key_for_endpoint(ep))
+        except Exception:
+            continue
+    return out
+
+
+def _pool_like_response_with_filter(user: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    if not isinstance(payload.get("pool"), dict):
+        return dict(payload)
+    out = dict(payload)
+    out["pool"] = _filter_pool_for_user(user, payload.get("pool"))
+    return out
+
+
 async def _pool_job_wait_ack(node_id: int, desired_ver: int) -> Tuple[bool, str]:
     need = int(desired_ver or 0)
     if need <= 0:
         return True, ""
+    if not _POOL_JOB_REQUIRE_ACK:
+        return True, ""
     deadline = _pool_job_now() + float(_POOL_JOB_ACK_TIMEOUT_SEC)
     last_ack = 0
+    last_seen = ""
+    report_fresh = False
     while _pool_job_now() < deadline:
         n = get_node(int(node_id))
         if not n:
@@ -270,9 +473,20 @@ async def _pool_job_wait_ack(node_id: int, desired_ver: int) -> Tuple[bool, str]
             last_ack = int(n.get("agent_ack_version") or 0)
         except Exception:
             last_ack = 0
+        last_seen = str(n.get("last_seen_at") or "")
+        try:
+            report_fresh = bool(is_report_fresh(n, max_age_sec=max(90, int(_POOL_JOB_ACK_TIMEOUT_SEC) * 2)))
+        except Exception:
+            report_fresh = False
         if last_ack >= need:
             return True, ""
         await asyncio.sleep(max(0.2, float(_POOL_JOB_ACK_POLL_SEC)))
+    if not report_fresh:
+        return (
+            False,
+            f"节点未确认配置版本（ack={last_ack}, desired={need}，last_seen={last_seen or 'never'}）。"
+            f"请检查 Agent 上报链路（REALM_PANEL_URL/REALM_AGENT_ID/网络连通）。"
+        )
     return False, f"节点未确认配置版本（ack={last_ack}, desired={need}）"
 
 
@@ -640,13 +854,17 @@ async def _collect_site_file_index(site: Dict[str, Any], node: Dict[str, Any]) -
     return out
 
 
-async def _build_full_backup_bundle(request: Request, progress_callback: Any = None) -> Dict[str, Any]:
+async def _build_full_backup_bundle(
+    request: Request,
+    progress_callback: Any = None,
+    nodes_override: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     await _emit_backup_progress(
         progress_callback,
         {"progress": 4, "stage": "扫描数据", "step_key": "scan", "step_status": "running", "step_detail": "读取节点与面板配置"},
     )
 
-    nodes = list_nodes()
+    nodes = list(nodes_override) if isinstance(nodes_override, list) else list_nodes()
     group_orders = get_group_orders()
     node_map = {int(n.get("id") or 0): n for n in nodes}
     sites = list_sites()
@@ -1289,15 +1507,22 @@ async def api_pool_get(request: Request, node_id: int, user: str = Depends(requi
     # Push-report mode: prefer desired pool stored on panel
     desired_ver, desired_pool = get_desired_pool(node_id)
     if isinstance(desired_pool, dict):
-        return {"ok": True, "pool": desired_pool, "desired_version": desired_ver, "source": "panel_desired"}
+        return {
+            "ok": True,
+            "pool": _filter_pool_for_user(user, desired_pool),
+            "desired_version": desired_ver,
+            "source": "panel_desired",
+        }
 
     # If no desired pool, try last report snapshot
     rep = get_last_report(node_id)
     if isinstance(rep, dict) and isinstance(rep.get("pool"), dict):
-        return {"ok": True, "pool": rep.get("pool"), "source": "report_cache"}
+        return {"ok": True, "pool": _filter_pool_for_user(user, rep.get("pool")), "source": "report_cache"}
 
     try:
         data = await agent_get(node["base_url"], node["api_key"], "/api/v1/pool", node_verify_tls(node))
+        if isinstance(data, dict):
+            return _pool_like_response_with_filter(user, data)
         return data
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
@@ -1309,6 +1534,8 @@ async def api_backup(request: Request, node_id: int, user: str = Depends(require
     if not node:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
     data = await get_pool_for_backup(node)
+    if isinstance(data, dict):
+        data = _pool_like_response_with_filter(user, data)
     # 规则文件名包含节点名，便于区分
     safe = safe_filename_part(node.get("name") or f"node-{node_id}")
     filename = f"realm-rules-{safe}-id{node_id}.json"
@@ -1320,7 +1547,8 @@ async def api_backup(request: Request, node_id: int, user: str = Depends(require
 @router.get("/api/backup/full")
 async def api_backup_full(request: Request, user: str = Depends(require_login)):
     """Direct download full backup zip (legacy one-shot behavior)."""
-    bundle = await _build_full_backup_bundle(request)
+    visible_nodes = filter_nodes_for_user(user, list_nodes())
+    bundle = await _build_full_backup_bundle(request, nodes_override=visible_nodes)
     filename = str(bundle.get("filename") or f"nexus-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip")
     content = bytes(bundle.get("content") or b"")
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
@@ -1330,6 +1558,7 @@ async def api_backup_full(request: Request, user: str = Depends(require_login)):
 @router.post("/api/backup/full/start")
 async def api_backup_full_start(request: Request, user: str = Depends(require_login)):
     """Start full backup in background and return a job id for progress polling."""
+    visible_nodes = filter_nodes_for_user(user, list_nodes())
     _prune_full_backup_jobs()
     job_id = uuid.uuid4().hex
     now = time.time()
@@ -1372,7 +1601,7 @@ async def api_backup_full_start(request: Request, user: str = Depends(require_lo
 
     async def _run() -> None:
         try:
-            bundle = await _build_full_backup_bundle(request, _progress_cb)
+            bundle = await _build_full_backup_bundle(request, _progress_cb, nodes_override=visible_nodes)
             meta = bundle.get("meta") if isinstance(bundle.get("meta"), dict) else {}
             counts = {
                 "nodes": int(meta.get("nodes") or 0),
@@ -2850,32 +3079,32 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
                     unlock_sync_ids.add(sid)
 
     sanitize_pool(pool)
+    existing_pool: Dict[str, Any]
+    try:
+        existing_pool = await load_pool_for_node(node)
+    except Exception:
+        existing_pool = {}
+    existing_pool = _normalize_pool_dict(existing_pool)
+    pool = _merge_submitted_pool_for_user(user, existing_pool, pool)
+    sanitize_pool(pool)
 
     # Prevent editing/deleting synced receiver rules from UI
     try:
-        _, existing_desired = get_desired_pool(node_id)
-        existing_pool = existing_desired
-        if not isinstance(existing_pool, dict):
-            rep = get_last_report(node_id)
-            if isinstance(rep, dict) and isinstance(rep.get("pool"), dict):
-                existing_pool = rep.get("pool")
-
         locked: Dict[str, Any] = {}
-        if isinstance(existing_pool, dict):
-            for ep in existing_pool.get("endpoints") or []:
-                if not isinstance(ep, dict):
-                    continue
-                ex0 = ep.get("extra_config") or {}
-                if not isinstance(ex0, dict):
-                    ex0 = {}
-                sid = ex0.get("sync_id")
-                if sid and (
-                    ex0.get("sync_lock") is True
-                    or ex0.get("sync_role") == "receiver"
-                    or ex0.get("intranet_lock") is True
-                    or ex0.get("intranet_role") == "client"
-                ):
-                    locked[str(sid)] = ep
+        for ep in existing_pool.get("endpoints") or []:
+            if not isinstance(ep, dict):
+                continue
+            ex0 = ep.get("extra_config") or {}
+            if not isinstance(ex0, dict):
+                ex0 = {}
+            sid = ex0.get("sync_id")
+            if sid and (
+                ex0.get("sync_lock") is True
+                or ex0.get("sync_role") == "receiver"
+                or ex0.get("intranet_lock") is True
+                or ex0.get("intranet_role") == "client"
+            ):
+                locked[str(sid)] = ep
 
         if locked:
             posted: Dict[str, Any] = {}
@@ -2966,6 +3195,12 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
         if isinstance(i, PoolValidationIssue):
             _append_precheck_issue(precheck_issues, precheck_seen, i, _SAVE_PRECHECK_MAX_ISSUES)
 
+    try:
+        upsert_rule_owner_map(node_id=node_id, pool=pool)
+    except Exception:
+        # Ownership map is best-effort; do not block save path.
+        pass
+
     # Store desired pool on panel. Agent will pull it on next report.
     try:
         desired_ver, _ = set_desired_pool(node_id, pool)
@@ -2980,7 +3215,7 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
 
     return {
         "ok": True,
-        "pool": pool,
+        "pool": _filter_pool_for_user(user, pool),
         "desired_version": desired_ver,
         "queued": True,
         "note": "waiting agent report",
@@ -3053,27 +3288,28 @@ async def api_rule_delete(node_id: int, payload: Dict[str, Any], user: str = Dep
             if sid:
                 unlock_sync_ids.add(sid)
 
-    pool = await load_pool_for_node(node)
+    user_ref = _resolve_rule_user(user)
+    scoped = is_rule_owner_scoped(user_ref)
+    pool = _normalize_pool_dict(await load_pool_for_node(node))
     eps = pool.get("endpoints")
     if not isinstance(eps, list):
         eps = []
+    if scoped:
+        visible = _visible_endpoint_tuples(user_ref, pool)
+        if idx >= len(visible):
+            return JSONResponse({"ok": False, "error": "规则不存在或已删除"}, status_code=404)
+        idx = int(visible[idx][0])
     if idx >= len(eps):
         return JSONResponse({"ok": False, "error": "规则不存在或已删除"}, status_code=404)
 
     ep = eps[idx] if isinstance(eps[idx], dict) else {}
+    if scoped and not can_access_rule_endpoint(user_ref, ep):
+        return JSONResponse({"ok": False, "error": "规则不存在或已删除"}, status_code=404)
     ex = ep.get("extra_config") if isinstance(ep.get("extra_config"), dict) else {}
 
     expected_key = str((payload or {}).get("expected_key") or "").strip()
     if expected_key:
-        sid0 = str(ex.get("sync_id") or "").strip() if isinstance(ex, dict) else ""
-        if sid0 and (ex.get("sync_role") or ex.get("sync_peer_node_id") or ex.get("sync_lock")):
-            actual_key = f"wss:{sid0}"
-        elif sid0 and (ex.get("intranet_role") or ex.get("intranet_peer_node_id") or ex.get("intranet_lock")):
-            actual_key = f"intranet:{sid0}"
-        else:
-            listen0 = str(ep.get("listen") or "").strip()
-            proto0 = str(ep.get("protocol") or "tcp+udp").strip().lower()
-            actual_key = f"tcp:{listen0}|{proto0}"
+        actual_key = _rule_key_for_endpoint(ep)
         if actual_key != expected_key:
             return JSONResponse(
                 {
@@ -3112,7 +3348,7 @@ async def api_rule_delete(node_id: int, payload: Dict[str, Any], user: str = Dep
         return JSONResponse({"ok": False, "error": f"删除失败：下发任务创建失败（{exc}）"}, status_code=500)
     return {
         "ok": True,
-        "pool": pool,
+        "pool": _filter_pool_for_user(user, pool),
         "desired_version": desired_ver,
         "queued": True,
         "note": "waiting agent report",
@@ -3511,7 +3747,7 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
 @router.get("/api/nodes")
 async def api_nodes_list(user: str = Depends(require_login)):
     out = []
-    for n in list_nodes():
+    for n in filter_nodes_for_user(user, list_nodes()):
         out.append(
             {
                 "id": int(n["id"]),
@@ -3586,11 +3822,13 @@ async def api_stats(request: Request, node_id: int, force: int = 0, user: str = 
     if not node:
         return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
 
+    pool_for_scope: Optional[Dict[str, Any]] = None
+    scoped_rule_view = is_rule_owner_scoped(user)
     # Push-report cache (unless forced)
     if not force and is_report_fresh(node):
         rep = get_last_report(node_id)
         if isinstance(rep, dict) and isinstance(rep.get("stats"), dict):
-            out = rep["stats"]
+            out = dict(rep["stats"])
             out["source"] = "report"
             # Use report receive time as series timestamp.
             # If we always use "now" here, repeated reads of an unchanged cached report
@@ -3613,6 +3851,12 @@ async def api_stats(request: Request, node_id: int, force: int = 0, user: str = 
                     ts_ms = 0
             if ts_ms > 0:
                 out["ts_ms"] = ts_ms
+            if scoped_rule_view:
+                try:
+                    pool_for_scope = await load_pool_for_node(node)
+                except Exception:
+                    pool_for_scope = {}
+                out = _filter_stats_payload_for_user(user, _normalize_pool_dict(pool_for_scope), out)
             return out
 
     try:
@@ -3633,6 +3877,14 @@ async def api_stats(request: Request, node_id: int, force: int = 0, user: str = 
                 ingest_stats_snapshot(node_id=node_id, stats=data)
         except Exception:
             pass
+
+        if scoped_rule_view and isinstance(data, dict):
+            if pool_for_scope is None:
+                try:
+                    pool_for_scope = await load_pool_for_node(node)
+                except Exception:
+                    pool_for_scope = {}
+            data = _filter_stats_payload_for_user(user, _normalize_pool_dict(pool_for_scope), data)
 
         return data
     except Exception as exc:
@@ -3705,6 +3957,31 @@ async def api_stats_history(
         from_ms = 0
 
     k = (key or "__all__").strip() or "__all__"
+    if is_rule_owner_scoped(user):
+        try:
+            scoped_pool = _normalize_pool_dict(await load_pool_for_node(node))
+        except Exception:
+            scoped_pool = {"endpoints": []}
+        allowed_keys = _visible_rule_history_keys(user, scoped_pool)
+        if k == "__all__":
+            # Scoped users cannot read aggregated series that may include hidden rules.
+            return {
+                "ok": True,
+                "node_id": int(node_id),
+                "key": k,
+                "from_ts_ms": int(from_ms),
+                "to_ts_ms": int(now_ms),
+                "window_ms": int(win),
+                "limit": int(lim),
+                "t": [],
+                "rx": [],
+                "tx": [],
+                "conn": [],
+                "source": "db_scoped",
+                "config": stats_history_config(),
+            }
+        if k not in allowed_keys:
+            return JSONResponse({"ok": False, "error": "规则不存在或无权限"}, status_code=403)
 
     try:
         rows = list_rule_stats_series(
@@ -3858,6 +4135,9 @@ async def api_graph(request: Request, node_id: int, user: str = Depends(require_
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
+    if not isinstance(pool, dict):
+        pool = {}
+    pool = _filter_pool_for_user(user, pool)
     endpoints = pool.get("endpoints", []) if isinstance(pool, dict) else []
     elements: List[Dict[str, Any]] = []
 
@@ -3899,7 +4179,7 @@ async def api_reset_all_traffic(request: Request, user: str = Depends(require_lo
     - If direct call fails, queue a signed push-report command (agent -> panel),
       so private/unreachable nodes will reset next time they report.
     """
-    nodes = list_nodes()
+    nodes = filter_nodes_for_user(user, list_nodes())
 
     if not nodes:
         return {"ok": True, "total": 0, "ok_count": 0, "queued_count": 0, "fail_count": 0, "results": []}

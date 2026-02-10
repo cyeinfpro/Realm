@@ -34,6 +34,7 @@ class QoSPolicy:
     bandwidth_kbps: Optional[int] = None
     max_conns: Optional[int] = None
     conn_rate: Optional[int] = None
+    traffic_total_bytes: Optional[int] = None
 
 
 def _now_ts() -> int:
@@ -119,7 +120,7 @@ def _read_qos_number(src: Dict[str, Any], keys: Iterable[str]) -> Optional[int]:
     return None
 
 
-def _extract_qos(ep: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+def _extract_qos(ep: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
     ex = ep.get("extra_config") if isinstance(ep.get("extra_config"), dict) else {}
     net = ep.get("network") if isinstance(ep.get("network"), dict) else {}
     ex_qos = ex.get("qos") if isinstance(ex.get("qos"), dict) else {}
@@ -167,10 +168,45 @@ def _extract_qos(ep: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Opti
     if conn_rate is None:
         conn_rate = _read_qos_number(net, ("qos_conn_rate", "conn_rate", "new_conn_per_sec"))
 
+    traffic_total_bytes = _read_qos_number(
+        ex_qos,
+        ("traffic_total_bytes", "traffic_bytes", "traffic_limit_bytes"),
+    )
+    if traffic_total_bytes is None:
+        traffic_total_bytes = _read_qos_number(
+            net_qos,
+            ("traffic_total_bytes", "traffic_bytes", "traffic_limit_bytes"),
+        )
+    if traffic_total_bytes is None:
+        traffic_total_bytes = _read_qos_number(ex, ("qos_traffic_total_bytes", "traffic_total_bytes", "traffic_bytes"))
+    if traffic_total_bytes is None:
+        traffic_total_bytes = _read_qos_number(net, ("qos_traffic_total_bytes", "traffic_total_bytes", "traffic_bytes"))
+
+    traffic_total_gb = _read_qos_number(
+        ex_qos,
+        ("traffic_total_gb", "traffic_gb", "traffic_limit_gb"),
+    )
+    if traffic_total_gb is None:
+        traffic_total_gb = _read_qos_number(
+            net_qos,
+            ("traffic_total_gb", "traffic_gb", "traffic_limit_gb"),
+        )
+    if traffic_total_gb is None:
+        traffic_total_gb = _read_qos_number(ex, ("qos_traffic_total_gb", "traffic_total_gb", "traffic_gb"))
+    if traffic_total_gb is None:
+        traffic_total_gb = _read_qos_number(net, ("qos_traffic_total_gb", "traffic_total_gb", "traffic_gb"))
+
+    if traffic_total_bytes is None and traffic_total_gb is not None:
+        try:
+            traffic_total_bytes = int(traffic_total_gb) * 1024 * 1024 * 1024
+        except Exception:
+            traffic_total_bytes = None
+
     return (
         _sanitize_positive(bw_kbps),
         _sanitize_positive(max_conns),
         _sanitize_positive(conn_rate),
+        _sanitize_positive(traffic_total_bytes),
     )
 
 
@@ -193,8 +229,8 @@ def policies_from_pool(pool: Dict[str, Any]) -> Tuple[List[QoSPolicy], List[str]
         if port <= 0 or port > 65535:
             continue
 
-        bw_kbps, max_conns, conn_rate = _extract_qos(ep)
-        if bw_kbps is None and max_conns is None and conn_rate is None:
+        bw_kbps, max_conns, conn_rate, traffic_total_bytes = _extract_qos(ep)
+        if bw_kbps is None and max_conns is None and conn_rate is None and traffic_total_bytes is None:
             continue
 
         pset = _proto_set(ep.get("protocol"))
@@ -206,6 +242,7 @@ def policies_from_pool(pool: Dict[str, Any]) -> Tuple[List[QoSPolicy], List[str]
                 bandwidth_kbps=bw_kbps,
                 max_conns=max_conns,
                 conn_rate=conn_rate,
+                traffic_total_bytes=traffic_total_bytes,
             )
             continue
 
@@ -217,6 +254,12 @@ def policies_from_pool(pool: Dict[str, Any]) -> Tuple[List[QoSPolicy], List[str]
             cur.max_conns = max_conns if cur.max_conns is None else min(cur.max_conns, max_conns)
         if conn_rate is not None:
             cur.conn_rate = conn_rate if cur.conn_rate is None else min(cur.conn_rate, conn_rate)
+        if traffic_total_bytes is not None:
+            cur.traffic_total_bytes = (
+                traffic_total_bytes
+                if cur.traffic_total_bytes is None
+                else min(cur.traffic_total_bytes, traffic_total_bytes)
+            )
         warnings.append(f"端口 {port} 存在多条 QoS 规则，已自动合并为更严格限制（endpoints[{idx}]）")
 
     return sorted(by_port.values(), key=lambda x: x.port), warnings
@@ -234,6 +277,7 @@ def _copy_policy(
         bandwidth_kbps=int(p.bandwidth_kbps) if (keep_bandwidth and p.bandwidth_kbps is not None) else None,
         max_conns=int(p.max_conns) if (keep_conn_controls and p.max_conns is not None) else None,
         conn_rate=int(p.conn_rate) if (keep_conn_controls and p.conn_rate is not None) else None,
+        traffic_total_bytes=int(p.traffic_total_bytes) if p.traffic_total_bytes is not None else None,
     )
 
 
@@ -860,6 +904,7 @@ def apply_qos_from_pool(pool: Dict[str, Any]) -> Dict[str, Any]:
                 "bandwidth_kbps": p.bandwidth_kbps,
                 "max_conns": p.max_conns,
                 "conn_rate": p.conn_rate,
+                "traffic_total_bytes": p.traffic_total_bytes,
             }
             for p in policies
         ],

@@ -198,7 +198,151 @@ CREATE TABLE IF NOT EXISTS rule_stats_samples (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_rule_stats_samples_unique ON rule_stats_samples(node_id, rule_key, ts_ms);
 CREATE INDEX IF NOT EXISTS idx_rule_stats_samples_node_ts ON rule_stats_samples(node_id, ts_ms);
 CREATE INDEX IF NOT EXISTS idx_rule_stats_samples_node_rule_ts ON rule_stats_samples(node_id, rule_key, ts_ms);
+
+-- Rule ownership mapping (for per-subaccount traffic accounting)
+CREATE TABLE IF NOT EXISTS rule_owner_map (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  node_id INTEGER NOT NULL,
+  rule_key TEXT NOT NULL,
+  owner_user_id INTEGER NOT NULL DEFAULT 0,
+  owner_username TEXT NOT NULL DEFAULT '',
+  first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+  active INTEGER NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rule_owner_map_unique ON rule_owner_map(node_id, rule_key);
+CREATE INDEX IF NOT EXISTS idx_rule_owner_map_owner ON rule_owner_map(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_rule_owner_map_node_owner ON rule_owner_map(node_id, owner_user_id);
+
+-- Auth / RBAC
+CREATE TABLE IF NOT EXISTS roles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL DEFAULT '',
+  permissions_json TEXT NOT NULL DEFAULT '[]',
+  builtin INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_roles_name ON roles(name);
+
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL UNIQUE,
+  salt_b64 TEXT NOT NULL,
+  hash_b64 TEXT NOT NULL,
+  iterations INTEGER NOT NULL DEFAULT 120000,
+  role_id INTEGER NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  expires_at TEXT,
+  policy_json TEXT NOT NULL DEFAULT '{}',
+  last_login_at TEXT,
+  created_by TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(role_id) REFERENCES roles(id)
+);
+CREATE INDEX IF NOT EXISTS idx_users_role_id ON users(role_id);
+CREATE INDEX IF NOT EXISTS idx_users_enabled ON users(enabled);
+
+CREATE TABLE IF NOT EXISTS user_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  token_sha256 TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL DEFAULT '',
+  scopes_json TEXT NOT NULL DEFAULT '[]',
+  expires_at TEXT,
+  last_used_at TEXT,
+  created_by TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  revoked_at TEXT,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_user_tokens_user_id ON user_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_tokens_expires_at ON user_tokens(expires_at);
 """
+
+BUILTIN_ROLE_DEFS: Dict[str, Dict[str, Any]] = {
+    "owner": {
+        "description": "系统所有者（全部权限）",
+        "permissions": ["*"],
+        "builtin": 1,
+    },
+    "admin": {
+        "description": "管理员（不含用户/角色管理）",
+        "permissions": [
+            "panel.view",
+            "nodes.*",
+            "publish.apply",
+            "groups.write",
+            "sync.*",
+            "websites.*",
+            "cert.manage",
+            "files.*",
+            "netmon.*",
+            "agents.*",
+            "backup.manage",
+            "restore.manage",
+        ],
+        "builtin": 1,
+    },
+    "operator": {
+        "description": "运维（节点/发布/网站管理）",
+        "permissions": [
+            "panel.view",
+            "nodes.read",
+            "nodes.write",
+            "publish.apply",
+            "sync.*",
+            "websites.*",
+            "cert.manage",
+            "files.*",
+            "netmon.*",
+            "agents.read",
+            "backup.manage",
+        ],
+        "builtin": 1,
+    },
+    "forwarder": {
+        "description": "转发操作员（仅转发与发布）",
+        "permissions": [
+            "panel.view",
+            "nodes.read",
+            "publish.apply",
+            "sync.wss",
+            "sync.intranet",
+            "sync.delete",
+            "sync.job.read",
+        ],
+        "builtin": 1,
+    },
+    "viewer": {
+        "description": "只读观察员",
+        "permissions": [
+            "panel.view",
+            "nodes.read",
+            "websites.read",
+            "files.read",
+            "netmon.read",
+            "agents.read",
+            "sync.job.read",
+        ],
+        "builtin": 1,
+    },
+}
+
+
+def _normalize_permissions(perms: Any) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    seq = perms if isinstance(perms, list) else []
+    for p in seq:
+        name = str(p or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
 
 
 def ensure_parent_dir(path: str) -> None:
@@ -377,6 +521,98 @@ def ensure_db(db_path: str = DEFAULT_DB_PATH) -> None:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_rule_stats_samples_node_rule_ts ON rule_stats_samples(node_id, rule_key, ts_ms)"
             )
+        except Exception:
+            pass
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS rule_owner_map ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "node_id INTEGER NOT NULL,"
+                "rule_key TEXT NOT NULL,"
+                "owner_user_id INTEGER NOT NULL DEFAULT 0,"
+                "owner_username TEXT NOT NULL DEFAULT '',"
+                "first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),"
+                "last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),"
+                "active INTEGER NOT NULL DEFAULT 1"
+                ")"
+            )
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_rule_owner_map_unique ON rule_owner_map(node_id, rule_key)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_rule_owner_map_owner ON rule_owner_map(owner_user_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_rule_owner_map_node_owner ON rule_owner_map(node_id, owner_user_id)")
+        except Exception:
+            pass
+
+        # Auth/RBAC tables migrations
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS roles ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "name TEXT NOT NULL UNIQUE,"
+                "description TEXT NOT NULL DEFAULT '',"
+                "permissions_json TEXT NOT NULL DEFAULT '[]',"
+                "builtin INTEGER NOT NULL DEFAULT 0,"
+                "created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+                "updated_at TEXT NOT NULL DEFAULT (datetime('now'))"
+                ")"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_roles_name ON roles(name)")
+        except Exception:
+            pass
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS users ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "username TEXT NOT NULL UNIQUE,"
+                "salt_b64 TEXT NOT NULL,"
+                "hash_b64 TEXT NOT NULL,"
+                "iterations INTEGER NOT NULL DEFAULT 120000,"
+                "role_id INTEGER NOT NULL,"
+                "enabled INTEGER NOT NULL DEFAULT 1,"
+                "expires_at TEXT,"
+                "policy_json TEXT NOT NULL DEFAULT '{}',"
+                "last_login_at TEXT,"
+                "created_by TEXT NOT NULL DEFAULT '',"
+                "created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+                "updated_at TEXT NOT NULL DEFAULT (datetime('now')),"
+                "FOREIGN KEY(role_id) REFERENCES roles(id)"
+                ")"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role_id ON users(role_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_users_enabled ON users(enabled)")
+            ucols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+            if ucols:
+                if "policy_json" not in ucols:
+                    conn.execute("ALTER TABLE users ADD COLUMN policy_json TEXT NOT NULL DEFAULT '{}'")
+                if "expires_at" not in ucols:
+                    conn.execute("ALTER TABLE users ADD COLUMN expires_at TEXT")
+                if "enabled" not in ucols:
+                    conn.execute("ALTER TABLE users ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+                if "last_login_at" not in ucols:
+                    conn.execute("ALTER TABLE users ADD COLUMN last_login_at TEXT")
+        except Exception:
+            pass
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS user_tokens ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "user_id INTEGER NOT NULL,"
+                "token_sha256 TEXT NOT NULL UNIQUE,"
+                "name TEXT NOT NULL DEFAULT '',"
+                "scopes_json TEXT NOT NULL DEFAULT '[]',"
+                "expires_at TEXT,"
+                "last_used_at TEXT,"
+                "created_by TEXT NOT NULL DEFAULT '',"
+                "created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+                "revoked_at TEXT,"
+                "FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE"
+                ")"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_user_tokens_user_id ON user_tokens(user_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_user_tokens_expires_at ON user_tokens(expires_at)")
+        except Exception:
+            pass
+        try:
+            _ensure_builtin_roles_conn(conn)
         except Exception:
             pass
         conn.commit()
@@ -2063,6 +2299,17 @@ def list_tasks(
     return out
 
 
+def get_task(task_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (int(task_id),)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["payload"] = _json_loads(str(d.get("payload_json") or "{}"), {})
+    d["result"] = _json_loads(str(d.get("result_json") or "{}"), {})
+    return d
+
+
 def add_task(
     node_id: int,
     task_type: str,
@@ -2122,3 +2369,576 @@ def update_task(
             (*params, int(task_id)),
         )
         conn.commit()
+
+
+# =========================
+# Auth / RBAC
+# =========================
+
+def _ensure_builtin_roles_conn(conn: sqlite3.Connection) -> None:
+    for name, info in BUILTIN_ROLE_DEFS.items():
+        desc = str(info.get("description") or "").strip()
+        perms = _normalize_permissions(info.get("permissions") or [])
+        perms_json = json.dumps(perms, ensure_ascii=False)
+        builtin = 1 if bool(info.get("builtin")) else 0
+        row = conn.execute("SELECT id, builtin FROM roles WHERE name=?", (name,)).fetchone()
+        if row:
+            role_id = int(row["id"])
+            is_builtin = int(row["builtin"] or 0) == 1
+            if is_builtin:
+                conn.execute(
+                    "UPDATE roles SET description=?, permissions_json=?, builtin=?, updated_at=datetime('now') WHERE id=?",
+                    (desc, perms_json, builtin, role_id),
+                )
+            continue
+        conn.execute(
+            "INSERT INTO roles(name, description, permissions_json, builtin, created_at, updated_at) "
+            "VALUES(?,?,?,?,datetime('now'),datetime('now'))",
+            (name, desc, perms_json, builtin),
+        )
+
+
+def ensure_builtin_roles(db_path: str = DEFAULT_DB_PATH) -> None:
+    with connect(db_path) as conn:
+        _ensure_builtin_roles_conn(conn)
+        conn.commit()
+
+
+def _parse_role_row(row: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(row)
+    perms = _json_loads(str(d.get("permissions_json") or "[]"), [])
+    if not isinstance(perms, list):
+        perms = []
+    d["permissions"] = _normalize_permissions(perms)
+    d["builtin"] = bool(d.get("builtin") or 0)
+    return d
+
+
+def list_roles(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM roles ORDER BY builtin DESC, id ASC").fetchall()
+    return [_parse_role_row(r) for r in rows]
+
+
+def get_role_by_id(role_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM roles WHERE id=?", (int(role_id),)).fetchone()
+    return _parse_role_row(row) if row else None
+
+
+def get_role_by_name(name: str, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    role_name = str(name or "").strip()
+    if not role_name:
+        return None
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM roles WHERE name=?", (role_name,)).fetchone()
+    return _parse_role_row(row) if row else None
+
+
+def upsert_role(
+    name: str,
+    permissions: List[str],
+    description: str = "",
+    builtin: bool = False,
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    role_name = str(name or "").strip()
+    if not role_name:
+        raise ValueError("role name required")
+    perms = _normalize_permissions(permissions or [])
+    payload = json.dumps(perms, ensure_ascii=False)
+    desc = str(description or "").strip()
+    builtin_flag = 1 if bool(builtin) else 0
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT id FROM roles WHERE name=?", (role_name,)).fetchone()
+        if row:
+            role_id = int(row["id"])
+            conn.execute(
+                "UPDATE roles SET description=?, permissions_json=?, builtin=?, updated_at=datetime('now') WHERE id=?",
+                (desc, payload, builtin_flag, role_id),
+            )
+            conn.commit()
+            return role_id
+        cur = conn.execute(
+            "INSERT INTO roles(name, description, permissions_json, builtin, created_at, updated_at) "
+            "VALUES(?,?,?,?,datetime('now'),datetime('now'))",
+            (role_name, desc, payload, builtin_flag),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def count_users(enabled_only: bool = False, db_path: str = DEFAULT_DB_PATH) -> int:
+    sql = "SELECT COUNT(1) FROM users"
+    params: Tuple[Any, ...] = ()
+    if enabled_only:
+        sql += " WHERE enabled=1"
+    with connect(db_path) as conn:
+        row = conn.execute(sql, params).fetchone()
+    return int(row[0] if row else 0)
+
+
+def _parse_user_row(row: sqlite3.Row, include_secret: bool = False) -> Dict[str, Any]:
+    d = dict(row)
+    policy = _json_loads(str(d.get("policy_json") or "{}"), {})
+    if not isinstance(policy, dict):
+        policy = {}
+    d["policy"] = policy
+    role_perms = _json_loads(str(d.get("role_permissions_json") or "[]"), [])
+    if not isinstance(role_perms, list):
+        role_perms = []
+    d["role_permissions"] = _normalize_permissions(role_perms)
+    d["enabled"] = bool(d.get("enabled") or 0)
+    if not include_secret:
+        d.pop("salt_b64", None)
+        d.pop("hash_b64", None)
+        d.pop("iterations", None)
+    return d
+
+
+def list_users(include_disabled: bool = True, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    sql = (
+        "SELECT u.*, r.name AS role_name, r.permissions_json AS role_permissions_json "
+        "FROM users u LEFT JOIN roles r ON r.id=u.role_id"
+    )
+    params: List[Any] = []
+    if not include_disabled:
+        sql += " WHERE u.enabled=1"
+    sql += " ORDER BY u.id ASC"
+    with connect(db_path) as conn:
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    return [_parse_user_row(r, include_secret=False) for r in rows]
+
+
+def get_user_auth_record_by_username(username: str, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    name = str(username or "").strip()
+    if not name:
+        return None
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT u.*, r.name AS role_name, r.permissions_json AS role_permissions_json "
+            "FROM users u LEFT JOIN roles r ON r.id=u.role_id WHERE u.username=?",
+            (name,),
+        ).fetchone()
+    return _parse_user_row(row, include_secret=True) if row else None
+
+
+def get_user_auth_record_by_id(user_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT u.*, r.name AS role_name, r.permissions_json AS role_permissions_json "
+            "FROM users u LEFT JOIN roles r ON r.id=u.role_id WHERE u.id=?",
+            (int(user_id),),
+        ).fetchone()
+    return _parse_user_row(row, include_secret=True) if row else None
+
+
+def create_user_record(
+    username: str,
+    salt_b64: str,
+    hash_b64: str,
+    iterations: int,
+    role_id: int,
+    enabled: bool = True,
+    expires_at: Optional[str] = None,
+    policy: Optional[Dict[str, Any]] = None,
+    created_by: str = "",
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    uname = str(username or "").strip()
+    if not uname:
+        raise ValueError("username required")
+    payload = _json_dumps(policy or {}, "{}")
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO users("
+            "username, salt_b64, hash_b64, iterations, role_id, enabled, expires_at, "
+            "policy_json, created_by, created_at, updated_at"
+            ") VALUES(?,?,?,?,?,?,?,?,?,datetime('now'),datetime('now'))",
+            (
+                uname,
+                str(salt_b64 or "").strip(),
+                str(hash_b64 or "").strip(),
+                int(iterations or 120000),
+                int(role_id),
+                1 if bool(enabled) else 0,
+                str(expires_at or "").strip() or None,
+                payload,
+                str(created_by or "").strip(),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_user_record(
+    user_id: int,
+    username: Optional[str] = None,
+    salt_b64: Optional[str] = None,
+    hash_b64: Optional[str] = None,
+    iterations: Optional[int] = None,
+    role_id: Optional[int] = None,
+    enabled: Optional[bool] = None,
+    expires_at: Optional[str] = None,
+    policy: Optional[Dict[str, Any]] = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    fields: List[str] = []
+    params: List[Any] = []
+    if username is not None:
+        fields.append("username=?")
+        params.append(str(username or "").strip())
+    if salt_b64 is not None:
+        fields.append("salt_b64=?")
+        params.append(str(salt_b64 or "").strip())
+    if hash_b64 is not None:
+        fields.append("hash_b64=?")
+        params.append(str(hash_b64 or "").strip())
+    if iterations is not None:
+        fields.append("iterations=?")
+        params.append(int(iterations or 120000))
+    if role_id is not None:
+        fields.append("role_id=?")
+        params.append(int(role_id))
+    if enabled is not None:
+        fields.append("enabled=?")
+        params.append(1 if bool(enabled) else 0)
+    if expires_at is not None:
+        fields.append("expires_at=?")
+        params.append(str(expires_at or "").strip() or None)
+    if policy is not None:
+        fields.append("policy_json=?")
+        params.append(_json_dumps(policy or {}, "{}"))
+    if not fields:
+        return
+    fields.append("updated_at=datetime('now')")
+    params.append(int(user_id))
+    with connect(db_path) as conn:
+        conn.execute(
+            f"UPDATE users SET {', '.join(fields)} WHERE id=?",
+            tuple(params),
+        )
+        conn.commit()
+
+
+def delete_user_record(user_id: int, db_path: str = DEFAULT_DB_PATH) -> int:
+    with connect(db_path) as conn:
+        cur = conn.execute("DELETE FROM users WHERE id=?", (int(user_id),))
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def touch_user_login(user_id: int, db_path: str = DEFAULT_DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE users SET last_login_at=datetime('now'), updated_at=datetime('now') WHERE id=?",
+            (int(user_id),),
+        )
+        conn.commit()
+
+
+def upsert_rule_owner_map(
+    node_id: int,
+    pool: Dict[str, Any],
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    """Upsert node rule ownership map from pool endpoints.
+
+    rule_key aligns with stats history key (currently endpoint.listen).
+    The mapping is intentionally retained even when rules are later deleted,
+    so historical traffic accounting for sub-accounts does not rollback.
+    """
+    try:
+        nid = int(node_id)
+    except Exception:
+        nid = 0
+    if nid <= 0 or not isinstance(pool, dict):
+        return 0
+
+    eps = pool.get("endpoints")
+    if not isinstance(eps, list):
+        return 0
+
+    rows: List[Tuple[int, str, int, str]] = []
+    seen: set[str] = set()
+    for ep in eps:
+        if not isinstance(ep, dict):
+            continue
+        key = str(ep.get("listen") or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+
+        ex = ep.get("extra_config")
+        if not isinstance(ex, dict):
+            ex = {}
+        try:
+            owner_user_id = int(ex.get("owner_user_id") or 0)
+        except Exception:
+            owner_user_id = 0
+        owner_username = str(ex.get("owner_username") or "").strip()
+        if owner_user_id <= 0 and (not owner_username):
+            continue
+        rows.append((nid, key, max(0, owner_user_id), owner_username))
+
+    if not rows:
+        return 0
+
+    affected = 0
+    with connect(db_path) as conn:
+        for nid0, key, uid, uname in rows:
+            cur = conn.execute(
+                "SELECT id, owner_user_id, owner_username FROM rule_owner_map WHERE node_id=? AND rule_key=? LIMIT 1",
+                (nid0, key),
+            )
+            ex = cur.fetchone()
+            if ex:
+                try:
+                    ex_uid = int(ex["owner_user_id"] or 0)
+                except Exception:
+                    ex_uid = 0
+                ex_uname = str(ex["owner_username"] or "").strip()
+                if ex_uid == int(uid) and ex_uname == str(uname or "").strip():
+                    conn.execute(
+                        "UPDATE rule_owner_map SET last_seen_at=datetime('now'), active=1 WHERE id=?",
+                        (int(ex["id"]),),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE rule_owner_map "
+                        "SET owner_user_id=?, owner_username=?, last_seen_at=datetime('now'), active=1 "
+                        "WHERE id=?",
+                        (int(uid), str(uname or "").strip(), int(ex["id"])),
+                    )
+                affected += 1
+                continue
+            conn.execute(
+                "INSERT INTO rule_owner_map("
+                "node_id, rule_key, owner_user_id, owner_username, first_seen_at, last_seen_at, active"
+                ") VALUES(?,?,?,?,datetime('now'),datetime('now'),1)",
+                (int(nid0), str(key), int(uid), str(uname or "").strip()),
+            )
+            affected += 1
+        conn.commit()
+    return int(affected)
+
+
+def sum_user_rule_traffic_bytes(
+    user_id: int,
+    node_ids: Optional[List[int]] = None,
+    since_ts_ms: Optional[int] = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    """Sum rule traffic deltas for one user from owned rules history.
+
+    Computation:
+    - resolve owned (node_id, rule_key) from rule_owner_map
+    - for each key, read samples in window and accumulate positive deltas
+      against previous sample (counter reset => take current as delta)
+    """
+    try:
+        uid = int(user_id)
+    except Exception:
+        uid = 0
+    if uid <= 0:
+        return 0
+
+    cutoff = int(since_ts_ms or 0)
+    scoped_nodes: Optional[set[int]] = None
+    if node_ids is not None:
+        scoped_nodes = set()
+        for nid in node_ids:
+            try:
+                v = int(nid)
+            except Exception:
+                continue
+            if v > 0:
+                scoped_nodes.add(v)
+        if not scoped_nodes:
+            return 0
+
+    total = 0
+    with connect(db_path) as conn:
+        sql = "SELECT node_id, rule_key FROM rule_owner_map WHERE owner_user_id=?"
+        params: List[Any] = [uid]
+        if scoped_nodes is not None:
+            marks = ",".join("?" for _ in scoped_nodes)
+            sql += f" AND node_id IN ({marks})"
+            params.extend(sorted(list(scoped_nodes)))
+        keys = conn.execute(sql, tuple(params)).fetchall()
+
+        for row in keys:
+            try:
+                nid = int(row["node_id"] or 0)
+            except Exception:
+                nid = 0
+            key = str(row["rule_key"] or "").strip()
+            if nid <= 0 or not key:
+                continue
+
+            prev_total: Optional[int] = None
+            if cutoff > 0:
+                r0 = conn.execute(
+                    "SELECT rx_bytes, tx_bytes FROM rule_stats_samples "
+                    "WHERE node_id=? AND rule_key=? AND ts_ms<? "
+                    "ORDER BY ts_ms DESC LIMIT 1",
+                    (nid, key, cutoff),
+                ).fetchone()
+                if r0:
+                    try:
+                        prev_total = int(r0["rx_bytes"] or 0) + int(r0["tx_bytes"] or 0)
+                    except Exception:
+                        prev_total = None
+
+                rows = conn.execute(
+                    "SELECT rx_bytes, tx_bytes FROM rule_stats_samples "
+                    "WHERE node_id=? AND rule_key=? AND ts_ms>=? "
+                    "ORDER BY ts_ms ASC",
+                    (nid, key, cutoff),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT rx_bytes, tx_bytes FROM rule_stats_samples "
+                    "WHERE node_id=? AND rule_key=? "
+                    "ORDER BY ts_ms ASC",
+                    (nid, key),
+                ).fetchall()
+
+            for r in rows:
+                try:
+                    cur_total = int(r["rx_bytes"] or 0) + int(r["tx_bytes"] or 0)
+                except Exception:
+                    cur_total = 0
+                if cur_total < 0:
+                    cur_total = 0
+                if prev_total is None:
+                    prev_total = cur_total
+                    continue
+                if cur_total >= prev_total:
+                    delta = cur_total - prev_total
+                else:
+                    # Counter reset/restart: treat current as new incremental bytes.
+                    delta = cur_total
+                if delta > 0:
+                    total += int(delta)
+                prev_total = cur_total
+    return int(total)
+
+
+def sum_rule_traffic_bytes(
+    node_ids: Optional[List[int]] = None,
+    since_ts_ms: Optional[int] = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    sql = "SELECT COALESCE(SUM(rx_bytes + tx_bytes), 0) FROM rule_stats_samples WHERE 1=1"
+    params: List[Any] = []
+    cutoff = int(since_ts_ms or 0)
+    if cutoff > 0:
+        sql += " AND ts_ms>=?"
+        params.append(cutoff)
+    if node_ids is not None:
+        ids: List[int] = []
+        for nid in node_ids:
+            try:
+                val = int(nid)
+            except Exception:
+                continue
+            if val > 0:
+                ids.append(val)
+        if not ids:
+            return 0
+        marks = ",".join("?" for _ in ids)
+        sql += f" AND node_id IN ({marks})"
+        params.extend(ids)
+    with connect(db_path) as conn:
+        row = conn.execute(sql, tuple(params)).fetchone()
+    try:
+        return int(row[0] or 0) if row else 0
+    except Exception:
+        return 0
+
+
+def create_user_token_record(
+    user_id: int,
+    token_sha256: str,
+    name: str = "",
+    scopes: Optional[List[str]] = None,
+    expires_at: Optional[str] = None,
+    created_by: str = "",
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO user_tokens("
+            "user_id, token_sha256, name, scopes_json, expires_at, created_by, created_at"
+            ") VALUES(?,?,?,?,?,?,datetime('now'))",
+            (
+                int(user_id),
+                str(token_sha256 or "").strip(),
+                str(name or "").strip(),
+                _json_dumps(_normalize_permissions(scopes or []), "[]"),
+                str(expires_at or "").strip() or None,
+                str(created_by or "").strip(),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def list_user_tokens(user_id: int, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id, user_id, name, scopes_json, expires_at, last_used_at, created_by, created_at, revoked_at "
+            "FROM user_tokens WHERE user_id=? ORDER BY id DESC",
+            (int(user_id),),
+        ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        scopes = _json_loads(str(d.get("scopes_json") or "[]"), [])
+        if not isinstance(scopes, list):
+            scopes = []
+        d["scopes"] = _normalize_permissions(scopes)
+        out.append(d)
+    return out
+
+
+def revoke_user_token(token_id: int, db_path: str = DEFAULT_DB_PATH) -> int:
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE user_tokens SET revoked_at=datetime('now') WHERE id=? AND revoked_at IS NULL",
+            (int(token_id),),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def touch_user_token(token_sha256: str, db_path: str = DEFAULT_DB_PATH) -> None:
+    digest = str(token_sha256 or "").strip()
+    if not digest:
+        return
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE user_tokens SET last_used_at=datetime('now') WHERE token_sha256=?",
+            (digest,),
+        )
+        conn.commit()
+
+
+def get_user_token_by_sha256(token_sha256: str, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    digest = str(token_sha256 or "").strip()
+    if not digest:
+        return None
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM user_tokens WHERE token_sha256=?",
+            (digest,),
+        ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    scopes = _json_loads(str(d.get("scopes_json") or "[]"), [])
+    if not isinstance(scopes, list):
+        scopes = []
+    d["scopes"] = _normalize_permissions(scopes)
+    return d

@@ -63,6 +63,27 @@ def enabled() -> bool:
     return bool(_SITE_MONITOR_ENABLED)
 
 
+def _is_agent_unreachable_error(err: Any) -> bool:
+    msg = str(err or "").strip().lower()
+    if not msg:
+        return False
+    tokens = (
+        "all connection attempts failed",
+        "connection refused",
+        "connect timeout",
+        "read timeout",
+        "timed out",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "network is unreachable",
+        "no route to host",
+        "cannot assign requested address",
+        "tls handshake",
+        "ssl:",
+    )
+    return any(t in msg for t in tokens)
+
+
 async def _check_site(site: Dict[str, Any], node: Dict[str, Any]) -> None:
     async with _SEM:
         payload = {
@@ -90,10 +111,21 @@ async def _check_site(site: Dict[str, Any], node: Dict[str, Any]) -> None:
             latency_ms = int(data.get("latency_ms") or 0)
             error = str(data.get("error") or "").strip()
         except Exception as exc:
+            error = str(exc)
+            # Panel -> Agent management path may be temporarily unreachable.
+            # This does not prove the website itself is down, so mark as unknown.
+            if _is_agent_unreachable_error(error):
+                update_site_health(
+                    int(site.get("id") or 0),
+                    "unknown",
+                    health_code=0,
+                    health_latency_ms=0,
+                    health_error=error,
+                )
+                return
             ok = False
             status_code = 0
             latency_ms = 0
-            error = str(exc)
 
         new_status = "ok" if ok else "fail"
         update_site_health(

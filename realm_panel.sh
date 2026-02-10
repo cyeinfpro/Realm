@@ -2,7 +2,11 @@
 set -euo pipefail
 
 VERSION="v38"
-REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
+REPO_ZIP_URL_DEFAULT="https://nexus.infpro.me/nexus/archive/refs/heads/main.zip"
+REPO_BASE_URL_DEFAULT="https://nexus.infpro.me/nexus"
+REPO_MANIFEST_URL_DEFAULT="${REPO_BASE_URL_DEFAULT}/repo.manifest"
+REPO_FETCH_MODE_DEFAULT="manifest"
+REPO_MANIFEST_CONCURRENCY_DEFAULT="8"
 PANEL_ROOT="/opt/realm-panel"
 PANEL_STATIC_REALM_DIR="${PANEL_ROOT}/panel/static/realm"
 PANEL_REQ_STAMP="${PANEL_ROOT}/.requirements.sha256"
@@ -41,12 +45,262 @@ download_file(){
   local url="$1"
   local out="$2"
   local tmp="${out}.tmp"
-  if curl -fL --silent --show-error --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 300 "$url" -o "$tmp"; then
+  if curl -fL --max-redirs 8 --silent --show-error --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 300 "$url" -o "$tmp"; then
     mv -f "$tmp" "$out"
     return 0
   fi
   rm -f "$tmp" || true
   return 1
+}
+
+manifest_concurrency(){
+  local raw="${REPO_MANIFEST_CONCURRENCY:-${REPO_MANIFEST_CONCURRENCY_DEFAULT}}"
+  if [[ ! "${raw}" =~ ^[0-9]+$ ]]; then
+    echo "${REPO_MANIFEST_CONCURRENCY_DEFAULT}"
+    return
+  fi
+  if (( raw < 1 )); then
+    raw=1
+  fi
+  if (( raw > 32 )); then
+    raw=32
+  fi
+  echo "${raw}"
+}
+
+download_repo_manifest_path(){
+  local base_url="${1%/}"
+  local out_dir="$2"
+  local path="$3"
+  local bust="$4"
+  local src="${base_url}/${path}"
+  local dest="${out_dir}/${path}"
+  mkdir -p "$(dirname "${dest}")"
+  if ! download_file "${src}?${bust}" "${dest}"; then
+    if ! download_file "${src}" "${dest}"; then
+      err "下载文件失败：${src}"
+      return 1
+    fi
+  fi
+}
+
+render_manifest_progress(){
+  local done="$1"
+  local total="$2"
+  local width=28
+  local percent filled i
+  local bar=""
+  if (( total <= 0 )); then
+    return
+  fi
+  if (( done < 0 )); then
+    done=0
+  fi
+  if (( done > total )); then
+    done="${total}"
+  fi
+  percent=$(( done * 100 / total ))
+  filled=$(( done * width / total ))
+  for ((i=0; i<filled; i++)); do
+    bar="${bar}#"
+  done
+  for ((i=filled; i<width; i++)); do
+    bar="${bar}-"
+  done
+  printf "\r\033[33m[提示]\033[0m 文件拉取进度 [%s] %3d%% (%d/%d)" "${bar}" "${percent}" "${done}" "${total}" >&2
+  if (( done >= total )); then
+    printf "\n" >&2
+  fi
+}
+
+build_abs_url(){
+  local base_url="${1%/}"
+  local raw="$2"
+  local origin
+  if [[ -z "${raw}" ]]; then
+    echo ""
+    return
+  fi
+  if [[ "${raw}" == http://* || "${raw}" == https://* ]]; then
+    echo "${raw}"
+    return
+  fi
+  origin="$(echo "${base_url}" | sed -E 's#^(https?://[^/]+).*$#\1#')"
+  if [[ "${raw}" == /* ]]; then
+    echo "${origin}${raw}"
+    return
+  fi
+  raw="${raw#./}"
+  echo "${base_url}/${raw}"
+}
+
+probe_url_200(){
+  local url="$1"
+  local code
+  code="$(curl -L --max-redirs 5 --connect-timeout 8 --max-time 20 -s -o /dev/null -w '%{http_code}' "${url}" 2>/dev/null || true)"
+  [[ "${code}" == "200" ]]
+}
+
+discover_repo_zip_url(){
+  local base_url="${1%/}"
+  local -a candidates=()
+  local c
+
+  if [[ -n "${REPO_ZIP_URL:-}" ]]; then
+    echo "${REPO_ZIP_URL}"
+    return 0
+  fi
+
+  candidates+=("${REPO_ZIP_URL_DEFAULT}")
+  candidates+=(
+    "${base_url}/main.zip"
+    "${base_url}/nexus-main.zip"
+    "${base_url}/realm-main.zip"
+    "${base_url}/repo.zip"
+    "${base_url}/latest.zip"
+  )
+
+  if [[ -n "${REPO_ZIP_CANDIDATES:-}" ]]; then
+    local -a extra=()
+    IFS=',' read -r -a extra <<< "${REPO_ZIP_CANDIDATES}"
+    for c in "${extra[@]}"; do
+      c="${c#"${c%%[![:space:]]*}"}"
+      c="${c%"${c##*[![:space:]]}"}"
+      [[ -z "${c}" ]] && continue
+      candidates+=("$(build_abs_url "${base_url}" "${c}")")
+    done
+  fi
+
+  for c in "${candidates[@]}"; do
+    info "探测仓库 ZIP：${c}"
+    if probe_url_200 "${c}"; then
+      echo "${c}"
+      return 0
+    fi
+  done
+
+  # 尝试从目录索引里自动发现 zip（如 nexus-20260210-004312.zip）
+  local index link url
+  local -a discovered=()
+  index="$(curl -L --max-redirs 5 --connect-timeout 8 --max-time 20 -fsSL "${base_url}/" 2>/dev/null || true)"
+  if [[ -n "${index}" ]]; then
+    while IFS= read -r link; do
+      [[ -z "${link}" ]] && continue
+      url="$(build_abs_url "${base_url}" "${link}")"
+      case "${url##*/}" in
+        *.zip|*.ZIP) discovered+=("${url}") ;;
+      esac
+    done < <(printf '%s' "${index}" | grep -oiE 'href="[^"]+"' | sed -E 's/^href="([^"]+)"$/\1/I')
+  fi
+
+  if [[ ${#discovered[@]} -gt 0 ]]; then
+    local best=""
+    local item
+    for item in "${discovered[@]}"; do
+      case "${item##*/}" in
+        *main*.zip|*main*.ZIP|nexus-*.zip|realm-*.zip|*repo*.zip)
+          if [[ -z "${best}" || "${item}" > "${best}" ]]; then
+            best="${item}"
+          fi
+          ;;
+      esac
+    done
+    if [[ -z "${best}" ]]; then
+      for item in "${discovered[@]}"; do
+        if [[ -z "${best}" || "${item}" > "${best}" ]]; then
+          best="${item}"
+        fi
+      done
+    fi
+    if [[ -n "${best}" ]]; then
+      if probe_url_200 "${best}"; then
+        info "已自动识别仓库 ZIP：${best}"
+        echo "${best}"
+        return 0
+      fi
+    fi
+  fi
+
+  return 1
+}
+
+guess_repo_base_from_zip_url(){
+  local zip_url="$1"
+  case "$zip_url" in
+    */archive/refs/heads/*.zip) echo "${zip_url%/archive/refs/heads/*.zip}" ;;
+    */archive/*.zip) echo "${zip_url%/archive/*.zip}" ;;
+    *) echo "${REPO_BASE_URL_DEFAULT}" ;;
+  esac
+}
+
+download_repo_from_manifest(){
+  local base_url="${1%/}"
+  local manifest_url="$2"
+  local out_dir="$3"
+  local manifest_file="${TMPDIR}/repo.manifest"
+  local bust downloaded=0
+  local -a paths=()
+  local concurrency running failed completed
+  bust="ts=$(date +%s)"
+
+  info "拉取仓库文件清单..."
+  if ! download_file "${manifest_url}?${bust}" "${manifest_file}"; then
+    if ! download_file "${manifest_url}" "${manifest_file}"; then
+      err "下载仓库文件清单失败"
+      return 1
+    fi
+  fi
+
+  mkdir -p "${out_dir}"
+  while IFS= read -r path || [[ -n "${path}" ]]; do
+    path="${path%$'\r'}"
+    [[ -z "${path}" ]] && continue
+    [[ "${path}" == \#* ]] && continue
+    if [[ "${path}" == /* || "${path}" == *".."* ]]; then
+      err "清单包含非法路径：${path}"
+      return 1
+    fi
+    paths+=("${path}")
+  done < "${manifest_file}"
+
+  downloaded="${#paths[@]}"
+  if [[ "${downloaded}" -eq 0 ]]; then
+    err "仓库文件清单为空"
+    return 1
+  fi
+
+  concurrency="$(manifest_concurrency)"
+  info "开始拉取文件（并发 ${concurrency}，共 ${downloaded} 个）"
+  running=0
+  failed=0
+  completed=0
+  render_manifest_progress "${completed}" "${downloaded}"
+  for path in "${paths[@]}"; do
+    while (( running >= concurrency )); do
+      if ! wait -n; then
+        failed=1
+      fi
+      running=$((running-1))
+      completed=$((completed+1))
+      render_manifest_progress "${completed}" "${downloaded}"
+    done
+    (
+      download_repo_manifest_path "${base_url}" "${out_dir}" "${path}" "${bust}"
+    ) &
+    running=$((running+1))
+  done
+  while (( running > 0 )); do
+    if ! wait -n; then
+      failed=1
+    fi
+    running=$((running-1))
+    completed=$((completed+1))
+    render_manifest_progress "${completed}" "${downloaded}"
+  done
+  if [[ "${failed}" -ne 0 ]]; then
+    return 1
+  fi
+  ok "仓库文件拉取完成（共 ${downloaded} 个）"
 }
 
 latest_realm_tag(){
@@ -87,7 +341,7 @@ prepare_realm_assets(){
     fi
   fi
 
-  info "拉取 realm 安装文件到面板..."
+  info "同步 realm 二进制到面板..."
   local pids=()
   local names=()
   for arch in "${archs[@]}"; do
@@ -221,17 +475,73 @@ extract_repo(){
     err "创建临时目录失败"
     exit 1
   fi
+  EXTRACT_ROOT="$TMPDIR/extract"
+  mkdir -p "$EXTRACT_ROOT"
   if [[ "$mode" == "online" ]]; then
-    local url="${REPO_ZIP_URL:-$REPO_ZIP_URL_DEFAULT}"
-    info "正在下载仓库..."
-    curl -fsSL "$url" -o "$TMPDIR/repo.zip"
-    zip_path="$TMPDIR/repo.zip"
+    local url repo_base manifest_url fetch_mode
+    local used_manifest="0"
+    local tried_manifest="0"
+    repo_base="${REPO_BASE_URL:-$(guess_repo_base_from_zip_url "${REPO_ZIP_URL:-$REPO_ZIP_URL_DEFAULT}")}"
+    manifest_url="${REPO_MANIFEST_URL:-${repo_base}/repo.manifest}"
+    fetch_mode="${REPO_FETCH_MODE:-${REPO_FETCH_MODE_DEFAULT}}"
+    fetch_mode="$(echo "${fetch_mode}" | tr '[:upper:]' '[:lower:]')"
+    case "${fetch_mode}" in
+      manifest|zip|auto) ;;
+      *) fetch_mode="${REPO_FETCH_MODE_DEFAULT}" ;;
+    esac
+
+    if [[ "${fetch_mode}" != "zip" ]]; then
+      tried_manifest="1"
+      info "优先使用文件清单拉取..."
+      if download_repo_from_manifest "$repo_base" "$manifest_url" "$EXTRACT_ROOT/raw"; then
+        used_manifest="1"
+        EXTRACT_ROOT="$EXTRACT_ROOT/raw"
+      else
+        err "文件清单拉取失败，改用 ZIP 包..."
+      fi
+    fi
+
+    if [[ "${used_manifest}" != "1" ]]; then
+      url="$(discover_repo_zip_url "${repo_base}" || true)"
+      [[ -n "${url}" ]] || url="${REPO_ZIP_URL:-$REPO_ZIP_URL_DEFAULT}"
+      info "正在下载 ZIP 包..."
+      if download_file "$url" "$TMPDIR/repo.zip" && unzip -tq "$TMPDIR/repo.zip" >/dev/null 2>&1; then
+        zip_path="$TMPDIR/repo.zip"
+        info "解压中..."
+        unzip -q "$zip_path" -d "$EXTRACT_ROOT"
+      else
+        if [[ -f "$TMPDIR/repo.zip" ]]; then
+          err "仓库 ZIP 校验失败"
+        fi
+        if [[ "${tried_manifest}" != "1" ]]; then
+          info "ZIP 包不可用，尝试文件清单拉取..."
+          if download_repo_from_manifest "$repo_base" "$manifest_url" "$EXTRACT_ROOT/raw"; then
+            used_manifest="1"
+            EXTRACT_ROOT="$EXTRACT_ROOT/raw"
+          fi
+        fi
+      fi
+    fi
+
+    if [[ "${used_manifest}" != "1" && ! -f "${TMPDIR}/repo.zip" ]]; then
+      err "仓库下载失败：ZIP 与清单模式均不可用"
+      err "可手动指定 REPO_MANIFEST_URL，或设置 REPO_ZIP_URL 为可直接下载的 ZIP"
+      exit 1
+    fi
+    if [[ "${used_manifest}" != "1" && ! -d "${EXTRACT_ROOT}/panel" ]]; then
+      # zip 下载流程在上面已尝试解压；若解压后结构不完整，仍按失败处理。
+      PANEL_DIR="$(find "$EXTRACT_ROOT" -maxdepth 6 -type d -name panel -print -quit)"
+      if [[ -z "$PANEL_DIR" ]]; then
+        err "仓库 ZIP 解压后结构不正确，且清单模式不可用"
+        err "可手动指定 REPO_MANIFEST_URL，或设置 REPO_ZIP_URL 为可直接下载的 ZIP"
+        exit 1
+      fi
+    fi
   else
     [[ -f "$zip_path" ]] || { err "ZIP 文件不存在：$zip_path"; exit 1; }
+    info "解压中..."
+    unzip -q "$zip_path" -d "$EXTRACT_ROOT"
   fi
-  info "解压中..."
-  EXTRACT_ROOT="$TMPDIR/extract"
-  unzip -q "$zip_path" -d "$EXTRACT_ROOT"
   PANEL_DIR="$(find "$EXTRACT_ROOT" -maxdepth 6 -type d -name panel -print -quit)"
   if [[ -z "$PANEL_DIR" ]]; then
     err "找不到 panel 目录。请确认仓库里包含 panel/ 或 realm-pro-suite-vXX/panel/"
@@ -260,7 +570,7 @@ prepare_agent_bundle(){
   fi
   local agent_dir
   agent_dir="$(find_agent_dir "$extract_root")"
-  info "生成 Agent 离线包..."
+  info "打包 Agent 离线安装包..."
   mkdir -p /opt/realm-panel/panel/static
   ( cd "$agent_dir/.." && zip -qr /opt/realm-panel/panel/static/realm-agent.zip "$(basename "$agent_dir")" )
   local script_path
@@ -270,7 +580,7 @@ prepare_agent_bundle(){
     exit 1
   fi
   cp -a "$script_path" /opt/realm-panel/panel/static/realm_agent.sh
-  ok "Agent 离线包已就绪：/opt/realm-panel/panel/static/realm-agent.zip"
+  ok "Agent 离线包就绪：/opt/realm-panel/panel/static/realm-agent.zip"
 }
 
 write_systemd(){
@@ -317,7 +627,7 @@ install_panel(){
     err "解压目录不存在：$EXTRACT_ROOT"
     exit 1
   fi
-  ok "panel 目录：$PANEL_DIR"
+  ok "已定位 panel 目录：$PANEL_DIR"
 
   local user pass port
   user="$(prompt "设置面板登录用户名" "admin")"
@@ -425,8 +735,8 @@ update_panel(){
     err "解压目录不存在：$EXTRACT_ROOT"
     exit 1
   fi
-  ok "panel 目录：$PANEL_DIR"
-  info "更新面板文件..."
+  ok "已定位 panel 目录：$PANEL_DIR"
+  info "更新面板程序文件..."
   rm -rf "${PANEL_ROOT}/panel"
   mkdir -p "${PANEL_ROOT}"
   cp -a "$PANEL_DIR" "${PANEL_ROOT}/panel"

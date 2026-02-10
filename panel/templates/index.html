@@ -1,6 +1,13 @@
 {% extends "base.html" %}
 {% block content %}
 <div id="toast" class="toast" style="display:none;"></div>
+{% set perms = (request.session.get('user_permissions') if request and request.session else []) or [] %}
+{% set can_backup = ('*' in perms) or ('backup.manage' in perms) %}
+{% set can_restore = ('*' in perms) or ('restore.manage' in perms) %}
+{% set can_reset_all = ('*' in perms) or ('nodes.write' in perms) or ('nodes.*' in perms) %}
+{% set can_update_agents = ('*' in perms) or ('agents.write' in perms) or ('agents.*' in perms) %}
+{% set can_add_node = ('*' in perms) or ('nodes.write' in perms) or ('nodes.*' in perms) %}
+{% set can_backup_restore = can_backup or can_restore %}
 
 <div class="page-head">
   <div class="page-title">
@@ -10,16 +17,28 @@
     </div>
   </div>
   <div class="right">
-    <details class="menu">
-      <summary class="btn sm secondary" aria-label="备份与恢复">备份与恢复 ▾</summary>
-      <div class="menu-pop">
-        <button class="menu-item" type="button" onclick="openFullBackupModal()">全量备份</button>
-        <button class="menu-item" type="button" onclick="openRestoreFullModal()">全量恢复</button>
-      </div>
-    </details>
-    <button class="btn sm ghost" type="button" onclick="resetAllTraffic()" title="规则统计清零">一键重置流量</button>
-    <button class="btn sm secondary" type="button" onclick="openAgentUpdateModal()">一键更新 Agent</button>
-    <button class="btn sm" type="button" onclick="openAddNodeModal()">接入节点</button>
+    {% if can_backup_restore %}
+      <details class="menu">
+        <summary class="btn sm secondary" aria-label="备份与恢复">备份与恢复 ▾</summary>
+        <div class="menu-pop">
+          {% if can_backup %}
+            <button class="menu-item" type="button" onclick="openFullBackupModal()">全量备份</button>
+          {% endif %}
+          {% if can_restore %}
+            <button class="menu-item" type="button" onclick="openRestoreFullModal()">全量恢复</button>
+          {% endif %}
+        </div>
+      </details>
+    {% endif %}
+    {% if can_reset_all %}
+      <button class="btn sm ghost" type="button" onclick="resetAllTraffic()" title="规则统计清零">一键重置流量</button>
+    {% endif %}
+    {% if can_update_agents %}
+      <button class="btn sm secondary" type="button" onclick="openAgentUpdateModal()">一键更新 Agent</button>
+    {% endif %}
+    {% if can_add_node %}
+      <button class="btn sm" type="button" onclick="openAddNodeModal()">接入节点</button>
+    {% endif %}
   </div>
 </div>
 
@@ -379,5 +398,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=89.0"></script>
+<script src="/static/app.js?v=90.0"></script>
 {% endblock %}

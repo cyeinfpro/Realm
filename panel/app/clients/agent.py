@@ -236,6 +236,26 @@ def _format_agent_error(response: httpx.Response) -> str:
     data = _parse_agent_json(response)
     error: Any = None
     detail: Any = None
+    raw_text = (response.text or "").strip()
+    low_raw = raw_text.lower()
+
+    # Common misconfig: node base_url points to website nginx instead of realm-agent.
+    # Symptom: HTML 404 page like "<center>nginx/1.18.0</center>".
+    if (
+        int(response.status_code or 0) == 404
+        and ("<html" in low_raw or "text/html" in str(response.headers.get("content-type") or "").lower())
+        and "nginx" in low_raw
+    ):
+        req_path = ""
+        try:
+            req_path = str(response.request.url.path or "")
+        except Exception:
+            req_path = ""
+        path_hint = f"（path={req_path}）" if req_path else ""
+        return (
+            "Agent 请求失败（404）：命中了站点 Nginx 页面而不是 Agent API"
+            f"{path_hint}。请检查该节点 base_url 是否指向 Agent 地址/端口（默认 :18700）。"
+        )
 
     if isinstance(data, dict):
         error = data.get("error") or data.get("detail") or data.get("message")
@@ -247,6 +267,19 @@ def _format_agent_error(response: httpx.Response) -> str:
         msg = response.text.strip()
     if not msg:
         msg = f"HTTP {response.status_code}"
+
+    # Older agents (or wrong route) may return 404 Not Found for website APIs.
+    try:
+        req_path = str(response.request.url.path or "")
+    except Exception:
+        req_path = ""
+    if int(response.status_code or 0) == 404 and req_path.startswith("/api/v1/website/"):
+        low_msg = str(msg or "").lower()
+        if "not found" in low_msg:
+            return (
+                "Agent 请求失败（404）：节点不支持该网站 API（可能 Agent 版本过旧）"
+                "，请升级 Agent 到最新版本。"
+            )
 
     # 常见错误码翻译（优先匹配原始 error 码）
     code_map = {

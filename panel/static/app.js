@@ -96,6 +96,53 @@ let SYNC_TASKS = new Map(); // job_id -> task status (sync + pool async jobs)
 let SYNC_PENDING_SUBMITS = new Map(); // kind:sync_id -> {kind,sync_id,created_at}
 const SYNC_TASK_DONE_KEEP_MS = 12000;
 
+function _modePerms(){
+  const raw = (window && window.__MODE_PERMS__ && typeof window.__MODE_PERMS__ === 'object') ? window.__MODE_PERMS__ : {};
+  return {
+    tcp: !!raw.tcp,
+    wss: !!raw.wss,
+    intranet: !!raw.intranet,
+  };
+}
+
+function isModeAllowed(mode){
+  const m = String(mode || '').trim().toLowerCase();
+  const p = _modePerms();
+  if(m === 'wss') return !!p.wss;
+  if(m === 'intranet') return !!p.intranet;
+  return !!p.tcp;
+}
+
+function allowedTunnelModes(){
+  const out = [];
+  if(isModeAllowed('tcp')) out.push('tcp');
+  if(isModeAllowed('wss')) out.push('wss');
+  if(isModeAllowed('intranet')) out.push('intranet');
+  return out;
+}
+
+function defaultTunnelMode(){
+  const arr = allowedTunnelModes();
+  return arr.length ? arr[0] : 'tcp';
+}
+
+function modeDenyReason(mode){
+  const m = String(mode || '').trim().toLowerCase();
+  if(m === 'wss') return '当前账号无 WSS 隧道权限';
+  if(m === 'intranet') return '当前账号无内网穿透权限';
+  return '当前账号无普通转发权限';
+}
+
+function endpointMode(e){
+  const m = wssMode(e);
+  if(m === 'wss' || m === 'intranet') return m;
+  return 'tcp';
+}
+
+function canOperateEndpoint(e){
+  return isModeAllowed(endpointMode(e));
+}
+
 function _nowTs(){
   return Date.now();
 }
@@ -2191,6 +2238,25 @@ function showHealthDetail(idx){
   }
 }
 
+function getTrafficLimitMeta(stats, statsError){
+  if(statsError){
+    return {enabled:false, blocked:false, label:'', title:''};
+  }
+  const limitRaw = Number(stats && stats.traffic_limit_bytes != null ? stats.traffic_limit_bytes : 0);
+  const limitBytes = Number.isFinite(limitRaw) ? Math.max(0, Math.floor(limitRaw)) : 0;
+  if(!(limitBytes > 0)){
+    return {enabled:false, blocked:false, label:'', title:''};
+  }
+  const usedRaw = Number(stats && stats.traffic_used_bytes != null ? stats.traffic_used_bytes : 0);
+  const usedBytes = Number.isFinite(usedRaw) ? Math.max(0, Math.floor(usedRaw)) : 0;
+  const blocked = !!(stats && (stats.traffic_limit_blocked || stats.traffic_limited));
+  const limitTxt = formatBytes(limitBytes);
+  const usedTxt = formatBytes(usedBytes);
+  const label = blocked ? `流量封禁 ${limitTxt}` : `流量上限 ${limitTxt}`;
+  const title = `累计 ${usedTxt} / 上限 ${limitTxt}`;
+  return {enabled:true, blocked, label, title};
+}
+
 function renderRuleCard(e, idx, rowNo, stats, statsError){
   const rx = statsError ? null : (stats.rx_bytes || 0);
   const tx = statsError ? null : (stats.tx_bytes || 0);
@@ -2199,14 +2265,20 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
   const est = statsError ? 0 : (stats.connections_established ?? stats.connections ?? 0);
   const totalStr = total == null ? '—' : formatBytes(total);
   const trafficTitle = (statsError || total == null) ? '' : `title="↓ ${escapeHtml(formatBytes(rx))}  ↑ ${escapeHtml(formatBytes(tx))}"`;
+  const trafficLimitMeta = getTrafficLimitMeta(stats, statsError);
+  const trafficLimitPill = trafficLimitMeta.enabled
+    ? `<span class="pill ${trafficLimitMeta.blocked ? 'bad' : 'warn'}" title="${escapeHtml(trafficLimitMeta.title)}">${escapeHtml(trafficLimitMeta.label)}</span>`
+    : '';
   const healthHtml = renderHealthMobile(stats.health, statsError, idx);
   const adaptiveHtml = renderAdaptiveInfo(e, stats, statsError);
   const activeTitle = statsError ? '' : `title="当前已建立连接：${est}"`;
   const lockInfo = getRuleLockInfo(e);
+  const modeAllowed = canOperateEndpoint(e);
+  const modeReason = modeAllowed ? '' : modeDenyReason(endpointMode(e));
   const key = getRuleKey(e);
   const sel = key && RULE_SELECTED_KEYS.has(key);
-  const selDisabled = !!(lockInfo && lockInfo.locked);
-  const selTitle = selDisabled ? (lockInfo.reason || '该规则已锁定不可批量操作') : '选择该规则（用于批量操作）';
+  const selDisabled = (!!(lockInfo && lockInfo.locked)) || (!modeAllowed);
+  const selTitle = !modeAllowed ? modeReason : (selDisabled ? (lockInfo.reason || '该规则已锁定不可批量操作') : '选择该规则（用于批量操作）');
   const selHtml = `<input type="checkbox" class="rule-select" ${sel ? 'checked' : ''} ${selDisabled ? 'disabled' : ''} title="${escapeHtml(selTitle)}" onchange="setRuleSelectedByIdx(${idx}, this.checked, event)">`;
 
   const fav = isRuleFavorite(e);
@@ -2217,7 +2289,12 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
   const sourceHtml = renderRuleSourceInfo(e);
   const lockBtn = renderRuleLockBtn(e, idx, lockInfo);
 
-  const actionsHtml = (lockInfo && lockInfo.locked) ? `
+  const actionsHtml = (!modeAllowed) ? `
+    <div class="rule-actions">
+      <button class="btn xs icon ghost" title="复制" onclick="copyRule(${idx})">⧉</button>
+      <span class="pill ghost" title="${escapeHtml(modeReason)}">🔒 无权限</span>
+    </div>
+  ` : ((lockInfo && lockInfo.locked) ? `
     <div class="rule-actions">
       <button class="btn xs icon ghost" title="复制" onclick="copyRule(${idx})">⧉</button>
       <button class="btn xs icon ghost" title="备注" onclick="editRemark(${idx}, event)">📝</button>
@@ -2232,7 +2309,7 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
       <button class="btn xs icon ghost" title="删除" onclick="deleteRule(${idx})">🗑</button>
       ${lockBtn || ''}
     </div>
-  `;
+  `);
   return `
   <div class="rule-card">
     <div class="rule-head">
@@ -2251,6 +2328,7 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
       <div class="rule-right">
         <span class="pill ghost" ${activeTitle}>活跃 ${escapeHtml(connActive)}</span>
         <span class="pill ghost" ${trafficTitle}>${escapeHtml(totalStr)}</span>
+        ${trafficLimitPill}
       </div>
     </div>
     <div class="rule-health-block">
@@ -2498,17 +2576,26 @@ function renderRules(){
       const rx = statsError ? null : (stats.rx_bytes || 0);
       const tx = statsError ? null : (stats.tx_bytes || 0);
       const total = (rx == null || tx == null) ? null : rx + tx;
+      const trafficLimitMeta = getTrafficLimitMeta(stats, statsError);
+      const trafficLimitHtml = trafficLimitMeta.enabled
+        ? `<div class="muted sm"><span class="pill xs ${trafficLimitMeta.blocked ? 'bad' : 'warn'}" title="${escapeHtml(trafficLimitMeta.title)}">${escapeHtml(trafficLimitMeta.label)}</span></div>`
+        : '';
       const connActive = statsError ? 0 : (stats.connections_active ?? 0);
       const est = statsError ? 0 : (stats.connections_established ?? stats.connections ?? 0);
       const lockInfo = getRuleLockInfo(e);
+      const modeAllowed = canOperateEndpoint(e);
+      const modeReason = modeAllowed ? '' : modeDenyReason(endpointMode(e));
       const key = getRuleKey(e);
       const sel = key && RULE_SELECTED_KEYS.has(key);
-      const selDisabled = !!(lockInfo && lockInfo.locked);
-      const selTitle = selDisabled ? (lockInfo.reason || '该规则已锁定不可批量操作') : '选择该规则（用于批量操作）';
+      const selDisabled = (!!(lockInfo && lockInfo.locked)) || (!modeAllowed);
+      const selTitle = (!modeAllowed)
+        ? modeReason
+        : (selDisabled ? (lockInfo.reason || '该规则已锁定不可批量操作') : '选择该规则（用于批量操作）');
       const fav = isRuleFavorite(e);
       const remark = getRuleRemark(e);
       const sourceHtml = renderRuleSourceInfo(e);
       const lockBtn = renderRuleLockBtn(e, idx, lockInfo);
+      const noPermPill = !modeAllowed ? `<span class="pill ghost" title="${escapeHtml(modeReason)}">🔒 无权限</span>` : '';
 
       const tr = document.createElement('tr');
       tr.innerHTML = `
@@ -2526,9 +2613,17 @@ function renderRules(){
         </td>
         <td class="health">${healthHtml}${adaptiveHtml}</td>
         <td class="stat" title="当前已建立连接：${escapeHtml(est)}">${statsError ? '—' : escapeHtml(connActive)}</td>
-        <td class="stat" ${statsError || total == null ? '' : `title="↓ ${escapeHtml(formatBytes(rx))}  ↑ ${escapeHtml(formatBytes(tx))}"`}>${total == null ? '—' : formatBytes(total)}</td>
+        <td class="stat" ${statsError || total == null ? '' : `title="↓ ${escapeHtml(formatBytes(rx))}  ↑ ${escapeHtml(formatBytes(tx))}"`}>
+          <div>${total == null ? '—' : formatBytes(total)}</div>
+          ${trafficLimitHtml}
+        </td>
         <td class="actions">
-          ${lockInfo && lockInfo.locked ? `
+          ${!modeAllowed ? `
+            <div class="action-inline">
+              <button class="btn xs icon ghost" title="复制" onclick="copyRule(${idx})">⧉</button>
+              ${noPermPill}
+            </div>
+          ` : (lockInfo && lockInfo.locked ? `
             <div class="action-inline">
               <button class="btn xs icon ghost" title="复制" onclick="copyRule(${idx})">⧉</button>
               <button class="btn xs icon ghost" title="备注" onclick="editRemark(${idx}, event)">📝</button>
@@ -2543,7 +2638,7 @@ function renderRules(){
               <button class="btn xs icon ghost" title="删除" onclick="deleteRule(${idx})">🗑</button>
               ${lockBtn || ''}
             </div>
-          `}
+          `)}
         </td>
       `;
       tbody.appendChild(tr);
@@ -2989,6 +3084,32 @@ function collectQosFromEndpoint(e){
   if(Number.isFinite(connRate) && connRate > 0){
     out.conn_rate = connRate;
   }
+
+  const trafficBytesRaw = pick([
+    'traffic_total_bytes',
+    'traffic_bytes',
+    'traffic_limit_bytes',
+    'qos_traffic_total_bytes',
+  ]);
+  const trafficGbRaw = pick([
+    'traffic_total_gb',
+    'traffic_gb',
+    'traffic_limit_gb',
+    'qos_traffic_total_gb',
+  ]);
+  let trafficBytes = parseInt(String(trafficBytesRaw != null ? trafficBytesRaw : ''), 10);
+  if(!(Number.isFinite(trafficBytes) && trafficBytes > 0)){
+    trafficBytes = 0;
+  }
+  if(!(trafficBytes > 0)){
+    const trafficGb = parseInt(String(trafficGbRaw != null ? trafficGbRaw : ''), 10);
+    if(Number.isFinite(trafficGb) && trafficGb > 0){
+      trafficBytes = trafficGb * 1024 * 1024 * 1024;
+    }
+  }
+  if(trafficBytes > 0){
+    out.traffic_total_bytes = trafficBytes;
+  }
   return out;
 }
 
@@ -3003,6 +3124,12 @@ function fillQosFields(e){
 
   const connRate = parseInt(String(qos.conn_rate || '0'), 10);
   if(q('f_qos_conn_rate')) setField('f_qos_conn_rate', Number.isFinite(connRate) && connRate > 0 ? connRate : '');
+
+  const trafficBytes = parseInt(String(qos.traffic_total_bytes || '0'), 10);
+  const trafficGb = Number.isFinite(trafficBytes) && trafficBytes > 0
+    ? Math.max(1, Math.round(trafficBytes / (1024 * 1024 * 1024)))
+    : '';
+  if(q('f_qos_traffic_total_gb')) setField('f_qos_traffic_total_gb', trafficGb);
 }
 
 function readQosFields(){
@@ -3023,6 +3150,12 @@ function readQosFields(){
   if(q3.error) return {ok:false, error:q3.error};
   if(q3.set && q3.value > 0){
     qos.conn_rate = q3.value;
+  }
+
+  const q4 = readNonnegIntInput('f_qos_traffic_total_gb', '总流量上限');
+  if(q4.error) return {ok:false, error:q4.error};
+  if(q4.set && q4.value > 0){
+    qos.traffic_total_bytes = q4.value * 1024 * 1024 * 1024;
   }
   return {ok:true, qos};
 }
@@ -3207,7 +3340,12 @@ function showWssBox(){
 // -------------------- Tunnel mode UX (3 modes) --------------------
 
 function setTunnelMode(mode){
-  const m = ['tcp','wss','intranet'].includes(String(mode||'').trim()) ? String(mode||'').trim() : 'tcp';
+  const req = ['tcp','wss','intranet'].includes(String(mode||'').trim()) ? String(mode||'').trim() : defaultTunnelMode();
+  const m = isModeAllowed(req) ? req : defaultTunnelMode();
+  if(!isModeAllowed(m)){
+    toast('当前账号无可用转发模式', true);
+    return;
+  }
   if(q('f_type')) q('f_type').value = m;
   showWssBox();
 }
@@ -3216,7 +3354,14 @@ function setTunnelMode(mode){
 function syncTunnelModeUI(){
   const sel = q('f_type');
   if(!sel) return;
-  const mode = String(sel.value || 'tcp').trim() || 'tcp';
+  let mode = String(sel.value || 'tcp').trim() || 'tcp';
+  if(!isModeAllowed(mode)){
+    const fallback = defaultTunnelMode();
+    if(isModeAllowed(fallback)){
+      mode = fallback;
+      sel.value = fallback;
+    }
+  }
 
   // Compact mode pill (params screen)
   const modePill = document.getElementById('currentModePill');
@@ -3233,6 +3378,11 @@ function syncTunnelModeUI(){
   if(wrap){
     wrap.querySelectorAll('.mode-card').forEach((btn)=>{
       const m = btn.getAttribute('data-mode');
+      if(!isModeAllowed(m)){
+        btn.style.display = 'none';
+        return;
+      }
+      btn.style.display = '';
       btn.classList.toggle('active', m === mode);
     });
   }
@@ -3722,6 +3872,10 @@ function findPortConflict(newListen, newProtocol, skipIdx){
 }
 
 function newRule(){
+  if(allowedTunnelModes().length <= 0){
+    toast('当前账号无可用转发模式', true);
+    return;
+  }
   CURRENT_EDIT_INDEX = -1;
   q('modalTitle').textContent = '新增规则';
 
@@ -3744,7 +3898,7 @@ function newRule(){
   q('f_protocol').value = 'tcp+udp';
 
   // Mode default
-  q('f_type').value = 'tcp';
+  q('f_type').value = defaultTunnelMode();
 
   // reset autosync receiver fields
   if(q('f_wss_receiver_node')) setField('f_wss_receiver_node','');
@@ -3770,6 +3924,10 @@ function copyRule(idx){
   const eps = (CURRENT_POOL && Array.isArray(CURRENT_POOL.endpoints)) ? CURRENT_POOL.endpoints : [];
   const src = eps[idx];
   if(!src) return;
+  if(!canOperateEndpoint(src)){
+    toast(modeDenyReason(endpointMode(src)), true);
+    return;
+  }
 
   // Copy means "new", so clear edit index to avoid overwriting existing
   CURRENT_EDIT_INDEX = -1;
@@ -3935,6 +4093,10 @@ window.toggleRuleTempUnlock = toggleRuleTempUnlock;
 function editRule(idx){
   CURRENT_EDIT_INDEX = idx;
   const e = CURRENT_POOL.endpoints[idx];
+  if(!canOperateEndpoint(e)){
+    toast(modeDenyReason(endpointMode(e)), true);
+    return;
+  }
   const ex = (e && e.extra_config) ? e.extra_config : {};
 
   // Auto-sync generated rules are read-only (receiver/client side)
@@ -4057,6 +4219,10 @@ async function toggleRule(idx){
   const e = eps[idx];
   if(!e){
     toast('规则不存在或已删除', true);
+    return;
+  }
+  if(!canOperateEndpoint(e)){
+    toast(modeDenyReason(endpointMode(e)), true);
     return;
   }
   const ex = (e && e.extra_config) ? e.extra_config : {};
@@ -4192,6 +4358,10 @@ async function editRemark(idx, ev){
   const eps = (CURRENT_POOL && CURRENT_POOL.endpoints) ? CURRENT_POOL.endpoints : [];
   const e = eps[idx];
   if(!e) return;
+  if(!canOperateEndpoint(e)){
+    toast(modeDenyReason(endpointMode(e)), true);
+    return;
+  }
 
   const next = prompt('规则备注（用于搜索/筛选，可留空清除）：', getRuleRemark(e));
   if(next === null) return;
@@ -4220,6 +4390,10 @@ async function deleteRule(idx){
   const e = eps[idx];
   if(!e){
     toast('规则不存在或已删除', true);
+    return;
+  }
+  if(!canOperateEndpoint(e)){
+    toast(modeDenyReason(endpointMode(e)), true);
     return;
   }
   const ex = (e && e.extra_config) ? e.extra_config : {};
@@ -4310,6 +4484,10 @@ async function bulkSetDisabled(disabled){
     for(const it of items){
       const e = it.e;
       if(!e) continue;
+      if(!canOperateEndpoint(e)){
+        skipped += 1;
+        continue;
+      }
       const li = getRuleLockInfo(e);
       if(li && li.locked){
         skipped += 1;
@@ -4455,6 +4633,10 @@ async function bulkDeleteSelected(){
     for(const it of items){
       const e = it.e;
       if(!e) continue;
+      if(!canOperateEndpoint(e)){
+        skipped += 1;
+        continue;
+      }
       const li = getRuleLockInfo(e);
       if(li && li.locked){
         skipped += 1;
@@ -4522,6 +4704,10 @@ window.bulkDeleteSelected = bulkDeleteSelected;
 
 async function saveRule(){
   const typeSel = q('f_type').value;
+  if(!isModeAllowed(typeSel)){
+    toast(modeDenyReason(typeSel), true);
+    return;
+  }
   // Listen: port-only UI
   syncListenComputed();
   const listen = getListenString();
@@ -6254,6 +6440,20 @@ async function refreshSys(){
 
 
 function initNodePage(){
+  try{
+    const selMode = q('f_type');
+    if(selMode){
+      Array.from(selMode.options || []).forEach((opt)=>{
+        const mv = String((opt && opt.value) || '').trim();
+        if(!mv) return;
+        opt.disabled = !isModeAllowed(mv);
+      });
+      if(!isModeAllowed(String(selMode.value || '').trim())){
+        selMode.value = defaultTunnelMode();
+      }
+    }
+  }catch(_e){}
+
   // Compact "last seen" time in header (and anywhere with data-last-seen)
   try{ refreshDashboardLastSeenShort(); }catch(_e){}
   setInterval(()=>{ try{ refreshDashboardLastSeenShort(); }catch(_e){} }, 5000);

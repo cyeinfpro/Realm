@@ -47,24 +47,49 @@
       {% set nav_active = 'websites' %}
     {% elif p.startswith('/netmon') %}
       {% set nav_active = 'netmon' %}
+    {% elif p.startswith('/users') %}
+      {% set nav_active = 'users' %}
     {% endif %}
+    {% set perms = (request.session.get('user_permissions') if request and request.session else []) or [] %}
+    {% set can_dashboard = ('*' in perms) or ('nodes.read' in perms) or ('nodes.*' in perms) %}
+    {% set can_websites = ('*' in perms) or ('websites.read' in perms) or ('websites.write' in perms) or ('websites.*' in perms) or ('files.read' in perms) or ('files.write' in perms) or ('files.*' in perms) or ('cert.manage' in perms) %}
+    {% set can_netmon = ('*' in perms) or ('netmon.read' in perms) or ('netmon.*' in perms) %}
+    {% set can_users = ('*' in perms) or ('users.manage' in perms) %}
 
     <div class="top-actions">
       <nav class="nav">
         {% if user %}
           <div class="nav-desktop">
-            <a href="/" class="nav-link {{ 'active' if nav_active == 'dashboard' else '' }}">控制台</a>
-            <a href="/websites" class="nav-link {{ 'active' if nav_active == 'websites' else '' }}">网站管理</a>
-            <a href="/netmon" class="nav-link {{ 'active' if nav_active == 'netmon' else '' }}">网络波动</a>
+            {% if can_dashboard %}
+              <a href="/" class="nav-link {{ 'active' if nav_active == 'dashboard' else '' }}">控制台</a>
+            {% endif %}
+            {% if can_websites %}
+              <a href="/websites" class="nav-link {{ 'active' if nav_active == 'websites' else '' }}">网站管理</a>
+            {% endif %}
+            {% if can_netmon %}
+              <a href="/netmon" class="nav-link {{ 'active' if nav_active == 'netmon' else '' }}">网络波动</a>
+            {% endif %}
+            {% if can_users %}
+              <a href="/users" class="nav-link {{ 'active' if nav_active == 'users' else '' }}">用户权限</a>
+            {% endif %}
             <a href="/logout" class="nav-link">退出</a>
           </div>
 
           <details class="menu nav-mobile">
             <summary class="btn icon xs ghost" aria-label="菜单">☰</summary>
             <div class="menu-pop">
-              <a href="/" class="menu-item {{ 'active' if nav_active == 'dashboard' else '' }}">控制台</a>
-              <a href="/websites" class="menu-item {{ 'active' if nav_active == 'websites' else '' }}">网站管理</a>
-              <a href="/netmon" class="menu-item {{ 'active' if nav_active == 'netmon' else '' }}">网络波动</a>
+              {% if can_dashboard %}
+                <a href="/" class="menu-item {{ 'active' if nav_active == 'dashboard' else '' }}">控制台</a>
+              {% endif %}
+              {% if can_websites %}
+                <a href="/websites" class="menu-item {{ 'active' if nav_active == 'websites' else '' }}">网站管理</a>
+              {% endif %}
+              {% if can_netmon %}
+                <a href="/netmon" class="menu-item {{ 'active' if nav_active == 'netmon' else '' }}">网络波动</a>
+              {% endif %}
+              {% if can_users %}
+                <a href="/users" class="menu-item {{ 'active' if nav_active == 'users' else '' }}">用户权限</a>
+              {% endif %}
               <div class="menu-sep"></div>
               <a href="/logout" class="menu-item">退出</a>
             </div>

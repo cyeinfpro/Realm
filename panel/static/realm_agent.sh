@@ -2,7 +2,10 @@
 set -euo pipefail
 
 VERSION="v40"
-REPO_ZIP_URL_DEFAULT="https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
+REPO_ZIP_URL_DEFAULT="https://nexus.infpro.me/nexus/archive/refs/heads/main.zip"
+REPO_BASE_URL_DEFAULT="https://nexus.infpro.me/nexus"
+REPO_MANIFEST_URL_DEFAULT="${REPO_BASE_URL_DEFAULT}/repo.manifest"
+REPO_MANIFEST_CONCURRENCY_DEFAULT="8"
 DEFAULT_MODE="1"
 DEFAULT_PORT="18700"
 DEFAULT_HOST="0.0.0.0"
@@ -151,6 +154,158 @@ apt_install(){
 
 command_exists(){
   command -v "$1" >/dev/null 2>&1
+}
+
+download_file(){
+  local url="$1"
+  local out="$2"
+  local tmp="${out}.tmp"
+  if curl -fL --max-redirs 8 --silent --show-error --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 300 "$url" -o "$tmp"; then
+    mv -f "$tmp" "$out"
+    return 0
+  fi
+  rm -f "$tmp" || true
+  return 1
+}
+
+manifest_concurrency(){
+  local raw="${REPO_MANIFEST_CONCURRENCY:-${REPO_MANIFEST_CONCURRENCY_DEFAULT}}"
+  if [[ ! "${raw}" =~ ^[0-9]+$ ]]; then
+    echo "${REPO_MANIFEST_CONCURRENCY_DEFAULT}"
+    return
+  fi
+  if (( raw < 1 )); then
+    raw=1
+  fi
+  if (( raw > 32 )); then
+    raw=32
+  fi
+  echo "${raw}"
+}
+
+download_repo_manifest_path(){
+  local base_url="${1%/}"
+  local out_dir="$2"
+  local path="$3"
+  local bust="$4"
+  local src="${base_url}/${path}"
+  local dest="${out_dir}/${path}"
+  mkdir -p "$(dirname "${dest}")"
+  if ! download_file "${src}?${bust}" "${dest}"; then
+    if ! download_file "${src}" "${dest}"; then
+      err "下载文件失败：${src}"
+      return 1
+    fi
+  fi
+}
+
+render_manifest_progress(){
+  local done="$1"
+  local total="$2"
+  local width=28
+  local percent filled i
+  local bar=""
+  if (( total <= 0 )); then
+    return
+  fi
+  if (( done < 0 )); then
+    done=0
+  fi
+  if (( done > total )); then
+    done="${total}"
+  fi
+  percent=$(( done * 100 / total ))
+  filled=$(( done * width / total ))
+  for ((i=0; i<filled; i++)); do
+    bar="${bar}#"
+  done
+  for ((i=filled; i<width; i++)); do
+    bar="${bar}-"
+  done
+  printf "\r[提示] 文件拉取进度 [%s] %3d%% (%d/%d)" "${bar}" "${percent}" "${done}" "${total}"
+  if (( done >= total )); then
+    printf "\n"
+  fi
+}
+
+guess_repo_base_from_zip_url(){
+  local zip_url="$1"
+  case "$zip_url" in
+    */archive/refs/heads/*.zip) echo "${zip_url%/archive/refs/heads/*.zip}" ;;
+    */archive/*.zip) echo "${zip_url%/archive/*.zip}" ;;
+    */static/realm-agent.zip) echo "${zip_url%/static/realm-agent.zip}" ;;
+    *) echo "${REPO_BASE_URL_DEFAULT}" ;;
+  esac
+}
+
+download_repo_from_manifest(){
+  local base_url="${1%/}"
+  local manifest_url="$2"
+  local out_dir="$3"
+  local manifest_file="${out_dir}/repo.manifest"
+  local bust downloaded=0
+  local -a paths=()
+  local concurrency running failed completed
+  bust="ts=$(date +%s)"
+  mkdir -p "${out_dir}"
+
+  info "拉取仓库文件清单..."
+  if ! download_file "${manifest_url}?${bust}" "${manifest_file}"; then
+    if ! download_file "${manifest_url}" "${manifest_file}"; then
+      err "下载仓库文件清单失败"
+      return 1
+    fi
+  fi
+
+  while IFS= read -r path || [[ -n "${path}" ]]; do
+    path="${path%$'\r'}"
+    [[ -z "${path}" ]] && continue
+    [[ "${path}" == \#* ]] && continue
+    if [[ "${path}" == /* || "${path}" == *".."* ]]; then
+      err "清单包含非法路径：${path}"
+      return 1
+    fi
+    paths+=("${path}")
+  done < "${manifest_file}"
+
+  downloaded="${#paths[@]}"
+  if [[ "${downloaded}" -eq 0 ]]; then
+    err "仓库文件清单为空"
+    return 1
+  fi
+
+  concurrency="$(manifest_concurrency)"
+  info "开始拉取文件（并发 ${concurrency}，共 ${downloaded} 个）"
+  running=0
+  failed=0
+  completed=0
+  render_manifest_progress "${completed}" "${downloaded}"
+  for path in "${paths[@]}"; do
+    while (( running >= concurrency )); do
+      if ! wait -n; then
+        failed=1
+      fi
+      running=$((running-1))
+      completed=$((completed+1))
+      render_manifest_progress "${completed}" "${downloaded}"
+    done
+    (
+      download_repo_manifest_path "${base_url}" "${out_dir}" "${path}" "${bust}"
+    ) &
+    running=$((running+1))
+  done
+  while (( running > 0 )); do
+    if ! wait -n; then
+      failed=1
+    fi
+    running=$((running-1))
+    completed=$((completed+1))
+    render_manifest_progress "${completed}" "${downloaded}"
+  done
+  if [[ "${failed}" -ne 0 ]]; then
+    return 1
+  fi
+  ok "仓库文件拉取完成（共 ${downloaded} 个）"
 }
 
 install_tcping(){
@@ -452,7 +607,7 @@ fetch_repo(){
     info "使用离线 ZIP：${zip_path}"
     unzip -q "${zip_path}" -d "${tmpdir}"
   else
-    local url panel_base panel_zip
+    local url panel_base panel_zip repo_base manifest_url
     local -a candidates=()
     local fetched="0"
 
@@ -468,7 +623,7 @@ fetch_repo(){
         candidates+=("${panel_zip}")
       fi
       candidates+=("${REPO_ZIP_URL_DEFAULT}")
-      info "未指定仓库 ZIP 地址，将按优先级尝试：${candidates[*]}"
+      info "未指定仓库 ZIP 地址，按内置优先级尝试"
     fi
 
     local bust candidate
@@ -479,20 +634,50 @@ fetch_repo(){
         -H 'Cache-Control: no-cache' \
         -H 'Pragma: no-cache' \
         "${candidate}?${bust}" -o "${tmpdir}/repo.zip"; then
-        fetched="1"
-        info "下载成功：${candidate}"
-        break
+        if unzip -tq "${tmpdir}/repo.zip" >/dev/null 2>&1; then
+          fetched="1"
+          info "下载成功：${candidate}"
+          break
+        fi
+        err "下载内容不是有效 ZIP，尝试下一个源：${candidate}"
       fi
       if curl -fsSL "${candidate}" -o "${tmpdir}/repo.zip"; then
-        fetched="1"
-        info "下载成功：${candidate}"
-        break
+        if unzip -tq "${tmpdir}/repo.zip" >/dev/null 2>&1; then
+          fetched="1"
+          info "下载成功：${candidate}"
+          break
+        fi
+        err "下载内容不是有效 ZIP，尝试下一个源：${candidate}"
       fi
       err "下载失败，尝试下一个源：${candidate}"
     done
     if [[ "${fetched}" != "1" ]]; then
-      err "仓库 ZIP 下载失败（面板与 GitHub 均不可达）"
-      exit 1
+      repo_base="${REALM_AGENT_REPO_BASE_URL:-}"
+      if [[ -z "${repo_base}" ]]; then
+        if [[ ${#candidates[@]} -gt 0 ]]; then
+          repo_base="$(guess_repo_base_from_zip_url "${candidates[0]}")"
+        else
+          repo_base="${REPO_BASE_URL_DEFAULT}"
+        fi
+      fi
+      manifest_url="${REALM_AGENT_REPO_MANIFEST_URL:-${REPO_MANIFEST_URL_DEFAULT}}"
+      if [[ -n "${repo_base}" && -z "${REALM_AGENT_REPO_MANIFEST_URL:-}" ]]; then
+        manifest_url="${repo_base%/}/repo.manifest"
+      fi
+      info "仓库 ZIP 下载失败，尝试文件清单拉取..."
+      if ! download_repo_from_manifest "${repo_base}" "${manifest_url}" "${tmpdir}/raw"; then
+        if [[ -z "${REALM_AGENT_REPO_BASE_URL:-}" && -z "${REALM_AGENT_REPO_MANIFEST_URL:-}" && "${repo_base}" != "${REPO_BASE_URL_DEFAULT}" ]]; then
+          info "文件清单拉取失败，回退默认源重试..."
+          if ! download_repo_from_manifest "${REPO_BASE_URL_DEFAULT}" "${REPO_MANIFEST_URL_DEFAULT}" "${tmpdir}/raw"; then
+            err "仓库下载失败（ZIP 与清单模式均不可用）"
+            exit 1
+          fi
+        else
+          err "仓库下载失败（ZIP 与清单模式均不可用）"
+          exit 1
+        fi
+      fi
+      return 0
     fi
     info "解压中..."
     unzip -q "${tmpdir}/repo.zip" -d "${tmpdir}"
@@ -506,6 +691,46 @@ stop_service_if_running(){
       systemctl stop realm-agent.service >/dev/null 2>&1 || true
     fi
   fi
+}
+
+parse_nonneg_int(){
+  local raw="$1"
+  local def="$2"
+  if [[ "${raw}" =~ ^[0-9]+$ ]]; then
+    printf "%s" "${raw}"
+  else
+    printf "%s" "${def}"
+  fi
+}
+
+prune_agent_artifacts(){
+  local base="/opt/realm-agent"
+  local keep_bak log_days tmp_days
+  keep_bak="$(parse_nonneg_int "${REALM_AGENT_KEEP_BAK:-1}" "1")"
+  log_days="$(parse_nonneg_int "${REALM_AGENT_UPDATE_LOG_RETENTION_DAYS:-7}" "7")"
+  tmp_days="$(parse_nonneg_int "${REALM_AGENT_UPDATE_TMP_RETENTION_DAYS:-1}" "1")"
+
+  # Keep the newest N backups only to avoid disk growth on small nodes.
+  local -a bak_dirs=()
+  local d
+  while IFS= read -r d; do
+    bak_dirs+=("${d}")
+  done < <(find "${base}" -maxdepth 1 -mindepth 1 -type d -name '.bak.*' -print 2>/dev/null | sort -r)
+
+  if (( ${#bak_dirs[@]} > keep_bak )); then
+    local i removed=0
+    for ((i=keep_bak; i<${#bak_dirs[@]}; i++)); do
+      rm -rf "${bak_dirs[$i]}" || true
+      removed=$((removed + 1))
+    done
+    if (( removed > 0 )); then
+      info "已清理旧 Agent 备份目录：${removed} 个（保留 ${keep_bak} 个）"
+    fi
+  fi
+
+  find /var/log -maxdepth 1 -type f -name 'realm-agent-update-*.log' -mtime +"${log_days}" -delete 2>/dev/null || true
+  find /tmp -maxdepth 1 -type f -name 'realm-agent-update-*.sh' -mtime +"${tmp_days}" -delete 2>/dev/null || true
+  find /tmp -maxdepth 1 -type f -name 'realm-agent-repo-*.zip' -mtime +"${tmp_days}" -delete 2>/dev/null || true
 }
 
 atomic_update_agent(){
@@ -651,6 +876,8 @@ EOF
       systemctl restart realm-agent.service >/dev/null 2>&1 || true
     fi
   fi
+
+  prune_agent_artifacts
 }
 
 find_agent_dir(){

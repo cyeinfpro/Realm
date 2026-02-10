@@ -111,7 +111,9 @@
           <td class="mono">{{ it.mtime or "-" }}</td>
           <td class="fm-actions-cell">
             <div class="fm-inline-actions">
-              {% if not it.is_dir %}
+              {% if it.is_dir %}
+                <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/download?path={{ it.path }}">下载</a>
+              {% else %}
                 <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/edit?path={{ it.path }}">编辑</a>
                 <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/download?path={{ it.path }}">下载</a>
                 {% if it.name.endswith('.zip') %}

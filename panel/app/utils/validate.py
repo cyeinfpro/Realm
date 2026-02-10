@@ -559,11 +559,19 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> List[PoolValidationIssue]:
         conn_rate_raw = _pick_qos_raw(
             ("conn_rate", "conn_per_sec", "new_conn_per_sec", "new_connections_per_sec", "qos_conn_rate")
         )
+        traffic_bytes_raw = _pick_qos_raw(
+            ("traffic_total_bytes", "traffic_bytes", "traffic_limit_bytes", "qos_traffic_total_bytes")
+        )
+        traffic_gb_raw = _pick_qos_raw(
+            ("traffic_total_gb", "traffic_gb", "traffic_limit_gb", "qos_traffic_total_gb")
+        )
 
         bw_kbps = _coerce_nonneg_int(bw_kbps_raw)
         bw_mbps = _coerce_nonneg_int(bw_mbps_raw)
         max_conns = _coerce_nonneg_int(max_conns_raw)
         conn_rate = _coerce_nonneg_int(conn_rate_raw)
+        traffic_bytes = _coerce_nonneg_int(traffic_bytes_raw)
+        traffic_gb = _coerce_nonneg_int(traffic_gb_raw)
 
         if bw_kbps is None and (bw_kbps_raw is not None and str(bw_kbps_raw).strip()):
             issues.append(
@@ -581,9 +589,25 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> List[PoolValidationIssue]:
             issues.append(
                 PoolValidationIssue(path=f"endpoints[{idx}].extra_config.qos.conn_rate", message="QoS 每秒新建连接上限必须是非负整数")
             )
+        if traffic_bytes is None and (traffic_bytes_raw is not None and str(traffic_bytes_raw).strip()):
+            issues.append(
+                PoolValidationIssue(
+                    path=f"endpoints[{idx}].extra_config.qos.traffic_total_bytes",
+                    message="QoS 总流量上限(bytes)必须是非负整数",
+                )
+            )
+        if traffic_gb is None and (traffic_gb_raw is not None and str(traffic_gb_raw).strip()):
+            issues.append(
+                PoolValidationIssue(
+                    path=f"endpoints[{idx}].extra_config.qos.traffic_total_gb",
+                    message="QoS 总流量上限(GB)必须是非负整数",
+                )
+            )
 
         if bw_kbps is None and bw_mbps is not None:
             bw_kbps = int(bw_mbps) * 1024
+        if traffic_bytes is None and traffic_gb is not None:
+            traffic_bytes = int(traffic_gb) * 1024 * 1024 * 1024
 
         qos_norm: Dict[str, int] = {}
         if bw_kbps is not None and bw_kbps > 0:
@@ -592,6 +616,8 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> List[PoolValidationIssue]:
             qos_norm["max_conns"] = int(max_conns)
         if conn_rate is not None and conn_rate > 0:
             qos_norm["conn_rate"] = int(conn_rate)
+        if traffic_bytes is not None and traffic_bytes > 0:
+            qos_norm["traffic_total_bytes"] = int(traffic_bytes)
 
         if qos_norm:
             ex["qos"] = dict(qos_norm)

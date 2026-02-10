@@ -1,0 +1,412 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1 class="h1">用户与权限</h1>
+    <div class="muted">子账户可按角色、机器、转发方式、月流量与有效期限制。</div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <div class="card-header">
+      <div>
+        <div class="card-title" id="umFormTitle">创建子账户</div>
+        <div class="card-sub">密码至少 6 位；用户名支持字母数字与 ._-</div>
+      </div>
+    </div>
+    <form class="form" id="umForm">
+      <input type="hidden" id="umUserId" value="">
+      <div class="form-grid">
+        <div class="col">
+          <label class="label">用户名</label>
+          <input class="input" id="umUsername" placeholder="例如: forwarder01" required>
+        </div>
+        <div class="col">
+          <label class="label">密码 <span class="muted sm">编辑时留空=不改</span></label>
+          <input class="input" id="umPassword" type="password" placeholder="至少 6 位">
+        </div>
+      </div>
+
+      <div class="form-grid">
+        <div class="col">
+          <label class="label">角色</label>
+          <select class="select" id="umRole"></select>
+        </div>
+        <div class="col">
+          <label class="label">有效期</label>
+          <input class="input" id="umExpires" type="datetime-local">
+        </div>
+      </div>
+
+      <div class="form-grid">
+        <div class="col">
+          <label class="label">允许机器 ID（逗号分隔，留空=不限制）</label>
+          <input class="input" id="umAllowedNodes" placeholder="例如: 1,2,8">
+        </div>
+        <div class="col">
+          <label class="label">月流量额度（GB，0=不限制）</label>
+          <input class="input" id="umQuotaGB" type="number" min="0" step="0.1" value="0">
+        </div>
+      </div>
+
+      <div class="form-grid">
+        <div class="col">
+          <label class="label">允许转发方式 <span class="muted sm">不选=全部禁用</span></label>
+          <div class="row" style="gap:12px; align-items:center;">
+            <label class="muted" style="display:inline-flex;gap:6px;align-items:center;">
+              <input type="checkbox" id="umTunnelWss" checked> WSS
+            </label>
+            <label class="muted" style="display:inline-flex;gap:6px;align-items:center;">
+              <input type="checkbox" id="umTunnelIntranet" checked> 内网穿透
+            </label>
+          </div>
+        </div>
+        <div class="col">
+          <label class="label">状态</label>
+          <label class="muted" style="display:inline-flex;gap:6px;align-items:center;">
+            <input type="checkbox" id="umEnabled" checked> 启用账号
+          </label>
+        </div>
+      </div>
+
+      <div class="row" style="justify-content:flex-end; gap:8px;">
+        <button class="btn sm ghost" type="button" id="umResetBtn">清空</button>
+        <button class="btn sm" type="submit" id="umSubmitBtn">创建用户</button>
+      </div>
+      <div class="muted sm" id="umMsg"></div>
+    </form>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <div>
+        <div class="card-title">机器 ID 参考</div>
+        <div class="card-sub">用于配置“允许机器 ID”</div>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table class="table dense no-sticky">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>名称</th>
+            <th>分组</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for n in nodes %}
+          <tr>
+            <td>{{ n.id }}</td>
+            <td>{{ n.name }}</td>
+            <td>{{ n.group_name or '默认分组' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="card" style="margin-top:12px;">
+  <div class="card-header">
+    <div>
+      <div class="card-title">账号列表</div>
+      <div class="card-sub">编辑后立即生效；已登录会话下次请求会按新权限校验。</div>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table class="table no-sticky">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>用户名</th>
+          <th>角色</th>
+          <th>机器限制</th>
+          <th>转发方式</th>
+          <th>额度(30d)</th>
+          <th>有效期</th>
+          <th>状态</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="umTableBody"></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+  const ACTOR = {{ (user or '') | tojson }};
+  let ROLES = [];
+  let USERS = [];
+  let EDITING_ID = 0;
+
+  function q(id){ return document.getElementById(id); }
+  function esc(s){ return String(s == null ? '' : s).replace(/[&<>\"']/g, (c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c] || c)); }
+  function formatBytes(bytes){
+    const n = Number(bytes || 0);
+    if(!Number.isFinite(n) || n <= 0) return '0 B';
+    const units = ['B','KB','MB','GB','TB'];
+    let v = n;
+    let i = 0;
+    while(v >= 1024 && i < units.length - 1){ v /= 1024; i += 1; }
+    return `${v.toFixed(v >= 100 ? 0 : (v >= 10 ? 1 : 2))} ${units[i]}`;
+  }
+  function toLocalInputValue(iso){
+    const s = String(iso || '').trim();
+    if(!s) return '';
+    const d = new Date(s);
+    if(Number.isNaN(d.getTime())) return '';
+    const pad = (n)=>String(n).padStart(2,'0');
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  function parseNodeIds(text){
+    const arr = String(text || '').split(',');
+    const out = [];
+    const seen = new Set();
+    for(const item of arr){
+      const n = Number(String(item || '').trim());
+      if(!Number.isInteger(n) || n <= 0 || seen.has(n)) continue;
+      seen.add(n);
+      out.push(n);
+    }
+    return out;
+  }
+  function setMsg(msg, bad){
+    const el = q('umMsg');
+    if(!el) return;
+    el.textContent = String(msg || '');
+    el.style.color = bad ? 'var(--bad)' : 'var(--muted)';
+  }
+  async function fetchJSON(url, options={}){
+    const res = await fetch(url, {
+      headers: {'Content-Type':'application/json'},
+      credentials: 'same-origin',
+      ...options
+    });
+    const text = await res.text();
+    let data = {};
+    try{ data = text ? JSON.parse(text) : {}; }catch(_e){ data = {ok:false,error:text}; }
+    if(!res.ok || data.ok === false){
+      throw new Error(String(data.error || `HTTP ${res.status}`));
+    }
+    return data;
+  }
+  function fillRoleOptions(){
+    const sel = q('umRole');
+    if(!sel) return;
+    sel.innerHTML = '';
+    for(const role of ROLES){
+      const opt = document.createElement('option');
+      opt.value = String(role.name || '');
+      opt.textContent = role.description ? `${role.name} - ${role.description}` : role.name;
+      sel.appendChild(opt);
+    }
+    if(sel.options.length) sel.value = 'forwarder';
+  }
+  function resetForm(){
+    EDITING_ID = 0;
+    q('umUserId').value = '';
+    q('umFormTitle').textContent = '创建子账户';
+    q('umSubmitBtn').textContent = '创建用户';
+    q('umUsername').value = '';
+    q('umPassword').value = '';
+    q('umEnabled').checked = true;
+    q('umExpires').value = '';
+    q('umAllowedNodes').value = '';
+    q('umTunnelWss').checked = true;
+    q('umTunnelIntranet').checked = true;
+    q('umQuotaGB').value = '0';
+    if(q('umRole') && q('umRole').options.length){ q('umRole').value = 'forwarder'; }
+    setMsg('');
+  }
+  function fillForm(user){
+    EDITING_ID = Number(user.id || 0);
+    q('umUserId').value = String(EDITING_ID);
+    q('umFormTitle').textContent = `编辑用户 #${EDITING_ID}`;
+    q('umSubmitBtn').textContent = '保存修改';
+    q('umUsername').value = String(user.username || '');
+    q('umPassword').value = '';
+    q('umEnabled').checked = !!user.enabled;
+    q('umExpires').value = toLocalInputValue(user.expires_at);
+    const policy = (user && user.policy && typeof user.policy === 'object') ? user.policy : {};
+    const nodeIds = Array.isArray(policy.allowed_node_ids) ? policy.allowed_node_ids : [];
+    q('umAllowedNodes').value = nodeIds.join(',');
+    const tunnels = Array.isArray(policy.allowed_tunnel_types) ? policy.allowed_tunnel_types : [];
+    const tunnelLimitEnabled = (typeof policy.tunnel_limit_enabled === 'boolean')
+      ? policy.tunnel_limit_enabled
+      : Object.prototype.hasOwnProperty.call(policy, 'allowed_tunnel_types');
+    if(tunnelLimitEnabled){
+      q('umTunnelWss').checked = tunnels.includes('wss');
+      q('umTunnelIntranet').checked = tunnels.includes('intranet');
+    }else{
+      q('umTunnelWss').checked = true;
+      q('umTunnelIntranet').checked = true;
+    }
+    const limit = Number(policy.max_monthly_traffic_bytes || 0);
+    q('umQuotaGB').value = limit > 0 ? String((limit / (1024 ** 3)).toFixed(2)) : '0';
+    q('umRole').value = String(user.role_name || 'viewer');
+    setMsg('');
+  }
+  function renderUsers(){
+    const tb = q('umTableBody');
+    if(!tb) return;
+    tb.innerHTML = '';
+    for(const u of USERS){
+      const policy = (u && u.policy && typeof u.policy === 'object') ? u.policy : {};
+      const nodes = Array.isArray(policy.allowed_node_ids) ? policy.allowed_node_ids : [];
+      const tunnels = Array.isArray(policy.allowed_tunnel_types) ? policy.allowed_tunnel_types : [];
+      const tunnelLimitEnabled = (typeof policy.tunnel_limit_enabled === 'boolean')
+        ? policy.tunnel_limit_enabled
+        : Object.prototype.hasOwnProperty.call(policy, 'allowed_tunnel_types');
+      const quota = Number(policy.max_monthly_traffic_bytes || 0);
+      const used = Number(u.traffic_used_bytes_30d || 0);
+      let tunnelText = '<span class="muted">全部</span>';
+      if(tunnelLimitEnabled){
+        tunnelText = tunnels.length ? esc(tunnels.join('/')) : '<span class="muted">禁用</span>';
+      }
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${Number(u.id || 0)}</td>
+        <td>${esc(u.username)}</td>
+        <td>${esc(u.role_name)}</td>
+        <td>${nodes.length ? esc(nodes.join(',')) : '<span class="muted">全部</span>'}</td>
+        <td>${tunnelText}</td>
+        <td>${quota > 0 ? `${esc(formatBytes(used))} / ${esc(formatBytes(quota))}` : '<span class="muted">不限制</span>'}</td>
+        <td>${u.expires_at ? esc(String(u.expires_at)) : '<span class="muted">永久</span>'}</td>
+        <td>${u.enabled ? '<span class="pill ok">启用</span>' : '<span class="pill bad">禁用</span>'}</td>
+        <td>
+          <div class="row" style="gap:6px; flex-wrap:wrap;">
+            <button class="btn xs ghost" type="button" data-act="edit" data-id="${Number(u.id || 0)}">编辑</button>
+            <button class="btn xs danger" type="button" data-act="del" data-id="${Number(u.id || 0)}">删除</button>
+          </div>
+        </td>
+      `;
+      tb.appendChild(tr);
+    }
+  }
+
+  function handleEditUser(id){
+    const uid = Number(id || 0);
+    const user = USERS.find((it)=>Number(it.id || 0) === uid);
+    if(!user) return;
+    fillForm(user);
+    const form = q('umForm');
+    const card = form ? form.closest('.card') : null;
+    try{
+      if(card && typeof card.scrollIntoView === 'function'){
+        card.scrollIntoView({behavior:'smooth', block:'start'});
+      }
+    }catch(_e){}
+    try{
+      const input = q('umUsername');
+      if(input && typeof input.focus === 'function'){
+        input.focus();
+        if(typeof input.select === 'function') input.select();
+      }
+    }catch(_e){}
+    setMsg(`正在编辑用户：${user.username}`);
+  }
+
+  async function handleDeleteUser(id){
+    const uid = Number(id || 0);
+    const target = USERS.find((it)=>Number(it.id || 0) === uid);
+    if(!target) return;
+    if(!confirm(`确认删除用户 ${target.username} 吗？`)) return;
+    try{
+      await fetchJSON(`/api/users/${uid}/delete`, {method:'POST', body:'{}'});
+      await loadUsers();
+      if(EDITING_ID === uid) resetForm();
+      setMsg('删除成功');
+    }catch(err){
+      setMsg(err.message || '删除失败', true);
+    }
+  }
+
+  async function handleTableAction(ev){
+    const target = ev && ev.target ? ev.target : null;
+    if(!target || typeof target.closest !== 'function') return;
+    const btn = target.closest('button[data-act]');
+    if(!btn) return;
+    ev.preventDefault();
+    const act = String(btn.getAttribute('data-act') || '').trim();
+    const id = Number(btn.getAttribute('data-id') || 0);
+    if(!(id > 0)) return;
+    if(act === 'edit'){
+      handleEditUser(id);
+      return;
+    }
+    if(act === 'del'){
+      await handleDeleteUser(id);
+    }
+  }
+  async function loadRoles(){
+    const data = await fetchJSON('/api/roles');
+    ROLES = Array.isArray(data.roles) ? data.roles : [];
+    fillRoleOptions();
+  }
+  async function loadUsers(){
+    const data = await fetchJSON('/api/users');
+    USERS = Array.isArray(data.users) ? data.users : [];
+    renderUsers();
+  }
+  async function submitForm(ev){
+    ev.preventDefault();
+    const username = String(q('umUsername').value || '').trim();
+    const password = String(q('umPassword').value || '');
+    const roleName = String(q('umRole').value || '').trim();
+    const enabled = !!q('umEnabled').checked;
+    const expiresAt = String(q('umExpires').value || '').trim();
+    const allowedNodeIds = parseNodeIds(q('umAllowedNodes').value);
+    const allowedTunnelTypes = [];
+    if(q('umTunnelWss').checked) allowedTunnelTypes.push('wss');
+    if(q('umTunnelIntranet').checked) allowedTunnelTypes.push('intranet');
+    const quotaGb = Number(q('umQuotaGB').value || 0);
+    const payload = {
+      username,
+      role_name: roleName,
+      enabled,
+      expires_at: expiresAt || '',
+      allowed_node_ids: allowedNodeIds,
+      tunnel_limit_enabled: true,
+      allowed_tunnel_types: allowedTunnelTypes,
+      max_monthly_traffic_gb: Number.isFinite(quotaGb) ? Math.max(0, quotaGb) : 0
+    };
+    if(password.trim()) payload.password = password;
+    if(!EDITING_ID && !payload.password){
+      setMsg('创建用户时必须输入密码', true);
+      return;
+    }
+    let url = '/api/users/create';
+    if(EDITING_ID > 0) url = `/api/users/${EDITING_ID}/update`;
+    try{
+      await fetchJSON(url, {method:'POST', body: JSON.stringify(payload)});
+      await loadUsers();
+      const doneMsg = EDITING_ID > 0 ? '更新成功' : '创建成功';
+      resetForm();
+      setMsg(doneMsg);
+    }catch(err){
+      setMsg(err.message || '提交失败', true);
+    }
+  }
+
+  document.addEventListener('DOMContentLoaded', async ()=>{
+    try{
+      await loadRoles();
+      await loadUsers();
+      resetForm();
+      q('umForm').addEventListener('submit', submitForm);
+      q('umResetBtn').addEventListener('click', resetForm);
+      const tb = q('umTableBody');
+      if(tb) tb.addEventListener('click', handleTableAction);
+      setMsg(`当前登录：${ACTOR}`);
+    }catch(err){
+      setMsg(err.message || '初始化失败', true);
+    }
+  });
+})();
+</script>
+{% endblock %}

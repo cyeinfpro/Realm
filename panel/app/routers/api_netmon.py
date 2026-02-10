@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from ..auth import filter_node_ids_for_user, filter_nodes_for_user, get_allowed_node_ids_set
 from ..clients.agent import agent_post
 from ..core.deps import require_login
 from ..core.share import is_share_public_enabled, make_share_token, require_login_or_share_api
@@ -30,6 +31,54 @@ from ..services.node_status import is_report_fresh
 from ..utils.normalize import extract_ip_for_display, safe_int_list
 
 router = APIRouter()
+
+
+def _netmon_allowed_node_set(user: str) -> Optional[Set[int]]:
+    # share token mode should not be coupled with user policy
+    if str(user or "").strip() == "__share__":
+        return None
+    return get_allowed_node_ids_set(user)
+
+
+def _share_allowed_node_set(request: Request) -> Optional[Set[int]]:
+    share_ctx = getattr(request.state, "share", None)
+    if not isinstance(share_ctx, dict):
+        return None
+    raw = share_ctx.get("allow_nodes")
+    if isinstance(raw, str):
+        raw = [x.strip() for x in raw.split(",") if x.strip()]
+    if not isinstance(raw, list):
+        return None
+    out: Set[int] = set()
+    for x in raw:
+        try:
+            nid = int(x)
+        except Exception:
+            continue
+        if nid > 0:
+            out.add(nid)
+    return out if out else set()
+
+
+def _netmon_effective_allowed_node_set(request: Request, user: str) -> Optional[Set[int]]:
+    policy_allowed = _netmon_allowed_node_set(user)
+    share_allowed = _share_allowed_node_set(request)
+    if share_allowed is None:
+        return policy_allowed
+    if policy_allowed is None:
+        return share_allowed
+    return set(nid for nid in policy_allowed if nid in share_allowed)
+
+
+def _monitor_visible_node_ids(mon: Dict[str, Any], allowed: Optional[Set[int]]) -> List[int]:
+    raw = safe_int_list((mon or {}).get("node_ids") or [])
+    if allowed is None:
+        return [nid for nid in raw if nid > 0]
+    out: List[int] = []
+    for nid in raw:
+        if nid > 0 and nid in allowed and nid not in out:
+            out.append(nid)
+    return out
 
 
 @router.get("/api/netmon/snapshot")
@@ -153,13 +202,24 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
     now_ms = int(time.time() * 1000)
     cutoff_ms = now_ms - int(window_sec * 1000)
 
-    monitors = list_netmon_monitors()
+    allowed_node_set = _netmon_effective_allowed_node_set(request, user)
+
+    monitors_raw = list_netmon_monitors()
     if only_mid is not None:
-        monitors = [m for m in monitors if int(m.get("id") or 0) == int(only_mid)]
+        monitors_raw = [m for m in monitors_raw if int(m.get("id") or 0) == int(only_mid)]
+    monitors: List[Dict[str, Any]] = []
+    for m in monitors_raw:
+        node_ids_visible = _monitor_visible_node_ids(m, allowed_node_set)
+        if not node_ids_visible:
+            continue
+        m2 = dict(m)
+        m2["node_ids"] = node_ids_visible
+        monitors.append(m2)
     monitor_ids = [int(m.get("id") or 0) for m in monitors if int(m.get("id") or 0) > 0]
 
     # Node metadata (for legend)
-    nodes = list_nodes()
+    nodes_raw = list_nodes()
+    nodes = filter_nodes_for_user(user, nodes_raw) if allowed_node_set is not None else nodes_raw
     nodes_meta: Dict[str, Any] = {}
     for n in nodes:
         nid = int(n.get("id") or 0)
@@ -206,6 +266,8 @@ async def api_netmon_snapshot(request: Request, user: str = Depends(require_logi
         except Exception:
             continue
         if mid <= 0 or nid <= 0 or ts <= 0:
+            continue
+        if allowed_node_set is not None and nid not in allowed_node_set:
             continue
         mid_s = str(mid)
         nid_s = str(nid)
@@ -389,8 +451,14 @@ async def api_netmon_range(request: Request, user: str = Depends(require_login_o
     mon = get_netmon_monitor(mid)
     if not mon:
         return JSONResponse({"ok": False, "error": "monitor 不存在"}, status_code=404)
+    allowed_node_set = _netmon_effective_allowed_node_set(request, user)
+    visible_node_ids = _monitor_visible_node_ids(mon, allowed_node_set)
+    if not visible_node_ids:
+        return JSONResponse({"ok": False, "error": "monitor 不存在"}, status_code=404)
+    visible_node_id_set = set(visible_node_ids)
 
-    nodes = list_nodes()
+    nodes_raw = list_nodes()
+    nodes = filter_nodes_for_user(user, nodes_raw) if allowed_node_set is not None else nodes_raw
     nodes_meta: Dict[str, Any] = {}
     for n in nodes:
         nid = int(n.get("id") or 0)
@@ -407,7 +475,7 @@ async def api_netmon_range(request: Request, user: str = Depends(require_login_o
     rows = list_netmon_samples_range(mid, from_ms, to_ms, limit=80000)
     series: Dict[str, List[Dict[str, Any]]] = {}
 
-    for nid in (mon.get("node_ids") or []):
+    for nid in visible_node_ids:
         try:
             nid_i = int(nid)
         except Exception:
@@ -421,6 +489,8 @@ async def api_netmon_range(request: Request, user: str = Depends(require_login_o
         except Exception:
             continue
         if nid <= 0 or ts <= 0:
+            continue
+        if nid not in visible_node_id_set:
             continue
         nid_s = str(nid)
         if nid_s not in series:
@@ -456,11 +526,7 @@ async def api_netmon_range(request: Request, user: str = Depends(require_login_o
             "warn_ms": int(mon.get("warn_ms") or 0),
             "crit_ms": int(mon.get("crit_ms") or 0),
             "enabled": bool(mon.get("enabled") or 0),
-            "node_ids": [
-                int(x)
-                for x in (mon.get("node_ids") or [])
-                if isinstance(x, int) or str(x).isdigit()
-            ],
+            "node_ids": visible_node_ids,
         },
         "from": int(from_ms),
         "to": int(to_ms),
@@ -489,12 +555,19 @@ async def api_netmon_share(request: Request, user: str = Depends(require_login))
     except Exception:
         mid = 0
     mon = None
+    mon_visible_node_ids: List[int] = []
+    allowed_node_set = _netmon_allowed_node_set(user)
     if mid <= 0:
+        if allowed_node_set is not None and page == "wall":
+            return JSONResponse({"ok": False, "error": "受限账号请指定一个可见监控项"}, status_code=400)
         if page != "wall":
             return JSONResponse({"ok": False, "error": "mid 无效"}, status_code=400)
     else:
         mon = get_netmon_monitor(mid)
         if not mon:
+            return JSONResponse({"ok": False, "error": "monitor 不存在"}, status_code=404)
+        mon_visible_node_ids = _monitor_visible_node_ids(mon, allowed_node_set)
+        if not mon_visible_node_ids:
             return JSONResponse({"ok": False, "error": "monitor 不存在"}, status_code=404)
 
     mode = str(payload.get("mode") or "follow").strip().lower()
@@ -521,7 +594,7 @@ async def api_netmon_share(request: Request, user: str = Depends(require_login))
     if isinstance(hidden_in, list):
         allow = set(
             str(int(x))
-            for x in ((mon.get("node_ids") or []) if mon else [])
+            for x in (mon_visible_node_ids if mon else [])
             if str(x).isdigit()
         )
         for x in hidden_in:
@@ -539,6 +612,8 @@ async def api_netmon_share(request: Request, user: str = Depends(require_login))
     token_payload: Dict[str, Any] = {"page": page, "mode": mode}
     if mid > 0:
         token_payload["mid"] = int(mid)
+        if allowed_node_set is not None:
+            token_payload["allow_nodes"] = [int(x) for x in mon_visible_node_ids if int(x) > 0]
     if win is not None:
         token_payload["win"] = int(max(1, min(24 * 60, win)))
     if mode == "fixed" and s_from is not None and s_to is not None and s_to > s_from:
@@ -593,6 +668,7 @@ async def api_netmon_share(request: Request, user: str = Depends(require_login))
 
 @router.get("/api/netmon/monitors")
 async def api_netmon_monitors_list(user: str = Depends(require_login)):
+    allowed_node_set = _netmon_allowed_node_set(user)
     monitors = list_netmon_monitors()
     out: List[Dict[str, Any]] = []
     for m in monitors:
@@ -601,6 +677,9 @@ async def api_netmon_monitors_list(user: str = Depends(require_login)):
         except Exception:
             continue
         if mid <= 0:
+            continue
+        node_ids_visible = _monitor_visible_node_ids(m, allowed_node_set)
+        if not node_ids_visible:
             continue
         out.append(
             {
@@ -612,11 +691,7 @@ async def api_netmon_monitors_list(user: str = Depends(require_login)):
                 "warn_ms": int(m.get("warn_ms") or 0),
                 "crit_ms": int(m.get("crit_ms") or 0),
                 "enabled": bool(m.get("enabled") or 0),
-                "node_ids": [
-                    int(x)
-                    for x in (m.get("node_ids") or [])
-                    if isinstance(x, int) or str(x).isdigit()
-                ],
+                "node_ids": node_ids_visible,
                 "last_run_ts_ms": int(m.get("last_run_ts_ms") or 0),
                 "last_run_msg": str(m.get("last_run_msg") or ""),
             }
@@ -696,6 +771,11 @@ async def api_netmon_monitors_create(request: Request, user: str = Depends(requi
         if nid > 0 and nid not in cleaned:
             cleaned.append(nid)
     cleaned = cleaned[:60]
+    cleaned_allowed = filter_node_ids_for_user(user, cleaned)
+    if len(cleaned_allowed) < len(cleaned):
+        denied = [nid for nid in cleaned if nid not in set(cleaned_allowed)]
+        return JSONResponse({"ok": False, "error": f"包含无权限节点: {denied}"}, status_code=403)
+    cleaned = cleaned_allowed
     if not cleaned:
         return JSONResponse({"ok": False, "error": "请选择至少一个节点"}, status_code=400)
 
@@ -730,6 +810,9 @@ async def api_netmon_monitors_create(request: Request, user: str = Depends(requi
 async def api_netmon_monitors_update(monitor_id: int, request: Request, user: str = Depends(require_login)):
     mon = get_netmon_monitor(int(monitor_id))
     if not mon:
+        return JSONResponse({"ok": False, "error": "monitor 不存在"}, status_code=404)
+    allowed_node_set = _netmon_allowed_node_set(user)
+    if not _monitor_visible_node_ids(mon, allowed_node_set):
         return JSONResponse({"ok": False, "error": "monitor 不存在"}, status_code=404)
 
     try:
@@ -820,6 +903,11 @@ async def api_netmon_monitors_update(monitor_id: int, request: Request, user: st
             if nid > 0 and nid not in cleaned:
                 cleaned.append(nid)
         cleaned = cleaned[:60]
+        cleaned_allowed = filter_node_ids_for_user(user, cleaned)
+        if len(cleaned_allowed) < len(cleaned):
+            denied = [nid for nid in cleaned if nid not in set(cleaned_allowed)]
+            return JSONResponse({"ok": False, "error": f"包含无权限节点: {denied}"}, status_code=403)
+        cleaned = cleaned_allowed
         if not cleaned:
             return JSONResponse({"ok": False, "error": "请选择至少一个节点"}, status_code=400)
         fields["node_ids"] = cleaned
@@ -830,6 +918,7 @@ async def api_netmon_monitors_update(monitor_id: int, request: Request, user: st
     update_netmon_monitor(int(monitor_id), **fields)
 
     mon2 = get_netmon_monitor(int(monitor_id)) or {}
+    node_ids_visible = _monitor_visible_node_ids(mon2, allowed_node_set)
     return {
         "ok": True,
         "monitor": {
@@ -841,7 +930,7 @@ async def api_netmon_monitors_update(monitor_id: int, request: Request, user: st
             "warn_ms": int(mon2.get("warn_ms") or 0),
             "crit_ms": int(mon2.get("crit_ms") or 0),
             "enabled": bool(mon2.get("enabled") or 0),
-            "node_ids": [nid for nid in safe_int_list(mon2.get("node_ids") or []) if nid > 0],
+            "node_ids": node_ids_visible,
             "last_run_ts_ms": int(mon2.get("last_run_ts_ms") or 0),
             "last_run_msg": str(mon2.get("last_run_msg") or ""),
         },
@@ -852,6 +941,9 @@ async def api_netmon_monitors_update(monitor_id: int, request: Request, user: st
 async def api_netmon_monitors_delete(monitor_id: int, user: str = Depends(require_login)):
     mon = get_netmon_monitor(int(monitor_id))
     if not mon:
+        return JSONResponse({"ok": False, "error": "monitor 不存在"}, status_code=404)
+    allowed_node_set = _netmon_allowed_node_set(user)
+    if not _monitor_visible_node_ids(mon, allowed_node_set):
         return JSONResponse({"ok": False, "error": "monitor 不存在"}, status_code=404)
     delete_netmon_monitor(int(monitor_id))
     return {"ok": True}
@@ -885,6 +977,11 @@ async def api_netmon_probe(request: Request, user: str = Depends(require_login))
         if nid > 0 and nid not in cleaned_node_ids:
             cleaned_node_ids.append(nid)
     node_ids = cleaned_node_ids[:30]
+    allowed_node_ids = filter_node_ids_for_user(user, node_ids)
+    if len(allowed_node_ids) < len(node_ids):
+        denied = [nid for nid in node_ids if nid not in set(allowed_node_ids)]
+        return JSONResponse({"ok": False, "error": f"包含无权限节点: {denied}"}, status_code=403)
+    node_ids = allowed_node_ids
 
     cleaned_targets = []
     for t in targets:

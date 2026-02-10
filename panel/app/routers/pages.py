@@ -6,7 +6,8 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from ..core.deps import require_login_page
+from ..auth import filter_nodes_for_user
+from ..core.deps import require_login_page, require_role_page
 from ..core.flash import flash, set_flash
 from ..core.settings import DEFAULT_AGENT_PORT
 from ..core.share import require_login_or_share_view_page, require_login_or_share_wall_page
@@ -22,7 +23,7 @@ router = APIRouter()
 
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request, user: str = Depends(require_login_page)):
-    nodes = list_nodes()
+    nodes = filter_nodes_for_user(user, list_nodes())
 
     group_orders = get_group_orders()
 
@@ -107,7 +108,7 @@ async def index(request: Request, user: str = Depends(require_login_page)):
 @router.get("/netmon", response_class=HTMLResponse)
 async def netmon_page(request: Request, user: str = Depends(require_login_page)):
     """Network fluctuation monitoring page."""
-    nodes = list_nodes()
+    nodes = filter_nodes_for_user(user, list_nodes())
 
     group_orders = get_group_orders()
 
@@ -229,6 +230,7 @@ async def node_new_page(request: Request, user: str = Depends(require_login_page
 @router.post("/nodes/new")
 async def node_new_action(
     request: Request,
+    user: str = Depends(require_role_page("nodes.write")),
     name: str = Form(""),
     group_name: str = Form("默认分组"),
     is_private: Optional[str] = Form(None),
@@ -239,9 +241,7 @@ async def node_new_action(
     api_key: str = Form(""),
     verify_tls: Optional[str] = Form(None),
 ):
-    user = request.session.get("user")
-    if not user:
-        return RedirectResponse(url="/login", status_code=303)
+    _ = user
 
     ip_address = ip_address.strip()
     api_key = api_key.strip() or generate_api_key()
@@ -299,6 +299,7 @@ async def node_new_action(
 @router.post("/nodes/add")
 async def node_add_action(
     request: Request,
+    user: str = Depends(require_role_page("nodes.write")),
     name: str = Form(""),
     group_name: str = Form("默认分组"),
     is_private: Optional[str] = Form(None),
@@ -308,8 +309,7 @@ async def node_add_action(
     api_key: str = Form(...),
     verify_tls: Optional[str] = Form(None),
 ):
-    if not request.session.get("user"):
-        return RedirectResponse(url="/login", status_code=303)
+    _ = user
 
     base_url = base_url.strip()
     api_key = api_key.strip()
@@ -336,9 +336,8 @@ async def node_add_action(
 
 
 @router.post("/nodes/{node_id}/delete")
-async def node_delete(request: Request, node_id: int):
-    if not request.session.get("user"):
-        return RedirectResponse(url="/login", status_code=303)
+async def node_delete(request: Request, node_id: int, user: str = Depends(require_role_page("nodes.delete"))):
+    _ = user
     delete_node(node_id)
     set_flash(request, "已删除机器")
     return RedirectResponse(url="/", status_code=303)
@@ -352,7 +351,10 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
         return RedirectResponse(url="/", status_code=303)
 
     # 用于节点页左侧快速切换列表
-    nodes = list_nodes()
+    nodes = filter_nodes_for_user(user, list_nodes())
+    if int(node.get("id") or 0) not in {int(n.get("id") or 0) for n in nodes}:
+        set_flash(request, "机器不存在或无权限")
+        return RedirectResponse(url="/", status_code=303)
 
     group_orders = get_group_orders()
 

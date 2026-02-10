@@ -92,7 +92,10 @@
               <div class="wm-site-line1">
                 <div class="wm-site-name" title="{{ s.name }}">{{ s.name }}</div>
                 <span class="pill xs {{ st_class }}" title="运行状态">{{ st or 'unknown' }}</span>
-                <span class="pill xs {{ hcls }}" title="健康状态">{{ h or 'unknown' }}</span>
+                <span
+                  class="pill xs {{ hcls }}"
+                  title="{{ (s.health_error or '健康状态') if h in ['fail','unknown'] else '健康状态' }}"
+                >{{ h or 'unknown' }}</span>
               </div>
 
               <div class="wm-site-line2">
@@ -241,6 +244,21 @@
                 </div>
               {% else %}
                 <div class="muted sm" style="margin-top:8px;">暂未收到能力信息，可能仍在安装中，请稍后刷新查看。</div>
+              {% endif %}
+
+              {% set et = n.latest_env_task %}
+              {% if et %}
+                {% set est = (et.status or '')|lower %}
+                {% set ecls = 'warn' if est in ['queued','running'] else ('ok' if est in ['success','done'] else ('bad' if est in ['failed','error'] else 'ghost')) %}
+                {% set etype = '安装环境' if (et.type or '') == 'website_env_ensure' else ('卸载环境' if (et.type or '') == 'website_env_uninstall' else (et.type or '环境任务')) %}
+                <div class="wm-node-meta" style="margin-top:8px;">
+                  最近任务：
+                  <span class="pill xs {{ ecls }}">{{ etype }} · {{ est or 'unknown' }}</span>
+                  <span class="muted sm">#{{ et.id }} · {{ et.progress or 0 }}%</span>
+                </div>
+                {% if et.error %}
+                  <div class="muted sm mono" style="margin-top:6px;overflow-wrap:anywhere;" title="{{ et.error }}">{{ et.error }}</div>
+                {% endif %}
               {% endif %}
 
               <div class="wm-node-quick">

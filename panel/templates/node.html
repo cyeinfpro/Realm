@@ -1,5 +1,29 @@
 {% extends "base.html" %}
 {% block content %}
+{% set perms = (request.session.get('user_permissions') if request and request.session else []) or [] %}
+{% set policy = (request.session.get('user_policy') if request and request.session else {}) or {} %}
+{% if policy is mapping %}
+  {% set allowed_tunnels = (policy.get('allowed_tunnel_types') or []) %}
+  {% if policy.get('tunnel_limit_enabled') is not none %}
+    {% set tunnel_limit_enabled = policy.get('tunnel_limit_enabled') %}
+  {% else %}
+    {% set tunnel_limit_enabled = 'allowed_tunnel_types' in policy %}
+  {% endif %}
+{% else %}
+  {% set allowed_tunnels = [] %}
+  {% set tunnel_limit_enabled = false %}
+{% endif %}
+{% set can_nodes_write = ('*' in perms) or ('nodes.write' in perms) or ('nodes.*' in perms) %}
+{% set can_nodes_delete = ('*' in perms) or ('nodes.delete' in perms) or ('nodes.*' in perms) %}
+{% set can_publish = ('*' in perms) or ('publish.apply' in perms) %}
+{% set can_backup = ('*' in perms) or ('backup.manage' in perms) %}
+{% set can_restore = ('*' in perms) or ('restore.manage' in perms) %}
+{% set can_mode_wss_perm = ('*' in perms) or ('sync.wss' in perms) or ('sync.*' in perms) %}
+{% set can_mode_intranet_perm = ('*' in perms) or ('sync.intranet' in perms) or ('sync.*' in perms) %}
+{% set tunnel_no_limit = not tunnel_limit_enabled %}
+{% set can_mode_tcp = can_publish %}
+{% set can_mode_wss = can_publish and can_mode_wss_perm and (tunnel_no_limit or ('wss' in allowed_tunnels)) %}
+{% set can_mode_intranet = can_publish and can_mode_intranet_perm and (tunnel_no_limit or ('intranet' in allowed_tunnels)) %}
 <div id="toast" class="toast"></div>
 
 <div class="split-layout">
@@ -11,7 +35,9 @@
         <div class="card-sub">切换查看该节点的转发规则</div>
       </div>
       <div class="right" style="flex:0 0 auto;">
+        {% if can_nodes_write %}
         <button class="btn xs" type="button" onclick="openAddNodeModal()">接入节点</button>
+        {% endif %}
       </div>
     </div>
     <div class="node-list">
@@ -96,8 +122,12 @@
                     <option value="running">运行中</option>
                     <option value="disabled">已暂停</option>
                     <option value="tcp">TCP/UDP</option>
+                    {% if can_mode_wss %}
                     <option value="wss">WSS 隧道</option>
+                    {% endif %}
+                    {% if can_mode_intranet %}
                     <option value="intranet">内网穿透</option>
+                    {% endif %}
                     <option value="lb">负载均衡（多目标）</option>
                     <option value="remark">有备注</option>
                   </select>
@@ -106,6 +136,7 @@
             </details>
 
             <!-- Bulk operations (shown only when any rules are selected) -->
+            {% if can_publish %}
             <div id="bulkBar" class="bulk-bar" style="display:none;">
               <span class="pill xs ghost" id="bulkCount">已选 0</span>
               <button class="btn xs ghost" type="button" title="批量启用" onclick="bulkSetDisabled(false)">▶ 启用</button>
@@ -113,35 +144,54 @@
               <button class="btn xs ghost" type="button" title="批量删除" onclick="bulkDeleteSelected()" style="color:var(--bad);">🗑 删除</button>
               <button class="btn xs ghost" type="button" title="清空选择" onclick="clearRuleSelection()">清空</button>
             </div>
+            {% endif %}
+            {% if can_publish %}
             <button class="btn sm primary toolbar-main-cta" type="button" onclick="newRule()">+ 创建转发</button>
+            {% endif %}
+            {% if can_nodes_write %}
             <button class="btn sm ghost toolbar-command" type="button" onclick="openCommandModal('一键接入命令', window.__INSTALL_CMD__)">接入命令</button>
+            {% endif %}
             <details class="menu toolbar-rules">
               <summary class="btn sm ghost">规则工具 ▾</summary>
               <div class="menu-pop">
+                {% if can_backup %}
                 <a class="menu-item" href="/api/nodes/{{ node.id }}/backup">备份规则 <span class="muted sm">下载</span></a>
+                {% endif %}
+                {% if can_restore %}
                 <button class="menu-item" type="button" id="restoreRulesBtn" onclick="triggerRestore()">恢复规则 <span class="muted sm">粘贴</span></button>
+                {% endif %}
+                {% if can_publish %}
                 <div class="menu-sep"></div>
                 <button class="menu-item danger" type="button" onclick="purgeAllRules()">
                   清空所有规则 <span class="muted sm">危险</span>
                 </button>
+                {% endif %}
               </div>
             </details>
 
             <details class="menu toolbar-node">
               <summary class="btn sm ghost">节点操作 ▾</summary>
               <div class="menu-pop">
+                {% if can_nodes_write %}
                 <button class="menu-item" type="button" onclick="openEditNodeModal()">编辑节点</button>
+                {% endif %}
                 <button class="menu-item" type="button" id="autoRefreshBtn" onclick="toggleAutoRefresh()">自动刷新：开</button>
+                {% if can_nodes_write %}
                 <div class="menu-sep"></div>
                 <button class="menu-item" type="button" onclick="confirmAndShowUninstallCommand()">
                   卸载 Agent <span class="muted sm">停止受控</span>
                 </button>
+                {% endif %}
+                {% if can_publish %}
                 <div class="menu-sep"></div>
                 <button class="menu-item" type="button" onclick="resetNodeTraffic()">重置流量统计 <span class="muted sm">清零</span></button>
+                {% endif %}
+                {% if can_nodes_delete %}
                 <div class="menu-sep"></div>
                 <button class="menu-item danger" type="button" onclick="removeCurrentNode()">
                   移除节点 <span class="muted sm">危险</span>
                 </button>
+                {% endif %}
               </div>
             </details>
           </div>
@@ -398,8 +448,12 @@
 	      <!-- 保留原 select（JS/接口依赖 #f_type），仅隐藏不展示 -->
 	      <select class="select" id="f_type" style="display:none;">
 	        <option value="tcp">TCP/UDP</option>
+	        {% if can_mode_wss %}
 	        <option value="wss">WSS 隧道</option>
+	        {% endif %}
+	        {% if can_mode_intranet %}
 	        <option value="intranet">内网穿透</option>
+	        {% endif %}
 	      </select>
 
 	      <!-- 模式卡片：直接放在参数页顶部（取消独立介绍页） -->
@@ -419,6 +473,7 @@
 	            </div>
 	          </button>
 
+	          {% if can_mode_wss %}
 	          <button class="mode-card" type="button" data-mode="wss" role="tab" aria-selected="false">
 	            <div class="mode-card-head">
 	              <div class="mode-ico">🛡️</div>
@@ -432,7 +487,9 @@
 	              <span class="mode-tag">双端</span>
 	            </div>
 	          </button>
+	          {% endif %}
 
+	          {% if can_mode_intranet %}
 	          <button class="mode-card" type="button" data-mode="intranet" role="tab" aria-selected="false">
 	            <div class="mode-card-head">
 	              <div class="mode-ico">🏠</div>
@@ -446,6 +503,7 @@
 	              <span class="mode-tag">双端</span>
 	            </div>
 	          </button>
+	          {% endif %}
 	        </div>
 	      </div>
 
@@ -545,6 +603,11 @@
                 <label class="label">每秒新建连接上限</label>
                 <input class="input" id="f_qos_conn_rate" type="number" step="1" placeholder="例如 300">
                 <div class="help">限制新建连接速率（每秒）。</div>
+              </div>
+              <div class="col" style="max-width:260px;">
+                <label class="label">总流量上限（GB）</label>
+                <input class="input" id="f_qos_traffic_total_gb" type="number" step="1" placeholder="例如 500">
+                <div class="help">达到上限后将阻断该端口新流量；留空=不限制。</div>
               </div>
             </div>
           </div>
@@ -859,7 +922,27 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=89.0"></script>
+{% set perms2 = (request.session.get('user_permissions') if request and request.session else []) or [] %}
+{% set policy2 = (request.session.get('user_policy') if request and request.session else {}) or {} %}
+{% if policy2 is mapping %}
+  {% set allowed_tunnels2 = (policy2.get('allowed_tunnel_types') or []) %}
+  {% if policy2.get('tunnel_limit_enabled') is not none %}
+    {% set tunnel_limit_enabled2 = policy2.get('tunnel_limit_enabled') %}
+  {% else %}
+    {% set tunnel_limit_enabled2 = 'allowed_tunnel_types' in policy2 %}
+  {% endif %}
+{% else %}
+  {% set allowed_tunnels2 = [] %}
+  {% set tunnel_limit_enabled2 = false %}
+{% endif %}
+{% set can_publish2 = ('*' in perms2) or ('publish.apply' in perms2) %}
+{% set can_mode_wss_perm2 = ('*' in perms2) or ('sync.wss' in perms2) or ('sync.*' in perms2) %}
+{% set can_mode_intranet_perm2 = ('*' in perms2) or ('sync.intranet' in perms2) or ('sync.*' in perms2) %}
+{% set tunnel_no_limit2 = not tunnel_limit_enabled2 %}
+{% set can_mode_tcp2 = can_publish2 %}
+{% set can_mode_wss2 = can_publish2 and can_mode_wss_perm2 and (tunnel_no_limit2 or ('wss' in allowed_tunnels2)) %}
+{% set can_mode_intranet2 = can_publish2 and can_mode_intranet_perm2 and (tunnel_no_limit2 or ('intranet' in allowed_tunnels2)) %}
+<script src="/static/app.js?v=90.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};
@@ -873,6 +956,8 @@ window.__NODE_GROUP__ = {{ (node.group_name or '默认分组')|tojson }};
 window.__INSTALL_CMD__ = {{ install_cmd|tojson }};
 window.__UNINSTALL_CMD__ = {{ uninstall_cmd|tojson }};
 window.__AUTO_OPEN_EDIT_NODE__ = {{ (1 if show_edit_node else 0) }};
+window.__MODE_PERMS__ = {{ {"tcp": can_mode_tcp2, "wss": can_mode_wss2, "intranet": can_mode_intranet2}|tojson }};
+window.__ALLOWED_TUNNEL_MODES__ = {{ ((["tcp"] if can_mode_tcp2 else []) + (["wss"] if can_mode_wss2 else []) + (["intranet"] if can_mode_intranet2 else []))|tojson }};
 window.addEventListener('DOMContentLoaded', () => {
   initNodePage();
 });

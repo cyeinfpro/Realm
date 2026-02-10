@@ -14,9 +14,11 @@ import threading
 import math
 import hashlib
 import hmac
+import ipaddress
 import ssl
 import http.client
 import glob
+import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -29,7 +31,7 @@ import requests
 
 from .config import CFG
 from .intranet_tunnel import IntranetManager, load_server_cert_pem, server_tls_ready
-from .qos import apply_qos_from_pool
+from .qos import apply_qos_from_pool, policies_from_pool
 
 API_KEY_FILE = Path('/etc/realm-agent/api.key')
 ACK_VER_FILE = Path('/etc/realm-agent/panel_ack.version')
@@ -631,11 +633,18 @@ IPT_TABLE = os.environ.get('REALM_IPT_TABLE', 'mangle')
 IPT_CHAIN_IN = os.environ.get('REALM_IPT_CHAIN_IN', 'REALMCOUNT_IN')
 IPT_CHAIN_OUT = os.environ.get('REALM_IPT_CHAIN_OUT', 'REALMCOUNT_OUT')
 IPT_CHAIN_CONN_IN = os.environ.get('REALM_IPT_CHAIN_CONN_IN', 'REALMCONN_IN')
+IPT_LIMIT_TABLE = os.environ.get('REALM_IPT_LIMIT_TABLE', 'filter')
+IPT_LIMIT_CHAIN_IN = os.environ.get('REALM_IPT_LIMIT_CHAIN_IN', 'REALMLIMIT_IN')
 
 _IPT_CACHE_LOCK = threading.Lock()
 _IPT_READY_TS = 0.0
 _IPT_CONN_READY_TS = 0.0
 IPT_READY_TTL = float(os.environ.get('REALM_IPT_READY_TTL', '5.0'))
+
+_IPT_LIMIT_LOCK = threading.Lock()
+_IPT_LIMIT_LAST_SIG = ''
+_IPT_LIMIT_LAST_APPLY_TS = 0.0
+IPT_LIMIT_APPLY_TTL = float(os.environ.get('REALM_IPT_LIMIT_APPLY_TTL', '15.0'))
 
 
 def _iptables_available() -> bool:
@@ -764,6 +773,201 @@ def _ensure_conn_counters(target_ports: set[int]) -> Optional[str]:
 
         _IPT_CONN_READY_TS = now
     return None
+
+
+def _ipt_err_noexist(text: str) -> bool:
+    s = str(text or '').strip().lower()
+    if not s:
+        return False
+    return (
+        ('no chain/target/match by that name' in s)
+        or ('does not exist' in s)
+        or ('not found' in s)
+        or ('bad rule' in s)
+        or ('不存在' in s)
+    )
+
+
+def _ipt_limit_clear_chain() -> List[str]:
+    errors: List[str] = []
+    while True:
+        rc, _o, err = _run_iptables(['-t', IPT_LIMIT_TABLE, '-D', 'INPUT', '-j', IPT_LIMIT_CHAIN_IN])
+        if rc != 0:
+            if err and (not _ipt_err_noexist(err)):
+                errors.append(err.strip() or '删除 INPUT 跳转规则失败')
+            break
+
+    for args in (
+        ['-t', IPT_LIMIT_TABLE, '-F', IPT_LIMIT_CHAIN_IN],
+        ['-t', IPT_LIMIT_TABLE, '-X', IPT_LIMIT_CHAIN_IN],
+    ):
+        rc, _o, err = _run_iptables(args)
+        if rc != 0 and (not _ipt_err_noexist(err)):
+            errors.append(err.strip() or '清理流量上限链失败')
+    return errors
+
+
+def _ipt_limit_append_drop_rule(proto: str, port: int) -> Optional[str]:
+    p = str(proto or '').strip().lower()
+    if p not in ('tcp', 'udp'):
+        return f'unsupported proto: {proto}'
+
+    if p == 'tcp':
+        rc, _o, err = _run_iptables(
+            [
+                '-t',
+                IPT_LIMIT_TABLE,
+                '-A',
+                IPT_LIMIT_CHAIN_IN,
+                '-p',
+                'tcp',
+                '--dport',
+                str(int(port)),
+                '-j',
+                'REJECT',
+                '--reject-with',
+                'tcp-reset',
+            ]
+        )
+        if rc == 0:
+            return None
+        rc2, _o2, err2 = _run_iptables(
+            [
+                '-t',
+                IPT_LIMIT_TABLE,
+                '-A',
+                IPT_LIMIT_CHAIN_IN,
+                '-p',
+                'tcp',
+                '--dport',
+                str(int(port)),
+                '-j',
+                'DROP',
+            ]
+        )
+        if rc2 == 0:
+            return None
+        return (err2 or err or 'append tcp drop failed').strip()
+
+    rc, _o, err = _run_iptables(
+        [
+            '-t',
+            IPT_LIMIT_TABLE,
+            '-A',
+            IPT_LIMIT_CHAIN_IN,
+            '-p',
+            'udp',
+            '--dport',
+            str(int(port)),
+            '-j',
+            'DROP',
+        ]
+    )
+    if rc == 0:
+        return None
+    return (err or 'append udp drop failed').strip()
+
+
+def _sync_traffic_limit_firewall(blocked_ports: Dict[int, Dict[str, Any]], has_limits: bool) -> Optional[str]:
+    """Apply/remove drop rules for traffic-cap exceeded ports."""
+    if has_limits and (not _iptables_available()):
+        return '已配置规则总流量上限，但当前系统缺少 iptables，无法执行超限阻断'
+
+    payload = []
+    for p in sorted(int(x) for x in blocked_ports.keys() if int(x) > 0):
+        item = blocked_ports.get(p) or {}
+        protos = item.get('protocols')
+        if not isinstance(protos, set):
+            protos = set(protos or [])
+        protos_norm = sorted(x for x in protos if x in ('tcp', 'udp'))
+        if not protos_norm:
+            protos_norm = ['tcp', 'udp']
+        payload.append({'port': int(p), 'protocols': protos_norm})
+
+    sig_src = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
+    sig = hashlib.sha1(sig_src.encode('utf-8')).hexdigest()
+
+    global _IPT_LIMIT_LAST_SIG, _IPT_LIMIT_LAST_APPLY_TS
+    now = time.monotonic()
+    with _IPT_LIMIT_LOCK:
+        if (sig == _IPT_LIMIT_LAST_SIG) and ((now - float(_IPT_LIMIT_LAST_APPLY_TS)) <= float(IPT_LIMIT_APPLY_TTL)):
+            return None
+
+        errors: List[str] = []
+        if not payload:
+            errors.extend(_ipt_limit_clear_chain())
+        else:
+            _ipt_ensure_chain(IPT_LIMIT_TABLE, IPT_LIMIT_CHAIN_IN)
+            _ipt_ensure_jump(IPT_LIMIT_TABLE, 'INPUT', IPT_LIMIT_CHAIN_IN)
+            rc, _o, err = _run_iptables(['-t', IPT_LIMIT_TABLE, '-F', IPT_LIMIT_CHAIN_IN])
+            if rc != 0 and (not _ipt_err_noexist(err)):
+                errors.append(err.strip() or '清空流量上限链失败')
+
+            for it in payload:
+                port = int(it['port'])
+                for proto in (it.get('protocols') or ['tcp', 'udp']):
+                    e = _ipt_limit_append_drop_rule(str(proto), port)
+                    if e:
+                        errors.append(f'port {port}/{proto}: {e}')
+
+        _IPT_LIMIT_LAST_APPLY_TS = now
+        _IPT_LIMIT_LAST_SIG = sig
+        if errors:
+            return '; '.join(errors[:4])
+        return None
+
+
+def _traffic_limit_status_from_pool(
+    pool: Dict[str, Any],
+    conn_map: Dict[int, Dict[str, int]],
+) -> Tuple[Dict[int, Dict[str, Any]], Optional[str]]:
+    """Build per-port traffic-cap status and enforce firewall blocks."""
+    status_by_port: Dict[int, Dict[str, Any]] = {}
+    blocked: Dict[int, Dict[str, Any]] = {}
+
+    try:
+        policies, _warnings = policies_from_pool(pool if isinstance(pool, dict) else {'endpoints': []})
+    except Exception as exc:
+        return {}, f'读取规则 QoS 失败：{exc}'
+
+    has_limits = False
+    for p in policies:
+        try:
+            port = int(getattr(p, 'port', 0) or 0)
+        except Exception:
+            port = 0
+        if port <= 0:
+            continue
+
+        try:
+            limit = int(getattr(p, 'traffic_total_bytes', 0) or 0)
+        except Exception:
+            limit = 0
+        if limit <= 0:
+            continue
+        has_limits = True
+
+        raw = conn_map.get(port) or {}
+        rx = int(raw.get('rx_bytes') or 0)
+        tx = int(raw.get('tx_bytes') or 0)
+        used = max(0, rx + tx)
+        blocked_now = used >= int(limit)
+
+        status_by_port[port] = {
+            'limit_bytes': int(limit),
+            'used_bytes': int(used),
+            'blocked': bool(blocked_now),
+        }
+
+        if blocked_now:
+            protos = getattr(p, 'protocols', set()) or set()
+            protos_norm = {x for x in protos if x in ('tcp', 'udp')}
+            if not protos_norm:
+                protos_norm = {'tcp', 'udp'}
+            blocked[port] = {'protocols': protos_norm}
+
+    warn = _sync_traffic_limit_firewall(blocked, has_limits=has_limits)
+    return status_by_port, warn
 
 
 def _parse_iptables_chain_pkts(stdout: str, want: set[int], match_token: str) -> dict[int, int]:
@@ -1928,6 +2132,9 @@ _QOS_STATUS: Dict[str, Any] = {
     "warnings": [],
     "errors": [],
 }
+_PANEL_TASK_RESULTS_LOCK = threading.Lock()
+_PANEL_TASK_RESULTS: List[Dict[str, Any]] = []
+_PANEL_TASK_RESULTS_MAX = max(20, int(os.getenv("REALM_AGENT_PANEL_TASK_RESULTS_MAX", "200") or "200"))
 
 # ------------------------ Intranet Tunnel Supervisor ------------------------
 # 说明：公网节点(A) 与 内网节点(B) 之间的一对一“内网穿透”由 Agent 负责：
@@ -1936,6 +2143,46 @@ _QOS_STATUS: Dict[str, Any] = {
 # 这些规则在 pool 中以 extra_config.intranet_role 标记，realm 本体不会接管。
 
 _INTRANET = IntranetManager(node_id=AGENT_ID)
+
+
+def _queue_panel_task_result(row: Dict[str, Any]) -> None:
+    if not isinstance(row, dict):
+        return
+    out = dict(row)
+    out_id = str(out.get("id") or "").strip()
+    if not out_id:
+        out["id"] = uuid.uuid4().hex
+    out.setdefault("time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    with _PANEL_TASK_RESULTS_LOCK:
+        _PANEL_TASK_RESULTS.append(out)
+        if len(_PANEL_TASK_RESULTS) > _PANEL_TASK_RESULTS_MAX:
+            overflow = len(_PANEL_TASK_RESULTS) - _PANEL_TASK_RESULTS_MAX
+            del _PANEL_TASK_RESULTS[:overflow]
+
+
+def _peek_panel_task_results(limit: int = 40) -> List[Dict[str, Any]]:
+    n = int(limit or 40)
+    if n < 1:
+        n = 1
+    if n > _PANEL_TASK_RESULTS_MAX:
+        n = _PANEL_TASK_RESULTS_MAX
+    with _PANEL_TASK_RESULTS_LOCK:
+        if not _PANEL_TASK_RESULTS:
+            return []
+        rows = _PANEL_TASK_RESULTS[:n]
+    return [dict(r) for r in rows if isinstance(r, dict)]
+
+
+def _ack_panel_task_results(ids: List[str]) -> None:
+    seq = [str(x or "").strip() for x in (ids or []) if str(x or "").strip()]
+    if not seq:
+        return
+    done = set(seq)
+    with _PANEL_TASK_RESULTS_LOCK:
+        if not _PANEL_TASK_RESULTS:
+            return
+        kept = [r for r in _PANEL_TASK_RESULTS if str((r or {}).get("id") or "").strip() not in done]
+        _PANEL_TASK_RESULTS[:] = kept
 
 
 def _qos_set_status(st: Dict[str, Any]) -> None:
@@ -2271,8 +2518,28 @@ set -euo pipefail
 TMP_ZIP=\"/tmp/realm-agent-repo-{update_id}.zip\"
 LOG=\"{log_path}\"
 STATE=\"{UPDATE_STATE_FILE}\"
+SCRIPT_PATH=\"{script_path}\"
+LOG_RETENTION_DAYS=\"${{REALM_AGENT_UPDATE_LOG_RETENTION_DAYS:-7}}\"
+TMP_RETENTION_DAYS=\"${{REALM_AGENT_UPDATE_TMP_RETENTION_DAYS:-1}}\"
 
 mkdir -p \"$(dirname \"$LOG\")\" || true
+
+prune_old_artifacts() {{
+  if [[ \"$LOG_RETENTION_DAYS\" =~ ^[0-9]+$ ]]; then
+    find /var/log -maxdepth 1 -type f -name 'realm-agent-update-*.log' -mtime +\"$LOG_RETENTION_DAYS\" -delete 2>/dev/null || true
+  fi
+  if [[ \"$TMP_RETENTION_DAYS\" =~ ^[0-9]+$ ]]; then
+    find /tmp -maxdepth 1 -type f -name 'realm-agent-update-*.sh' -mtime +\"$TMP_RETENTION_DAYS\" -delete 2>/dev/null || true
+    find /tmp -maxdepth 1 -type f -name 'realm-agent-repo-*.zip' -mtime +\"$TMP_RETENTION_DAYS\" -delete 2>/dev/null || true
+  fi
+}}
+
+cleanup() {{
+  rm -f \"$TMP_ZIP\" \"$SCRIPT_PATH\" 2>/dev/null || true
+  prune_old_artifacts
+}}
+
+trap cleanup EXIT
 
 fail() {{
   local code=\"$1\"; shift || true
@@ -2418,6 +2685,90 @@ def _apply_reset_traffic_cmd(cmd: Dict[str, Any]) -> None:
         _LAST_SYNC_ERROR = f'reset_traffic 失败：{exc}'
         return
 
+
+def _cmd_bool(v: Any, default: bool = False) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return bool(default)
+    s = str(v).strip().lower()
+    if not s:
+        return bool(default)
+    if s in ("1", "true", "yes", "on", "y"):
+        return True
+    if s in ("0", "false", "no", "off", "n"):
+        return False
+    return bool(default)
+
+
+def _apply_website_task_cmd(cmd: Dict[str, Any]) -> None:
+    global _LAST_SYNC_ERROR
+    t = str(cmd.get("type") or "").strip()
+    try:
+        task_id = int(cmd.get("task_id") or 0)
+    except Exception:
+        task_id = 0
+    try:
+        attempt = int(cmd.get("attempt") or 0)
+    except Exception:
+        attempt = 0
+
+    if task_id <= 0:
+        return
+
+    result_payload: Dict[str, Any] = {}
+    ok = False
+    err_text = ""
+    try:
+        if t == "website_env_ensure":
+            req = {
+                "need_nginx": _cmd_bool(cmd.get("need_nginx"), True),
+                "need_php": _cmd_bool(cmd.get("need_php"), _cmd_bool(cmd.get("include_php"), False)),
+                "need_acme": _cmd_bool(cmd.get("need_acme"), True),
+            }
+            result_payload = api_website_env_ensure(req)
+        elif t == "website_env_uninstall":
+            req = {
+                "purge_data": _cmd_bool(cmd.get("purge_data"), False),
+                "deep_uninstall": _cmd_bool(cmd.get("deep_uninstall"), False),
+                "sites": cmd.get("sites") if isinstance(cmd.get("sites"), list) else [],
+            }
+            result_payload = api_website_env_uninstall(req)
+        elif t == "website_ssl_issue":
+            req = cmd.get("request") if isinstance(cmd.get("request"), dict) else {}
+            result_payload = api_ssl_issue(req)
+        elif t == "website_ssl_renew":
+            req = cmd.get("request") if isinstance(cmd.get("request"), dict) else {}
+            result_payload = api_ssl_renew(req)
+        else:
+            return
+
+        if not isinstance(result_payload, dict):
+            result_payload = {"ok": False, "error": "invalid_response"}
+        ok = bool(result_payload.get("ok", False))
+        if not ok:
+            err_text = str(result_payload.get("error") or "执行失败")
+            _LAST_SYNC_ERROR = f"{t} 失败：{err_text}"
+        else:
+            _LAST_SYNC_ERROR = None
+    except Exception as exc:
+        ok = False
+        err_text = str(exc)
+        result_payload = {"ok": False, "error": err_text}
+        _LAST_SYNC_ERROR = f"{t} 失败：{err_text}"
+
+    _queue_panel_task_result(
+        {
+            "task_id": int(task_id),
+            "type": t,
+            "attempt": int(attempt) if attempt > 0 else 1,
+            "ok": bool(ok),
+            "error": "" if ok else str(err_text or result_payload.get("error") or "执行失败"),
+            "result": result_payload,
+        }
+    )
+
+
 def _handle_panel_commands(cmds: Any) -> None:
     if not isinstance(cmds, list) or not cmds:
         return
@@ -2429,7 +2780,16 @@ def _handle_panel_commands(cmds: Any) -> None:
 
         # Signature required for panel commands that modify state
         t = str(cmd.get('type') or '').strip()
-        if t in ('sync_pool', 'pool_patch', 'update_agent', 'reset_traffic'):
+        if t in (
+            'sync_pool',
+            'pool_patch',
+            'update_agent',
+            'reset_traffic',
+            'website_env_ensure',
+            'website_env_uninstall',
+            'website_ssl_issue',
+            'website_ssl_renew',
+        ):
             if not api_key or not _verify_cmd_sig(cmd, api_key):
                 # do not crash; keep reporting error for UI
                 global _LAST_SYNC_ERROR
@@ -2444,6 +2804,8 @@ def _handle_panel_commands(cmds: Any) -> None:
             _apply_update_agent_cmd(cmd)
         elif t == 'reset_traffic':
             _apply_reset_traffic_cmd(cmd)
+        elif t in ('website_env_ensure', 'website_env_uninstall', 'website_ssl_issue', 'website_ssl_renew'):
+            _apply_website_task_cmd(cmd)
 
 def _push_loop() -> None:
     """后台上报线程。"""
@@ -2477,6 +2839,7 @@ def _push_loop() -> None:
         started = time.time()
         try:
             ack = _read_int(ACK_VER_FILE, 0)
+            task_results = _peek_panel_task_results(limit=40)
             payload = {
                 'node_id': AGENT_ID,
                 'ack_version': ack,
@@ -2485,11 +2848,16 @@ def _push_loop() -> None:
                 'agent_update': _load_update_state(),
                 'report': _build_push_report(),
             }
+            if task_results:
+                payload['task_results'] = task_results
             raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
             zipped = gzip.compress(raw, compresslevel=5)
             r = sess.post(url, data=zipped, headers=headers, timeout=3)
             if r.status_code == 200:
                 data = r.json() if r.content else {}
+                if task_results:
+                    ack_ids = [str((x or {}).get("id") or "").strip() for x in task_results]
+                    _ack_panel_task_results(ack_ids)
                 _handle_panel_commands(data.get('commands'))
                 backoff = 0.0
             else:
@@ -3535,6 +3903,10 @@ def _build_stats_snapshot() -> Dict[str, Any]:
     # will reset the displayed traffic to 0, even though iptables counters are cumulative.
     _apply_traffic_baseline(port_sig, conn_traffic_map)
 
+    # Traffic cap (per rule/listen port): once cumulative bytes reach limit,
+    # block new packets on INPUT for that listen port.
+    traffic_limit_status, traffic_limit_warn = _traffic_limit_status_from_pool(full, conn_traffic_map)
+
     # 组装规则统计
     def _attach_probe_meta(dst: Dict[str, Any], rid: str) -> None:
         meta = probe_stats_map.get(rid)
@@ -3568,6 +3940,10 @@ def _build_stats_snapshot() -> Dict[str, Any]:
         ct = conn_traffic_map.get(port) or {'connections': 0, 'connections_active': 0, 'connections_total': 0, 'rx_bytes': 0, 'tx_bytes': 0}
         rx_bytes = int(ct.get('rx_bytes') or 0)
         tx_bytes = int(ct.get('tx_bytes') or 0)
+        tl = traffic_limit_status.get(port) or {}
+        traffic_limit_bytes = int(tl.get('limit_bytes') or 0)
+        traffic_used_bytes = int(tl.get('used_bytes') or (rx_bytes + tx_bytes if traffic_limit_bytes > 0 else 0))
+        traffic_limit_blocked = bool(tl.get('blocked'))
 
         health: List[Dict[str, Any]] = []
         entries = per_rule_entries[idx] if idx < len(per_rule_entries) else []
@@ -3617,6 +3993,10 @@ def _build_stats_snapshot() -> Dict[str, Any]:
                 'connections_total': int(ct.get('connections_total') or 0),
                 'rx_bytes': rx_bytes,
                 'tx_bytes': tx_bytes,
+                'traffic_limit_bytes': traffic_limit_bytes,
+                'traffic_used_bytes': traffic_used_bytes,
+                'traffic_limit_blocked': traffic_limit_blocked,
+                'traffic_limited': traffic_limit_blocked,
                 'health': health,
             })
             continue
@@ -3671,12 +4051,21 @@ def _build_stats_snapshot() -> Dict[str, Any]:
             'connections_total': int(ct.get('connections_total') or 0),
             'rx_bytes': rx_bytes,
             'tx_bytes': tx_bytes,
+            'traffic_limit_bytes': traffic_limit_bytes,
+            'traffic_used_bytes': traffic_used_bytes,
+            'traffic_limit_blocked': traffic_limit_blocked,
+            'traffic_limited': traffic_limit_blocked,
             'health': health,
         })
 
     resp: Dict[str, Any] = {'ok': True, 'rules': rules, 'probe_remotes': probe_remotes}
+    warnings: List[str] = []
     if ss_err:
-        resp['warning'] = ss_err
+        warnings.append(str(ss_err))
+    if traffic_limit_warn:
+        warnings.append(str(traffic_limit_warn))
+    if warnings:
+        resp['warning'] = '; '.join(dict.fromkeys([w for w in warnings if str(w).strip()]))
     return resp
 
 
@@ -3756,6 +4145,13 @@ def _reset_traffic_stats(
                 _CONN_TOTAL_HISTORY.clear()
         except Exception:
             pass
+
+    # 4) clear traffic-cap drop chain (best-effort)
+    try:
+        warn = _sync_traffic_limit_firewall({}, has_limits=False)
+        out["traffic_limit"] = {"cleared": warn is None, "warning": str(warn or "")}
+    except Exception:
+        out["traffic_limit"] = {"cleared": False}
 
     out["memory"]["cleared"] = True
     return out
@@ -4879,6 +5275,144 @@ def _acme_register_account(acme: str, server: str, email: str) -> Tuple[bool, st
         return True, out
     return False, out
 
+
+def _is_public_ip(ip: str) -> bool:
+    try:
+        obj = ipaddress.ip_address(str(ip or "").strip())
+    except Exception:
+        return False
+    return not (
+        obj.is_private
+        or obj.is_loopback
+        or obj.is_link_local
+        or obj.is_multicast
+        or obj.is_reserved
+        or obj.is_unspecified
+    )
+
+
+def _resolve_domain_ips(domain: str) -> List[str]:
+    d = str(domain or "").strip()
+    if not d:
+        return []
+    out: List[str] = []
+    try:
+        rows = socket.getaddrinfo(d, 80, type=socket.SOCK_STREAM)
+    except Exception:
+        rows = []
+    for row in rows:
+        try:
+            ip = str((row[4] or [None])[0] or "").strip()
+        except Exception:
+            ip = ""
+        if ip and ip not in out:
+            out.append(ip)
+    return out
+
+
+def _acme_challenge_probe(domain: str, token: str, timeout: float = 4.5) -> Tuple[bool, int, str]:
+    path = f"/.well-known/acme-challenge/{token}"
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", 80, timeout=timeout)
+        conn.request(
+            "GET",
+            path,
+            headers={"Host": str(domain or ""), "User-Agent": "Nexus-ACME-Preflight"},
+        )
+        resp = conn.getresponse()
+        code = int(resp.status or 0)
+        raw = resp.read(4096)
+        conn.close()
+        body = raw.decode("utf-8", errors="ignore")
+        if code == 200 and token in body:
+            return True, code, ""
+        short = (body or "").strip().replace("\r", " ").replace("\n", " ")
+        if len(short) > 180:
+            short = short[:180] + "..."
+        return False, code, short
+    except Exception as exc:
+        return False, 0, str(exc)
+
+
+def _acme_precheck_domains(domains: List[str], root_path: str) -> Tuple[bool, str, List[Dict[str, Any]]]:
+    rp = str(root_path or "").strip()
+    if not rp:
+        return False, "ACME 预检失败：root_path 为空", []
+    root = Path(rp)
+    out: List[Dict[str, Any]] = []
+    for raw in (domains or []):
+        d = str(raw or "").strip().lower()
+        if not d:
+            continue
+        if d.startswith("*."):
+            return False, f"ACME 预检失败：通配符域名 {d} 不支持 HTTP-01，请改用 DNS-01", out
+
+        ips = _resolve_domain_ips(d)
+        diag: Dict[str, Any] = {"domain": d, "dns_ips": ips}
+        out.append(diag)
+        if not ips:
+            return False, f"ACME 预检失败：域名解析失败（{d}）", out
+
+        if not any(_is_public_ip(ip) for ip in ips):
+            return False, f"ACME 预检失败：域名 {d} 仅解析到内网/保留地址（{', '.join(ips)}）", out
+
+        token = f"nexus-preflight-{uuid.uuid4().hex[:20]}"
+        token_file = root / ".well-known" / "acme-challenge" / token
+        try:
+            token_file.parent.mkdir(parents=True, exist_ok=True)
+            token_file.write_text(token, encoding="utf-8")
+        except Exception as exc:
+            return False, f"ACME 预检失败：写入 challenge 文件失败（{exc}）", out
+
+        try:
+            ok, code, msg = _acme_challenge_probe(d, token)
+            diag["local_http_ok"] = bool(ok)
+            diag["local_http_status"] = int(code)
+            if msg:
+                diag["local_http_detail"] = str(msg)
+            if not ok:
+                hint = f"ACME 预检失败：本机 80 口 challenge 不可达（domain={d}, status={code or '-'}"
+                if msg:
+                    hint += f", detail={msg}"
+                hint += ")"
+                return False, hint, out
+        finally:
+            try:
+                if token_file.exists():
+                    token_file.unlink()
+            except Exception:
+                pass
+
+    return True, "", out
+
+
+def _acme_error_hint(out: str) -> str:
+    low = str(out or "").lower()
+    if not low:
+        return ""
+    if "rate limit" in low or "too many failed authorizations" in low or "too many certificates" in low:
+        return "触发 CA 频率限制，请等待后重试（可先用 staging 测试）。"
+    if "dns problem" in low or "nxdomain" in low or "no valid ip addresses found" in low:
+        return "域名 DNS 解析异常或未生效。"
+    if "connection refused" in low or "timeout" in low or "connection reset" in low or "all connection attempts failed" in low:
+        return "CA 无法从公网访问该域名的 80 端口（请检查解析、放行和转发）。"
+    if "invalid response" in low or "404" in low:
+        return "challenge 路径返回异常（请确认 Nginx 对 /.well-known/acme-challenge 可访问）。"
+    if "wildcard" in low and "http-01" in low:
+        return "通配符域名不支持 HTTP-01，需要 DNS-01。"
+    return ""
+
+
+def _acme_error_text(out: str, fallback: str) -> str:
+    base = str(out or "").strip() or str(fallback or "证书操作失败")
+    if len(base) > 3600:
+        base = base[:3600] + "\n...（已截断）"
+    hint = _acme_error_hint(base)
+    if hint and hint not in base:
+        return f"{base}\n提示：{hint}"
+    return base
+
+
 def _cert_dates(cert_path: Path) -> Dict[str, str]:
     out: Dict[str, str] = {}
     code, txt = _run_cmd(["openssl", "x509", "-noout", "-dates", "-in", str(cert_path)])
@@ -5106,6 +5640,10 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
         return {"ok": False, "error": err}
     root_path = str(root_valid) if root_valid else root_path
 
+    pre_ok, pre_err, pre_diag = _acme_precheck_domains(domains, root_path)
+    if not pre_ok:
+        return {"ok": False, "error": pre_err, "precheck": pre_diag}
+
     acme = _find_acme_sh()
     if not acme:
         # Auto-install acme.sh on demand (common first-use scenario)
@@ -5169,7 +5707,7 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     cmd += ["-w", root_path]
     code, out = _run_cmd(cmd, timeout=300, env=_acme_env())
     if code != 0:
-        return {"ok": False, "error": out or "证书申请失败"}
+        return {"ok": False, "error": _acme_error_text(out, "证书申请失败")}
 
     main_domain = str(domains[0])
     safe = _slugify(main_domain)
@@ -5192,7 +5730,7 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     ]
     code, out = _run_cmd(install_cmd, timeout=90, env=_acme_env())
     if code != 0:
-        return {"ok": False, "error": out or "证书安装失败"}
+        return {"ok": False, "error": _acme_error_text(out, "证书安装失败")}
 
     # Optional: update nginx config to enable HTTPS
     if isinstance(update_conf, dict):
@@ -5271,6 +5809,9 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
         _root_valid, err = _ensure_acme_webroot(root_path, extra_bases)
         if err:
             return {"ok": False, "error": err}
+        pre_ok, pre_err, pre_diag = _acme_precheck_domains(domains, root_path)
+        if not pre_ok:
+            return {"ok": False, "error": pre_err, "precheck": pre_diag}
 
     acme = _find_acme_sh()
     if not acme:
@@ -5328,7 +5869,7 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     cmd = [acme, "--renew", "-d", main_domain, "--server", acme_server]
     code, out = _run_cmd(cmd, timeout=300, env=_acme_env())
     if code != 0:
-        return {"ok": False, "error": out or "证书续期失败"}
+        return {"ok": False, "error": _acme_error_text(out, "证书续期失败")}
 
     safe = _slugify(main_domain)
     cert_dir = Path("/etc/ssl/nexus") / safe
@@ -5350,7 +5891,7 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     ]
     code, out = _run_cmd(install_cmd, timeout=90, env=_acme_env())
     if code != 0:
-        return {"ok": False, "error": out or "证书安装失败"}
+        return {"ok": False, "error": _acme_error_text(out, "证书安装失败")}
 
     if isinstance(update_conf, dict):
         proxy_target = _normalize_proxy_target(str(update_conf.get("proxy_target") or ""))

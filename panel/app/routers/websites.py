@@ -12,11 +12,12 @@ import threading
 import time
 import uuid
 import zipfile
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from ..auth import can_access_node, filter_nodes_for_user
 from ..clients.agent import AgentError, agent_get, agent_get_raw_stream, agent_post
 from ..core.deps import require_login_page
 from ..core.flash import flash, set_flash
@@ -42,6 +43,7 @@ from ..db import (
     list_site_checks,
     list_site_events,
     list_site_file_share_short_links,
+    list_tasks,
     list_nodes,
     list_sites,
     get_site_file_share_short_link,
@@ -106,6 +108,16 @@ def _parse_int_env(name: str, default: int) -> int:
         return int(default)
 
 
+def _parse_float_env(name: str, default: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
 FILE_SHARE_MIN_TTL_SEC = max(300, _parse_int_env("REALM_WEBSITE_FILE_SHARE_MIN_TTL_SEC", 300))
 FILE_SHARE_MAX_TTL_SEC = max(FILE_SHARE_MIN_TTL_SEC, _parse_int_env("REALM_WEBSITE_FILE_SHARE_MAX_TTL_SEC", 30 * 86400))
 FILE_SHARE_DEFAULT_TTL_SEC = _parse_int_env("REALM_WEBSITE_FILE_SHARE_DEFAULT_TTL_SEC", 86400)
@@ -119,6 +131,119 @@ _SHARE_ZIP_JOB_TTL_SEC = max(300, _parse_int_env("REALM_WEBSITE_SHARE_ZIP_JOB_TT
 _SHARE_ZIP_MAX_JOBS = max(20, _parse_int_env("REALM_WEBSITE_SHARE_ZIP_MAX_JOBS", 200))
 _SHARE_ZIP_JOBS: Dict[str, Dict[str, Any]] = {}
 _SHARE_ZIP_JOBS_LOCK = threading.Lock()
+
+_SITE_OP_MAX_ATTEMPTS = max(1, min(30, _parse_int_env("REALM_WEBSITE_OP_MAX_ATTEMPTS", 10)))
+_SITE_OP_RETRY_BASE_SEC = max(1.0, min(120.0, _parse_float_env("REALM_WEBSITE_OP_RETRY_BASE_SEC", 3.0)))
+_SITE_OP_RETRY_MAX_SEC = max(_SITE_OP_RETRY_BASE_SEC, min(600.0, _parse_float_env("REALM_WEBSITE_OP_RETRY_MAX_SEC", 60.0)))
+_SITE_OP_MAX_CONCURRENT = max(1, min(8, _parse_int_env("REALM_WEBSITE_OP_MAX_CONCURRENT", 2)))
+_SITE_OP_SEM: Optional[asyncio.Semaphore] = None
+_SITE_OP_SEM_LOCK = threading.Lock()
+_SITE_BG_TASKS: set[asyncio.Task[Any]] = set()
+_SITE_BG_TASKS_LOCK = threading.Lock()
+
+
+class _WebsiteTaskFatalError(RuntimeError):
+    """Unrecoverable website background task error (do not retry)."""
+
+
+def _site_op_semaphore() -> asyncio.Semaphore:
+    global _SITE_OP_SEM
+    sem = _SITE_OP_SEM
+    if sem is not None:
+        return sem
+    with _SITE_OP_SEM_LOCK:
+        sem = _SITE_OP_SEM
+        if sem is None:
+            sem = asyncio.Semaphore(_SITE_OP_MAX_CONCURRENT)
+            _SITE_OP_SEM = sem
+        return sem
+
+
+def _site_task_backoff_sec(attempt_no: int) -> float:
+    n = max(1, int(attempt_no or 1))
+    return float(min(_SITE_OP_RETRY_MAX_SEC, _SITE_OP_RETRY_BASE_SEC * (2 ** (n - 1))))
+
+
+def _site_task_progress_for_attempt(attempt_no: int, max_attempts: int) -> int:
+    total = max(1, int(max_attempts or 1))
+    cur = max(1, min(total, int(attempt_no or 1)))
+    if total <= 1:
+        return 10
+    ratio = float(cur - 1) / float(total - 1)
+    return max(8, min(90, int(8 + ratio * 72)))
+
+
+def _track_site_bg_task(task: asyncio.Task[Any]) -> None:
+    with _SITE_BG_TASKS_LOCK:
+        _SITE_BG_TASKS.add(task)
+
+    def _done(t: asyncio.Task[Any]) -> None:
+        with _SITE_BG_TASKS_LOCK:
+            _SITE_BG_TASKS.discard(t)
+        try:
+            _ = t.exception()
+        except Exception:
+            pass
+
+    task.add_done_callback(_done)
+
+
+def _launch_site_bg_job(coro: Awaitable[Any]) -> bool:
+    try:
+        t = asyncio.create_task(coro)
+    except Exception:
+        return False
+    _track_site_bg_task(t)
+    return True
+
+
+def _to_flag(value: Any) -> bool:
+    s = str(value or "").strip().lower()
+    return s in ("1", "true", "yes", "on", "y")
+
+
+async def _run_site_task_with_retry(
+    task_id: int,
+    op_name: str,
+    runner: Callable[[], Awaitable[Any]],
+) -> Tuple[Any, int]:
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, _SITE_OP_MAX_ATTEMPTS + 1):
+        update_task(
+            int(task_id),
+            status="running",
+            progress=_site_task_progress_for_attempt(attempt, _SITE_OP_MAX_ATTEMPTS),
+            error="",
+            result={"op": str(op_name or ""), "attempt": int(attempt), "max_attempts": int(_SITE_OP_MAX_ATTEMPTS)},
+        )
+        try:
+            async with _site_op_semaphore():
+                data = await runner()
+            return data, int(attempt)
+        except _WebsiteTaskFatalError as exc:
+            last_exc = exc
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= _SITE_OP_MAX_ATTEMPTS:
+                break
+            wait_s = _site_task_backoff_sec(attempt)
+            update_task(
+                int(task_id),
+                status="queued",
+                progress=_site_task_progress_for_attempt(attempt, _SITE_OP_MAX_ATTEMPTS),
+                error=str(exc),
+                result={
+                    "op": str(op_name or ""),
+                    "attempt": int(attempt),
+                    "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+                    "retry_in_sec": float(wait_s),
+                },
+            )
+            await asyncio.sleep(wait_s)
+    if last_exc is None:
+        raise RuntimeError("任务执行失败")
+    raise last_exc
 
 
 def _parse_share_ttl_sec(raw: Any) -> int:
@@ -416,6 +541,14 @@ def _build_stream_zip_filename(site_id: int, site_name: Any) -> str:
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     base = _sanitize_download_name(site_name, f"site-{site_id}")
     return f"{base}-share-{stamp}.zip"
+
+
+def _build_path_zip_filename(site_id: int, site_name: Any, rel_path: str) -> str:
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    leaf = str(rel_path or "").replace("\\", "/").rstrip("/").split("/")[-1]
+    fallback = _sanitize_download_name(site_name, f"site-{site_id}")
+    base = _sanitize_download_name(leaf, fallback)
+    return f"{base}-{stamp}.zip"
 
 
 async def _iter_share_zip_stream(
@@ -760,6 +893,27 @@ def _normalize_proxy_target(target: str) -> str:
     return f"http://{t}"
 
 
+def _is_agent_unreachable_error(err: Any) -> bool:
+    msg = str(err or "").strip().lower()
+    if not msg:
+        return False
+    tokens = (
+        "all connection attempts failed",
+        "connection refused",
+        "connect timeout",
+        "read timeout",
+        "timed out",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "network is unreachable",
+        "no route to host",
+        "cannot assign requested address",
+        "tls handshake",
+        "ssl:",
+    )
+    return any(t in msg for t in tokens)
+
+
 def _format_bytes(num: int) -> str:
     try:
         n = float(num)
@@ -846,6 +1000,300 @@ def _merge_node_env_caps(node: Dict[str, Any], env_data: Any) -> None:
 
     if changed:
         _persist_node_capabilities(node, merged)
+
+
+_ENV_TASK_TYPES = {"website_env_ensure", "website_env_uninstall"}
+
+
+def _attach_latest_env_tasks(nodes: List[Dict[str, Any]]) -> None:
+    if not isinstance(nodes, list) or not nodes:
+        return
+    node_ids: set[int] = set()
+    for n in nodes:
+        try:
+            nid = int((n or {}).get("id") or 0)
+        except Exception:
+            nid = 0
+        if nid > 0:
+            node_ids.add(nid)
+    if not node_ids:
+        return
+    latest: Dict[int, Dict[str, Any]] = {}
+    try:
+        rows = list_tasks(limit=max(80, len(node_ids) * 10))
+    except Exception:
+        rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        tname = str(row.get("type") or "").strip().lower()
+        if tname not in _ENV_TASK_TYPES:
+            continue
+        try:
+            nid = int(row.get("node_id") or 0)
+        except Exception:
+            nid = 0
+        if nid <= 0 or nid not in node_ids or nid in latest:
+            continue
+        latest[nid] = row
+    for n in nodes:
+        try:
+            nid = int((n or {}).get("id") or 0)
+        except Exception:
+            nid = 0
+        if nid > 0:
+            n["latest_env_task"] = latest.get(nid)
+
+
+def _ensure_certificate_pending(site_id: int, node_id: int, domains: List[str]) -> int:
+    existing = list_certificates(site_id=int(site_id))
+    cert_id = int(existing[0].get("id") or 0) if existing else 0
+    if cert_id > 0:
+        update_certificate(
+            cert_id,
+            domains=list(domains or []),
+            status="pending",
+            last_error="",
+        )
+        return cert_id
+    return int(
+        add_certificate(
+            node_id=int(node_id),
+            site_id=int(site_id),
+            domains=list(domains or []),
+            status="pending",
+            last_error="",
+        )
+    )
+
+
+async def _bg_website_env_ensure(task_id: int, node_id: int, include_php: bool) -> None:
+    try:
+        async def _runner() -> Dict[str, Any]:
+            node = get_node(int(node_id))
+            if not node or str(node.get("role") or "") != "website":
+                raise _WebsiteTaskFatalError("节点不存在或不是网站机")
+            payload = {
+                "need_nginx": True,
+                "need_php": bool(include_php),
+                "need_acme": True,
+            }
+            data = await agent_post(
+                node["base_url"],
+                node["api_key"],
+                "/api/v1/website/env/ensure",
+                payload,
+                node_verify_tls(node),
+                timeout=300,
+            )
+            if not data.get("ok", True):
+                raise AgentError(str(data.get("error") or "安装失败"))
+            _merge_node_env_caps(node, data)
+            return data
+
+        data, attempts = await _run_site_task_with_retry(int(task_id), "website_env_ensure", _runner)
+        result = dict(data) if isinstance(data, dict) else {}
+        result["attempts"] = int(attempts)
+        update_task(int(task_id), status="success", progress=100, error="", result=result)
+    except Exception as exc:
+        update_task(
+            int(task_id),
+            status="failed",
+            progress=100,
+            error=str(exc),
+            result={"op": "website_env_ensure"},
+        )
+
+
+async def _bg_website_env_uninstall(task_id: int, node_id: int, purge_data: bool, deep_uninstall: bool) -> None:
+    try:
+        async def _runner() -> Dict[str, Any]:
+            node = get_node(int(node_id))
+            if not node or str(node.get("role") or "") != "website":
+                raise _WebsiteTaskFatalError("节点不存在或不是网站机")
+            sites = list_sites(node_id=int(node_id))
+            payload = {
+                "purge_data": bool(purge_data),
+                "deep_uninstall": bool(deep_uninstall),
+                "sites": [
+                    {
+                        "domains": s.get("domains") or [],
+                        "root_path": s.get("root_path") or "",
+                        "root_base": _node_root_base(node),
+                    }
+                    for s in sites
+                ],
+            }
+            data = await agent_post(
+                node["base_url"],
+                node["api_key"],
+                "/api/v1/website/env/uninstall",
+                payload,
+                node_verify_tls(node),
+                timeout=30,
+            )
+            if not data.get("ok", True):
+                raise AgentError(str(data.get("error") or "卸载失败"))
+            if purge_data:
+                delete_certificates_by_node(int(node_id))
+                delete_sites_by_node(int(node_id))
+            return data
+
+        data, attempts = await _run_site_task_with_retry(int(task_id), "website_env_uninstall", _runner)
+        result = dict(data) if isinstance(data, dict) else {}
+        result["attempts"] = int(attempts)
+        update_task(int(task_id), status="success", progress=100, error="", result=result)
+    except Exception as exc:
+        update_task(
+            int(task_id),
+            status="failed",
+            progress=100,
+            error=str(exc),
+            result={"op": "website_env_uninstall"},
+        )
+
+
+async def _bg_website_ssl_task(task_id: int, site_id: int, cert_id: int, actor: str, action: str) -> None:
+    act = str(action or "").strip().lower()
+    if act not in ("issue", "renew"):
+        update_task(
+            int(task_id),
+            status="failed",
+            progress=100,
+            error="不支持的 SSL 任务类型",
+            result={"op": f"website_ssl_{act or 'unknown'}"},
+        )
+        return
+
+    event_action = f"ssl_{act}"
+    site_payload: Dict[str, Any] = {}
+    site_obj = get_site(int(site_id))
+    if isinstance(site_obj, dict):
+        site_payload = {"domains": list(site_obj.get("domains") or []), "task_id": int(task_id)}
+    add_site_event(int(site_id), event_action, status="running", actor=str(actor or ""), payload=site_payload)
+
+    path = "/api/v1/website/ssl/issue" if act == "issue" else "/api/v1/website/ssl/renew"
+    task_op = f"website_ssl_{act}"
+
+    try:
+        async def _runner() -> Dict[str, Any]:
+            site = get_site(int(site_id))
+            if not site:
+                raise _WebsiteTaskFatalError("站点不存在")
+            node_id = int(site.get("node_id") or 0)
+            node = get_node(node_id)
+            if not node:
+                raise _WebsiteTaskFatalError("节点不存在")
+            domains = site.get("domains") or []
+            if not domains:
+                raise _WebsiteTaskFatalError("站点域名为空")
+
+            req_payload = {
+                "domains": domains,
+                "root_path": site.get("root_path") or "",
+                "root_base": _node_root_base(node),
+                "update_conf": {
+                    "type": site.get("type") or "static",
+                    "root_path": site.get("root_path") or "",
+                    "proxy_target": _normalize_proxy_target(site.get("proxy_target") or ""),
+                    "https_redirect": bool(site.get("https_redirect") or False),
+                    "gzip_enabled": True if site.get("gzip_enabled") is None else bool(site.get("gzip_enabled")),
+                    "nginx_tpl": site.get("nginx_tpl") or "",
+                },
+            }
+
+            data = await agent_post(
+                node["base_url"],
+                node["api_key"],
+                path,
+                req_payload,
+                node_verify_tls(node),
+                timeout=240,
+            )
+            if not data.get("ok", True):
+                err = str(data.get("error") or ("证书申请失败" if act == "issue" else "证书续期失败"))
+                if "未安装" in err and "acme.sh" in err:
+                    env_payload = {
+                        "need_nginx": True,
+                        "need_php": bool((site.get("type") or "") == "php"),
+                        "need_acme": True,
+                    }
+                    env_data = await agent_post(
+                        node["base_url"],
+                        node["api_key"],
+                        "/api/v1/website/env/ensure",
+                        env_payload,
+                        node_verify_tls(node),
+                        timeout=300,
+                    )
+                    if not env_data.get("ok", True):
+                        raise AgentError(f"{err}；自动安装环境失败：{env_data.get('error')}")
+                    _merge_node_env_caps(node, env_data)
+                    data = await agent_post(
+                        node["base_url"],
+                        node["api_key"],
+                        path,
+                        req_payload,
+                        node_verify_tls(node),
+                        timeout=240,
+                    )
+                    if not data.get("ok", True):
+                        raise AgentError(str(data.get("error") or err))
+                else:
+                    raise AgentError(err)
+            return {"site": site, "domains": domains, "data": data}
+
+        ret, attempts = await _run_site_task_with_retry(int(task_id), task_op, _runner)
+        site = ret.get("site") if isinstance(ret, dict) else {}
+        domains = (ret.get("domains") if isinstance(ret, dict) else []) or []
+        data = (ret.get("data") if isinstance(ret, dict) else {}) or {}
+        node_id = int((site or {}).get("node_id") or 0)
+
+        if int(cert_id) > 0:
+            update_certificate(
+                int(cert_id),
+                status="valid",
+                domains=list(domains),
+                not_before=data.get("not_before"),
+                not_after=data.get("not_after"),
+                renew_at=data.get("renew_at"),
+                last_error="",
+            )
+        elif node_id > 0:
+            add_certificate(
+                node_id=node_id,
+                site_id=int(site_id),
+                domains=list(domains),
+                status="valid",
+                not_before=data.get("not_before"),
+                not_after=data.get("not_after"),
+                renew_at=data.get("renew_at"),
+                last_error="",
+            )
+
+        result = dict(data) if isinstance(data, dict) else {}
+        result["attempts"] = int(attempts)
+        update_task(int(task_id), status="success", progress=100, error="", result=result)
+        add_site_event(int(site_id), event_action, status="success", actor=str(actor or ""), result=data)
+    except Exception as exc:
+        err_text = str(exc)
+        if int(cert_id) > 0:
+            update_certificate(int(cert_id), status="failed", last_error=err_text)
+        else:
+            site = get_site(int(site_id))
+            if isinstance(site, dict):
+                node_id = int(site.get("node_id") or 0)
+                domains = site.get("domains") or []
+                if node_id > 0 and domains:
+                    add_certificate(
+                        node_id=node_id,
+                        site_id=int(site_id),
+                        domains=domains,
+                        status="failed",
+                        last_error=err_text,
+                    )
+        update_task(int(task_id), status="failed", progress=100, error=err_text, result={"op": task_op})
+        add_site_event(int(site_id), event_action, status="failed", actor=str(actor or ""), error=err_text)
 
 
 def _default_nginx_template(site_type: str) -> str:
@@ -1023,7 +1471,8 @@ def _diag_merge(base: Dict[str, Any], live: Any) -> Dict[str, Any]:
 
 @router.get("/websites", response_class=HTMLResponse)
 async def websites_index(request: Request, user: str = Depends(require_login_page)):
-    nodes = [n for n in list_nodes() if str(n.get("role") or "") == "website"]
+    nodes = [n for n in filter_nodes_for_user(user, list_nodes()) if str(n.get("role") or "") == "website"]
+    _attach_latest_env_tasks(nodes)
     sites = list_sites()
     node_map = {int(n["id"]): n for n in nodes}
     open_create = str(request.query_params.get("create") or request.query_params.get("new") or "").strip().lower() in (
@@ -1033,10 +1482,30 @@ async def websites_index(request: Request, user: str = Depends(require_login_pag
         "on",
     )
 
+    visible_sites: List[Dict[str, Any]] = []
     for s in sites:
         nid = int(s.get("node_id") or 0)
-        s["node"] = node_map.get(nid)
+        node = node_map.get(nid)
+        if not node:
+            continue
+        # If health failed only because panel cannot reach agent, show as unknown instead of fail.
+        hs = str(s.get("health_status") or "").strip().lower()
+        herr = str(s.get("health_error") or "").strip()
+        if hs == "fail" and _is_agent_unreachable_error(herr):
+            try:
+                update_site_health(
+                    int(s.get("id") or 0),
+                    "unknown",
+                    health_code=int(s.get("health_code") or 0),
+                    health_latency_ms=int(s.get("health_latency_ms") or 0),
+                    health_error=herr,
+                )
+            except Exception:
+                pass
+            s["health_status"] = "unknown"
+        s["node"] = node
         s["domains_text"] = ", ".join(s.get("domains") or [])
+        visible_sites.append(s)
 
     return templates.TemplateResponse(
         "websites.html",
@@ -1046,7 +1515,7 @@ async def websites_index(request: Request, user: str = Depends(require_login_pag
             "flash": flash(request),
             "title": "网站管理",
             "nodes": nodes,
-            "sites": sites,
+            "sites": visible_sites,
             "open_create": open_create,
         },
     )
@@ -1072,6 +1541,9 @@ async def websites_new_action(
     nginx_tpl: str = Form(""),
     user: str = Depends(require_login_page),
 ):
+    if not can_access_node(user, int(node_id)):
+        set_flash(request, "无权访问该机器")
+        return RedirectResponse(url="/websites?create=1", status_code=303)
     node = get_node(int(node_id))
     if not node or str(node.get("role") or "") != "website":
         set_flash(request, "请选择网站机节点")
@@ -1232,12 +1704,12 @@ async def websites_new_action(
                     health_status = "fail"
                     health_error = str(health.get("error") or "")
         except Exception as exc:
-            health_status = "fail"
             health_error = str(exc)
+            health_status = "unknown" if _is_agent_unreachable_error(health_error) else "fail"
 
         update_site(site_id, status="running" if health_status != "fail" else "error")
         try:
-            if health_status in ("ok", "fail"):
+            if health_status in ("ok", "fail", "unknown"):
                 update_site_health(
                     site_id,
                     health_status,
@@ -1251,6 +1723,8 @@ async def websites_new_action(
         add_site_event(site_id, "site_create", status="success", actor=str(user or ""), result=data)
         if health_status == "fail":
             set_flash(request, f"站点创建成功，但健康检查失败：{health_error or 'HTTP 探测失败'}")
+        elif health_status == "unknown":
+            set_flash(request, f"站点创建成功，但暂时无法连到节点执行健康检查：{health_error or '等待节点连通'}")
         else:
             set_flash(request, "站点创建成功")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
@@ -1507,8 +1981,8 @@ async def website_edit_post(
                     health_status = "fail"
                     health_error = str(health.get("error") or "")
         except Exception as exc:
-            health_status = "fail"
             health_error = str(exc)
+            health_status = "unknown" if _is_agent_unreachable_error(health_error) else "fail"
 
         # Update DB
         update_site(
@@ -1524,7 +1998,7 @@ async def website_edit_post(
             status="running" if health_status != "fail" else "error",
         )
         try:
-            if health_status in ("ok", "fail"):
+            if health_status in ("ok", "fail", "unknown"):
                 update_site_health(
                     int(site_id),
                     health_status,
@@ -1553,6 +2027,8 @@ async def website_edit_post(
         add_site_event(int(site_id), "site_update", status="success", actor=str(user or ""), result=data)
         if health_status == "fail":
             set_flash(request, f"站点更新成功，但健康检查失败：{health_error or 'HTTP 探测失败'}")
+        elif health_status == "unknown":
+            set_flash(request, f"站点更新成功，但暂时无法连到节点执行健康检查：{health_error or '等待节点连通'}")
         else:
             set_flash(request, "站点更新成功")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
@@ -1664,126 +2140,29 @@ async def website_ssl_issue(request: Request, site_id: int, user: str = Depends(
     if not domains:
         set_flash(request, "站点域名为空")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
-
-    cert_id = None
-    existing = list_certificates(site_id=int(site_id))
-    if existing:
-        cert_id = int(existing[0].get("id") or 0)
-
+    cert_id = _ensure_certificate_pending(int(site_id), int(site.get("node_id") or 0), domains)
     task_id = add_task(
         node_id=int(site.get("node_id") or 0),
-        task_type="ssl_issue",
-        payload={"site_id": site_id, "domains": domains},
-        status="running",
-        progress=10,
-    )
-    add_site_event(site_id, "ssl_issue", status="running", actor=str(user or ""), payload={"domains": domains})
-
-    try:
-        req_payload = {
+        task_type="website_ssl_issue",
+        payload={
+            "site_id": int(site_id),
+            "cert_id": int(cert_id),
             "domains": domains,
-            "root_path": site.get("root_path") or "",
-            "root_base": _node_root_base(node),
-            "update_conf": {
-                "type": site.get("type") or "static",
-                "root_path": site.get("root_path") or "",
-                "proxy_target": _normalize_proxy_target(site.get("proxy_target") or ""),
-                "https_redirect": bool(site.get("https_redirect") or False),
-                "gzip_enabled": True if site.get("gzip_enabled") is None else bool(site.get("gzip_enabled")),
-                "nginx_tpl": site.get("nginx_tpl") or "",
-            },
-        }
-
-        data = await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/website/ssl/issue",
-            req_payload,
-            node_verify_tls(node),
-            # SSL issuance can take a while (DNS, CA validation, network).
-            timeout=240,
-        )
-
-        if not data.get("ok", True):
-            err = str(data.get("error") or "证书申请失败")
-
-            # Common first-use failure: node doesn't have acme.sh yet.
-            # Try to auto-install website env once, then retry issuance.
-            if "未安装" in err and "acme.sh" in err:
-                update_task(task_id, progress=20)
-                env_payload = {
-                    "need_nginx": True,
-                    "need_php": bool((site.get("type") or "") == "php"),
-                    "need_acme": True,
-                }
-                env_data = await agent_post(
-                    node["base_url"],
-                    node["api_key"],
-                    "/api/v1/website/env/ensure",
-                    env_payload,
-                    node_verify_tls(node),
-                    timeout=300,
-                )
-                if not env_data.get("ok", True):
-                    raise AgentError(f"{err}；自动安装环境失败：{env_data.get('error')}")
-                _merge_node_env_caps(node, env_data)
-
-                update_task(task_id, progress=35)
-                data = await agent_post(
-                    node["base_url"],
-                    node["api_key"],
-                    "/api/v1/website/ssl/issue",
-                    req_payload,
-                    node_verify_tls(node),
-                    timeout=240,
-                )
-                if not data.get("ok", True):
-                    raise AgentError(str(data.get("error") or err))
-            else:
-                raise AgentError(err)
-
-        if cert_id:
-            update_certificate(
-                cert_id,
-                status="valid",
-                not_before=data.get("not_before"),
-                not_after=data.get("not_after"),
-                renew_at=data.get("renew_at"),
-                last_error="",
-            )
-        else:
-            add_certificate(
-                node_id=int(site.get("node_id") or 0),
-                site_id=int(site_id),
-                domains=domains,
-                status="valid",
-                not_before=data.get("not_before"),
-                not_after=data.get("not_after"),
-                renew_at=data.get("renew_at"),
-                last_error="",
-            )
-        update_task(task_id, status="success", progress=100, result=data)
-        warn = str(data.get("warning") or "").strip() if isinstance(data, dict) else ""
-        add_site_event(site_id, "ssl_issue", status="success", actor=str(user or ""), result=data)
-        if warn:
-            set_flash(request, f"证书申请成功，但有警告：{warn}")
-        else:
-            set_flash(request, "证书申请成功")
-    except Exception as exc:
-        if cert_id:
-            update_certificate(cert_id, status="failed", last_error=str(exc))
-        else:
-            add_certificate(
-                node_id=int(site.get("node_id") or 0),
-                site_id=int(site_id),
-                domains=domains,
-                status="failed",
-                last_error=str(exc),
-            )
-        update_task(task_id, status="failed", progress=100, error=str(exc))
-        add_site_event(site_id, "ssl_issue", status="failed", actor=str(user or ""), error=str(exc))
-        set_flash(request, f"证书申请失败：{exc}")
-
+            "actor": str(user or ""),
+            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+        },
+        status="queued",
+        progress=0,
+        result={"queued": True, "op": "website_ssl_issue", "max_attempts": int(_SITE_OP_MAX_ATTEMPTS), "attempt": 0},
+    )
+    add_site_event(
+        int(site_id),
+        "ssl_issue",
+        status="queued",
+        actor=str(user or ""),
+        payload={"domains": domains, "task_id": int(task_id)},
+    )
+    set_flash(request, f"已创建 SSL 申请任务 #{task_id}，等待节点上报后自动执行（支持内网节点）。")
     return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
 
@@ -1802,119 +2181,29 @@ async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(
     if not domains:
         set_flash(request, "站点域名为空")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
-
-    existing = list_certificates(site_id=int(site_id))
-    cert_id = int(existing[0].get("id") or 0) if existing else None
-
+    cert_id = _ensure_certificate_pending(int(site_id), int(site.get("node_id") or 0), domains)
     task_id = add_task(
         node_id=int(site.get("node_id") or 0),
-        task_type="ssl_renew",
-        payload={"site_id": site_id, "domains": domains},
-        status="running",
-        progress=10,
-    )
-    add_site_event(site_id, "ssl_renew", status="running", actor=str(user or ""), payload={"domains": domains})
-
-    try:
-        req_payload = {
+        task_type="website_ssl_renew",
+        payload={
+            "site_id": int(site_id),
+            "cert_id": int(cert_id),
             "domains": domains,
-            "root_path": site.get("root_path") or "",
-            "root_base": _node_root_base(node),
-            "update_conf": {
-                "type": site.get("type") or "static",
-                "root_path": site.get("root_path") or "",
-                "proxy_target": _normalize_proxy_target(site.get("proxy_target") or ""),
-                "https_redirect": bool(site.get("https_redirect") or False),
-                "gzip_enabled": True if site.get("gzip_enabled") is None else bool(site.get("gzip_enabled")),
-                "nginx_tpl": site.get("nginx_tpl") or "",
-            },
-        }
-
-        data = await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/website/ssl/renew",
-            req_payload,
-            node_verify_tls(node),
-            # SSL renewal may take time as well.
-            timeout=240,
-        )
-        if not data.get("ok", True):
-            err = str(data.get("error") or "证书续期失败")
-            if "未安装" in err and "acme.sh" in err:
-                update_task(task_id, progress=20)
-                env_payload = {
-                    "need_nginx": True,
-                    "need_php": bool((site.get("type") or "") == "php"),
-                    "need_acme": True,
-                }
-                env_data = await agent_post(
-                    node["base_url"],
-                    node["api_key"],
-                    "/api/v1/website/env/ensure",
-                    env_payload,
-                    node_verify_tls(node),
-                    timeout=300,
-                )
-                if not env_data.get("ok", True):
-                    raise AgentError(f"{err}；自动安装环境失败：{env_data.get('error')}")
-                _merge_node_env_caps(node, env_data)
-                update_task(task_id, progress=35)
-                data = await agent_post(
-                    node["base_url"],
-                    node["api_key"],
-                    "/api/v1/website/ssl/renew",
-                    req_payload,
-                    node_verify_tls(node),
-                    timeout=240,
-                )
-                if not data.get("ok", True):
-                    raise AgentError(str(data.get("error") or err))
-            else:
-                raise AgentError(err)
-
-        if cert_id:
-            update_certificate(
-                cert_id,
-                status="valid",
-                not_before=data.get("not_before"),
-                not_after=data.get("not_after"),
-                renew_at=data.get("renew_at"),
-                last_error="",
-            )
-        else:
-            add_certificate(
-                node_id=int(site.get("node_id") or 0),
-                site_id=int(site_id),
-                domains=domains,
-                status="valid",
-                not_before=data.get("not_before"),
-                not_after=data.get("not_after"),
-                renew_at=data.get("renew_at"),
-                last_error="",
-            )
-
-        update_task(task_id, status="success", progress=100, result=data)
-        warn = str(data.get("warning") or "").strip() if isinstance(data, dict) else ""
-        add_site_event(site_id, "ssl_renew", status="success", actor=str(user or ""), result=data)
-        if warn:
-            set_flash(request, f"证书续期成功，但有警告：{warn}")
-        else:
-            set_flash(request, "证书续期成功")
-    except Exception as exc:
-        if cert_id:
-            update_certificate(cert_id, status="failed", last_error=str(exc))
-        else:
-            add_certificate(
-                node_id=int(site.get("node_id") or 0),
-                site_id=int(site_id),
-                domains=domains,
-                status="failed",
-                last_error=str(exc),
-            )
-        update_task(task_id, status="failed", progress=100, error=str(exc))
-        add_site_event(site_id, "ssl_renew", status="failed", actor=str(user or ""), error=str(exc))
-        set_flash(request, f"证书续期失败：{exc}")
+            "actor": str(user or ""),
+            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+        },
+        status="queued",
+        progress=0,
+        result={"queued": True, "op": "website_ssl_renew", "max_attempts": int(_SITE_OP_MAX_ATTEMPTS), "attempt": 0},
+    )
+    add_site_event(
+        int(site_id),
+        "ssl_renew",
+        status="queued",
+        actor=str(user or ""),
+        payload={"domains": domains, "task_id": int(task_id)},
+    )
+    set_flash(request, f"已创建 SSL 续期任务 #{task_id}，等待节点上报后自动执行（支持内网节点）。")
     return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
 
@@ -2072,43 +2361,28 @@ async def website_env_uninstall(
     if not node or str(node.get("role") or "") != "website":
         set_flash(request, "节点不存在或不是网站机")
         return RedirectResponse(url="/websites", status_code=303)
-
-    sites = list_sites(node_id=int(node_id))
-    payload = {
-        "purge_data": bool(purge_data),
-        "deep_uninstall": bool(deep_uninstall),
-        "sites": [
-            {
-                "domains": s.get("domains") or [],
-                "root_path": s.get("root_path") or "",
-                "root_base": _node_root_base(node),
-            }
-            for s in sites
-        ],
-    }
-
-    try:
-        data = await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/website/env/uninstall",
-            payload,
-            node_verify_tls(node),
-            timeout=30,
-        )
-        if not data.get("ok", True):
-            raise AgentError(str(data.get("error") or "卸载失败"))
-        if purge_data:
-            delete_certificates_by_node(int(node_id))
-            delete_sites_by_node(int(node_id))
-            # related events/checks are deleted in delete_sites_by_node
-        errors = data.get("errors") if isinstance(data, dict) else None
-        if isinstance(errors, list) and errors:
-            set_flash(request, f"卸载完成，但有警告：{'；'.join([str(x) for x in errors])}")
-        else:
-            set_flash(request, "网站环境已卸载")
-    except Exception as exc:
-        set_flash(request, f"卸载失败：{exc}")
+    purge_flag = _to_flag(purge_data)
+    deep_flag = _to_flag(deep_uninstall)
+    task_id = add_task(
+        node_id=int(node_id),
+        task_type="website_env_uninstall",
+        payload={
+            "node_id": int(node_id),
+            "purge_data": bool(purge_flag),
+            "deep_uninstall": bool(deep_flag),
+            "actor": str(user or ""),
+            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+        },
+        status="queued",
+        progress=0,
+        result={
+            "queued": True,
+            "op": "website_env_uninstall",
+            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+            "attempt": 0,
+        },
+    )
+    set_flash(request, f"已创建环境卸载任务 #{task_id}，等待节点上报后自动执行（支持内网节点）。")
     return RedirectResponse(url="/websites", status_code=303)
 
 
@@ -2123,34 +2397,26 @@ async def website_env_ensure(
     if not node or str(node.get("role") or "") != "website":
         set_flash(request, "节点不存在或不是网站机")
         return RedirectResponse(url="/websites", status_code=303)
-
-    payload = {
-        "need_nginx": True,
-        "need_php": bool(include_php),
-        "need_acme": True,
-    }
-    try:
-        data = await agent_post(
-            node["base_url"],
-            node["api_key"],
-            "/api/v1/website/env/ensure",
-            payload,
-            node_verify_tls(node),
-            timeout=300,
-        )
-        if not data.get("ok", True):
-            raise AgentError(str(data.get("error") or "安装失败"))
-        _merge_node_env_caps(node, data)
-        installed = data.get("installed") if isinstance(data, dict) else None
-        already = data.get("already") if isinstance(data, dict) else None
-        msg = "环境安装完成"
-        if installed:
-            msg += f"（新安装：{', '.join([str(x) for x in installed])}）"
-        if already:
-            msg += f"（已存在：{', '.join([str(x) for x in already])}）"
-        set_flash(request, msg)
-    except Exception as exc:
-        set_flash(request, f"环境安装失败：{exc}")
+    php_flag = _to_flag(include_php)
+    task_id = add_task(
+        node_id=int(node_id),
+        task_type="website_env_ensure",
+        payload={
+            "node_id": int(node_id),
+            "include_php": bool(php_flag),
+            "actor": str(user or ""),
+            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+        },
+        status="queued",
+        progress=0,
+        result={
+            "queued": True,
+            "op": "website_env_ensure",
+            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+            "attempt": 0,
+        },
+    )
+    set_flash(request, f"已创建环境安装任务 #{task_id}，等待节点上报后自动执行（支持内网节点）。")
     return RedirectResponse(url="/websites", status_code=303)
 
 
@@ -2696,15 +2962,34 @@ async def website_files_download(
         set_flash(request, "该站点没有可管理的根目录")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
-    filename = path.split("/")[-1] or "download.bin"
+    rel_path = str(path or "").replace("\\", "/").strip().lstrip("/")
+    parent_path = "/".join(rel_path.split("/")[:-1]) if rel_path else ""
+    if not rel_path:
+        set_flash(request, "请选择要下载的文件或目录")
+        return RedirectResponse(url=f"/websites/{site_id}/files?path={parent_path}", status_code=303)
+
+    # Directory download: stream as zip.
     try:
-        upstream, status_code, _detail = await _open_agent_file_stream(node, root, path, timeout=600)
+        await _agent_list_files(node, root, rel_path)
+        zip_name = _build_path_zip_filename(site_id, site.get("name"), rel_path)
+        headers = {"Content-Disposition": _download_content_disposition(zip_name)}
+        return StreamingResponse(
+            _iter_share_zip_stream(node, root, [{"path": rel_path, "is_dir": True}]),
+            media_type="application/zip",
+            headers=headers,
+        )
+    except Exception:
+        pass
+
+    filename = rel_path.split("/")[-1] or "download.bin"
+    try:
+        upstream, status_code, _detail = await _open_agent_file_stream(node, root, rel_path, timeout=600)
     except Exception as exc:
         set_flash(request, f"下载失败：{exc}")
-        return RedirectResponse(url=f"/websites/{site_id}/files?path={'/'.join(path.split('/')[:-1])}", status_code=303)
+        return RedirectResponse(url=f"/websites/{site_id}/files?path={parent_path}", status_code=303)
     if upstream is None:
         set_flash(request, f"下载失败（HTTP {status_code}）")
-        return RedirectResponse(url=f"/websites/{site_id}/files?path={'/'.join(path.split('/')[:-1])}", status_code=303)
+        return RedirectResponse(url=f"/websites/{site_id}/files?path={parent_path}", status_code=303)
     return _stream_file_download_response(upstream, filename)
 
 @router.post("/websites/{site_id}/files/share")

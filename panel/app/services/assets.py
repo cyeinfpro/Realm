@@ -71,10 +71,10 @@ def agent_asset_urls(base_url: str) -> Tuple[str, str, bool]:
     src = panel_asset_source()
     if src == "github":
         sh_url = (os.getenv("REALM_PANEL_AGENT_SH_URL") or "").strip() or (
-            "https://raw.githubusercontent.com/cyeinfpro/Realm/main/realm_agent.sh"
+            "https://nexus.infpro.me/nexus/realm_agent.sh"
         )
         zip_url = (os.getenv("REALM_PANEL_AGENT_ZIP_URL") or "").strip() or (
-            "https://github.com/cyeinfpro/Realm/archive/refs/heads/main.zip"
+            "https://nexus.infpro.me/nexus/archive/refs/heads/main.zip"
         )
         return sh_url, zip_url, True
 
