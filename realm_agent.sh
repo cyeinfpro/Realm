@@ -5,6 +5,10 @@ VERSION="v40"
 REPO_ZIP_URL_DEFAULT="https://nexus.infpro.me/nexus/archive/refs/heads/main.zip"
 REPO_BASE_URL_DEFAULT="https://nexus.infpro.me/nexus"
 REPO_MANIFEST_URL_DEFAULT="${REPO_BASE_URL_DEFAULT}/repo.manifest"
+REPO_FALLBACK_GITHUB_REPO_DEFAULT="https://github.com/cyeinfpro/NexusControlPlane"
+REPO_FALLBACK_BASE_URL_DEFAULT="https://raw.githubusercontent.com/cyeinfpro/NexusControlPlane/main"
+REPO_FALLBACK_ZIP_URL_DEFAULT="${REPO_FALLBACK_GITHUB_REPO_DEFAULT}/archive/refs/heads/main.zip"
+REPO_FALLBACK_MANIFEST_URL_DEFAULT="${REPO_FALLBACK_BASE_URL_DEFAULT}/repo.manifest"
 REPO_MANIFEST_CONCURRENCY_DEFAULT="8"
 DEFAULT_MODE="1"
 DEFAULT_PORT="18700"
@@ -238,6 +242,23 @@ guess_repo_base_from_zip_url(){
   esac
 }
 
+repo_fallback_base_url(){
+  local url="${REALM_AGENT_REPO_FALLBACK_BASE_URL:-${REPO_FALLBACK_BASE_URL_DEFAULT}}"
+  echo "${url%/}"
+}
+
+repo_fallback_manifest_url(){
+  if [[ -n "${REALM_AGENT_REPO_FALLBACK_MANIFEST_URL:-}" ]]; then
+    echo "${REALM_AGENT_REPO_FALLBACK_MANIFEST_URL}"
+    return
+  fi
+  echo "$(repo_fallback_base_url)/repo.manifest"
+}
+
+repo_fallback_zip_url(){
+  echo "${REALM_AGENT_REPO_FALLBACK_ZIP_URL:-${REPO_FALLBACK_ZIP_URL_DEFAULT}}"
+}
+
 download_repo_from_manifest(){
   local base_url="${1%/}"
   local manifest_url="$2"
@@ -306,6 +327,32 @@ download_repo_from_manifest(){
     return 1
   fi
   ok "仓库文件拉取完成（共 ${downloaded} 个）"
+}
+
+download_repo_from_manifest_with_fallback(){
+  local base_url="${1%/}"
+  local manifest_url="$2"
+  local out_dir="$3"
+  local fallback_base fallback_manifest
+
+  if download_repo_from_manifest "${base_url}" "${manifest_url}" "${out_dir}"; then
+    return 0
+  fi
+
+  fallback_base="$(repo_fallback_base_url)"
+  fallback_manifest="$(repo_fallback_manifest_url)"
+  if [[ "${base_url}" == "${fallback_base}" && "${manifest_url}" == "${fallback_manifest}" ]]; then
+    return 1
+  fi
+
+  info "主源清单拉取失败，切换 GitHub 备用源..."
+  rm -rf "${out_dir}" || true
+  mkdir -p "${out_dir}"
+  if download_repo_from_manifest "${fallback_base}" "${fallback_manifest}" "${out_dir}"; then
+    ok "已从 GitHub 备用源拉取仓库文件"
+    return 0
+  fi
+  return 1
 }
 
 install_tcping(){
@@ -607,7 +654,7 @@ fetch_repo(){
     info "使用离线 ZIP：${zip_path}"
     unzip -q "${zip_path}" -d "${tmpdir}"
   else
-    local url panel_base panel_zip repo_base manifest_url
+    local url panel_base panel_zip repo_base manifest_url fallback_zip
     local -a candidates=()
     local fetched="0"
 
@@ -615,6 +662,10 @@ fetch_repo(){
     url="${REALM_AGENT_REPO_ZIP_URL:-}"
     if [[ -n "${url}" ]]; then
       candidates+=("${url}")
+      fallback_zip="$(repo_fallback_zip_url)"
+      if [[ -n "${fallback_zip}" && "${fallback_zip}" != "${url}" ]]; then
+        candidates+=("${fallback_zip}")
+      fi
       info "使用自定义仓库 ZIP 地址：${url}"
     else
       panel_base="$(normalize_panel_url "${REALM_PANEL_URL:-}")"
@@ -623,6 +674,10 @@ fetch_repo(){
         candidates+=("${panel_zip}")
       fi
       candidates+=("${REPO_ZIP_URL_DEFAULT}")
+      fallback_zip="$(repo_fallback_zip_url)"
+      if [[ -n "${fallback_zip}" ]]; then
+        candidates+=("${fallback_zip}")
+      fi
       info "未指定仓库 ZIP 地址，按内置优先级尝试"
     fi
 
@@ -665,10 +720,10 @@ fetch_repo(){
         manifest_url="${repo_base%/}/repo.manifest"
       fi
       info "仓库 ZIP 下载失败，尝试文件清单拉取..."
-      if ! download_repo_from_manifest "${repo_base}" "${manifest_url}" "${tmpdir}/raw"; then
+      if ! download_repo_from_manifest_with_fallback "${repo_base}" "${manifest_url}" "${tmpdir}/raw"; then
         if [[ -z "${REALM_AGENT_REPO_BASE_URL:-}" && -z "${REALM_AGENT_REPO_MANIFEST_URL:-}" && "${repo_base}" != "${REPO_BASE_URL_DEFAULT}" ]]; then
           info "文件清单拉取失败，回退默认源重试..."
-          if ! download_repo_from_manifest "${REPO_BASE_URL_DEFAULT}" "${REPO_MANIFEST_URL_DEFAULT}" "${tmpdir}/raw"; then
+          if ! download_repo_from_manifest_with_fallback "${REPO_BASE_URL_DEFAULT}" "${REPO_MANIFEST_URL_DEFAULT}" "${tmpdir}/raw"; then
             err "仓库下载失败（ZIP 与清单模式均不可用）"
             exit 1
           fi

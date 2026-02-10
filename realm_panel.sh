@@ -5,6 +5,10 @@ VERSION="v38"
 REPO_ZIP_URL_DEFAULT="https://nexus.infpro.me/nexus/archive/refs/heads/main.zip"
 REPO_BASE_URL_DEFAULT="https://nexus.infpro.me/nexus"
 REPO_MANIFEST_URL_DEFAULT="${REPO_BASE_URL_DEFAULT}/repo.manifest"
+REPO_FALLBACK_GITHUB_REPO_DEFAULT="https://github.com/cyeinfpro/NexusControlPlane"
+REPO_FALLBACK_BASE_URL_DEFAULT="https://raw.githubusercontent.com/cyeinfpro/NexusControlPlane/main"
+REPO_FALLBACK_ZIP_URL_DEFAULT="${REPO_FALLBACK_GITHUB_REPO_DEFAULT}/archive/refs/heads/main.zip"
+REPO_FALLBACK_MANIFEST_URL_DEFAULT="${REPO_FALLBACK_BASE_URL_DEFAULT}/repo.manifest"
 REPO_FETCH_MODE_DEFAULT="manifest"
 REPO_MANIFEST_CONCURRENCY_DEFAULT="8"
 PANEL_ROOT="/opt/realm-panel"
@@ -233,6 +237,23 @@ guess_repo_base_from_zip_url(){
   esac
 }
 
+repo_fallback_base_url(){
+  local url="${REPO_FALLBACK_BASE_URL:-${REPO_FALLBACK_BASE_URL_DEFAULT}}"
+  echo "${url%/}"
+}
+
+repo_fallback_manifest_url(){
+  if [[ -n "${REPO_FALLBACK_MANIFEST_URL:-}" ]]; then
+    echo "${REPO_FALLBACK_MANIFEST_URL}"
+    return
+  fi
+  echo "$(repo_fallback_base_url)/repo.manifest"
+}
+
+repo_fallback_zip_url(){
+  echo "${REPO_FALLBACK_ZIP_URL:-${REPO_FALLBACK_ZIP_URL_DEFAULT}}"
+}
+
 download_repo_from_manifest(){
   local base_url="${1%/}"
   local manifest_url="$2"
@@ -301,6 +322,32 @@ download_repo_from_manifest(){
     return 1
   fi
   ok "仓库文件拉取完成（共 ${downloaded} 个）"
+}
+
+download_repo_from_manifest_with_fallback(){
+  local base_url="${1%/}"
+  local manifest_url="$2"
+  local out_dir="$3"
+  local fallback_base fallback_manifest
+
+  if download_repo_from_manifest "${base_url}" "${manifest_url}" "${out_dir}"; then
+    return 0
+  fi
+
+  fallback_base="$(repo_fallback_base_url)"
+  fallback_manifest="$(repo_fallback_manifest_url)"
+  if [[ "${base_url}" == "${fallback_base}" && "${manifest_url}" == "${fallback_manifest}" ]]; then
+    return 1
+  fi
+
+  info "主源清单拉取失败，切换 GitHub 备用源..."
+  rm -rf "${out_dir}" || true
+  mkdir -p "${out_dir}"
+  if download_repo_from_manifest "${fallback_base}" "${fallback_manifest}" "${out_dir}"; then
+    ok "已从 GitHub 备用源拉取仓库文件"
+    return 0
+  fi
+  return 1
 }
 
 latest_realm_tag(){
@@ -478,7 +525,7 @@ extract_repo(){
   EXTRACT_ROOT="$TMPDIR/extract"
   mkdir -p "$EXTRACT_ROOT"
   if [[ "$mode" == "online" ]]; then
-    local url repo_base manifest_url fetch_mode
+    local url repo_base manifest_url fetch_mode fallback_zip_url zip_ok
     local used_manifest="0"
     local tried_manifest="0"
     repo_base="${REPO_BASE_URL:-$(guess_repo_base_from_zip_url "${REPO_ZIP_URL:-$REPO_ZIP_URL_DEFAULT}")}"
@@ -493,7 +540,7 @@ extract_repo(){
     if [[ "${fetch_mode}" != "zip" ]]; then
       tried_manifest="1"
       info "优先使用文件清单拉取..."
-      if download_repo_from_manifest "$repo_base" "$manifest_url" "$EXTRACT_ROOT/raw"; then
+      if download_repo_from_manifest_with_fallback "$repo_base" "$manifest_url" "$EXTRACT_ROOT/raw"; then
         used_manifest="1"
         EXTRACT_ROOT="$EXTRACT_ROOT/raw"
       else
@@ -504,31 +551,46 @@ extract_repo(){
     if [[ "${used_manifest}" != "1" ]]; then
       url="$(discover_repo_zip_url "${repo_base}" || true)"
       [[ -n "${url}" ]] || url="${REPO_ZIP_URL:-$REPO_ZIP_URL_DEFAULT}"
+      fallback_zip_url="$(repo_fallback_zip_url)"
+      zip_ok="0"
       info "正在下载 ZIP 包..."
       if download_file "$url" "$TMPDIR/repo.zip" && unzip -tq "$TMPDIR/repo.zip" >/dev/null 2>&1; then
-        zip_path="$TMPDIR/repo.zip"
-        info "解压中..."
-        unzip -q "$zip_path" -d "$EXTRACT_ROOT"
+        zip_ok="1"
       else
         if [[ -f "$TMPDIR/repo.zip" ]]; then
-          err "仓库 ZIP 校验失败"
+          err "仓库 ZIP 校验失败：${url}"
         fi
-        if [[ "${tried_manifest}" != "1" ]]; then
+        if [[ -n "${fallback_zip_url}" && "${fallback_zip_url}" != "${url}" ]]; then
+          info "主源 ZIP 下载失败，切换 GitHub 备用源..."
+          if download_file "${fallback_zip_url}" "$TMPDIR/repo.zip" && unzip -tq "$TMPDIR/repo.zip" >/dev/null 2>&1; then
+            zip_ok="1"
+            url="${fallback_zip_url}"
+            ok "已从 GitHub 备用源下载仓库 ZIP"
+          elif [[ -f "$TMPDIR/repo.zip" ]]; then
+            err "备用源 ZIP 校验失败：${fallback_zip_url}"
+          fi
+        fi
+        if [[ "${zip_ok}" != "1" && "${tried_manifest}" != "1" ]]; then
           info "ZIP 包不可用，尝试文件清单拉取..."
-          if download_repo_from_manifest "$repo_base" "$manifest_url" "$EXTRACT_ROOT/raw"; then
+          if download_repo_from_manifest_with_fallback "$repo_base" "$manifest_url" "$EXTRACT_ROOT/raw"; then
             used_manifest="1"
             EXTRACT_ROOT="$EXTRACT_ROOT/raw"
           fi
         fi
       fi
+      if [[ "${zip_ok}" == "1" ]]; then
+        zip_path="$TMPDIR/repo.zip"
+        info "解压中..."
+        unzip -q "$zip_path" -d "$EXTRACT_ROOT"
+      fi
     fi
 
-    if [[ "${used_manifest}" != "1" && ! -f "${TMPDIR}/repo.zip" ]]; then
+    if [[ "${used_manifest}" != "1" && "${zip_ok:-0}" != "1" ]]; then
       err "仓库下载失败：ZIP 与清单模式均不可用"
       err "可手动指定 REPO_MANIFEST_URL，或设置 REPO_ZIP_URL 为可直接下载的 ZIP"
       exit 1
     fi
-    if [[ "${used_manifest}" != "1" && ! -d "${EXTRACT_ROOT}/panel" ]]; then
+    if [[ "${used_manifest}" != "1" && "${zip_ok:-0}" == "1" && ! -d "${EXTRACT_ROOT}/panel" ]]; then
       # zip 下载流程在上面已尝试解压；若解压后结构不完整，仍按失败处理。
       PANEL_DIR="$(find "$EXTRACT_ROOT" -maxdepth 6 -type d -name panel -print -quit)"
       if [[ -z "$PANEL_DIR" ]]; then

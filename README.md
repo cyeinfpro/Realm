@@ -144,7 +144,7 @@ Browser
 ### 4.1 一键安装 Panel（推荐）
 
 ```bash
-bash <(curl -fsSL https://nexus.infpro.me/nexus/realm_panel.sh)
+bash <(curl -fsSL https://nexus.infpro.me/nexus/realm_panel.sh || curl -fsSL https://raw.githubusercontent.com/cyeinfpro/NexusControlPlane/main/realm_panel.sh)
 ```
 
 脚本支持：
