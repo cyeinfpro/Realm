@@ -7800,7 +7800,8 @@ def api_ssl_issue(payload: Dict[str, Any], _: None = Depends(_api_key_required))
         if not ok_conf:
             return {"ok": False, "error": f"更新 Nginx 配置失败：{msg}"}
 
-    cmd = [acme, "--issue", "--server", acme_server]
+    # Always force re-issuance when user explicitly triggers "issue".
+    cmd = [acme, "--issue", "--force", "--server", acme_server]
     for d in domains:
         cmd += ["-d", str(d)]
     cmd += ["-w", root_path]
