@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div class="page-title">
+    <h1 class="h1">面板设置</h1>
+    <div class="meta">
+      <span class="meta-item">配置接入地址、SSL 执行策略与发布预检参数（优先级：面板设置 > 环境变量 > 内置默认）。</span>
+    </div>
+  </div>
+  <div class="right">
+    <a href="/" class="btn sm ghost">返回控制台</a>
+  </div>
+</div>
+
+<div class="center-wrap lg">
+  <div class="card center-card">
+    <form method="post" action="/settings" class="form">
+      <div class="h2" style="margin-bottom:6px;">接入与下载地址</div>
+
+      <label class="label">Agent 拉取地址（域名/IP + 端口）</label>
+      <input class="input mono" type="password" autocomplete="off" data-sensitive-input="1" name="agent_bootstrap_url" placeholder="例如：realm.infpro.me:443 或 https://realm.infpro.me:443" value="{{ agent_bootstrap_url or '' }}">
+      <div class="help">用于“接入命令”和 /join /uninstall 脚本入口地址。</div>
+
+      <label class="label">Bootstrap 默认协议（未写协议时）</label>
+      <select class="input" name="agent_bootstrap_default_scheme">
+        <option value="" {{ 'selected' if not agent_bootstrap_default_scheme else '' }}>自动（跟随请求）</option>
+        <option value="https" {{ 'selected' if agent_bootstrap_default_scheme == 'https' else '' }}>https</option>
+        <option value="http" {{ 'selected' if agent_bootstrap_default_scheme == 'http' else '' }}>http</option>
+      </select>
+
+      <label class="label">Agent 更新命令 IP 回退端口</label>
+      <input class="input mono" name="agent_panel_ip_fallback_port" placeholder="默认 6080" value="{{ agent_panel_ip_fallback_port or '' }}">
+      <div class="help">当节点上报入口与公网域名不一致时，作为 panel_ip_fallback_port 下发。</div>
+
+      <label class="label">HTTPS 证书校验</label>
+      <label class="help">
+        <input type="checkbox" name="agent_bootstrap_insecure_tls" value="1" {{ 'checked' if agent_bootstrap_insecure_tls else '' }} style="transform:translateY(1px);">
+        忽略 HTTPS 证书校验（curl 使用 -k）
+      </label>
+
+      <label class="label">面板对外地址（Public URL）</label>
+      <input class="input mono" type="password" autocomplete="off" data-sensitive-input="1" name="panel_public_url" placeholder="例如：https://realm.infpro.me:443" value="{{ panel_public_url or '' }}">
+      <div class="help">用于生成外部脚本链接、短链、更新地址。</div>
+
+      <label class="label">Agent 资源来源</label>
+      <select class="input" name="panel_asset_source">
+        <option value="panel" {{ 'selected' if (panel_asset_source or 'panel') == 'panel' else '' }}>panel（从 /static 拉取）</option>
+        <option value="github" {{ 'selected' if (panel_asset_source or '') == 'github' else '' }}>github（从 GitHub 拉取）</option>
+      </select>
+
+      <label class="label">覆盖 Agent 安装脚本 URL（可选）</label>
+      <input class="input mono" type="password" autocomplete="off" data-sensitive-input="1" name="panel_agent_sh_url" placeholder="例如：https://raw.githubusercontent.com/.../realm_agent.sh" value="{{ panel_agent_sh_url or '' }}">
+
+      <label class="label">覆盖 Agent ZIP URL（可选）</label>
+      <input class="input mono" type="password" autocomplete="off" data-sensitive-input="1" name="panel_agent_zip_url" placeholder="例如：https://github.com/.../main.zip" value="{{ panel_agent_zip_url or '' }}">
+
+      <div class="row" style="margin-top:6px;">
+        <button id="toggleSensitiveSettings" class="btn xs ghost" type="button">显示敏感地址</button>
+      </div>
+
+      <div class="help mono">当前生效 Bootstrap：{{ (effective_bootstrap_url|mask_url) if effective_bootstrap_url else '-' }}</div>
+      <div class="help mono">当前生效 Public URL：{{ (effective_public_url|mask_url) if effective_public_url else '-' }}</div>
+      <div class="help mono">当前生效资源来源：{{ effective_asset_source or '-' }} · fallback_port={{ effective_panel_ip_fallback_port }}</div>
+
+      <hr style="border:none;border-top:1px solid var(--line);margin:16px 0;">
+      <div class="h2" style="margin-bottom:6px;">SSL 申请/续期策略</div>
+
+      <label class="help">
+        <input type="checkbox" name="ssl_direct_first" value="1" {{ 'checked' if ssl_direct_first else '' }} style="transform:translateY(1px);">
+        优先走 panel -> agent 直连执行
+      </label>
+
+      <label class="label">直连超时（秒）</label>
+      <input class="input mono" name="ssl_direct_timeout_sec" placeholder="默认 240" value="{{ ssl_direct_timeout_sec or '' }}">
+
+      <label class="label">直连最大尝试次数</label>
+      <input class="input mono" name="ssl_direct_max_attempts" placeholder="默认 1" value="{{ ssl_direct_max_attempts or '' }}">
+
+      <label class="help">
+        <input type="checkbox" name="ssl_fallback_to_queue" value="1" {{ 'checked' if ssl_fallback_to_queue else '' }} style="transform:translateY(1px);">
+        直连失败后自动回退到当前队列模式（节点上报后执行）
+      </label>
+
+      <div class="help mono">当前生效：timeout={{ effective_ssl_direct_timeout }}s · max_attempts={{ effective_ssl_direct_max_attempts }}</div>
+
+      <hr style="border:none;border-top:1px solid var(--line);margin:16px 0;">
+      <div class="h2" style="margin-bottom:6px;">保存预检（节点规则）</div>
+
+      <label class="help">
+        <input type="checkbox" name="save_precheck_enabled" value="1" {{ 'checked' if save_precheck_enabled else '' }} style="transform:translateY(1px);">
+        启用规则保存前运行时预检（agent /netprobe）
+      </label>
+      <label class="label">预检 HTTP 超时（秒）</label>
+      <input class="input mono" name="save_precheck_http_timeout" placeholder="默认 4.5" value="{{ save_precheck_http_timeout or '' }}">
+      <label class="label">预检探测超时（秒）</label>
+      <input class="input mono" name="save_precheck_probe_timeout" placeholder="默认 1.2" value="{{ save_precheck_probe_timeout or '' }}">
+      <label class="label">最多问题数</label>
+      <input class="input mono" name="save_precheck_max_issues" placeholder="默认 24" value="{{ save_precheck_max_issues or '' }}">
+
+      <hr style="border:none;border-top:1px solid var(--line);margin:16px 0;">
+      <div class="h2" style="margin-bottom:6px;">同步预检（WSS/内网）</div>
+
+      <label class="help">
+        <input type="checkbox" name="sync_precheck_enabled" value="1" {{ 'checked' if sync_precheck_enabled else '' }} style="transform:translateY(1px);">
+        启用同步保存前运行时预检
+      </label>
+      <label class="label">同步预检 HTTP 超时（秒）</label>
+      <input class="input mono" name="sync_precheck_http_timeout" placeholder="默认 4.5" value="{{ sync_precheck_http_timeout or '' }}">
+      <label class="label">同步预检探测超时（秒）</label>
+      <input class="input mono" name="sync_precheck_probe_timeout" placeholder="默认 1.2" value="{{ sync_precheck_probe_timeout or '' }}">
+      <label class="label">同步下发超时（秒）</label>
+      <input class="input mono" name="sync_apply_timeout" placeholder="默认 3" value="{{ sync_apply_timeout or '' }}">
+
+      <div class="row" style="margin-top:14px;">
+        <div class="col">
+          <a href="/" class="btn ghost">取消</a>
+        </div>
+        <div class="col right">
+          <button class="btn" type="submit">保存设置</button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+<script>
+(function(){
+  var btn = document.getElementById('toggleSensitiveSettings');
+  if(!btn) return;
+  var fields = Array.prototype.slice.call(document.querySelectorAll('input[data-sensitive-input="1"]'));
+  if(!fields.length) return;
+  var reveal = false;
+
+  function applyState(){
+    fields.forEach(function(el){
+      var t = reveal ? 'text' : 'password';
+      if(el.type !== t) el.type = t;
+    });
+    btn.textContent = reveal ? '隐藏敏感地址' : '显示敏感地址';
+  }
+
+  btn.addEventListener('click', function(){
+    reveal = !reveal;
+    applyState();
+  });
+
+  applyState();
+})();
+</script>
+{% endblock %}

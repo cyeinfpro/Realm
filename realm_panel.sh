@@ -645,9 +645,92 @@ prepare_agent_bundle(){
   ok "Agent 离线包就绪：/opt/realm-panel/panel/static/realm-agent.zip"
 }
 
+is_valid_port(){
+  local p="${1:-}"
+  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  (( p >= 1 && p <= 65535 ))
+}
+
+normalize_panel_port(){
+  local p="${1:-}"
+  if is_valid_port "$p"; then
+    echo "$p"
+  else
+    echo "6080"
+  fi
+}
+
+current_panel_port(){
+  local from_env=""
+  if [[ -f /etc/realm-panel/panel.env ]]; then
+    from_env="$(grep -E '^REALM_PANEL_PORT=' /etc/realm-panel/panel.env | tail -n1 | cut -d= -f2- || true)"
+    from_env="$(echo "${from_env}" | tr -d '[:space:]')"
+    if is_valid_port "$from_env"; then
+      echo "$from_env"
+      return
+    fi
+  fi
+
+  local from_service=""
+  if [[ -f /etc/systemd/system/realm-panel.service ]]; then
+    from_service="$(grep -Eo -- '--port[[:space:]]+[0-9]+' /etc/systemd/system/realm-panel.service | tail -n1 | awk '{print $2}' || true)"
+    from_service="$(echo "${from_service}" | tr -d '[:space:]')"
+    if is_valid_port "$from_service"; then
+      echo "$from_service"
+      return
+    fi
+  fi
+  echo "6080"
+}
+
+ensure_panel_env_defaults(){
+  local default_port
+  default_port="$(normalize_panel_port "${1:-6080}")"
+  mkdir -p /etc/realm-panel
+  touch /etc/realm-panel/panel.env
+  if ! grep -q '^REALM_PANEL_DB=' /etc/realm-panel/panel.env; then
+    echo "REALM_PANEL_DB=/etc/realm-panel/panel.db" >> /etc/realm-panel/panel.env
+  fi
+  if ! grep -q '^REALM_PANEL_HOST=' /etc/realm-panel/panel.env; then
+    echo "REALM_PANEL_HOST=0.0.0.0" >> /etc/realm-panel/panel.env
+  fi
+  if ! grep -q '^REALM_PANEL_PORT=' /etc/realm-panel/panel.env; then
+    echo "REALM_PANEL_PORT=${default_port}" >> /etc/realm-panel/panel.env
+  fi
+  if ! grep -q '^REALM_PANEL_LOG_FILE=' /etc/realm-panel/panel.env; then
+    echo "REALM_PANEL_LOG_FILE=/var/log/realm-panel/panel.log" >> /etc/realm-panel/panel.env
+  fi
+  if ! grep -q '^REALM_PANEL_LOG_MAX_BYTES=' /etc/realm-panel/panel.env; then
+    echo "REALM_PANEL_LOG_MAX_BYTES=5242880" >> /etc/realm-panel/panel.env
+  fi
+  if ! grep -q '^REALM_PANEL_LOG_BACKUP_COUNT=' /etc/realm-panel/panel.env; then
+    echo "REALM_PANEL_LOG_BACKUP_COUNT=5" >> /etc/realm-panel/panel.env
+  fi
+  if ! grep -q '^REALM_PANEL_CRASH_LOG_FILE=' /etc/realm-panel/panel.env; then
+    echo "REALM_PANEL_CRASH_LOG_FILE=/var/log/realm-panel/crash.log" >> /etc/realm-panel/panel.env
+  fi
+  if ! grep -q '^REALM_PANEL_CRASH_LOG_MAX_BYTES=' /etc/realm-panel/panel.env; then
+    echo "REALM_PANEL_CRASH_LOG_MAX_BYTES=5242880" >> /etc/realm-panel/panel.env
+  fi
+  if ! grep -q '^REALM_PANEL_CRASH_LOG_BACKUP_COUNT=' /etc/realm-panel/panel.env; then
+    echo "REALM_PANEL_CRASH_LOG_BACKUP_COUNT=5" >> /etc/realm-panel/panel.env
+  fi
+  if ! grep -q '^REALM_PANEL_FAULT_LOG_FILE=' /etc/realm-panel/panel.env; then
+    echo "REALM_PANEL_FAULT_LOG_FILE=/var/log/realm-panel/fault.log" >> /etc/realm-panel/panel.env
+  fi
+}
+
+write_start_shim(){
+  cat > /opt/realm-panel/start.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exec /bin/bash /opt/realm-panel/panel/start.sh "$@"
+EOF
+  chmod +x /opt/realm-panel/start.sh
+}
+
 write_systemd(){
-  local port="$1"
-  cat > /etc/systemd/system/realm-panel.service <<EOF
+  cat > /etc/systemd/system/realm-panel.service <<'EOF'
 [Unit]
 Description=Realm Pro Panel
 After=network-online.target
@@ -657,8 +740,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/realm-panel/panel
 EnvironmentFile=-/etc/realm-panel/panel.env
-Environment=REALM_PANEL_DB=/etc/realm-panel/panel.db
-ExecStart=/opt/realm-panel/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port ${port} --workers 1
+ExecStart=/bin/bash -lc 'set -e; if [[ -x /opt/realm-panel/panel/start.sh ]]; then exec /opt/realm-panel/panel/start.sh; fi; if [[ -x /opt/realm-panel/start.sh ]]; then exec /opt/realm-panel/start.sh; fi; echo "panel start script missing under /opt/realm-panel" >&2; exit 1'
 Restart=on-failure
 RestartSec=2
 
@@ -705,7 +787,7 @@ install_panel(){
     [[ "$pass" == "$pass2" ]] || { err "两次输入的密码不一致"; continue; }
     break
   done
-  port="$(prompt "面板端口" "6080")"
+  port="$(normalize_panel_port "$(prompt "面板端口" "6080")")"
 
   # ✅ 新增：是否为公网 IP
   # - 是：继续询问是否输入域名（反代/HTTPS）；否则使用公网 IP+端口
@@ -756,6 +838,15 @@ install_panel(){
 REALM_PANEL_PUBLIC_URL=${public_url}
 REALM_PANEL_DB=/etc/realm-panel/panel.db
 REALM_PANEL_ASSET_SOURCE=${asset_source}
+REALM_PANEL_HOST=0.0.0.0
+REALM_PANEL_PORT=${port}
+REALM_PANEL_LOG_FILE=/var/log/realm-panel/panel.log
+REALM_PANEL_LOG_MAX_BYTES=5242880
+REALM_PANEL_LOG_BACKUP_COUNT=5
+REALM_PANEL_CRASH_LOG_FILE=/var/log/realm-panel/crash.log
+REALM_PANEL_CRASH_LOG_MAX_BYTES=5242880
+REALM_PANEL_CRASH_LOG_BACKUP_COUNT=5
+REALM_PANEL_FAULT_LOG_FILE=/var/log/realm-panel/fault.log
 EOF
   export PANEL_USER="$user"
   export PANEL_PASS="$pass"
@@ -766,9 +857,11 @@ ensure_secret_key()
 save_credentials(os.environ['PANEL_USER'], os.environ['PANEL_PASS'])
 print('OK')
 PY
-) 
+  ) 
 
-  write_systemd "$port"
+  write_start_shim
+  ensure_panel_env_defaults "$port"
+  write_systemd
   systemctl daemon-reload
   systemctl enable realm-panel.service >/dev/null
   systemctl restart realm-panel.service
@@ -809,6 +902,11 @@ update_panel(){
     python3 -m venv "${PANEL_ROOT}/venv"
   fi
   install_python_deps
+  write_start_shim
+  local keep_port
+  keep_port="$(current_panel_port)"
+  ensure_panel_env_defaults "$keep_port"
+  write_systemd
   systemctl daemon-reload
   systemctl restart realm-panel.service
   ok "面板已更新并重启"

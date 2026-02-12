@@ -3,7 +3,7 @@
   <div class="row between">
     <div>
       <div class="h1">节点：{{ node.name }}</div>
-      <div class="muted">{{ node.base_url }}</div>
+      <div class="muted">{{ (node.base_url|mask_url) if node.base_url else '-' }}</div>
     </div>
     <div class="row">
       <button class="btn" onclick="UI.refreshNode()">刷新</button>

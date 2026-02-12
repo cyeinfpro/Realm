@@ -21,7 +21,7 @@
 {% set can_mode_wss_perm = ('*' in perms) or ('sync.wss' in perms) or ('sync.*' in perms) %}
 {% set can_mode_intranet_perm = ('*' in perms) or ('sync.intranet' in perms) or ('sync.*' in perms) %}
 {% set tunnel_no_limit = not tunnel_limit_enabled %}
-{% set can_mode_tcp = can_publish %}
+{% set can_mode_tcp = can_publish and (tunnel_no_limit or ('direct' in allowed_tunnels) or ('tcp' in allowed_tunnels)) %}
 {% set can_mode_wss = can_publish and can_mode_wss_perm and (tunnel_no_limit or ('wss' in allowed_tunnels)) %}
 {% set can_mode_intranet = can_publish and can_mode_intranet_perm and (tunnel_no_limit or ('intranet' in allowed_tunnels)) %}
 <div id="toast" class="toast"></div>
@@ -62,6 +62,13 @@
                  data-node-is-private="{{ 1 if n.is_private else 0 }}"
                  data-node-role="{{ (n.role or 'normal')|e }}"
                  data-node-website-root="{{ (n.website_root_base or '')|e }}"
+                 data-node-ar-enabled="{{ 1 if (n.auto_restart_policy.enabled if n.auto_restart_policy else 1) else 0 }}"
+                 data-node-ar-schedule="{{ (n.auto_restart_policy.schedule_type if n.auto_restart_policy else 'daily')|e }}"
+                 data-node-ar-interval="{{ (n.auto_restart_policy.interval if n.auto_restart_policy else 1) }}"
+                 data-node-ar-hour="{{ (n.auto_restart_policy.hour if n.auto_restart_policy else 4) }}"
+                 data-node-ar-minute="{{ (n.auto_restart_policy.minute if n.auto_restart_policy else 8) }}"
+                 data-node-ar-weekdays="{{ ((n.auto_restart_policy.weekdays if n.auto_restart_policy else [1,2,3,4,5,6,7])|join(','))|e }}"
+                 data-node-ar-monthdays="{{ ((n.auto_restart_policy.monthdays if n.auto_restart_policy else [1])|join(','))|e }}"
                  data-node-display-ip="{{ (n.display_ip or '')|e }}">
               <a class="node-item{% if n.id == node.id %} active{% endif %}" href="/nodes/{{ n.id }}">
                 <span class="dot {% if n.online %}online{% else %}offline{% endif %}"></span>
@@ -175,6 +182,9 @@
                 {% if can_nodes_write %}
                 <button class="menu-item" type="button" onclick="openEditNodeModal()">编辑节点</button>
                 {% endif %}
+                <button class="menu-item" type="button" onclick="promptTraceRouteTarget()">
+                  路由追踪 <span class="muted sm">mtr / traceroute</span>
+                </button>
                 <button class="menu-item" type="button" id="autoRefreshBtn" onclick="toggleAutoRefresh()">自动刷新：开</button>
                 {% if can_nodes_write %}
                 <div class="menu-sep"></div>
@@ -199,7 +209,31 @@
 
         <div id="nodeSummary" class="summary-bar" style="display:none;"></div>
 
-        <!-- Node system info removed (shown only in 控制台 cards) -->
+        <div id="autoRestartCard" class="auto-restart-card" style="display:none;">
+          <div class="auto-restart-head">
+            <div class="auto-restart-title">自动重启策略</div>
+            <span id="autoRestartBadge" class="pill xs ghost">未上报</span>
+          </div>
+          <div class="auto-restart-grid">
+            <div class="auto-restart-item">
+              <div class="k">今日计划</div>
+              <div class="v mono" id="autoRestartPlan">—</div>
+            </div>
+            <div class="auto-restart-item">
+              <div class="k">判定依据</div>
+              <div class="v" id="autoRestartReason">—</div>
+            </div>
+            <div class="auto-restart-item">
+              <div class="k">当前负载</div>
+              <div class="v mono" id="autoRestartLoad">—</div>
+            </div>
+            <div class="auto-restart-item">
+              <div class="k">最近执行</div>
+              <div class="v" id="autoRestartLast">—</div>
+            </div>
+          </div>
+          <div class="auto-restart-foot muted sm" id="autoRestartHint">等待 Agent 上报</div>
+        </div>
 
         <div id="rulesLoading" class="muted">正在加载规则…</div>
 
@@ -426,6 +460,60 @@
       <input class="input" id="editNodeWebsiteRoot" placeholder="/www">
       <div class="help">仅对网站机生效，用于文件管理根目录限制。</div>
 
+      <details class="advanced-details" style="margin-top:10px;" open>
+        <summary>
+          <div class="adv-summary-left">
+            <div class="adv-title">自动重启策略</div>
+            <div class="adv-hint">按节点独立设置（每日/每周/每月）</div>
+          </div>
+          <div class="adv-summary-right">
+            <span class="pill xs ghost">可选</span>
+          </div>
+        </summary>
+        <div class="adv-body">
+          <label class="help"><input type="checkbox" id="editNodeAutoRestartEnabled" style="transform:translateY(1px);"> 启用自动重启</label>
+
+          <div class="row" style="gap:12px; margin-top:8px;">
+            <div class="col" style="max-width:160px;">
+              <label class="label">周期</label>
+              <select class="select" id="editNodeAutoRestartSchedule" onchange="toggleAutoRestartEditor()">
+                <option value="daily">每天</option>
+                <option value="weekly">每周</option>
+                <option value="monthly">每月</option>
+              </select>
+            </div>
+            <div class="col" style="max-width:130px;">
+              <label class="label">间隔</label>
+              <input class="input" id="editNodeAutoRestartInterval" type="number" min="1" max="365" value="1" placeholder="1">
+              <div class="help">每 N 个周期</div>
+            </div>
+            <div class="col" style="max-width:160px;">
+              <label class="label">时间</label>
+              <input class="input" id="editNodeAutoRestartTime" type="time" value="04:08">
+            </div>
+          </div>
+
+          <div id="editNodeAutoRestartWeeklyBox" style="margin-top:8px; display:none;">
+            <label class="label">每周几执行</label>
+            <div class="row" style="gap:8px;flex-wrap:wrap;">
+              <label class="help"><input type="checkbox" data-ar-weekday="1"> 周一</label>
+              <label class="help"><input type="checkbox" data-ar-weekday="2"> 周二</label>
+              <label class="help"><input type="checkbox" data-ar-weekday="3"> 周三</label>
+              <label class="help"><input type="checkbox" data-ar-weekday="4"> 周四</label>
+              <label class="help"><input type="checkbox" data-ar-weekday="5"> 周五</label>
+              <label class="help"><input type="checkbox" data-ar-weekday="6"> 周六</label>
+              <label class="help"><input type="checkbox" data-ar-weekday="7"> 周日</label>
+            </div>
+          </div>
+
+          <div id="editNodeAutoRestartMonthlyBox" style="margin-top:8px; display:none;">
+            <label class="label">每月日期</label>
+            <input class="input" id="editNodeAutoRestartMonthdays" placeholder="例如：1,15,28">
+            <div class="help">支持多个日期（1-31，逗号分隔）</div>
+          </div>
+        </div>
+      </details>
+
       <div id="editNodeError" class="muted" style="margin-top:8px;color:var(--bad);"></div>
 
       <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
@@ -536,6 +624,16 @@
 	              <option value="1">暂停</option>
 	            </select>
 	          </div>
+
+          <!-- Normal forwarding tool (basic params for tcp mode) -->
+          <div class="col" id="forwardToolBox" style="max-width:240px; display:none;">
+            <label class="label">普通转发工具</label>
+            <select class="select" id="f_forward_tool">
+              <option value="iptables">iptables（默认）</option>
+              <option value="realm">realm</option>
+            </select>
+            <div class="help">仅普通转发生效；WSS/内网穿透不使用该选项。</div>
+          </div>
 
 	          <!-- WSS: 接收机节点 -->
 	          <div class="col peer-col" id="wssBox" style="display:none;">
@@ -919,6 +1017,46 @@
     </div>
   </div>
 </div>
+
+<div id="traceRouteModal" class="modal" style="display:none;">
+  <div class="modal-inner trace-route-modal-inner">
+    <div class="row" style="justify-content:space-between;align-items:center;">
+      <div class="col"><div class="h2" id="traceRouteTitle">路由追踪</div></div>
+      <div class="right"><button class="btn xs ghost" type="button" onclick="closeTraceRouteModal()">关闭</button></div>
+    </div>
+    <div id="traceRouteHint" class="muted sm" style="margin-top:8px;">在当前节点执行路由追踪（优先 mtr，回退 traceroute）。</div>
+    <div id="traceRouteMeta" class="trace-route-meta" style="margin-top:8px;"></div>
+    <div id="traceRouteError" class="form-error" style="margin-top:8px;"></div>
+
+    <div class="trace-route-chart-card" style="margin-top:10px;">
+      <div class="trace-route-chart-head">
+        <div class="name">每跳延迟</div>
+        <div class="hint muted sm">折线为 Avg(ms)，丢包跳会断开</div>
+      </div>
+      <canvas id="traceRouteCanvas" class="hist-canvas small trace-route-canvas" aria-label="trace-route-latency"></canvas>
+    </div>
+
+    <div class="table-wrap trace-route-table-wrap" style="margin-top:8px;">
+      <table class="table no-sticky trace-route-table">
+        <thead>
+          <tr>
+            <th>Hop</th>
+            <th>Host</th>
+            <th>IP</th>
+            <th>Loss</th>
+            <th>Avg</th>
+            <th>Best</th>
+            <th>Worst</th>
+            <th>Samples</th>
+          </tr>
+        </thead>
+        <tbody id="traceRouteBody">
+          <tr><td colspan="8" class="muted">暂无追踪结果</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -939,10 +1077,10 @@
 {% set can_mode_wss_perm2 = ('*' in perms2) or ('sync.wss' in perms2) or ('sync.*' in perms2) %}
 {% set can_mode_intranet_perm2 = ('*' in perms2) or ('sync.intranet' in perms2) or ('sync.*' in perms2) %}
 {% set tunnel_no_limit2 = not tunnel_limit_enabled2 %}
-{% set can_mode_tcp2 = can_publish2 %}
+{% set can_mode_tcp2 = can_publish2 and (tunnel_no_limit2 or ('direct' in allowed_tunnels2) or ('tcp' in allowed_tunnels2)) %}
 {% set can_mode_wss2 = can_publish2 and can_mode_wss_perm2 and (tunnel_no_limit2 or ('wss' in allowed_tunnels2)) %}
 {% set can_mode_intranet2 = can_publish2 and can_mode_intranet_perm2 and (tunnel_no_limit2 or ('intranet' in allowed_tunnels2)) %}
-<script src="/static/app.js?v=90.0"></script>
+<script src="/static/app.js?v=100.0"></script>
 <script>
 window.__NODE_ID__ = {{ node.id }};
 window.__NODE_IP__ = {{ (node.display_ip or node.name)|tojson }};
@@ -953,6 +1091,13 @@ window.__NODE_IS_PRIVATE__ = {{ (1 if node.is_private else 0) }};
 window.__NODE_ROLE__ = {{ (node.role or 'normal')|tojson }};
 window.__NODE_WEBSITE_ROOT__ = {{ (node.website_root_base or '')|tojson }};
 window.__NODE_GROUP__ = {{ (node.group_name or '默认分组')|tojson }};
+window.__NODE_AUTO_RESTART_ENABLED__ = {{ (1 if (node.auto_restart_policy.enabled if node.auto_restart_policy else 1) else 0) }};
+window.__NODE_AUTO_RESTART_SCHEDULE__ = {{ ((node.auto_restart_policy.schedule_type if node.auto_restart_policy else 'daily'))|tojson }};
+window.__NODE_AUTO_RESTART_INTERVAL__ = {{ (node.auto_restart_policy.interval if node.auto_restart_policy else 1) }};
+window.__NODE_AUTO_RESTART_HOUR__ = {{ (node.auto_restart_policy.hour if node.auto_restart_policy else 4) }};
+window.__NODE_AUTO_RESTART_MINUTE__ = {{ (node.auto_restart_policy.minute if node.auto_restart_policy else 8) }};
+window.__NODE_AUTO_RESTART_WEEKDAYS__ = {{ ((node.auto_restart_policy.weekdays if node.auto_restart_policy else [1,2,3,4,5,6,7]))|tojson }};
+window.__NODE_AUTO_RESTART_MONTHDAYS__ = {{ ((node.auto_restart_policy.monthdays if node.auto_restart_policy else [1]))|tojson }};
 window.__INSTALL_CMD__ = {{ install_cmd|tojson }};
 window.__UNINSTALL_CMD__ = {{ uninstall_cmd|tojson }};
 window.__AUTO_OPEN_EDIT_NODE__ = {{ (1 if show_edit_node else 0) }};

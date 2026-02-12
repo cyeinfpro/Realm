@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import calendar
 import gzip
 import json
 import re
@@ -24,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -31,13 +33,45 @@ import requests
 
 from .config import CFG
 from .intranet_tunnel import IntranetManager, load_server_cert_pem, server_tls_ready
+from .ipt_forward import IptablesForwardManager
+from .iptables_cmd import iptables_available, run_iptables
 from .qos import apply_qos_from_pool, policies_from_pool
+
+
+def _env_int(name: str, default: int, min_v: int, max_v: int) -> int:
+    raw = str(os.getenv(name, str(default)) or "").strip()
+    try:
+        v = int(float(raw))
+    except Exception:
+        v = int(default)
+    if v < int(min_v):
+        v = int(min_v)
+    if v > int(max_v):
+        v = int(max_v)
+    return int(v)
+
+
+def _env_float(name: str, default: float, min_v: float, max_v: float) -> float:
+    raw = str(os.getenv(name, str(default)) or "").strip()
+    try:
+        v = float(raw)
+    except Exception:
+        v = float(default)
+    if v < float(min_v):
+        v = float(min_v)
+    if v > float(max_v):
+        v = float(max_v)
+    return float(v)
+
 
 API_KEY_FILE = Path('/etc/realm-agent/api.key')
 ACK_VER_FILE = Path('/etc/realm-agent/panel_ack.version')
 UPDATE_STATE_FILE = Path('/etc/realm-agent/agent_update.json')
 TRAFFIC_STATE_FILE = Path('/etc/realm-agent/traffic_state.json')
 TRAFFIC_RESET_ACK_FILE = Path('/etc/realm-agent/traffic_reset_ack.version')
+AUTO_RESTART_STATE_FILE = Path('/etc/realm-agent/auto_restart_state.json')
+AUTO_RESTART_POLICY_FILE = Path('/etc/realm-agent/auto_restart_policy.json')
+AUTO_RESTART_ACK_FILE = Path('/etc/realm-agent/auto_restart_ack.version')
 POOL_FULL = Path('/etc/realm/pool_full.json')
 POOL_ACTIVE = Path('/etc/realm/pool.json')
 POOL_RUN_FILTER = Path('/etc/realm/pool_to_run.jq')
@@ -135,6 +169,10 @@ _PROBE_PRUNE_TS = 0.0
 _PROBE_HISTORY: Dict[str, Dict[str, Any]] = {}
 _PROBE_HISTORY_PRUNE_TS = 0.0
 _PROBE_LOCK = threading.Lock()
+TRACE_AUTO_INSTALL = str(os.getenv('REALM_AGENT_TRACE_AUTO_INSTALL', '1')).strip().lower() not in ('0', 'false', 'off', 'no')
+_TRACE_TOOL_INSTALL_LOCK = threading.Lock()
+_TRACE_TOOL_INSTALL_ATTEMPTED = False
+_TRACE_TOOL_INSTALL_LAST: Dict[str, Any] = {}
 
 # ---------------- System Snapshot (CPU/Mem/Disk/Net) ----------------
 # 说明：不依赖 psutil，纯 /proc + shutil.disk_usage 实现。
@@ -142,6 +180,39 @@ _PROBE_LOCK = threading.Lock()
 _SYS_LOCK = threading.Lock()
 _SYS_CPU_LAST: Optional[dict] = None  # {total:int, idle:int, ts:float}
 _SYS_NET_LAST: Optional[dict] = None  # {rx:int, tx:int, ts:float}
+
+# ---------------- Auto Daily Restart (per-node low-impact window) ----------------
+# 基于本机实时吞吐学习“每小时负载画像”（EMA），每天自动选择影响最小小时重启 realm + agent。
+AUTO_RESTART_ENABLED = str(os.getenv('REALM_AGENT_AUTO_DAILY_RESTART', '1')).strip().lower() not in (
+    '0',
+    'false',
+    'off',
+    'no',
+)
+AUTO_RESTART_DEFAULT_HOUR = _env_int('REALM_AGENT_AUTO_RESTART_DEFAULT_HOUR', 4, 0, 23)
+AUTO_RESTART_BASE_MINUTE = _env_int('REALM_AGENT_AUTO_RESTART_BASE_MINUTE', 8, 0, 59)
+AUTO_RESTART_WINDOW_MINUTES = _env_int('REALM_AGENT_AUTO_RESTART_WINDOW_MINUTES', 10, 1, 59)
+AUTO_RESTART_MIN_PROFILE_SAMPLES = _env_int('REALM_AGENT_AUTO_RESTART_MIN_PROFILE_SAMPLES', 6, 1, 1000)
+AUTO_RESTART_MIN_PROFILE_HOURS = _env_int('REALM_AGENT_AUTO_RESTART_MIN_PROFILE_HOURS', 4, 1, 24)
+AUTO_RESTART_PROFILE_ALPHA = _env_float('REALM_AGENT_AUTO_RESTART_PROFILE_ALPHA', 0.20, 0.01, 0.95)
+AUTO_RESTART_MIN_UPTIME_SEC = _env_float('REALM_AGENT_AUTO_RESTART_MIN_UPTIME_SEC', 600.0, 30.0, 604800.0)
+AUTO_RESTART_MINUTE_JITTER = _env_int('REALM_AGENT_AUTO_RESTART_MINUTE_JITTER', 0, 0, 30)
+AUTO_RESTART_SKIP_UPDATE_ACTIVE = str(os.getenv('REALM_AGENT_AUTO_RESTART_SKIP_UPDATE_ACTIVE', '1')).strip().lower() not in (
+    '0',
+    'false',
+    'off',
+    'no',
+)
+AUTO_RESTART_SAVE_MIN_INTERVAL = _env_float('REALM_AGENT_AUTO_RESTART_SAVE_INTERVAL', 20.0, 1.0, 3600.0)
+AUTO_RESTART_RETRY_COOLDOWN_SEC = _env_float('REALM_AGENT_AUTO_RESTART_RETRY_COOLDOWN_SEC', 120.0, 5.0, 3600.0)
+
+_AUTO_RESTART_LOCK = threading.Lock()
+_AUTO_RESTART_STATE_LOADED = False
+_AUTO_RESTART_STATE: Dict[str, Any] = {}
+_AUTO_RESTART_LAST_SAVE_TS = 0.0
+_AUTO_RESTART_POLICY_LOCK = threading.Lock()
+_AUTO_RESTART_POLICY_LOADED = False
+_AUTO_RESTART_POLICY: Dict[str, Any] = {}
 
 
 def _read_text(p: Path) -> str:
@@ -207,9 +278,49 @@ def _write_int(p: Path, value: int) -> None:
     _write_text(p, str(int(value)))
 
 
+def _canon_update_state(raw: Any) -> str:
+    s = str(raw or '').strip().lower()
+    if s in ('queued', 'pending'):
+        return 'queued'
+    if s in ('sent', 'delivered'):
+        return 'delivered'
+    if s == 'accepted':
+        return 'accepted'
+    if s in ('installing', 'running'):
+        return 'running'
+    if s == 'retrying':
+        return 'retrying'
+    if s in ('done', 'success'):
+        return 'done'
+    if s in ('failed', 'error'):
+        return 'failed'
+    if s in ('expired', 'timeout'):
+        return 'expired'
+    return s
+
+
+def _to_bool(v: Any, default: bool = False) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return bool(default)
+    if isinstance(v, (int, float)):
+        return bool(int(v))
+    s = str(v).strip().lower()
+    if s in ('1', 'true', 'yes', 'on', 'y'):
+        return True
+    if s in ('0', 'false', 'no', 'off', 'n', ''):
+        return False
+    return bool(default)
+
+
 def _load_update_state() -> Dict[str, Any]:
     st = _read_json(UPDATE_STATE_FILE, {})
-    return st if isinstance(st, dict) else {}
+    if not isinstance(st, dict):
+        return {}
+    if 'state' in st:
+        st['state'] = _canon_update_state(st.get('state'))
+    return st
 
 
 def _save_update_state(st: Dict[str, Any]) -> None:
@@ -232,8 +343,8 @@ def _reconcile_update_state() -> None:
         desired = int(m.group(1)) if m else 0
     except Exception:
         desired = 0
-    state = str(st.get('state') or '').strip().lower()
-    if desired > 0 and int(str(app.version)) >= desired and state in ('installing', 'sent', 'queued', 'pending'):
+    state = _canon_update_state(st.get('state'))
+    if desired > 0 and int(str(app.version)) >= desired and state in ('running', 'delivered', 'queued', 'accepted'):
         st['state'] = 'done'
         st['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         st.setdefault('from_version', st.get('from_version') or '')
@@ -388,6 +499,608 @@ def _build_sys_snapshot() -> dict:
     }
 
 
+def _default_auto_restart_policy() -> Dict[str, Any]:
+    return {
+        "enabled": bool(AUTO_RESTART_ENABLED),
+        "schedule_type": "daily",  # daily | weekly | monthly
+        "interval": 1,
+        "hour": int(AUTO_RESTART_DEFAULT_HOUR),
+        "minute": int(AUTO_RESTART_BASE_MINUTE),
+        "weekdays": [1, 2, 3, 4, 5, 6, 7],  # ISO weekday (Mon=1..Sun=7)
+        "monthdays": [1],  # 1..31 (overflow days fallback to month end)
+    }
+
+
+def _normalize_auto_restart_policy(raw: Any) -> Dict[str, Any]:
+    src = raw if isinstance(raw, dict) else {}
+    base = _default_auto_restart_policy()
+
+    enabled = _to_bool(src.get("enabled"), base["enabled"])
+    schedule_type = str(src.get("schedule_type") or base["schedule_type"]).strip().lower()
+    if schedule_type not in ("daily", "weekly", "monthly"):
+        schedule_type = "daily"
+    try:
+        interval = int(src.get("interval") or base["interval"])
+    except Exception:
+        interval = int(base["interval"])
+    if interval < 1:
+        interval = 1
+    if interval > 365:
+        interval = 365
+    hour_raw = src.get("hour", base["hour"])
+    if hour_raw is None:
+        hour_raw = base["hour"]
+    try:
+        hour = int(hour_raw)
+    except Exception:
+        hour = int(base["hour"])
+    if hour < 0:
+        hour = 0
+    if hour > 23:
+        hour = 23
+    minute_raw = src.get("minute", base["minute"])
+    if minute_raw is None:
+        minute_raw = base["minute"]
+    try:
+        minute = int(minute_raw)
+    except Exception:
+        minute = int(base["minute"])
+    if minute < 0:
+        minute = 0
+    if minute > 59:
+        minute = 59
+
+    def _norm_seq(val: Any, lo: int, hi: int, fallback: List[int]) -> List[int]:
+        out: List[int] = []
+        seen: set[int] = set()
+        seq = val if isinstance(val, list) else []
+        for x in seq:
+            try:
+                v = int(x)
+            except Exception:
+                continue
+            if v < int(lo) or v > int(hi):
+                continue
+            if v in seen:
+                continue
+            seen.add(v)
+            out.append(v)
+        if not out:
+            return list(fallback)
+        return out
+
+    weekdays = _norm_seq(src.get("weekdays"), 1, 7, [1, 2, 3, 4, 5, 6, 7])
+    monthdays = _norm_seq(src.get("monthdays"), 1, 31, [1])
+    return {
+        "enabled": bool(enabled),
+        "schedule_type": schedule_type,
+        "interval": int(interval),
+        "hour": int(hour),
+        "minute": int(minute),
+        "weekdays": weekdays,
+        "monthdays": monthdays,
+    }
+
+
+def _auto_restart_load_policy_locked() -> Dict[str, Any]:
+    global _AUTO_RESTART_POLICY_LOADED, _AUTO_RESTART_POLICY
+    if _AUTO_RESTART_POLICY_LOADED:
+        return dict(_AUTO_RESTART_POLICY)
+    raw = _read_json(AUTO_RESTART_POLICY_FILE, {})
+    policy = _normalize_auto_restart_policy(raw)
+    _AUTO_RESTART_POLICY = policy
+    _AUTO_RESTART_POLICY_LOADED = True
+    return dict(policy)
+
+
+def _auto_restart_save_policy_locked(policy: Dict[str, Any]) -> None:
+    global _AUTO_RESTART_POLICY_LOADED, _AUTO_RESTART_POLICY
+    norm = _normalize_auto_restart_policy(policy)
+    try:
+        _write_json(AUTO_RESTART_POLICY_FILE, norm)
+    except Exception:
+        pass
+    _AUTO_RESTART_POLICY = dict(norm)
+    _AUTO_RESTART_POLICY_LOADED = True
+
+
+def _auto_restart_default_state() -> Dict[str, Any]:
+    return {
+        'version': 1,
+        'profile': {},  # hour -> {ema_bps: float, samples: int}
+        'daily_date': '',
+        'daily_hourly': {},  # hour -> {sum_bps: float, samples: int}
+        'plan_date': '',
+        'plan_hour': int(AUTO_RESTART_DEFAULT_HOUR),
+        'plan_minute': int(AUTO_RESTART_BASE_MINUTE),
+        'plan_reason': 'init',
+        'last_check_at': '',
+        'last_load_bps': 0.0,
+        'last_skip_reason': '',
+        'last_restart_date': '',
+        'last_restart_ts': 0,
+        'last_attempt_ts': 0,
+        'last_restart_hour': -1,
+        'last_restart_minute': -1,
+        'last_restart_result': '',
+        'last_error': '',
+    }
+
+
+def _auto_restart_load_state_locked() -> None:
+    global _AUTO_RESTART_STATE_LOADED, _AUTO_RESTART_STATE
+    if _AUTO_RESTART_STATE_LOADED:
+        return
+
+    raw = _read_json(AUTO_RESTART_STATE_FILE, {})
+    st = _auto_restart_default_state()
+    if isinstance(raw, dict):
+        st['daily_date'] = str(raw.get('daily_date') or '').strip()
+        st['plan_date'] = str(raw.get('plan_date') or '').strip()
+        st['plan_reason'] = str(raw.get('plan_reason') or 'init').strip() or 'init'
+        st['last_check_at'] = str(raw.get('last_check_at') or '').strip()
+        st['last_skip_reason'] = str(raw.get('last_skip_reason') or '').strip()
+        st['last_restart_date'] = str(raw.get('last_restart_date') or '').strip()
+        st['last_restart_result'] = str(raw.get('last_restart_result') or '').strip()
+        st['last_error'] = str(raw.get('last_error') or '').strip()
+        try:
+            st['plan_hour'] = max(0, min(23, int(raw.get('plan_hour') or AUTO_RESTART_DEFAULT_HOUR)))
+        except Exception:
+            st['plan_hour'] = int(AUTO_RESTART_DEFAULT_HOUR)
+        try:
+            st['plan_minute'] = max(0, min(59, int(raw.get('plan_minute') or AUTO_RESTART_BASE_MINUTE)))
+        except Exception:
+            st['plan_minute'] = int(AUTO_RESTART_BASE_MINUTE)
+        try:
+            st['last_load_bps'] = max(0.0, float(raw.get('last_load_bps') or 0.0))
+        except Exception:
+            st['last_load_bps'] = 0.0
+        try:
+            st['last_restart_ts'] = max(0, int(raw.get('last_restart_ts') or 0))
+        except Exception:
+            st['last_restart_ts'] = 0
+        try:
+            st['last_attempt_ts'] = max(0, int(raw.get('last_attempt_ts') or 0))
+        except Exception:
+            st['last_attempt_ts'] = 0
+        try:
+            st['last_restart_hour'] = int(raw.get('last_restart_hour') or -1)
+        except Exception:
+            st['last_restart_hour'] = -1
+        try:
+            st['last_restart_minute'] = int(raw.get('last_restart_minute') or -1)
+        except Exception:
+            st['last_restart_minute'] = -1
+
+        profile_raw = raw.get('profile')
+        if isinstance(profile_raw, dict):
+            prof: Dict[str, Dict[str, Any]] = {}
+            for hk, hv in profile_raw.items():
+                if not isinstance(hv, dict):
+                    continue
+                try:
+                    hi = int(str(hk).strip())
+                except Exception:
+                    continue
+                if hi < 0 or hi > 23:
+                    continue
+                try:
+                    ema = max(0.0, float(hv.get('ema_bps') or 0.0))
+                except Exception:
+                    ema = 0.0
+                try:
+                    samples = max(0, int(hv.get('samples') or 0))
+                except Exception:
+                    samples = 0
+                prof[str(hi)] = {'ema_bps': round(float(ema), 4), 'samples': int(min(samples, 1000000))}
+            st['profile'] = prof
+
+        daily_raw = raw.get('daily_hourly')
+        if isinstance(daily_raw, dict):
+            daily: Dict[str, Dict[str, Any]] = {}
+            for hk, hv in daily_raw.items():
+                if not isinstance(hv, dict):
+                    continue
+                try:
+                    hi = int(str(hk).strip())
+                except Exception:
+                    continue
+                if hi < 0 or hi > 23:
+                    continue
+                try:
+                    sm = max(0.0, float(hv.get('sum_bps') or 0.0))
+                except Exception:
+                    sm = 0.0
+                try:
+                    sp = max(0, int(hv.get('samples') or 0))
+                except Exception:
+                    sp = 0
+                daily[str(hi)] = {'sum_bps': round(float(sm), 4), 'samples': int(min(sp, 1000000))}
+            st['daily_hourly'] = daily
+
+    _AUTO_RESTART_STATE = st
+    _AUTO_RESTART_STATE_LOADED = True
+
+
+def _auto_restart_save_state_locked(force: bool = False) -> None:
+    global _AUTO_RESTART_LAST_SAVE_TS
+    now_ts = float(time.time())
+    if not force and (now_ts - float(_AUTO_RESTART_LAST_SAVE_TS)) < float(AUTO_RESTART_SAVE_MIN_INTERVAL):
+        return
+    try:
+        _write_json(AUTO_RESTART_STATE_FILE, _AUTO_RESTART_STATE)
+        _AUTO_RESTART_LAST_SAVE_TS = now_ts
+    except Exception:
+        pass
+
+
+def _auto_restart_ingest_sample_locked(now_dt: datetime, load_bps: float) -> None:
+    if not math.isfinite(load_bps) or load_bps < 0:
+        load_bps = 0.0
+    st = _AUTO_RESTART_STATE
+    date_s = now_dt.strftime('%Y-%m-%d')
+    hour_k = str(int(now_dt.hour))
+
+    if str(st.get('daily_date') or '') != date_s:
+        st['daily_date'] = date_s
+        st['daily_hourly'] = {}
+
+    daily = st.get('daily_hourly')
+    if not isinstance(daily, dict):
+        daily = {}
+        st['daily_hourly'] = daily
+    dslot = daily.get(hour_k)
+    if not isinstance(dslot, dict):
+        dslot = {'sum_bps': 0.0, 'samples': 0}
+    try:
+        dslot_sum = float(dslot.get('sum_bps') or 0.0)
+    except Exception:
+        dslot_sum = 0.0
+    try:
+        dslot_samples = int(dslot.get('samples') or 0)
+    except Exception:
+        dslot_samples = 0
+    dslot['sum_bps'] = round(max(0.0, dslot_sum + float(load_bps)), 4)
+    dslot['samples'] = int(min(1000000, max(0, dslot_samples + 1)))
+    daily[hour_k] = dslot
+
+    prof = st.get('profile')
+    if not isinstance(prof, dict):
+        prof = {}
+        st['profile'] = prof
+    pslot = prof.get(hour_k)
+    if not isinstance(pslot, dict):
+        pslot = {'ema_bps': float(load_bps), 'samples': 0}
+    try:
+        p_ema = float(pslot.get('ema_bps') or 0.0)
+    except Exception:
+        p_ema = 0.0
+    try:
+        p_samples = int(pslot.get('samples') or 0)
+    except Exception:
+        p_samples = 0
+    if p_samples <= 0:
+        new_ema = float(load_bps)
+    else:
+        alpha = float(AUTO_RESTART_PROFILE_ALPHA)
+        new_ema = (1.0 - alpha) * p_ema + alpha * float(load_bps)
+    pslot['ema_bps'] = round(max(0.0, float(new_ema)), 4)
+    pslot['samples'] = int(min(1000000, max(0, p_samples + 1)))
+    prof[hour_k] = pslot
+
+    st['last_check_at'] = now_dt.strftime('%Y-%m-%d %H:%M:%S')
+    st['last_load_bps'] = round(max(0.0, float(load_bps)), 2)
+
+
+def _auto_restart_plan_locked(now_dt: datetime) -> tuple[int, int, str]:
+    st = _AUTO_RESTART_STATE
+    profile = st.get('profile')
+    if not isinstance(profile, dict):
+        profile = {}
+
+    observed_hours = 0
+    candidates: List[Tuple[float, int]] = []
+    for hour in range(24):
+        slot = profile.get(str(hour))
+        if not isinstance(slot, dict):
+            continue
+        try:
+            samples = int(slot.get('samples') or 0)
+        except Exception:
+            samples = 0
+        try:
+            ema_bps = float(slot.get('ema_bps') or 0.0)
+        except Exception:
+            ema_bps = 0.0
+        if samples > 0:
+            observed_hours += 1
+        if samples >= int(AUTO_RESTART_MIN_PROFILE_SAMPLES):
+            candidates.append((max(0.0, ema_bps), int(hour)))
+
+    plan_hour = int(AUTO_RESTART_DEFAULT_HOUR)
+    plan_reason = 'fallback_default'
+    if observed_hours >= int(AUTO_RESTART_MIN_PROFILE_HOURS) and candidates:
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        plan_hour = int(candidates[0][1])
+        plan_reason = 'profile_ema'
+
+    minute = int(AUTO_RESTART_BASE_MINUTE)
+    if int(AUTO_RESTART_MINUTE_JITTER) > 0:
+        # 节点级固定抖动：避免多节点在同一分钟同时重启。
+        seed = f"{socket.gethostname()}:{plan_hour}"
+        try:
+            hv = int(hashlib.sha256(seed.encode('utf-8')).hexdigest()[:8], 16)
+            minute = int((minute + (hv % (int(AUTO_RESTART_MINUTE_JITTER) + 1))) % 60)
+        except Exception:
+            minute = int(AUTO_RESTART_BASE_MINUTE)
+
+    st['plan_date'] = now_dt.strftime('%Y-%m-%d')
+    st['plan_hour'] = int(plan_hour)
+    st['plan_minute'] = int(minute)
+    st['plan_reason'] = str(plan_reason)
+    return int(plan_hour), int(minute), str(plan_reason)
+
+
+def _auto_restart_match_monthday(now_dt: datetime, monthdays: List[int]) -> bool:
+    try:
+        last_day = int(calendar.monthrange(int(now_dt.year), int(now_dt.month))[1])
+    except Exception:
+        last_day = 31
+    due_days: set[int] = set()
+    for d in monthdays or []:
+        try:
+            v = int(d)
+        except Exception:
+            continue
+        if v < 1:
+            continue
+        if v > 31:
+            continue
+        due_days.add(min(v, last_day))
+    if not due_days:
+        due_days = {1}
+    return int(now_dt.day) in due_days
+
+
+def _auto_restart_schedule_due(policy: Dict[str, Any], now_dt: datetime, last_restart_ts: int) -> tuple[bool, str]:
+    mode = str(policy.get("schedule_type") or "daily").strip().lower()
+    interval = int(policy.get("interval") or 1)
+    if interval < 1:
+        interval = 1
+
+    if mode == "weekly":
+        wd = set(int(x) for x in (policy.get("weekdays") or []) if isinstance(x, int) and 1 <= int(x) <= 7)
+        if not wd:
+            wd = {1, 2, 3, 4, 5, 6, 7}
+        if int(now_dt.isoweekday()) not in wd:
+            return False, ""
+        if last_restart_ts > 0:
+            try:
+                last_dt = datetime.fromtimestamp(float(last_restart_ts))
+                cur_week = (int(now_dt.date().toordinal()) - 1) // 7
+                last_week = (int(last_dt.date().toordinal()) - 1) // 7
+                week_delta = int(cur_week - last_week)
+                if week_delta == 0:
+                    if now_dt.date() == last_dt.date():
+                        return False, "already_today"
+                    return True, ""
+                if week_delta < int(interval):
+                    return False, "interval_wait"
+            except Exception:
+                pass
+        return True, ""
+
+    if mode == "monthly":
+        if not _auto_restart_match_monthday(now_dt, list(policy.get("monthdays") or [])):
+            return False, ""
+        if last_restart_ts > 0:
+            try:
+                last_dt = datetime.fromtimestamp(float(last_restart_ts))
+                cur_idx = int(now_dt.year) * 12 + int(now_dt.month)
+                last_idx = int(last_dt.year) * 12 + int(last_dt.month)
+                month_delta = int(cur_idx - last_idx)
+                if month_delta == 0:
+                    if now_dt.date() == last_dt.date():
+                        return False, "already_today"
+                    return True, ""
+                if month_delta < int(interval):
+                    return False, "interval_wait"
+            except Exception:
+                pass
+        return True, ""
+
+    # daily (default)
+    if last_restart_ts > 0:
+        try:
+            last_dt = datetime.fromtimestamp(float(last_restart_ts))
+            d_days = int((now_dt.date() - last_dt.date()).days)
+            if d_days < int(interval):
+                return False, "interval_wait"
+        except Exception:
+            pass
+    return True, ""
+
+
+def _auto_restart_policy_time(policy: Dict[str, Any]) -> tuple[int, int]:
+    try:
+        hh = int(policy.get("hour"))
+    except Exception:
+        hh = int(AUTO_RESTART_DEFAULT_HOUR)
+    try:
+        mm = int(policy.get("minute"))
+    except Exception:
+        mm = int(AUTO_RESTART_BASE_MINUTE)
+    hh = max(0, min(23, int(hh)))
+    mm = max(0, min(59, int(mm)))
+    return int(hh), int(mm)
+
+
+def _auto_restart_status_snapshot() -> Dict[str, Any]:
+    now_dt = datetime.now()
+    with _AUTO_RESTART_POLICY_LOCK:
+        policy = _auto_restart_load_policy_locked()
+    with _AUTO_RESTART_LOCK:
+        _auto_restart_load_state_locked()
+        st = _AUTO_RESTART_STATE
+        plan_hour, plan_minute = _auto_restart_policy_time(policy)
+        plan_reason = f"policy_{str(policy.get('schedule_type') or 'daily')}"
+        st['plan_date'] = now_dt.strftime('%Y-%m-%d')
+        st['plan_hour'] = int(plan_hour)
+        st['plan_minute'] = int(plan_minute)
+        st['plan_reason'] = str(plan_reason)
+        return {
+            'enabled': bool(policy.get("enabled", False)),
+            'schedule_type': str(policy.get("schedule_type") or "daily"),
+            'interval': int(policy.get("interval") or 1),
+            'weekdays': list(policy.get("weekdays") or [1, 2, 3, 4, 5, 6, 7]),
+            'monthdays': list(policy.get("monthdays") or [1]),
+            'plan_date': str(st.get('plan_date') or now_dt.strftime('%Y-%m-%d')),
+            'plan_hour': int(plan_hour),
+            'plan_minute': int(plan_minute),
+            'plan_reason': str(plan_reason),
+            'window_minutes': int(AUTO_RESTART_WINDOW_MINUTES),
+            'last_restart_date': str(st.get('last_restart_date') or ''),
+            'last_restart_ts': int(st.get('last_restart_ts') or 0),
+            'last_attempt_ts': int(st.get('last_attempt_ts') or 0),
+            'ack_version': int(_read_int(AUTO_RESTART_ACK_FILE, 0)),
+            'last_restart_result': str(st.get('last_restart_result') or ''),
+            'last_error': str(st.get('last_error') or ''),
+            'last_skip_reason': str(st.get('last_skip_reason') or ''),
+            'last_load_bps': float(st.get('last_load_bps') or 0.0),
+        }
+
+
+def _auto_restart_tick(report: Optional[Dict[str, Any]]) -> None:
+    if not isinstance(report, dict):
+        return
+
+    now_dt = datetime.now()
+    now_ts = float(time.time())
+    load_bps = 0.0
+    uptime_sec = 0.0
+
+    sys_part = report.get('sys')
+    if isinstance(sys_part, dict):
+        net = sys_part.get('net')
+        if isinstance(net, dict):
+            try:
+                load_bps = float(net.get('rx_bps') or 0.0) + float(net.get('tx_bps') or 0.0)
+            except Exception:
+                load_bps = 0.0
+        try:
+            uptime_sec = float(sys_part.get('uptime_sec') or 0.0)
+        except Exception:
+            uptime_sec = 0.0
+    if not math.isfinite(load_bps) or load_bps < 0.0:
+        load_bps = 0.0
+    if not math.isfinite(uptime_sec) or uptime_sec < 0.0:
+        uptime_sec = 0.0
+
+    with _AUTO_RESTART_POLICY_LOCK:
+        policy = _auto_restart_load_policy_locked()
+
+    restart_due = False
+    plan_hour, plan_minute = _auto_restart_policy_time(policy)
+    plan_reason = f"policy_{str(policy.get('schedule_type') or 'daily')}"
+    with _AUTO_RESTART_LOCK:
+        _auto_restart_load_state_locked()
+        _auto_restart_ingest_sample_locked(now_dt, load_bps)
+        st = _AUTO_RESTART_STATE
+        st['plan_date'] = now_dt.strftime('%Y-%m-%d')
+        st['plan_hour'] = int(plan_hour)
+        st['plan_minute'] = int(plan_minute)
+        st['plan_reason'] = str(plan_reason)
+        today = now_dt.strftime('%Y-%m-%d')
+        window_end = min(59, int(plan_minute) + int(AUTO_RESTART_WINDOW_MINUTES) - 1)
+        last_attempt_ts = float(st.get('last_attempt_ts') or 0.0)
+        last_restart_ts = int(st.get('last_restart_ts') or 0)
+
+        if not bool(policy.get("enabled", False)):
+            st['last_skip_reason'] = 'disabled'
+            _auto_restart_save_state_locked(force=False)
+            return
+
+        if uptime_sec < float(AUTO_RESTART_MIN_UPTIME_SEC):
+            st['last_skip_reason'] = 'uptime_too_short'
+            _auto_restart_save_state_locked(force=False)
+            return
+
+        in_window = (
+            int(now_dt.hour) == int(plan_hour)
+            and int(now_dt.minute) >= int(plan_minute)
+            and int(now_dt.minute) <= int(window_end)
+        )
+        if not in_window:
+            _auto_restart_save_state_locked(force=False)
+            return
+
+        due_ok, due_reason = _auto_restart_schedule_due(policy, now_dt, last_restart_ts)
+        if not due_ok:
+            if due_reason:
+                st['last_skip_reason'] = str(due_reason)
+            _auto_restart_save_state_locked(force=False)
+            return
+
+        if str(st.get('last_restart_date') or '') != today or last_restart_ts <= 0:
+            if uptime_sec < float(AUTO_RESTART_MIN_UPTIME_SEC):
+                st['last_skip_reason'] = 'uptime_too_short'
+            else:
+                if last_attempt_ts > 0 and (now_ts - last_attempt_ts) < float(AUTO_RESTART_RETRY_COOLDOWN_SEC):
+                    st['last_skip_reason'] = 'retry_cooldown'
+                else:
+                    block_update = False
+                    update_state = ''
+                    if AUTO_RESTART_SKIP_UPDATE_ACTIVE:
+                        update_state = _canon_update_state((_load_update_state() or {}).get('state'))
+                        if update_state in ('accepted', 'running'):
+                            block_update = True
+                    if block_update:
+                        st['last_skip_reason'] = f'update_active:{update_state}'
+                    else:
+                        restart_due = True
+                        st['last_skip_reason'] = ''
+                        st['last_attempt_ts'] = int(now_ts)
+                        st['last_restart_result'] = 'triggering'
+                        st['last_error'] = ''
+        _auto_restart_save_state_locked(force=restart_due)
+
+    if not restart_due:
+        return
+
+    try:
+        _restart_realm()
+    except Exception as exc:
+        with _AUTO_RESTART_LOCK:
+            _auto_restart_load_state_locked()
+            st = _AUTO_RESTART_STATE
+            st['last_restart_result'] = 'failed_realm'
+            st['last_error'] = str(exc)[:500]
+            _auto_restart_save_state_locked(force=True)
+        return
+
+    try:
+        _restart_agent_service()
+    except Exception as exc:
+        with _AUTO_RESTART_LOCK:
+            _auto_restart_load_state_locked()
+            st = _AUTO_RESTART_STATE
+            st['last_restart_result'] = 'failed_agent'
+            st['last_error'] = str(exc)[:500]
+            _auto_restart_save_state_locked(force=True)
+        return
+
+    with _AUTO_RESTART_LOCK:
+        _auto_restart_load_state_locked()
+        st = _AUTO_RESTART_STATE
+        st['last_restart_date'] = now_dt.strftime('%Y-%m-%d')
+        st['last_restart_ts'] = int(now_ts)
+        st['last_restart_hour'] = int(plan_hour)
+        st['last_restart_minute'] = int(plan_minute)
+        st['last_restart_result'] = 'dispatched'
+        st['last_error'] = ''
+        _auto_restart_save_state_locked(force=True)
+
+
 def _sha256_of_obj(obj: Any) -> str:
     try:
         s = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -412,6 +1125,8 @@ CMD_SIG_MAX_SKEW_SEC = int(os.getenv("REALM_CMD_SIG_MAX_SKEW_SEC", "300"))  # ma
 CMD_NONCE_TTL_SEC = int(os.getenv("REALM_CMD_NONCE_TTL_SEC", "600"))  # how long to remember seen nonces
 _CMD_NONCE_LOCK = threading.Lock()
 _CMD_NONCE_SEEN: Dict[str, float] = {}  # nonce -> monotonic timestamp
+_PANEL_TIME_LOCK = threading.Lock()
+_PANEL_TIME_OFFSET_SEC = 0.0  # panel_unix_ts - local_time.time()
 
 
 def _remember_cmd_nonce(nonce: str) -> bool:
@@ -432,35 +1147,69 @@ def _remember_cmd_nonce(nonce: str) -> bool:
 
 
 
-def _verify_cmd_sig(cmd: Dict[str, Any], api_key: str) -> bool:
-    """Verify command signature + timestamp window + (optional) nonce replay protection."""
+def _panel_now_ts() -> int:
+    with _PANEL_TIME_LOCK:
+        off = float(_PANEL_TIME_OFFSET_SEC)
+    return int(time.time() + off)
+
+
+def _update_panel_time_offset(server_ts: Any) -> None:
+    try:
+        panel_ts = float(server_ts)
+    except Exception:
+        return
+    if panel_ts <= 0:
+        return
+    now_local = float(time.time())
+    off = panel_ts - now_local
+    # Ignore impossible values to avoid poisoning local validation.
+    if abs(off) > 365.0 * 24.0 * 3600.0:
+        return
+    with _PANEL_TIME_LOCK:
+        global _PANEL_TIME_OFFSET_SEC
+        prev = float(_PANEL_TIME_OFFSET_SEC)
+        if prev == 0.0:
+            _PANEL_TIME_OFFSET_SEC = off
+        else:
+            # Smooth jitter between requests.
+            _PANEL_TIME_OFFSET_SEC = (prev * 0.8) + (off * 0.2)
+
+
+def _verify_cmd_sig_detail(cmd: Dict[str, Any], api_key: str) -> Tuple[bool, str]:
     sig = str(cmd.get("sig") or "").strip()
     if not sig:
-        return False
+        return False, "missing_sig"
 
     # 1) signature (covers ts/nonce/...)
     expect = _cmd_signature(api_key, cmd)
     if not hmac.compare_digest(sig, expect):
-        return False
+        return False, "bad_sig"
 
     # 2) timestamp window check (basic replay mitigation)
     try:
         ts = int(cmd.get("ts") or 0)
     except Exception:
-        return False
+        return False, "bad_ts"
     if ts <= 0:
-        return False
-    now = int(time.time())
-    if abs(now - ts) > int(max(1, CMD_SIG_MAX_SKEW_SEC)):
-        return False
+        return False, "bad_ts"
+    now_panel = int(_panel_now_ts())
+    skew = int(now_panel - ts)
+    if abs(skew) > int(max(1, CMD_SIG_MAX_SKEW_SEC)):
+        return False, f"ts_skew={skew}s"
 
     # 3) nonce replay protection (preferred). Keep legacy compatibility: if nonce missing, accept.
     nonce = str(cmd.get("nonce") or "").strip()
     if nonce:
         if not _remember_cmd_nonce(nonce):
-            return False
+            return False, "replay_nonce"
 
-    return True
+    return True, ""
+
+
+def _verify_cmd_sig(cmd: Dict[str, Any], api_key: str) -> bool:
+    """Verify command signature + timestamp window + (optional) nonce replay protection."""
+    ok, _ = _verify_cmd_sig_detail(cmd, api_key)
+    return bool(ok)
 
 
 
@@ -562,6 +1311,84 @@ def _restart_realm() -> None:
     raise RuntimeError(f'无法重启 realm 服务（尝试 {", ".join(services)} 失败）：{detail}')
 
 
+def _restart_agent_service() -> None:
+    candidates = []
+    override = str(os.getenv('REALM_AGENT_SERVICE') or '').strip()
+    if override:
+        candidates.append(override)
+    candidates.extend(['realm-agent.service', 'realm-agent-https.service', 'realm-agent'])
+
+    seen = set()
+    services = []
+    for s in candidates:
+        name = str(s or '').strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        services.append(name)
+
+    errors = []
+
+    # Prefer detached restart via transient unit, so this function can return
+    # before current agent process is stopped by systemd.
+    if shutil.which('systemd-run') and shutil.which('systemctl'):
+        for svc in services:
+            unit = svc if svc.endswith('.service') else f'{svc}.service'
+            transient_unit = f"realm-agent-auto-restart-{uuid.uuid4().hex[:10]}"
+            cmd = f"sleep 1; systemctl restart {shlex.quote(unit)}"
+            try:
+                r = subprocess.run(
+                    ['systemd-run', '--unit', transient_unit, '--collect', '--quiet', '/bin/sh', '-lc', cmd],
+                    capture_output=True,
+                    text=True,
+                )
+                if r.returncode == 0:
+                    return
+                errors.append(f"systemd-run {unit}: {r.stderr.strip() or r.stdout.strip()}")
+            except Exception as exc:
+                errors.append(f"systemd-run {unit}: {exc}")
+
+    if shutil.which('systemctl'):
+        for svc in services:
+            unit = svc if svc.endswith('.service') else f'{svc}.service'
+            try:
+                r = subprocess.run(['systemctl', 'restart', unit], capture_output=True, text=True)
+                if r.returncode == 0:
+                    return
+                errors.append(f"systemctl {unit}: {r.stderr.strip() or r.stdout.strip()}")
+            except Exception as exc:
+                errors.append(f"systemctl {unit}: {exc}")
+
+    legacy_names = []
+    for svc in services:
+        base = svc[:-8] if svc.endswith('.service') else svc
+        if base and base not in legacy_names:
+            legacy_names.append(base)
+
+    if shutil.which('service'):
+        for svc in legacy_names:
+            try:
+                r = subprocess.run(['service', svc, 'restart'], capture_output=True, text=True)
+                if r.returncode == 0:
+                    return
+                errors.append(f"service {svc}: {r.stderr.strip() or r.stdout.strip()}")
+            except Exception as exc:
+                errors.append(f"service {svc}: {exc}")
+
+    if shutil.which('rc-service'):
+        for svc in legacy_names:
+            try:
+                r = subprocess.run(['rc-service', svc, 'restart'], capture_output=True, text=True)
+                if r.returncode == 0:
+                    return
+                errors.append(f"rc-service {svc}: {r.stderr.strip() or r.stdout.strip()}")
+            except Exception as exc:
+                errors.append(f"rc-service {svc}: {exc}")
+
+    detail = '; '.join([e for e in errors if e]) or '未知错误'
+    raise RuntimeError(f'无法重启 agent 服务（尝试 {", ".join(services)} 失败）：{detail}')
+
+
 def _apply_pool_to_config() -> None:
     if not shutil.which('jq'):
         raise RuntimeError('缺少 jq 命令，无法生成 realm 配置')
@@ -648,15 +1475,11 @@ IPT_LIMIT_APPLY_TTL = float(os.environ.get('REALM_IPT_LIMIT_APPLY_TTL', '15.0'))
 
 
 def _iptables_available() -> bool:
-    return bool(shutil.which('iptables'))
+    return iptables_available()
 
 
 def _run_iptables(args: list[str]) -> tuple[int, str, str]:
-    try:
-        r = subprocess.run(['iptables', *args], capture_output=True, text=True, timeout=IPT_RUN_TIMEOUT)
-        return r.returncode, (r.stdout or ''), (r.stderr or '')
-    except Exception as exc:
-        return 127, '', str(exc)
+    return run_iptables(args, timeout=IPT_RUN_TIMEOUT)
 
 
 def _ipt_ensure_chain(table: str, chain: str) -> None:
@@ -1105,6 +1928,9 @@ def _traffic_endpoint_signature(ep: Dict[str, Any]) -> str:
 
         listen_transport = str(ep.get('listen_transport') or '').strip()
         remote_transport = str(ep.get('remote_transport') or '').strip()
+        forward_tool = str(ex.get('forward_tool') or ep.get('forward_tool') or '').strip().lower()
+        if forward_tool in ('ipt', 'iptables'):
+            forward_tool = 'iptables'
 
         payload = {
             'listen': listen,
@@ -1114,6 +1940,7 @@ def _traffic_endpoint_signature(ep: Dict[str, Any]) -> str:
             'role': role,
             'listen_transport': listen_transport,
             'remote_transport': remote_transport,
+            'forward_tool': forward_tool,
         }
         s = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
         return hashlib.sha1(s.encode('utf-8')).hexdigest()
@@ -2116,6 +2943,18 @@ try:
     HEARTBEAT_INTERVAL = max(1.0, float(os.environ.get('REALM_AGENT_HEARTBEAT_INTERVAL', '3') or '3'))
 except Exception:
     HEARTBEAT_INTERVAL = 3.0
+try:
+    REPORT_CONNECT_TIMEOUT = max(
+        1.0, min(30.0, float(os.environ.get('REALM_AGENT_REPORT_CONNECT_TIMEOUT', '5') or '5'))
+    )
+except Exception:
+    REPORT_CONNECT_TIMEOUT = 5.0
+try:
+    REPORT_READ_TIMEOUT = max(
+        3.0, min(120.0, float(os.environ.get('REALM_AGENT_REPORT_READ_TIMEOUT', '20') or '20'))
+    )
+except Exception:
+    REPORT_READ_TIMEOUT = 20.0
 
 _PUSH_STOP = threading.Event()
 _PUSH_THREAD: Optional[threading.Thread] = None
@@ -2143,6 +2982,7 @@ _PANEL_TASK_RESULTS_MAX = max(20, int(os.getenv("REALM_AGENT_PANEL_TASK_RESULTS_
 # 这些规则在 pool 中以 extra_config.intranet_role 标记，realm 本体不会接管。
 
 _INTRANET = IntranetManager(node_id=AGENT_ID)
+_IPTFWD = IptablesForwardManager()
 
 
 def _queue_panel_task_result(row: Dict[str, Any]) -> None:
@@ -2252,12 +3092,39 @@ def _build_push_report() -> Dict[str, Any]:
     }
     pool = _load_full_pool()
     stats = _build_stats_snapshot()
+    intranet_meta: Dict[str, Any] = {"tls_ready": False}
+    try:
+        cert_pem = str(load_server_cert_pem() or "").strip()
+    except Exception:
+        cert_pem = ""
+    try:
+        tls_ready = bool(server_tls_ready())
+    except Exception:
+        tls_ready = False
+    intranet_meta["tls_ready"] = bool(tls_ready)
+    if cert_pem:
+        intranet_meta["cert_pem"] = cert_pem
+    if not cert_pem:
+        intranet_meta["cert_error"] = "tls_cert_missing"
+    elif not tls_ready:
+        intranet_meta["cert_error"] = "tls_context_unavailable"
+    iptables_meta: Dict[str, Any] = {}
+    try:
+        iptables_meta = _IPTFWD.status()
+    except Exception:
+        iptables_meta = {}
+
     rep: Dict[str, Any] = {
         'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'info': info,
         'pool': pool,
         'stats': stats,
         'sys': _build_sys_snapshot(),
+        'auto_restart': _auto_restart_status_snapshot(),
+        'intranet': intranet_meta,
+        'iptables': iptables_meta,
+        # backward-compat alias
+        'ipt': iptables_meta,
     }
     if _LAST_SYNC_ERROR:
         rep['sync_error'] = _LAST_SYNC_ERROR
@@ -2285,6 +3152,10 @@ def _apply_sync_pool_cmd(cmd: Dict[str, Any]) -> None:
     do_apply = bool(cmd.get('apply', True))
     with _PUSH_LOCK:
         try:
+            prev_full = _load_full_pool()
+            if not isinstance(prev_full, dict):
+                prev_full = {}
+
             # 写入 full pool
             _write_json(POOL_FULL, pool)
             _sync_active_pool()
@@ -2297,13 +3168,27 @@ def _apply_sync_pool_cmd(cmd: Dict[str, Any]) -> None:
                 pass
 
             if do_apply:
-                _apply_pool_to_config()
-                _restart_realm()
-                # Keep intranet tunnel supervisor in sync for LAN/NAT nodes.
+                # Two-phase apply for iptables-forwarded rules:
+                # 1) stop/reconcile listeners that will change (avoid port conflicts)
+                # 2) apply realm config + restart realm
+                # 3) apply desired iptables rules
+                _IPTFWD.prepare_for_pool(pool)
                 try:
-                    _INTRANET.apply_from_pool(_load_full_pool())
+                    _apply_pool_to_config()
+                    _restart_realm()
+                    # Keep intranet tunnel supervisor in sync for LAN/NAT nodes.
+                    try:
+                        _INTRANET.apply_from_pool(_load_full_pool())
+                    except Exception:
+                        pass
+                    _IPTFWD.apply_from_pool(pool)
                 except Exception:
-                    pass
+                    # Best-effort rollback of managed iptables rules to previous full pool.
+                    try:
+                        _IPTFWD.apply_from_pool(prev_full)
+                    except Exception:
+                        pass
+                    raise
 
             # ✅ 只有成功才 ack
             _write_int(ACK_VER_FILE, ver)
@@ -2352,6 +3237,7 @@ def _apply_pool_patch_cmd(cmd: Dict[str, Any]) -> None:
     with _PUSH_LOCK:
         try:
             full = _load_full_pool()
+            prev_full = dict(full) if isinstance(full, dict) else {}
             eps = full.get('endpoints') or []
             if not isinstance(eps, list):
                 eps = []
@@ -2414,8 +3300,17 @@ def _apply_pool_patch_cmd(cmd: Dict[str, Any]) -> None:
                 pass
 
             if do_apply:
-                _apply_pool_to_config()
-                _restart_realm()
+                _IPTFWD.prepare_for_pool(new_full)
+                try:
+                    _apply_pool_to_config()
+                    _restart_realm()
+                    _IPTFWD.apply_from_pool(new_full)
+                except Exception:
+                    try:
+                        _IPTFWD.apply_from_pool(prev_full)
+                    except Exception:
+                        pass
+                    raise
 
             _write_int(ACK_VER_FILE, ver)
             _LAST_SYNC_ERROR = None
@@ -2456,27 +3351,62 @@ def _apply_update_agent_cmd(cmd: Dict[str, Any]) -> None:
     try:
         desired_ver = str(cmd.get('desired_version') or '').strip()
         update_id = str(cmd.get('update_id') or '').strip()
+        command_id = str(cmd.get('command_id') or '').strip()
         sh_url = str(cmd.get('sh_url') or '').strip()
         zip_url = str(cmd.get('zip_url') or '').strip()
         zip_sha256 = str(cmd.get('zip_sha256') or '').strip()
-        force = bool(cmd.get('force', True))
+        panel_url = str(cmd.get('panel_url') or '').strip()
+        try:
+            panel_ip_fallback_port = int(cmd.get('panel_ip_fallback_port') or 6080)
+        except Exception:
+            panel_ip_fallback_port = 6080
+        if panel_ip_fallback_port <= 0 or panel_ip_fallback_port > 65535:
+            panel_ip_fallback_port = 6080
+        fallback_sh_url = str(cmd.get('fallback_sh_url') or '').strip()
+        fallback_zip_url = str(cmd.get('fallback_zip_url') or '').strip()
+        fallback_zip_sha256 = str(cmd.get('fallback_zip_sha256') or '').strip()
+        force = _to_bool(cmd.get('force', True), True)
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         if not update_id or not desired_ver or not sh_url or not zip_url:
             st = _load_update_state()
             st.update({
+                'command_id': command_id,
                 'update_id': update_id,
                 'desired_version': desired_ver,
                 'state': 'failed',
+                'reason_code': 'invalid_command',
                 'error': 'update_agent：缺少必要参数',
-                'finished_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'finished_at': now,
+                'agent_version': str(app.version),
             })
             _save_update_state(st)
             return
 
-        # ✅ 去重：同一个 update_id 开始安装后（installing/done）不重复触发，避免心跳期间反复 systemd-run。
+        # 去重：同一个 command_id（优先）/update_id 已进入 accepted|running|done 不重复触发。
         st0 = _load_update_state()
-        if str(st0.get('update_id') or '').strip() == update_id and str(st0.get('state') or '').strip().lower() in ('installing', 'done'):
+        st0_state = _canon_update_state(st0.get('state'))
+        same_cmd = bool(command_id) and str(st0.get('command_id') or '').strip() == command_id
+        same_update = str(st0.get('update_id') or '').strip() == update_id
+        if (same_cmd and st0_state in ('accepted', 'running', 'done')) or (
+            (not command_id) and same_update and st0_state in ('accepted', 'running', 'done')
+        ):
             return
+
+        # 先回执 accepted，再进入 running（满足 panel 生命周期：delivered -> accepted -> running）。
+        st_ack = _load_update_state()
+        st_ack.update({
+            'command_id': command_id,
+            'update_id': update_id,
+            'desired_version': desired_ver,
+            'from_version': st_ack.get('from_version') or str(app.version),
+            'state': 'accepted',
+            'accepted_at': now,
+            'agent_version': str(app.version),
+            'reason_code': '',
+            'error': '',
+        })
+        _save_update_state(st_ack)
 
         # Already on desired (or newer)
         # 默认行为：若当前版本已满足 desired_version，则直接标记 done，不再安装。
@@ -2485,10 +3415,13 @@ def _apply_update_agent_cmd(cmd: Dict[str, Any]) -> None:
             if (not force) and int(str(app.version)) >= int(desired_ver) and int(desired_ver) > 0:
                 st = _load_update_state()
                 st.update({
+                    'command_id': command_id,
                     'update_id': update_id,
                     'desired_version': desired_ver,
                     'from_version': st.get('from_version') or str(app.version),
                     'state': 'done',
+                    'reason_code': '',
+                    'error': '',
                     'finished_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     'agent_version': str(app.version),
                 })
@@ -2498,31 +3431,58 @@ def _apply_update_agent_cmd(cmd: Dict[str, Any]) -> None:
             pass
 
         host, port = _get_current_agent_bind()
-        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        st = {
+        st = _load_update_state()
+        st.update({
+            'command_id': command_id,
             'update_id': update_id,
             'desired_version': desired_ver,
-            'from_version': str(app.version),
-            'state': 'installing',
+            'from_version': st.get('from_version') or str(app.version),
+            'state': 'running',
             'started_at': now,
             'agent_version': str(app.version),
-        }
+            'reason_code': '',
+            'error': '',
+        })
         _save_update_state(st)
 
         # Build updater script
         script_path = Path(f"/tmp/realm-agent-update-{update_id}.sh")
         log_path = Path(f"/var/log/realm-agent-update-{update_id}.log")
+        q_sh_url = shlex.quote(sh_url)
+        q_zip_url = shlex.quote(zip_url)
+        q_zip_sha256 = shlex.quote(zip_sha256)
+        q_panel_url = shlex.quote(panel_url)
+        q_panel_ip_fallback_port = shlex.quote(str(panel_ip_fallback_port))
+        q_fallback_sh_url = shlex.quote(fallback_sh_url)
+        q_fallback_zip_url = shlex.quote(fallback_zip_url)
+        q_fallback_zip_sha256 = shlex.quote(fallback_zip_sha256)
         script = f"""#!/usr/bin/env bash
 set -euo pipefail
 
 TMP_ZIP=\"/tmp/realm-agent-repo-{update_id}.zip\"
+TMP_SH=\"/tmp/realm-agent-installer-{update_id}.sh\"
 LOG=\"{log_path}\"
 STATE=\"{UPDATE_STATE_FILE}\"
 SCRIPT_PATH=\"{script_path}\"
+PRIMARY_SH_URL={q_sh_url}
+PRIMARY_ZIP_URL={q_zip_url}
+PRIMARY_ZIP_SHA256={q_zip_sha256}
+PANEL_URL={q_panel_url}
+PANEL_IP_FALLBACK_PORT={q_panel_ip_fallback_port}
+FALLBACK_SH_URL={q_fallback_sh_url}
+FALLBACK_ZIP_URL={q_fallback_zip_url}
+FALLBACK_ZIP_SHA256={q_fallback_zip_sha256}
 LOG_RETENTION_DAYS=\"${{REALM_AGENT_UPDATE_LOG_RETENTION_DAYS:-7}}\"
 TMP_RETENTION_DAYS=\"${{REALM_AGENT_UPDATE_TMP_RETENTION_DAYS:-1}}\"
+CURL_CONNECT_TIMEOUT=\"${{REALM_AGENT_UPDATE_CURL_CONNECT_TIMEOUT:-20}}\"
+CURL_MAX_TIME=\"${{REALM_AGENT_UPDATE_CURL_MAX_TIME:-300}}\"
+CURL_RETRY=\"${{REALM_AGENT_UPDATE_CURL_RETRY:-4}}\"
+CURL_RETRY_DELAY=\"${{REALM_AGENT_UPDATE_CURL_RETRY_DELAY:-3}}\"
+
+export STATE
 
 mkdir -p \"$(dirname \"$LOG\")\" || true
+exec > >(tee -a \"$LOG\") 2>&1
 
 prune_old_artifacts() {{
   if [[ \"$LOG_RETENTION_DAYS\" =~ ^[0-9]+$ ]]; then
@@ -2535,7 +3495,7 @@ prune_old_artifacts() {{
 }}
 
 cleanup() {{
-  rm -f \"$TMP_ZIP\" \"$SCRIPT_PATH\" 2>/dev/null || true
+  rm -f \"$TMP_ZIP\" \"$TMP_SH\" \"$SCRIPT_PATH\" 2>/dev/null || true
   prune_old_artifacts
 }}
 
@@ -2543,7 +3503,11 @@ trap cleanup EXIT
 
 fail() {{
   local code=\"$1\"; shift || true
-  local msg=\"$*\"
+  local hint=\"\"
+  if [[ -f \"$LOG\" ]]; then
+    hint=\"$(tail -n 20 \"$LOG\" 2>/dev/null | tr '\\n' ' ' | tail -c 900)\"
+  fi
+  export ERR_HINT=\"$hint\"
   python3 - <<'PY'
 import json, pathlib, datetime, os
 p=pathlib.Path(os.environ.get('STATE','/etc/realm-agent/agent_update.json'))
@@ -2552,8 +3516,24 @@ try:
   st=json.loads(p.read_text(encoding='utf-8'))
 except Exception:
   st={{}}
+cmd_id = r\"{command_id}\"
+upd_id = r\"{update_id}\"
+des_ver = r\"{desired_ver}\"
 st['state']='failed'
-st['error']=os.environ.get('ERR_MSG','update failed')
+st['reason_code']=os.environ.get('ERR_REASON','installer_error')
+err = os.environ.get('ERR_MSG','update failed')
+hint = os.environ.get('ERR_HINT','').strip()
+if hint:
+  err = f"{{err}} | {{hint}}"
+if len(err) > 1800:
+  err = err[-1800:]
+st['error']=err
+if cmd_id:
+  st['command_id']=cmd_id
+if upd_id:
+  st['update_id']=upd_id
+if des_ver:
+  st['desired_version']=des_ver
 st['finished_at']=datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 p.parent.mkdir(parents=True, exist_ok=True)
 p.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -2561,22 +3541,331 @@ PY
   exit \"$code\"
 }}
 
-trap 'export ERR_MSG=\"line $LINENO: $BASH_COMMAND\"; fail $?' ERR
+if ! [[ \"$CURL_CONNECT_TIMEOUT\" =~ ^[0-9]+$ ]]; then CURL_CONNECT_TIMEOUT=20; fi
+if ! [[ \"$CURL_MAX_TIME\" =~ ^[0-9]+$ ]]; then CURL_MAX_TIME=300; fi
+if ! [[ \"$CURL_RETRY\" =~ ^[0-9]+$ ]]; then CURL_RETRY=4; fi
+if ! [[ \"$CURL_RETRY_DELAY\" =~ ^[0-9]+$ ]]; then CURL_RETRY_DELAY=3; fi
 
-echo \"[update] download zip...\" | tee -a \"$LOG\"
-# cache-bust to avoid CDN/proxy caching when forcing a reinstall
-BUST=\"ts=$(date +%s)\"
-ZURL=\"{zip_url}\"
-if [[ \"$ZURL\" == http://* || \"$ZURL\" == https://* ]]; then
-  if [[ \"$ZURL\" == *\\?* ]]; then
-    ZURL=\"$ZURL&$BUST\"
-  else
-    ZURL=\"$ZURL?$BUST\"
-  fi
+if [[ -n \"$FALLBACK_ZIP_URL\" && \"$FALLBACK_ZIP_URL\" == \"$PRIMARY_ZIP_URL\" ]]; then
+  FALLBACK_ZIP_URL=\"\"
+  FALLBACK_ZIP_SHA256=\"\"
 fi
-curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \"$ZURL\" -o \"$TMP_ZIP\"
-if [[ -n \"{zip_sha256}\" ]]; then
-  echo \"{zip_sha256}  $TMP_ZIP\" | sha256sum -c -
+if [[ -n \"$FALLBACK_SH_URL\" && \"$FALLBACK_SH_URL\" == \"$PRIMARY_SH_URL\" ]]; then
+  FALLBACK_SH_URL=\"\"
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+  export ERR_REASON=\"installer_error\"
+  export ERR_MSG=\"curl 不存在，无法执行在线更新\"
+  fail 30
+fi
+
+trap 'export ERR_REASON=\"installer_error\"; export ERR_MSG=\"line $LINENO: $BASH_COMMAND\"; fail $?' ERR
+
+append_cache_bust() {{
+  local url=\"$1\"
+  local bust=\"ts=$(date +%s)\"
+  if [[ \"$url\" == http://* || \"$url\" == https://* ]]; then
+    if [[ \"$url\" == *\\?* ]]; then
+      printf '%s\\n' \"$url&$bust\"
+    else
+      printf '%s\\n' \"$url?$bust\"
+    fi
+  else
+    printf '%s\\n' \"$url\"
+  fi
+}}
+
+verify_sha256() {{
+  local expected=\"$1\"
+  local file=\"$2\"
+  [[ -z \"$expected\" ]] && return 0
+  if command -v sha256sum >/dev/null 2>&1; then
+    echo \"$expected  $file\" | sha256sum -c - >/dev/null 2>&1
+    return $?
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    local got
+    got=\"$(shasum -a 256 \"$file\" | awk '{{print $1}}')\"
+    [[ \"$got\" == \"$expected\" ]]
+    return $?
+  fi
+  # 无哈希校验工具时放行，避免旧系统直接失败。
+  return 0
+}}
+
+curl_fetch() {{
+  local url=\"$1\"
+  local out=\"$2\"
+  local real_url
+  real_url=\"$(append_cache_bust \"$url\")\"
+  local -a args=(
+    --fail
+    --silent
+    --show-error
+    --location
+    --connect-timeout \"$CURL_CONNECT_TIMEOUT\"
+    --max-time \"$CURL_MAX_TIME\"
+    --retry \"$CURL_RETRY\"
+    --retry-delay \"$CURL_RETRY_DELAY\"
+    -H 'Cache-Control: no-cache'
+    -H 'Pragma: no-cache'
+    \"$real_url\"
+    -o \"$out\"
+  )
+  if curl --help all 2>/dev/null | grep -q -- '--retry-connrefused'; then
+    args=(--retry-connrefused \"${{args[@]}}\")
+  fi
+  if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+    args=(--retry-all-errors \"${{args[@]}}\")
+  fi
+  curl \"${{args[@]}}\"
+}}
+
+curl_stream() {{
+  local url=\"$1\"
+  local real_url
+  real_url=\"$(append_cache_bust \"$url\")\"
+  local -a args=(
+    --fail
+    --silent
+    --show-error
+    --location
+    --connect-timeout \"$CURL_CONNECT_TIMEOUT\"
+    --max-time \"$CURL_MAX_TIME\"
+    --retry \"$CURL_RETRY\"
+    --retry-delay \"$CURL_RETRY_DELAY\"
+    -H 'Cache-Control: no-cache'
+    -H 'Pragma: no-cache'
+    \"$real_url\"
+  )
+  if curl --help all 2>/dev/null | grep -q -- '--retry-connrefused'; then
+    args=(--retry-connrefused \"${{args[@]}}\")
+  fi
+  if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+    args=(--retry-all-errors \"${{args[@]}}\")
+  fi
+  curl \"${{args[@]}}\"
+}}
+
+build_panel_ip_urls() {{
+  local src_url=\"$1\"
+  python3 - \"$src_url\" \"$PANEL_URL\" \"$PANEL_IP_FALLBACK_PORT\" <<'PY'
+import socket
+import sys
+from urllib.parse import urlsplit, urlunsplit
+
+src = str(sys.argv[1] if len(sys.argv) > 1 else "").strip()
+panel = str(sys.argv[2] if len(sys.argv) > 2 else "").strip()
+port_raw = str(sys.argv[3] if len(sys.argv) > 3 else "").strip()
+try:
+    fallback_port = int(port_raw)
+except Exception:
+    fallback_port = 6080
+if fallback_port <= 0 or fallback_port > 65535:
+    fallback_port = 6080
+
+def host_of(url: str) -> str:
+    try:
+        return (urlsplit(url).hostname or "").strip().lower()
+    except Exception:
+        return ""
+
+def explicit_port_of(url: str) -> int:
+    try:
+        p = int(urlsplit(url).port or 0)
+    except Exception:
+        p = 0
+    if p > 0 and p <= 65535:
+        return p
+    return 0
+
+def is_ipv4(host: str) -> bool:
+    parts = host.split(".")
+    if len(parts) != 4:
+        return False
+    for p in parts:
+        if not p.isdigit():
+            return False
+        v = int(p)
+        if v < 0 or v > 255:
+            return False
+    return True
+
+try:
+    su = urlsplit(src)
+except Exception:
+    sys.exit(0)
+if not su.scheme or not su.netloc:
+    sys.exit(0)
+scheme = (su.scheme or "http").strip().lower()
+if scheme not in ("http", "https"):
+    scheme = "http"
+port = explicit_port_of(src) or explicit_port_of(panel) or fallback_port
+
+src_host = host_of(src)
+panel_host = host_of(panel)
+if panel_host and src_host and src_host != panel_host:
+    # only replace panel-origin URLs; do not rewrite github or other mirrors
+    sys.exit(0)
+if not panel_host:
+    panel_host = src_host
+if not panel_host:
+    sys.exit(0)
+if panel_host in ("localhost", "127.0.0.1", "::1") or is_ipv4(panel_host):
+    sys.exit(0)
+
+try:
+    infos = socket.getaddrinfo(panel_host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+except Exception:
+    infos = []
+
+seen = set()
+for it in infos:
+    try:
+        ip = str(it[4][0] or "").strip()
+    except Exception:
+        ip = ""
+    if not ip:
+        continue
+    # keep simple and stable: IPv4 + fixed http port fallback
+    if ":" in ip:
+        continue
+    if ip in seen:
+        continue
+    seen.add(ip)
+    out = urlunsplit((scheme, f"{{ip}}:{{port}}", su.path or "/", su.query, ""))
+    print(out)
+PY
+}}
+
+emit_url_sha_candidates() {{
+  local primary_url=\"$1\"
+  local primary_sha=\"$2\"
+  local fallback_url=\"$3\"
+  local fallback_sha=\"$4\"
+  declare -A seen=()
+
+  emit_one() {{
+    local u=\"$1\"
+    local s=\"$2\"
+    [[ -n \"$u\" ]] || return 0
+    if [[ -n \"${{seen[$u]+x}}\" ]]; then
+      return 0
+    fi
+    seen[\"$u\"]=1
+    printf '%s\\t%s\\n' \"$u\" \"$s\"
+  }}
+
+  local u
+  emit_one \"$primary_url\" \"$primary_sha\"
+  while IFS= read -r u; do
+    emit_one \"$u\" \"$primary_sha\"
+  done < <(build_panel_ip_urls \"$primary_url\")
+
+  if [[ -n \"$fallback_url\" ]]; then
+    emit_one \"$fallback_url\" \"$fallback_sha\"
+    while IFS= read -r u; do
+      emit_one \"$u\" \"$fallback_sha\"
+    done < <(build_panel_ip_urls \"$fallback_url\")
+  fi
+}}
+
+download_asset() {{
+  local name=\"$1\"
+  local url=\"$2\"
+  local out=\"$3\"
+  local sha=\"$4\"
+  [[ -n \"$url\" ]] || return 1
+  echo \"[update] download $name from $url\" | tee -a \"$LOG\"
+  if ! curl_fetch \"$url\" \"$out\"; then
+    echo \"[update] download failed: $name from $url\" | tee -a \"$LOG\"
+    return 1
+  fi
+  if ! verify_sha256 \"$sha\" \"$out\"; then
+    echo \"[update] sha256 mismatch: $name from $url\" | tee -a \"$LOG\"
+    return 1
+  fi
+  return 0
+}}
+
+download_asset_candidates() {{
+  local name=\"$1\"
+  local out=\"$2\"
+  local primary_url=\"$3\"
+  local primary_sha=\"$4\"
+  local fallback_url=\"$5\"
+  local fallback_sha=\"$6\"
+  local c_url=\"\"
+  local c_sha=\"\"
+
+  while IFS=$'\\t' read -r c_url c_sha; do
+    [[ -n \"$c_url\" ]] || continue
+    if download_asset \"$name\" \"$c_url\" \"$out\" \"$c_sha\"; then
+      echo \"[update] selected $name source: $c_url\" | tee -a \"$LOG\"
+      return 0
+    fi
+  done < <(emit_url_sha_candidates \"$primary_url\" \"$primary_sha\" \"$fallback_url\" \"$fallback_sha\")
+  return 1
+}}
+
+run_installer_stream() {{
+  local url=\"$1\"
+  local run_log=\"$2\"
+  [[ -n \"$url\" ]] || return 1
+  : > \"$run_log\"
+  echo \"[update] execute installer stream: bash <(curl -fsSL $url)\" | tee -a \"$LOG\"
+  set +e
+  /bin/bash <(curl_stream \"$url\") 2>&1 | tee -a \"$LOG\" | tee -a \"$run_log\"
+  local rc=${{PIPESTATUS[0]}}
+  set -e
+  local last_line=\"\"
+  if [[ -f \"$run_log\" ]]; then
+    last_line=\"$(awk 'NF{{line=$0}} END{{print line}}' \"$run_log\" 2>/dev/null || true)\"
+  fi
+  if [[ -n \"$last_line\" ]]; then
+    echo \"[update] installer last line: $last_line\" | tee -a \"$LOG\"
+  fi
+  if [[ \"$rc\" -ne 0 ]]; then
+    return 1
+  fi
+  if grep -q '\\[OK\\][[:space:]]*Agent 已安装并启动' \"$run_log\" 2>/dev/null; then
+    return 0
+  fi
+  if grep -q 'Agent URL:' \"$run_log\" 2>/dev/null; then
+    return 0
+  fi
+  if [[ \"$last_line\" == *\"已安装并启动\"* ]]; then
+    return 0
+  fi
+  return 1
+}}
+
+run_installer_candidates() {{
+  local primary_url=\"$1\"
+  local fallback_url=\"$2\"
+  local run_log=\"/tmp/realm-agent-installer-run-{update_id}.log\"
+  local c_url=\"\"
+  local c_sha=\"\"
+  while IFS=$'\\t' read -r c_url c_sha; do
+    [[ -n \"$c_url\" ]] || continue
+    if run_installer_stream \"$c_url\" \"$run_log\"; then
+      echo \"[update] selected installer source: $c_url\" | tee -a \"$LOG\"
+      return 0
+    fi
+    echo \"[update] installer source failed: $c_url\" | tee -a \"$LOG\"
+  done < <(emit_url_sha_candidates \"$primary_url\" \"\" \"$fallback_url\" \"\")
+  return 1
+}}
+
+ZIP_OK=0
+if download_asset_candidates \"agent zip\" \"$TMP_ZIP\" \"$PRIMARY_ZIP_URL\" \"$PRIMARY_ZIP_SHA256\" \"$FALLBACK_ZIP_URL\" \"$FALLBACK_ZIP_SHA256\"; then
+  ZIP_OK=1
+fi
+if [[ \"$ZIP_OK\" != \"1\" ]]; then
+  export ERR_REASON=\"download_error\"
+  export ERR_MSG=\"下载 agent zip 失败：主备地址均不可用\"
+  fail 31
 fi
 
 export REALM_AGENT_ASSUME_YES=1
@@ -2587,15 +3876,11 @@ export REALM_AGENT_PORT=\"{port}\"
 export REALM_AGENT_REPO_ZIP_URL=\"file://$TMP_ZIP\"
 
 echo \"[update] run installer...\" | tee -a \"$LOG\"
-SURL=\"{sh_url}\"
-if [[ \"$SURL\" == http://* || \"$SURL\" == https://* ]]; then
-  if [[ \"$SURL\" == *\\?* ]]; then
-    SURL=\"$SURL&$BUST\"
-  else
-    SURL=\"$SURL?$BUST\"
-  fi
+if ! run_installer_candidates \"$PRIMARY_SH_URL\" \"$FALLBACK_SH_URL\"; then
+  export ERR_REASON=\"installer_error\"
+  export ERR_MSG=\"执行 installer 失败：主备地址不可用或未检测到成功输出\"
+  fail 32
 fi
-curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \"$SURL\" | bash
 
 python3 - <<'PY'
 import json, pathlib, datetime
@@ -2605,7 +3890,18 @@ try:
   st=json.loads(p.read_text(encoding='utf-8'))
 except Exception:
   st={{}}
+cmd_id = r\"{command_id}\"
+upd_id = r\"{update_id}\"
+des_ver = r\"{desired_ver}\"
 st['state']='done'
+st['reason_code']=''
+st['error']=''
+if cmd_id:
+  st['command_id']=cmd_id
+if upd_id:
+  st['update_id']=upd_id
+if des_ver:
+  st['desired_version']=des_ver
 st['finished_at']=datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 p.parent.mkdir(parents=True, exist_ok=True)
 p.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -2628,7 +3924,10 @@ echo \"[update] done\" | tee -a \"$LOG\"
         else:
             st = _load_update_state()
             st.update({
+                'command_id': command_id,
+                'update_id': update_id,
                 'state': 'failed',
+                'reason_code': 'missing_systemd_run',
                 'error': '缺少 systemd-run，无法安全执行自更新（避免被 systemd cgroup 一并杀掉）',
                 'finished_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             })
@@ -2636,7 +3935,10 @@ echo \"[update] done\" | tee -a \"$LOG\"
     except Exception as exc:
         st = _load_update_state()
         st.update({
+            'command_id': str(cmd.get('command_id') or '').strip(),
+            'update_id': str(cmd.get('update_id') or '').strip(),
             'state': 'failed',
+            'reason_code': 'update_cmd_exception',
             'error': f'update_agent 异常：{exc}',
             'finished_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         })
@@ -2683,6 +3985,35 @@ def _apply_reset_traffic_cmd(cmd: Dict[str, Any]) -> None:
         _write_int(TRAFFIC_RESET_ACK_FILE, ver)
     except Exception as exc:
         _LAST_SYNC_ERROR = f'reset_traffic 失败：{exc}'
+        return
+
+
+def _apply_auto_restart_policy_cmd(cmd: Dict[str, Any]) -> None:
+    global _LAST_SYNC_ERROR
+    try:
+        ver = int(cmd.get('version') or 0)
+    except Exception:
+        ver = 0
+    if ver <= 0:
+        return
+
+    ack = _read_int(AUTO_RESTART_ACK_FILE, 0)
+    if ver <= ack:
+        return
+
+    policy_raw = cmd.get('policy')
+    if not isinstance(policy_raw, dict):
+        _LAST_SYNC_ERROR = 'auto_restart_policy 失败：policy 不合法'
+        return
+
+    try:
+        policy = _normalize_auto_restart_policy(policy_raw)
+        with _AUTO_RESTART_POLICY_LOCK:
+            _auto_restart_save_policy_locked(policy)
+        _write_int(AUTO_RESTART_ACK_FILE, ver)
+        _LAST_SYNC_ERROR = None
+    except Exception as exc:
+        _LAST_SYNC_ERROR = f'auto_restart_policy 失败：{exc}'
         return
 
 
@@ -2785,15 +4116,42 @@ def _handle_panel_commands(cmds: Any) -> None:
             'pool_patch',
             'update_agent',
             'reset_traffic',
+            'auto_restart_policy',
             'website_env_ensure',
             'website_env_uninstall',
             'website_ssl_issue',
             'website_ssl_renew',
         ):
-            if not api_key or not _verify_cmd_sig(cmd, api_key):
+            ok_sig = False
+            sig_reason = "no_api_key"
+            if api_key:
+                ok_sig, sig_reason = _verify_cmd_sig_detail(cmd, api_key)
+            if not ok_sig:
                 # do not crash; keep reporting error for UI
                 global _LAST_SYNC_ERROR
-                _LAST_SYNC_ERROR = f'{t}：签名校验失败'
+                _LAST_SYNC_ERROR = f'{t}：签名校验失败（{sig_reason}）'
+                if t == 'update_agent':
+                    try:
+                        st = _load_update_state()
+                        cur_state = _canon_update_state(st.get('state'))
+                        cur_update_id = str(st.get('update_id') or '').strip()
+                        incoming_update_id = str(cmd.get('update_id') or '').strip()
+                        if incoming_update_id and cur_update_id == incoming_update_id and cur_state in ('accepted', 'running', 'done'):
+                            # A prior variant already passed signature and started update.
+                            continue
+                        st.update({
+                            'command_id': str(cmd.get('command_id') or '').strip(),
+                            'update_id': str(cmd.get('update_id') or '').strip(),
+                            'desired_version': str(cmd.get('desired_version') or '').strip() or st.get('desired_version') or '',
+                            'state': 'failed',
+                            'reason_code': 'signature_rejected',
+                            'error': f'update_agent：签名校验失败（{sig_reason}）',
+                            'finished_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            'agent_version': str(app.version),
+                        })
+                        _save_update_state(st)
+                    except Exception:
+                        pass
                 continue
 
         if t == 'sync_pool':
@@ -2804,8 +4162,21 @@ def _handle_panel_commands(cmds: Any) -> None:
             _apply_update_agent_cmd(cmd)
         elif t == 'reset_traffic':
             _apply_reset_traffic_cmd(cmd)
+        elif t == 'auto_restart_policy':
+            _apply_auto_restart_policy_cmd(cmd)
         elif t in ('website_env_ensure', 'website_env_uninstall', 'website_ssl_issue', 'website_ssl_renew'):
             _apply_website_task_cmd(cmd)
+
+
+def _agent_capabilities() -> Dict[str, Any]:
+    # Protocol v2 guarantees command_id + accepted/running lifecycle + reason_code reporting.
+    return {
+        'update_protocol_version': 2,
+        'supports_update_command_id': True,
+        'supports_update_accept_ack': True,
+        'supports_update_reason_code': True,
+    }
+
 
 def _push_loop() -> None:
     """后台上报线程。"""
@@ -2837,24 +4208,32 @@ def _push_loop() -> None:
 
     while not _PUSH_STOP.is_set():
         started = time.time()
+        report_payload: Optional[Dict[str, Any]] = None
         try:
             ack = _read_int(ACK_VER_FILE, 0)
             task_results = _peek_panel_task_results(limit=40)
+            report_payload = _build_push_report()
             payload = {
                 'node_id': AGENT_ID,
                 'ack_version': ack,
                 'traffic_ack_version': _read_int(TRAFFIC_RESET_ACK_FILE, 0),
+                'auto_restart_ack_version': _read_int(AUTO_RESTART_ACK_FILE, 0),
                 'agent_version': str(app.version),
+                'capabilities': _agent_capabilities(),
                 'agent_update': _load_update_state(),
-                'report': _build_push_report(),
+                'report': report_payload,
             }
             if task_results:
                 payload['task_results'] = task_results
             raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
             zipped = gzip.compress(raw, compresslevel=5)
-            r = sess.post(url, data=zipped, headers=headers, timeout=3)
+            r = sess.post(url, data=zipped, headers=headers, timeout=(REPORT_CONNECT_TIMEOUT, REPORT_READ_TIMEOUT))
             if r.status_code == 200:
                 data = r.json() if r.content else {}
+                try:
+                    _update_panel_time_offset(data.get('server_ts'))
+                except Exception:
+                    pass
                 if task_results:
                     ack_ids = [str((x or {}).get("id") or "").strip() for x in task_results]
                     _ack_panel_task_results(ack_ids)
@@ -2864,6 +4243,11 @@ def _push_loop() -> None:
                 backoff = min(max_backoff, backoff * 2 + 1.0) if backoff else 2.0
         except Exception:
             backoff = min(max_backoff, backoff * 2 + 1.0) if backoff else 2.0
+
+        try:
+            _auto_restart_tick(report_payload)
+        except Exception:
+            pass
 
         # 维持固定节奏：interval - 耗时 + 退避
         cost = time.time() - started
@@ -2902,6 +4286,12 @@ def _on_startup() -> None:
         _INTRANET.apply_from_pool(full_pool)
     except Exception:
         pass
+    # Apply iptables-forwarded normal rules on boot.
+    try:
+        _IPTFWD.prepare_for_pool(full_pool)
+        _IPTFWD.apply_from_pool(full_pool)
+    except Exception:
+        pass
     _qos_apply_safe(full_pool, "startup")
     _start_push_reporter()
 
@@ -2909,17 +4299,25 @@ def _on_startup() -> None:
 @app.on_event('shutdown')
 def _on_shutdown() -> None:
     _stop_push_reporter()
+    try:
+        _IPTFWD.stop()
+    except Exception:
+        pass
 
 
 
 @app.get('/api/v1/info')
 def api_info(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    iptables_status = _IPTFWD.status()
     return {
         'ok': True,
         'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'hostname': socket.gethostname(),
         'realm_active': any(_service_is_active(name) for name in REALM_SERVICE_NAMES),
         'qos': _qos_get_status(),
+        'iptables': iptables_status,
+        # backward-compat alias
+        'ipt': iptables_status,
     }
 
 
@@ -3001,8 +4399,18 @@ def api_apply(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
             _sync_active_pool()
             full_pool = _load_full_pool()
             _qos_apply_safe(full_pool, "apply")
-            _apply_pool_to_config()
-            _restart_realm()
+            _IPTFWD.prepare_for_pool(full_pool)
+            try:
+                _apply_pool_to_config()
+                _restart_realm()
+                _IPTFWD.apply_from_pool(full_pool)
+            except Exception:
+                # Keep managed iptables rules from staying in a partially-applied state.
+                try:
+                    _IPTFWD.apply_from_pool(full_pool)
+                except Exception:
+                    pass
+                raise
             # Apply intranet tunnel rules (handled by agent, not realm)
             try:
                 _INTRANET.apply_from_pool(full_pool)
@@ -3018,6 +4426,10 @@ def api_apply(_: None = Depends(_api_key_required)) -> Dict[str, Any]:
 
 _NETPROBE_PING_RE = re.compile(r'time[=<]?\s*([0-9.]+)\s*ms', re.IGNORECASE)
 _NETPROBE_TRANSPORT_RE = re.compile(r'(^|;)\s*([a-zA-Z0-9_]+)\s*=\s*([^;]+)')
+_NETPROBE_TRACE_HOP_RE = re.compile(r'^\s*(\d+)\s+(.*)$')
+_NETPROBE_TRACE_MS_RE = re.compile(r'([0-9]+(?:\.[0-9]+)?)\s*ms', re.IGNORECASE)
+_NETPROBE_TRACE_HOST_IP_RE = re.compile(r'^(\S+)\s+\(([^)]+)\)')
+_NETPROBE_TRACE_SPLIT_RE = re.compile(r'[\s,;]+')
 
 
 def _parse_tcp_target(target: str, default_port: int) -> tuple[str, int]:
@@ -3150,6 +4562,660 @@ def _tcp_ping_once(host: str, port: int, timeout_sec: float) -> Dict[str, Any]:
         if len(msg) > 200:
             msg = msg[:200] + '…'
         return {'ok': False, 'error': msg}
+
+
+def _netprobe_trace_max_hops(raw_hops: Any) -> int:
+    try:
+        v = int(raw_hops) if raw_hops is not None else 20
+    except Exception:
+        v = 20
+    if v < 3:
+        v = 3
+    if v > 64:
+        v = 64
+    return v
+
+
+def _netprobe_trace_timeout(raw_timeout: Any) -> float:
+    try:
+        v = float(raw_timeout) if raw_timeout is not None else 1.0
+    except Exception:
+        v = 1.0
+    if v < 0.3:
+        v = 0.3
+    if v > 5.0:
+        v = 5.0
+    return v
+
+
+def _netprobe_trace_probes(raw_probes: Any) -> int:
+    try:
+        v = int(raw_probes) if raw_probes is not None else 3
+    except Exception:
+        v = 3
+    if v < 1:
+        v = 1
+    if v > 5:
+        v = 5
+    return v
+
+
+def _netprobe_trace_clean_target(raw_target: Any) -> str:
+    s = str(raw_target or '').strip()
+    if len(s) > 256:
+        s = s[:256].strip()
+    return s
+
+
+def _netprobe_trace_host_is_ip(host: str) -> bool:
+    h = str(host or '').strip()
+    if not h:
+        return False
+    core = h.split('%', 1)[0]
+    try:
+        ipaddress.ip_address(core)
+        return True
+    except Exception:
+        return False
+
+
+def _netprobe_trace_host_valid(host: str) -> bool:
+    h = str(host or '').strip()
+    if not h:
+        return False
+    if len(h) > 253:
+        return False
+    if any(ch.isspace() for ch in h):
+        return False
+    if h in ('*', '-', '—'):
+        return False
+    if '/' in h:
+        return False
+    if _netprobe_trace_host_is_ip(h):
+        return True
+    if h.endswith('.'):
+        h = h[:-1]
+    if not h:
+        return False
+    labels = h.split('.')
+    for lb in labels:
+        if not lb:
+            return False
+        if len(lb) > 63:
+            return False
+        if lb.startswith('-') or lb.endswith('-'):
+            return False
+        if not re.match(r'^[a-zA-Z0-9-]+$', lb):
+            return False
+    return True
+
+
+def _netprobe_trace_host_token(token: str) -> str:
+    t = str(token or '').strip().strip(',;')
+    if not t:
+        return ''
+
+    # Strip common wrappers.
+    if t.startswith('(') and t.endswith(')') and len(t) > 2:
+        t = t[1:-1].strip()
+    if t.startswith('<') and t.endswith('>') and len(t) > 2:
+        t = t[1:-1].strip()
+
+    if '://' in t:
+        try:
+            parsed = urlparse(t)
+            t = str(parsed.hostname or '').strip()
+        except Exception:
+            t = t.split('://', 1)[-1].strip()
+            if '/' in t:
+                t = t.split('/', 1)[0].strip()
+
+    # [ipv6]:port
+    if t.startswith('[') and ']' in t:
+        host = t[1:t.index(']')].strip()
+        return host
+
+    # host:port (single ':' only to avoid IPv6 false positives)
+    if t.count(':') == 1:
+        host, p = t.rsplit(':', 1)
+        if p.isdigit():
+            return host.strip()
+
+    # trim plain path suffix if any
+    if '/' in t:
+        t = t.split('/', 1)[0].strip()
+
+    return t
+
+
+def _netprobe_trace_extract_host(raw_target: str) -> str:
+    s = _netprobe_trace_clean_target(raw_target)
+    if not s:
+        return ''
+
+    candidates: List[str] = [s]
+    if '→' in s:
+        right = s.split('→', 1)[-1].strip()
+        if right:
+            candidates.insert(0, right)
+
+    # Try right-most token first for labels like "本机监听 127.0.0.1:443".
+    toks = [x for x in _NETPROBE_TRACE_SPLIT_RE.split(s) if x]
+    for tok in reversed(toks):
+        candidates.append(tok)
+
+    seen: set[str] = set()
+    for c in candidates:
+        cc = str(c or '').strip()
+        if not cc:
+            continue
+        if cc in seen:
+            continue
+        seen.add(cc)
+        host = _netprobe_trace_host_token(cc)
+        if _netprobe_trace_host_valid(host):
+            return host
+    return ''
+
+
+def _netprobe_trace_num(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    s = str(v).strip().replace(',', '')
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _netprobe_trace_num_int(v: Any, default: int) -> int:
+    try:
+        return int(float(str(v).strip()))
+    except Exception:
+        return int(default)
+
+
+def _netprobe_trace_summary(hops: List[Dict[str, Any]], target_host: str, max_hops: int) -> Dict[str, Any]:
+    hops_sorted = sorted([h for h in hops if isinstance(h, dict)], key=lambda x: int(x.get('hop') or 0))
+    hops_total = len(hops_sorted)
+    responded = 0
+    for h in hops_sorted:
+        try:
+            if float(h.get('loss_pct') or 100.0) < 100.0:
+                responded += 1
+        except Exception:
+            pass
+
+    reached = False
+    if hops_sorted:
+        last = hops_sorted[-1]
+        host = str(last.get('host') or '').strip().lower()
+        ip = str(last.get('ip') or '').strip().lower()
+        target_l = str(target_host or '').strip().lower()
+        if target_l and (host == target_l or ip == target_l):
+            reached = True
+        elif host and host not in ('*', '???'):
+            try:
+                reached = float(last.get('loss_pct') or 100.0) < 100.0
+            except Exception:
+                reached = False
+
+    with_latency = 0
+    max_avg_ms: Optional[float] = None
+    for h in hops_sorted:
+        v = h.get('avg_ms')
+        if v is None:
+            continue
+        try:
+            f = float(v)
+        except Exception:
+            continue
+        with_latency += 1
+        if max_avg_ms is None or f > max_avg_ms:
+            max_avg_ms = f
+
+    out: Dict[str, Any] = {
+        'target': str(target_host or ''),
+        'hops_total': hops_total,
+        'responded_hops': int(responded),
+        'with_latency_hops': int(with_latency),
+        'max_hops': int(max_hops),
+        'reached': bool(reached),
+    }
+    if max_avg_ms is not None:
+        out['max_avg_ms'] = round(float(max_avg_ms), 3)
+    return out
+
+
+def _netprobe_trace_tools_state() -> Dict[str, bool]:
+    return {
+        'mtr': bool(shutil.which('mtr')),
+        'traceroute': bool(shutil.which('traceroute')),
+    }
+
+
+def _netprobe_trace_tools_ready(state: Optional[Dict[str, bool]] = None) -> bool:
+    st = state if isinstance(state, dict) else _netprobe_trace_tools_state()
+    return bool(st.get('mtr')) or bool(st.get('traceroute'))
+
+
+def _netprobe_trace_brief(text: Any, limit: int = 220) -> str:
+    s = ' '.join(str(text or '').split()).strip()
+    if not s:
+        return ''
+    if len(s) > int(limit):
+        return s[: int(limit)] + '…'
+    return s
+
+
+def _netprobe_trace_install_plans(mgr: str) -> List[List[str]]:
+    m = str(mgr or '').strip().lower()
+    if m == 'apt':
+        return [
+            ['mtr-tiny', 'traceroute'],
+            ['mtr', 'traceroute'],
+            ['traceroute'],
+            ['mtr-tiny'],
+            ['mtr'],
+        ]
+    return [
+        ['mtr', 'traceroute'],
+        ['traceroute'],
+        ['mtr'],
+    ]
+
+
+def _netprobe_trace_auto_install_once() -> Dict[str, Any]:
+    state0 = _netprobe_trace_tools_state()
+    if _netprobe_trace_tools_ready(state0):
+        return {
+            'ok': True,
+            'attempted': False,
+            'state': state0,
+            'detail': 'already_available',
+        }
+
+    global _TRACE_TOOL_INSTALL_ATTEMPTED, _TRACE_TOOL_INSTALL_LAST
+    with _TRACE_TOOL_INSTALL_LOCK:
+        state1 = _netprobe_trace_tools_state()
+        if _netprobe_trace_tools_ready(state1):
+            return {
+                'ok': True,
+                'attempted': False,
+                'state': state1,
+                'detail': 'available_after_wait',
+            }
+
+        if _TRACE_TOOL_INSTALL_ATTEMPTED:
+            if isinstance(_TRACE_TOOL_INSTALL_LAST, dict) and _TRACE_TOOL_INSTALL_LAST:
+                return dict(_TRACE_TOOL_INSTALL_LAST)
+            return {
+                'ok': False,
+                'attempted': True,
+                'error': 'install_already_attempted',
+                'state': state1,
+                'detail': '已尝试自动安装，请检查节点环境',
+            }
+
+        _TRACE_TOOL_INSTALL_ATTEMPTED = True
+
+        if not TRACE_AUTO_INSTALL:
+            out = {
+                'ok': False,
+                'attempted': True,
+                'error': 'auto_install_disabled',
+                'state': state1,
+                'detail': '自动安装已禁用（REALM_AGENT_TRACE_AUTO_INSTALL=0）',
+            }
+            _TRACE_TOOL_INSTALL_LAST = out
+            return dict(out)
+
+        try:
+            if hasattr(os, 'geteuid') and int(os.geteuid()) != 0:
+                out = {
+                    'ok': False,
+                    'attempted': True,
+                    'error': 'install_need_root',
+                    'state': state1,
+                    'detail': '自动安装需要 root 权限',
+                }
+                _TRACE_TOOL_INSTALL_LAST = out
+                return dict(out)
+        except Exception:
+            pass
+
+        mgr = _detect_pkg_mgr()
+        if not mgr:
+            out = {
+                'ok': False,
+                'attempted': True,
+                'error': 'pkg_mgr_not_found',
+                'state': state1,
+                'detail': '未检测到受支持的包管理器',
+            }
+            _TRACE_TOOL_INSTALL_LAST = out
+            return dict(out)
+
+        logs: List[str] = []
+        for plan in _netprobe_trace_install_plans(mgr):
+            ok, out_raw = _pkg_install(plan)
+            brief = _netprobe_trace_brief(out_raw, 180)
+            label = 'ok' if ok else 'fail'
+            logs.append(f"{label}:{'+'.join(plan)}{(':' + brief) if brief else ''}")
+
+            st_after = _netprobe_trace_tools_state()
+            if _netprobe_trace_tools_ready(st_after):
+                installed = [k for k, v in st_after.items() if bool(v) and not bool(state1.get(k))]
+                out = {
+                    'ok': True,
+                    'attempted': True,
+                    'manager': mgr,
+                    'packages': plan,
+                    'installed_tools': installed,
+                    'state': st_after,
+                    'detail': _netprobe_trace_brief('; '.join(logs), 240) or 'trace_tool_installed',
+                }
+                _TRACE_TOOL_INSTALL_LAST = out
+                return dict(out)
+
+        st_end = _netprobe_trace_tools_state()
+        out = {
+            'ok': False,
+            'attempted': True,
+            'error': 'install_failed',
+            'manager': mgr,
+            'state': st_end,
+            'detail': _netprobe_trace_brief('; '.join(logs), 240) or '自动安装失败',
+        }
+        _TRACE_TOOL_INSTALL_LAST = out
+        return dict(out)
+
+
+def _netprobe_trace_with_install_meta(payload: Dict[str, Any], install_meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    out = dict(payload or {})
+    if isinstance(install_meta, dict) and install_meta.get('attempted') is True:
+        out['auto_install'] = dict(install_meta)
+    return out
+
+
+def _netprobe_trace_parse_mtr(output: str, target_host: str, probes: int, max_hops: int) -> Dict[str, Any]:
+    try:
+        data = json.loads(str(output or '{}'))
+    except Exception:
+        return {'ok': False, 'error': 'mtr_parse_failed'}
+
+    report = data.get('report') if isinstance(data, dict) else None
+    hubs = report.get('hubs') if isinstance(report, dict) else None
+    if not isinstance(hubs, list):
+        return {'ok': False, 'error': 'mtr_no_hops'}
+
+    hops: List[Dict[str, Any]] = []
+    for idx, hub in enumerate(hubs):
+        if not isinstance(hub, dict):
+            continue
+        hop_n = _netprobe_trace_num_int(hub.get('count') or hub.get('hop') or (idx + 1), idx + 1)
+        if hop_n <= 0:
+            hop_n = idx + 1
+
+        host = str(hub.get('host') or hub.get('Host') or hub.get('addr') or '*').strip() or '*'
+        ip = str(hub.get('ip') or '').strip()
+        if (not ip) and _netprobe_trace_host_is_ip(host):
+            ip = host
+
+        sent = _netprobe_trace_num_int(hub.get('Snt') or hub.get('sent') or probes, probes)
+        if sent <= 0:
+            sent = int(probes)
+
+        loss_pct = _netprobe_trace_num(hub.get('Loss%') or hub.get('loss%') or hub.get('loss'))
+        last_ms = _netprobe_trace_num(hub.get('Last') or hub.get('last'))
+        avg_ms = _netprobe_trace_num(hub.get('Avg') or hub.get('avg'))
+        best_ms = _netprobe_trace_num(hub.get('Best') or hub.get('best'))
+        worst_ms = _netprobe_trace_num(hub.get('Wrst') or hub.get('worst') or hub.get('Worst'))
+
+        if avg_ms is None and last_ms is not None:
+            avg_ms = last_ms
+        if best_ms is None and avg_ms is not None:
+            best_ms = avg_ms
+        if worst_ms is None and avg_ms is not None:
+            worst_ms = avg_ms
+        if loss_pct is None:
+            if avg_ms is None and last_ms is None:
+                loss_pct = 100.0
+            else:
+                loss_pct = 0.0
+        loss_pct = max(0.0, min(100.0, float(loss_pct)))
+
+        samples: List[float] = []
+        for x in (last_ms, avg_ms, best_ms, worst_ms):
+            if x is None:
+                continue
+            fv = round(float(x), 3)
+            if not samples or abs(samples[-1] - fv) > 1e-9:
+                samples.append(fv)
+
+        item: Dict[str, Any] = {
+            'hop': int(hop_n),
+            'host': host,
+            'ip': ip,
+            'sent': int(sent),
+            'loss_pct': round(loss_pct, 2),
+            'samples_ms': samples,
+        }
+        if last_ms is not None:
+            item['last_ms'] = round(float(last_ms), 3)
+        if avg_ms is not None:
+            item['avg_ms'] = round(float(avg_ms), 3)
+        if best_ms is not None:
+            item['best_ms'] = round(float(best_ms), 3)
+        if worst_ms is not None:
+            item['worst_ms'] = round(float(worst_ms), 3)
+        hops.append(item)
+
+    hops.sort(key=lambda x: int(x.get('hop') or 0))
+    if not hops:
+        return {'ok': False, 'error': 'mtr_no_hops'}
+
+    return {
+        'ok': True,
+        'engine': 'mtr',
+        'target': str(target_host or ''),
+        'max_hops': int(max_hops),
+        'probes': int(probes),
+        'hops': hops,
+        'summary': _netprobe_trace_summary(hops, target_host, max_hops),
+    }
+
+
+def _netprobe_trace_run_mtr(host: str, max_hops: int, per_hop_timeout: float, probes: int) -> Dict[str, Any]:
+    mtr_bin = shutil.which('mtr')
+    if not mtr_bin:
+        return {'ok': False, 'error': 'mtr_not_found'}
+    cmd = [
+        mtr_bin,
+        '-n',
+        '--report',
+        '--report-cycles',
+        str(int(probes)),
+        '--json',
+        '-m',
+        str(int(max_hops)),
+        str(host),
+    ]
+    proc_timeout = float(max(8.0, min(45.0, float(max_hops) * float(per_hop_timeout) * float(probes) * 0.8)))
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=proc_timeout)
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'error': 'mtr_timeout'}
+    except Exception as exc:
+        return {'ok': False, 'error': f'mtr_exec_error:{exc}'}
+
+    output = ((r.stdout or '') + '\n' + (r.stderr or '')).strip()
+    if int(r.returncode or 0) != 0:
+        err = output.splitlines()[-1] if output else 'mtr_failed'
+        return {'ok': False, 'error': f'mtr_failed:{err[:200]}'}
+    parsed = _netprobe_trace_parse_mtr(output, host, probes, max_hops)
+    if parsed.get('ok') is not True:
+        return {'ok': False, 'error': parsed.get('error') or 'mtr_parse_failed'}
+    return parsed
+
+
+def _netprobe_trace_parse_traceroute(output: str, target_host: str, probes: int, max_hops: int) -> Dict[str, Any]:
+    hops: List[Dict[str, Any]] = []
+    for raw_line in str(output or '').splitlines():
+        line = str(raw_line or '').rstrip()
+        m = _NETPROBE_TRACE_HOP_RE.match(line)
+        if not m:
+            continue
+        hop_n = _netprobe_trace_num_int(m.group(1), 0)
+        if hop_n <= 0:
+            continue
+        rest = str(m.group(2) or '').strip()
+
+        host = '*'
+        ip = ''
+        host_ip_m = _NETPROBE_TRACE_HOST_IP_RE.match(rest)
+        if host_ip_m:
+            host = str(host_ip_m.group(1) or '').strip() or '*'
+            ip = str(host_ip_m.group(2) or '').strip()
+        else:
+            toks = rest.split()
+            if toks:
+                t0 = toks[0].strip()
+                if t0 != '*':
+                    host = t0
+
+        if host.startswith('(') and host.endswith(')') and len(host) > 2:
+            host = host[1:-1].strip()
+        if host.startswith('[') and host.endswith(']') and len(host) > 2:
+            host = host[1:-1].strip()
+        if (not ip) and _netprobe_trace_host_is_ip(host):
+            ip = host
+
+        samples: List[float] = []
+        for mm in _NETPROBE_TRACE_MS_RE.finditer(rest):
+            try:
+                samples.append(round(float(mm.group(1)), 3))
+            except Exception:
+                continue
+
+        sent = max(1, int(probes))
+        recv = len(samples)
+        loss_pct = round(max(0.0, min(100.0, (float(sent - recv) / float(sent)) * 100.0)), 2)
+
+        item: Dict[str, Any] = {
+            'hop': int(hop_n),
+            'host': host or '*',
+            'ip': ip,
+            'sent': int(sent),
+            'loss_pct': float(loss_pct),
+            'samples_ms': samples,
+        }
+        if samples:
+            item['last_ms'] = round(float(samples[-1]), 3)
+            item['avg_ms'] = round(float(sum(samples) / len(samples)), 3)
+            item['best_ms'] = round(float(min(samples)), 3)
+            item['worst_ms'] = round(float(max(samples)), 3)
+
+        note_m = re.search(r'(!\S+)', rest)
+        if note_m:
+            item['note'] = str(note_m.group(1) or '').strip()
+
+        hops.append(item)
+
+    hops.sort(key=lambda x: int(x.get('hop') or 0))
+    if not hops:
+        return {'ok': False, 'error': 'traceroute_no_hops'}
+
+    return {
+        'ok': True,
+        'engine': 'traceroute',
+        'target': str(target_host or ''),
+        'max_hops': int(max_hops),
+        'probes': int(probes),
+        'hops': hops,
+        'summary': _netprobe_trace_summary(hops, target_host, max_hops),
+    }
+
+
+def _netprobe_trace_run_traceroute(host: str, max_hops: int, per_hop_timeout: float, probes: int) -> Dict[str, Any]:
+    tr_bin = shutil.which('traceroute')
+    if not tr_bin:
+        return {'ok': False, 'error': 'traceroute_not_found'}
+    wait_s = max(0.3, min(5.0, float(per_hop_timeout)))
+    cmd = [
+        tr_bin,
+        '-n',
+        '-m',
+        str(int(max_hops)),
+        '-w',
+        f'{wait_s:.2f}',
+        '-q',
+        str(int(probes)),
+        str(host),
+    ]
+    proc_timeout = float(max(6.0, min(60.0, float(max_hops) * wait_s * 1.8)))
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=proc_timeout)
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'error': 'traceroute_timeout'}
+    except Exception as exc:
+        return {'ok': False, 'error': f'traceroute_exec_error:{exc}'}
+
+    output = ((r.stdout or '') + '\n' + (r.stderr or '')).strip()
+    if int(r.returncode or 0) != 0 and not _NETPROBE_TRACE_HOP_RE.search(output):
+        err = output.splitlines()[-1] if output else 'traceroute_failed'
+        return {'ok': False, 'error': f'traceroute_failed:{err[:200]}'}
+    parsed = _netprobe_trace_parse_traceroute(output, host, probes, max_hops)
+    if parsed.get('ok') is not True:
+        return {'ok': False, 'error': parsed.get('error') or 'traceroute_parse_failed'}
+    return parsed
+
+
+def _netprobe_trace(host: str, max_hops: int, per_hop_timeout: float, probes: int) -> Dict[str, Any]:
+    target = str(host or '').strip()
+    if not _netprobe_trace_host_valid(target):
+        return {'ok': False, 'error': 'invalid_target'}
+
+    tries: List[str] = []
+    install_meta: Optional[Dict[str, Any]] = None
+    tools = _netprobe_trace_tools_state()
+    if not _netprobe_trace_tools_ready(tools):
+        install_meta = _netprobe_trace_auto_install_once()
+        tools = _netprobe_trace_tools_state()
+
+    if bool(tools.get('mtr')):
+        res_mtr = _netprobe_trace_run_mtr(target, max_hops, per_hop_timeout, probes)
+        if res_mtr.get('ok') is True:
+            return _netprobe_trace_with_install_meta(res_mtr, install_meta)
+        tries.append(str(res_mtr.get('error') or 'mtr_failed'))
+
+    if bool(tools.get('traceroute')):
+        res_tr = _netprobe_trace_run_traceroute(target, max_hops, per_hop_timeout, probes)
+        if res_tr.get('ok') is True:
+            return _netprobe_trace_with_install_meta(res_tr, install_meta)
+        tries.append(str(res_tr.get('error') or 'traceroute_failed'))
+
+    if not _netprobe_trace_tools_ready(tools):
+        detail = 'mtr / traceroute 均不可用'
+        if isinstance(install_meta, dict):
+            d = _netprobe_trace_brief(install_meta.get('detail'), 160)
+            if d:
+                detail = f'{detail}；{d}'
+        out = {'ok': False, 'error': 'trace_tool_not_found', 'detail': detail}
+        return _netprobe_trace_with_install_meta(out, install_meta)
+
+    detail = '; '.join([x for x in tries if x])[:240] if tries else 'trace_failed'
+    out = {
+        'ok': False,
+        'error': 'trace_failed',
+        'detail': detail,
+        'target': target,
+        'max_hops': int(max_hops),
+        'probes': int(probes),
+    }
+    return _netprobe_trace_with_install_meta(out, install_meta)
 
 
 def _netprobe_clean_targets(raw_targets: Any, max_items: int) -> List[str]:
@@ -3651,7 +5717,7 @@ def _netprobe_rules(payload: Dict[str, Any], default_port: int, timeout_f: float
     deps = {
         'ping': bool(shutil.which('ping') or shutil.which('ping6')),
         'ss': bool(shutil.which('ss')),
-        'iptables': bool(shutil.which('iptables')),
+        'iptables': _iptables_available(),
         'sysctl': bool(shutil.which('sysctl')),
     }
 
@@ -3725,6 +5791,22 @@ def api_netprobe(payload: Dict[str, Any], _: None = Depends(_api_key_required)) 
 
     results = _netprobe_run_targets(mode, targets, default_port, timeout_f)
     return {'ok': True, 'mode': mode, 'tcp_port': default_port, 'timeout': timeout_f, 'results': results}
+
+
+@app.post('/api/v1/netprobe/trace')
+def api_netprobe_trace(payload: Dict[str, Any], _: None = Depends(_api_key_required)) -> Dict[str, Any]:
+    raw_target = _netprobe_trace_clean_target(payload.get('target'))
+    if not raw_target:
+        return {'ok': False, 'error': 'target_empty'}
+
+    target_host = _netprobe_trace_extract_host(raw_target)
+    if not target_host:
+        return {'ok': False, 'error': 'invalid_target'}
+
+    max_hops = _netprobe_trace_max_hops(payload.get('max_hops'))
+    timeout_f = _netprobe_trace_timeout(payload.get('timeout'))
+    probes = _netprobe_trace_probes(payload.get('probes'))
+    return _netprobe_trace(target_host, max_hops, timeout_f, probes)
 
 
 
@@ -5413,6 +7495,23 @@ def _acme_error_text(out: str, fallback: str) -> str:
     return base
 
 
+def _acme_renew_skipped(out: str) -> bool:
+    """Return True when acme.sh reports renewal was skipped (not due yet)."""
+    low = str(out or "").lower()
+    if not low:
+        return False
+    signals = (
+        "domains not changed",
+        "next renewal time is",
+        "add '--force' to force renewal",
+        'add "--force" to force renewal',
+        "it is not yet time to renew",
+        "skip, next renewal time is",
+        "skipping. next renewal time is",
+    )
+    return any(sig in low for sig in signals)
+
+
 def _cert_dates(cert_path: Path) -> Dict[str, str]:
     out: Dict[str, str] = {}
     code, txt = _run_cmd(["openssl", "x509", "-noout", "-dates", "-in", str(cert_path)])
@@ -5868,8 +7967,12 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
     main_domain = str(domains[0])
     cmd = [acme, "--renew", "-d", main_domain, "--server", acme_server]
     code, out = _run_cmd(cmd, timeout=300, env=_acme_env())
+    renew_skipped = False
     if code != 0:
-        return {"ok": False, "error": _acme_error_text(out, "证书续期失败")}
+        if _acme_renew_skipped(out):
+            renew_skipped = True
+        else:
+            return {"ok": False, "error": _acme_error_text(out, "证书续期失败")}
 
     safe = _slugify(main_domain)
     cert_dir = Path("/etc/ssl/nexus") / safe
@@ -5935,11 +8038,15 @@ def api_ssl_renew(payload: Dict[str, Any], _: None = Depends(_api_key_required))
             }
 
     meta = _cert_dates(fullchain_path)
-    return {
+    ret = {
         "ok": True,
         "cert_dir": str(cert_dir),
         **meta,
     }
+    if renew_skipped:
+        ret["renew_skipped"] = True
+        ret["message"] = "证书未到续期时间，已保持当前证书"
+    return ret
 
 
 @app.post("/api/v1/website/site/delete")

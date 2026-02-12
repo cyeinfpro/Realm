@@ -90,8 +90,10 @@ let CURRENT_POOL = null;
 let CURRENT_EDIT_INDEX = -1;
 let CURRENT_STATS = null;
 let CURRENT_SYS = null;
+let CURRENT_AUTO_RESTART = null;
 let PENDING_COMMAND_TEXT = '';
 let NODES_LIST = [];
+let TRACE_ROUTE_REQUEST_SEQ = 0;
 let SYNC_TASKS = new Map(); // job_id -> task status (sync + pool async jobs)
 let SYNC_PENDING_SUBMITS = new Map(); // kind:sync_id -> {kind,sync_id,created_at}
 const SYNC_TASK_DONE_KEEP_MS = 12000;
@@ -431,6 +433,12 @@ async function pollSyncTask(jobId){
       }
       renderRules();
       toastWithPrecheck(result, task.ok_msg || '同步完成');
+      try{
+        if(result && result.tls_verify_degraded){
+          const reason = String(result.tls_verify_degraded_reason || '证书不可用，已自动降级为不校验证书').trim();
+          toast(`TLS 校验已降级：${reason}`, true, 6200);
+        }
+      }catch(_e){}
       _markSyncTaskDone(jid, 'success');
       return;
     }
@@ -795,6 +803,24 @@ function showTab(name){
   q(`tab-${name}`).classList.add('show');
 }
 
+function normalizeForwardTool(raw, fallback='realm'){
+  const fbRaw = String(fallback || 'realm').trim().toLowerCase();
+  const fb = (fbRaw === 'ipt' || fbRaw === 'iptables') ? 'iptables' : 'realm';
+  const v = String(raw || '').trim().toLowerCase();
+  if(v === 'ipt' || v === 'iptables') return 'iptables';
+  if(v === 'realm') return 'realm';
+  return fb;
+}
+
+function getForwardToolFromEndpoint(e, fallback='realm'){
+  const fb = normalizeForwardTool(fallback, 'realm');
+  if(!e || typeof e !== 'object') return fb;
+  const ex = (e.extra_config && typeof e.extra_config === 'object' && !Array.isArray(e.extra_config)) ? e.extra_config : {};
+  const raw = (ex.forward_tool != null) ? ex.forward_tool : e.forward_tool;
+  if(raw == null || String(raw || '').trim() === '') return fb;
+  return normalizeForwardTool(raw, fb);
+}
+
 function wssMode(e){
   // intranet tunnels are handled separately
   if(intranetMode(e)) return 'intranet';
@@ -899,7 +925,22 @@ function endpointType(e){
   const mode = wssMode(e);
   if(mode === 'wss') return 'WSS隧道';
   if(mode === 'intranet') return '内网穿透';
-  return 'TCP/UDP';
+  const tool = getForwardToolFromEndpoint(e, 'realm');
+  if(tool === 'iptables') return 'TCP/UDP（IPTables）';
+  return 'TCP/UDP（Realm）';
+}
+
+function displayListenText(e){
+  const listen = String((e && e.listen) || '').trim();
+  const ex = (e && e.extra_config) ? e.extra_config : {};
+  if(ex && String(ex.intranet_role || '').trim() === 'client'){
+    const peerHost = String(ex.intranet_peer_host || '').trim();
+    let peerPort = parseInt(ex.intranet_server_port || 0, 10);
+    if(!(peerPort >= 1 && peerPort <= 65535)) peerPort = 18443;
+    if(peerHost) return `拨号到 ${peerHost}:${peerPort}`;
+    return '客户端主动拨号（不监听）';
+  }
+  return listen;
 }
 
 function formatRemoteForInput(e){
@@ -1068,16 +1109,31 @@ function formatHealthAvailability(item){
   return txt ? `可用率 ${txt}` : '';
 }
 
+function traceRouteTargetFromHealthItem(item){
+  if(!item || typeof item !== 'object') return '';
+  const kind = String(item.kind || '').trim().toLowerCase();
+  if(kind === 'handshake') return '';
+  const target = String(item.target || '').trim();
+  if(!target || target === '—') return '';
+  const low = target.toLowerCase();
+  if(low.startsWith('握手')) return '';
+  return target;
+}
+
 function renderHealthTargetMeta(item, mobile){
   const t = (item && item.target != null) ? String(item.target) : '';
   const avail = formatHealthAvailability(item);
+  const traceTarget = traceRouteTargetFromHealthItem(item);
+  const targetHtml = traceTarget
+    ? `<button class="mono health-target trace-target-btn" type="button" data-target="${escapeHtml(traceTarget)}" title="点击发起路由追踪">${escapeHtml(t)}</button>`
+    : `<span class="mono health-target" title="${escapeHtml(t)}">${escapeHtml(t)}</span>`;
   if(mobile){
     return `<div class="health-target-line">
-      <div class="mono health-target" title="${escapeHtml(t)}">${escapeHtml(t)}</div>
+      ${targetHtml}
       ${avail ? `<span class="health-avail">${escapeHtml(avail)}</span>` : ''}
     </div>`;
   }
-  return `<span class="mono health-target" title="${escapeHtml(t)}">${escapeHtml(t)}</span>
+  return `${targetHtml}
     ${avail ? `<span class="health-avail">${escapeHtml(avail)}</span>` : ''}`;
 }
 
@@ -1380,6 +1436,8 @@ function renderHealthExpanded(healthList, statsError){
     if(t === 'client_not_running') return '客户端未启动';
     if(t === 'server_not_running') return '入口未启动';
     if(t === 'client_not_running') return '客户端未启动';
+    if(t === 'dialing') return '正在连接';
+    if(t === 'not_connected') return '未建立连接';
     if(t === 'token_invalid') return '令牌无效';
     if(t === 'nonce_replay') return '握手重放被拒绝';
     if(t === 'server_cert_missing') return '缺少服务端证书';
@@ -1957,6 +2015,192 @@ function renderSysCard(sys){
   setProgress('sysDiskBar', diskPct);
 }
 
+function _autoRestartReasonText(raw){
+  const k = String(raw || '').trim().toLowerCase();
+  if(k === 'profile_ema') return '基于每小时 EMA 负载画像';
+  if(k === 'fallback_default') return '样本不足，使用默认时段';
+  if(k === 'policy_daily') return '按策略执行（每天）';
+  if(k === 'policy_weekly') return '按策略执行（每周）';
+  if(k === 'policy_monthly') return '按策略执行（每月）';
+  if(k === 'init') return '初始化';
+  return k || '—';
+}
+
+function _autoRestartResultMeta(raw){
+  const k = String(raw || '').trim().toLowerCase();
+  if(k === 'dispatched') return { cls: 'ok', text: '已执行' };
+  if(k === 'triggering') return { cls: 'warn', text: '执行中' };
+  if(k === 'failed_realm') return { cls: 'bad', text: '失败（realm）' };
+  if(k === 'failed_agent') return { cls: 'bad', text: '失败（agent）' };
+  if(!k) return { cls: 'ghost', text: '未执行' };
+  return { cls: 'ghost', text: k };
+}
+
+function _autoRestartSkipReasonText(raw){
+  const k = String(raw || '').trim().toLowerCase();
+  if(!k) return '';
+  if(k === 'disabled') return '策略已关闭';
+  if(k === 'already_today') return '今天已执行';
+  if(k === 'interval_wait') return '未到设定间隔周期';
+  if(k === 'uptime_too_short') return '节点刚启动，未到最小运行时长';
+  if(k === 'retry_cooldown') return '失败后冷却中，稍后自动重试';
+  if(k.startsWith('update_active:')){
+    const st = k.split(':', 2)[1] || 'running';
+    return `Agent 更新进行中（${st}）`;
+  }
+  return k;
+}
+
+function _pad2(n){
+  const v = Number(n);
+  if(!Number.isFinite(v)) return '00';
+  return String(Math.max(0, Math.min(99, Math.floor(v)))).padStart(2, '0');
+}
+
+function _autoRestartIntList(v, lo, hi){
+  const out = [];
+  const seen = new Set();
+  const seq = Array.isArray(v) ? v : String(v || '').split(',');
+  for(const x of seq){
+    const n = parseInt(String(x || '').trim(), 10);
+    if(!Number.isFinite(n)) continue;
+    if(n < lo || n > hi) continue;
+    if(seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+  return out;
+}
+
+function _autoRestartResolvePlanTime(st){
+  let hour = Number(st?.plan_hour);
+  let minute = Number(st?.plan_minute);
+  let fromPlan = (
+    Number.isFinite(hour) && hour >= 0 && hour <= 23 &&
+    Number.isFinite(minute) && minute >= 0 && minute <= 59
+  );
+  if(!fromPlan){
+    hour = Number(st?.hour);
+    minute = Number(st?.minute);
+  }
+  if(!Number.isFinite(hour) || hour < 0 || hour > 23 || !Number.isFinite(minute) || minute < 0 || minute > 59){
+    return null;
+  }
+  return { hour: Math.floor(hour), minute: Math.floor(minute), fromPlan };
+}
+
+function _autoRestartScheduleText(st, planTime){
+  if(!planTime) return '—';
+  const mode = String(st?.schedule_type || 'daily').trim().toLowerCase();
+  let interval = parseInt(String(st?.interval ?? '1'), 10);
+  if(!Number.isFinite(interval) || interval < 1) interval = 1;
+  if(interval > 365) interval = 365;
+  const timeText = `${_pad2(planTime.hour)}:${_pad2(planTime.minute)}`;
+
+  if(mode === 'weekly'){
+    const names = {1:'周一',2:'周二',3:'周三',4:'周四',5:'周五',6:'周六',7:'周日'};
+    const days = _autoRestartIntList(st?.weekdays, 1, 7);
+    const dayText = days.length ? days.map((d)=>names[d] || `周${d}`).join('、') : '周一至周日';
+    const freq = interval === 1 ? '每周' : `每${interval}周`;
+    return `${freq} ${dayText} ${timeText}`;
+  }
+  if(mode === 'monthly'){
+    const days = _autoRestartIntList(st?.monthdays, 1, 31);
+    const dayText = days.length ? days.map((d)=>`${d}号`).join('、') : '1号';
+    const freq = interval === 1 ? '每月' : `每${interval}个月`;
+    return `${freq} ${dayText} ${timeText}`;
+  }
+  const freq = interval === 1 ? '每天' : `每${interval}天`;
+  return `${freq} ${timeText}`;
+}
+
+function renderAutoRestartCard(st){
+  const card = q('autoRestartCard');
+  if(!card) return;
+  const setText = (id, txt) => {
+    const el = q(id);
+    if(el) el.textContent = txt;
+  };
+  const setBadge = (text, cls) => {
+    const el = q('autoRestartBadge');
+    if(!el) return;
+    el.className = `pill xs ${cls || 'ghost'}`;
+    el.textContent = text;
+  };
+
+  card.style.display = '';
+
+  if(!st || typeof st !== 'object'){
+    setBadge('未上报', 'ghost');
+    setText('autoRestartPlan', '—');
+    setText('autoRestartReason', '—');
+    setText('autoRestartLoad', '—');
+    setText('autoRestartLast', '—');
+    setText('autoRestartHint', '当前 Agent 暂未上报自动重启信息（升级并等待心跳后可见）');
+    return;
+  }
+
+  const enabled = st.enabled !== false;
+  if(!enabled){
+    setBadge('已关闭', 'ghost');
+  }else{
+    const resMeta = _autoRestartResultMeta(st.last_restart_result);
+    setBadge(resMeta.text, resMeta.cls);
+  }
+
+  const planTime = _autoRestartResolvePlanTime(st);
+  let planText = _autoRestartScheduleText(st, planTime);
+  if(planTime && planTime.fromPlan){
+    const dateStr = String(st.plan_date || '').trim();
+    const win = Math.max(1, Math.floor(Number(st.window_minutes || 10)));
+    const head = dateStr ? `${dateStr} ` : '';
+    planText = `${head}${planText}（窗口 ${win} 分钟）`;
+  }
+  setText('autoRestartPlan', planText);
+  {
+    const fallbackReason = st && st.schedule_type ? `policy_${String(st.schedule_type).trim().toLowerCase()}` : '';
+    setText('autoRestartReason', _autoRestartReasonText(st.plan_reason || fallbackReason));
+  }
+  {
+    const lastLoad = Number(st.last_load_bps);
+    setText('autoRestartLoad', (Number.isFinite(lastLoad) && lastLoad >= 0) ? formatBps(lastLoad) : '—');
+  }
+
+  let lastText = '未执行';
+  const lastTs = Number(st.last_restart_ts || 0);
+  if(Number.isFinite(lastTs) && lastTs > 0){
+    try{
+      lastText = new Date(lastTs * 1000).toLocaleString();
+    }catch(_e){
+      lastText = String(st.last_restart_date || '未执行');
+    }
+  }else if(String(st.last_restart_date || '').trim()){
+    lastText = String(st.last_restart_date || '').trim();
+  }
+  setText('autoRestartLast', lastText);
+
+  const hints = [];
+  const source = String(st.source || '').trim().toLowerCase();
+  if(source === 'report') hints.push('来源：上报缓存');
+  if(source === 'panel') hints.push('来源：面板策略');
+  if(st.stale) hints.push('缓存可能过期');
+  {
+    const dv = Number(st.desired_version);
+    const av = Number(st.ack_version);
+    if(Number.isFinite(dv) && Number.isFinite(av) && dv > 0 && av < dv){
+      hints.push(`策略待下发（版本 ${av}/${dv}）`);
+    }
+  }
+  const skipText = _autoRestartSkipReasonText(st.last_skip_reason);
+  if(skipText) hints.push(`最近跳过：${skipText}`);
+  const err = String(st.last_error || '').trim();
+  if(err){
+    const shortErr = err.length > 180 ? `${err.slice(0, 180)}...` : err;
+    hints.push(`错误：${shortErr}`);
+  }
+  setText('autoRestartHint', hints.length ? hints.join('；') : '状态正常');
+}
+
 
 // ================= Dashboard: Node mini system info =================
 function renderMiniSysOnCard(cardEl, sys){
@@ -2068,6 +2312,8 @@ function renderHealth(healthList, statsError, idx){
     if(t === 'client_not_running') return '客户端未启动';
     if(t === 'server_not_running') return '入口未启动';
     if(t === 'client_not_running') return '客户端未启动';
+    if(t === 'dialing') return '正在连接';
+    if(t === 'not_connected') return '未建立连接';
     if(t === 'token_invalid') return '令牌无效';
     if(t === 'nonce_replay') return '握手重放被拒绝';
     if(t === 'server_cert_missing') return '缺少服务端证书';
@@ -2148,6 +2394,8 @@ function renderHealthMobile(healthList, statsError, idx){
     if(t === 'client_not_running') return '客户端未启动';
     if(t === 'server_not_running') return '入口未启动';
     if(t === 'client_not_running') return '客户端未启动';
+    if(t === 'dialing') return '正在连接';
+    if(t === 'not_connected') return '未建立连接';
     if(t === 'token_invalid') return '令牌无效';
     if(t === 'nonce_replay') return '握手重放被拒绝';
     if(t === 'server_cert_missing') return '缺少服务端证书';
@@ -2320,7 +2568,7 @@ function renderRuleCard(e, idx, rowNo, stats, statsError){
           ${favBtn}
           ${statusPill(e)}
         </div>
-        <div class="rule-listen mono">${escapeHtml(e.listen)}</div>
+        <div class="rule-listen mono">${escapeHtml(displayListenText(e))}</div>
         <div class="rule-sub muted sm">${endpointType(e)}</div>
         ${sourceHtml}
         ${remarkHtml}
@@ -2353,6 +2601,23 @@ function renderIntranetHealthCard(statsLookup){
   const statsError = String((lookup && lookup.error) || '').trim();
 
   const rows = [];
+  function intranetFriendlyError(err){
+    const s = String(err || '').trim();
+    if(!s) return '';
+    const t = s.toLowerCase();
+    if(t === 'dialing') return '正在连接';
+    if(t === 'not_connected') return '未建立连接';
+    if(t === 'no_client_connected') return '未检测到客户端连接';
+    if(t === 'client_not_running') return '客户端未启动';
+    if(t === 'server_not_running') return '入口未启动';
+    if(t.startsWith('dial_failed')) return '连接失败';
+    if(t.startsWith('dial_tls_timeout')) return 'TLS握手超时';
+    if(t.startsWith('dial_tls_failed')) return 'TLS握手失败';
+    if(t.startsWith('tls_verify_failed')) return '证书校验失败';
+    if(t.startsWith('hello_timeout')) return '握手超时';
+    if(t.startsWith('hello_')) return '握手失败';
+    return s;
+  }
   for(let idx=0; idx<eps.length; idx++){
     const e = eps[idx];
     if(wssMode(e) !== 'intranet') continue;
@@ -2394,7 +2659,7 @@ function renderIntranetHealthCard(statsLookup){
     if(peer) meta.push(`对端 ${peer}`);
     if(dialMode) meta.push(`模式 ${dialMode}`);
     if(tokenCount > 0) meta.push(`Token ${tokenCount}`);
-    if(ok === false && err) meta.push(`错误 ${err}`);
+    if(ok === false && err) meta.push(`错误 ${intranetFriendlyError(err)}`);
     else if(msg) meta.push(msg);
     if(!meta.length) meta.push(roleLabel);
 
@@ -2605,7 +2870,7 @@ function renderRules(){
         <td class="listen">
           <div class="listen-line">
             <button class="btn xs icon ghost fav-btn ${fav ? 'active' : ''}" title="${fav ? '取消收藏' : '收藏'}" onclick="toggleFavorite(${idx}, event)">${fav ? '★' : '☆'}</button>
-            <div class="mono listen-text">${escapeHtml(e.listen)}</div>
+            <div class="mono listen-text">${escapeHtml(displayListenText(e))}</div>
           </div>
           <div class="muted sm">${endpointType(e)}</div>
           ${sourceHtml}
@@ -2733,6 +2998,290 @@ function closeCommandModal(){
   const modal = q('commandModal');
   if(!modal) return;
   modal.style.display = 'none';
+}
+
+function closeTraceRouteModal(){
+  const modal = q('traceRouteModal');
+  if(!modal) return;
+  TRACE_ROUTE_REQUEST_SEQ += 1;
+  modal.style.display = 'none';
+}
+
+function _traceRouteFmtMs(val){
+  const n = Number(val);
+  if(!Number.isFinite(n)) return '—';
+  if(n >= 100) return `${n.toFixed(1)} ms`;
+  if(n >= 10) return `${n.toFixed(2)} ms`;
+  return `${n.toFixed(3)} ms`;
+}
+
+function _traceRouteDrawChart(hops){
+  const canvas = q('traceRouteCanvas');
+  if(!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const w = Math.max(260, Math.floor(rect.width || canvas.clientWidth || 640));
+  const h = Math.max(120, Math.floor(rect.height || canvas.clientHeight || 140));
+  const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  canvas.width = Math.max(1, Math.floor(w * dpr));
+  canvas.height = Math.max(1, Math.floor(h * dpr));
+
+  const ctx = canvas.getContext('2d');
+  if(!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = 'rgba(15,23,42,0.16)';
+  ctx.fillRect(0, 0, w, h);
+
+  const list = Array.isArray(hops) ? hops : [];
+  const hopMap = new Map();
+  let maxHop = 1;
+  for(const it of list){
+    const hop = Number(it && it.hop);
+    if(!Number.isFinite(hop) || hop <= 0) continue;
+    const hi = Math.max(1, Math.floor(hop));
+    if(!hopMap.has(hi)) hopMap.set(hi, it);
+    if(hi > maxHop) maxHop = hi;
+  }
+
+  const latVals = [];
+  for(let i = 1; i <= maxHop; i += 1){
+    const v = Number(hopMap.get(i) && hopMap.get(i).avg_ms);
+    if(Number.isFinite(v) && v >= 0) latVals.push(v);
+  }
+
+  const pad = { l: 44, r: 12, t: 10, b: 24 };
+  const innerW = Math.max(10, w - pad.l - pad.r);
+  const innerH = Math.max(10, h - pad.t - pad.b);
+
+  if(!latVals.length){
+    ctx.fillStyle = 'rgba(148,163,184,0.86)';
+    ctx.font = '12px ui-monospace, Menlo, Monaco, Consolas, monospace';
+    ctx.fillText('暂无延迟样本', pad.l, pad.t + 20);
+    return;
+  }
+
+  const rawMax = Math.max(...latVals);
+  const yMax = Math.max(10, (rawMax <= 50) ? Math.ceil(rawMax / 5) * 5 : Math.ceil(rawMax / 10) * 10);
+
+  ctx.strokeStyle = 'rgba(148,163,184,0.22)';
+  ctx.lineWidth = 1;
+  ctx.fillStyle = 'rgba(148,163,184,0.85)';
+  ctx.font = '11px ui-monospace, Menlo, Monaco, Consolas, monospace';
+  for(let i = 0; i <= 4; i += 1){
+    const y = pad.t + (innerH / 4) * i;
+    ctx.beginPath();
+    ctx.moveTo(pad.l, y);
+    ctx.lineTo(pad.l + innerW, y);
+    ctx.stroke();
+    const val = yMax - (yMax / 4) * i;
+    ctx.fillText(String(Math.round(val)), 6, y + 4);
+  }
+
+  ctx.strokeStyle = 'rgba(148,163,184,0.28)';
+  ctx.beginPath();
+  ctx.moveTo(pad.l, pad.t + innerH);
+  ctx.lineTo(pad.l + innerW, pad.t + innerH);
+  ctx.stroke();
+
+  const step = maxHop <= 12 ? 1 : (maxHop <= 24 ? 2 : 4);
+  for(let i = 1; i <= maxHop; i += step){
+    const x = pad.l + ((i - 1) / Math.max(1, maxHop - 1)) * innerW;
+    ctx.fillText(String(i), x - 4, pad.t + innerH + 15);
+  }
+
+  ctx.strokeStyle = 'rgba(56,189,248,0.96)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  let started = false;
+  for(let i = 1; i <= maxHop; i += 1){
+    const it = hopMap.get(i);
+    const v = Number(it && it.avg_ms);
+    const x = pad.l + ((i - 1) / Math.max(1, maxHop - 1)) * innerW;
+    if(!Number.isFinite(v) || v < 0){
+      started = false;
+      continue;
+    }
+    const y = pad.t + innerH - (Math.min(v, yMax) / yMax) * innerH;
+    if(!started){
+      ctx.moveTo(x, y);
+      started = true;
+    }else{
+      ctx.lineTo(x, y);
+    }
+  }
+  ctx.stroke();
+
+  ctx.fillStyle = 'rgba(56,189,248,0.95)';
+  for(let i = 1; i <= maxHop; i += 1){
+    const it = hopMap.get(i);
+    const v = Number(it && it.avg_ms);
+    if(!Number.isFinite(v) || v < 0) continue;
+    const x = pad.l + ((i - 1) / Math.max(1, maxHop - 1)) * innerW;
+    const y = pad.t + innerH - (Math.min(v, yMax) / yMax) * innerH;
+    ctx.beginPath();
+    ctx.arc(x, y, 2.2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function _traceRouteSetMessageRow(msg){
+  const text = escapeHtml(String(msg || '暂无追踪结果'));
+  const bodyEl = q('traceRouteBody');
+  if(bodyEl) bodyEl.innerHTML = `<tr><td colspan="8" class="muted">${text}</td></tr>`;
+}
+
+function _traceRouteRenderResult(targetLabel, data){
+  const titleEl = q('traceRouteTitle');
+  if(titleEl) titleEl.textContent = `路由追踪 · ${targetLabel}`;
+  const errEl = q('traceRouteError');
+  if(errEl) errEl.textContent = '';
+  const hintEl = q('traceRouteHint');
+  if(hintEl) hintEl.textContent = '在当前节点执行路由追踪（优先 mtr，回退 traceroute）。';
+
+  const hops = Array.isArray(data && data.hops) ? data.hops : [];
+  const summary = (data && typeof data.summary === 'object') ? data.summary : {};
+  const engine = String((data && data.engine) || 'traceroute');
+  const reached = summary && summary.reached === true;
+  const metaEl = q('traceRouteMeta');
+  if(metaEl){
+    const parts = [];
+    parts.push(`<span class="pill xs ghost">目标 ${escapeHtml(String((data && data.target) || targetLabel))}</span>`);
+    parts.push(`<span class="pill xs ghost">引擎 ${escapeHtml(engine)}</span>`);
+    parts.push(`<span class="pill xs ${reached ? 'ok' : 'warn'}">${reached ? '已到达目标' : '未确认到达'}</span>`);
+    if(summary && summary.hops_total != null){
+      parts.push(`<span class="pill xs ghost">Hop ${escapeHtml(String(summary.hops_total))}</span>`);
+    }
+    if(summary && summary.responded_hops != null){
+      parts.push(`<span class="pill xs ghost">响应 ${escapeHtml(String(summary.responded_hops))}</span>`);
+    }
+    metaEl.innerHTML = parts.join('');
+  }
+
+  const bodyEl = q('traceRouteBody');
+  if(!bodyEl) return;
+  if(!hops.length){
+    _traceRouteSetMessageRow('无可用跳数数据');
+    _traceRouteDrawChart([]);
+    return;
+  }
+
+  const rowData = hops.map((it)=>{
+    const hop = Number(it && it.hop);
+    const host = String((it && it.host) || '*');
+    const ip = String((it && it.ip) || '');
+    const note = String((it && it.note) || '').trim();
+    const loss = Number(it && it.loss_pct);
+    const lossTxt = Number.isFinite(loss) ? `${loss >= 10 ? loss.toFixed(0) : loss.toFixed(1)}%` : '—';
+    const lossCls = !Number.isFinite(loss) ? 'ghost' : (loss >= 50 ? 'bad' : (loss > 0 ? 'warn' : 'ok'));
+    const avgTxt = _traceRouteFmtMs(it && it.avg_ms);
+    const bestTxt = _traceRouteFmtMs(it && it.best_ms);
+    const worstTxt = _traceRouteFmtMs(it && it.worst_ms);
+    const samples = Array.isArray(it && it.samples_ms)
+      ? it.samples_ms
+          .map((x)=>Number(x))
+          .filter((x)=>Number.isFinite(x))
+          .map((x)=>x >= 100 ? x.toFixed(1) : x.toFixed(2))
+          .join(', ')
+      : '';
+    return {
+      hopTxt: Number.isFinite(hop) ? String(Math.floor(hop)) : '—',
+      host,
+      ip: ip || '—',
+      note,
+      lossTxt,
+      lossCls,
+      avgTxt,
+      bestTxt,
+      worstTxt,
+      samples: samples || '—',
+    };
+  });
+
+  const rows = rowData.map((it)=>`<tr>
+      <td class="mono">${escapeHtml(it.hopTxt)}</td>
+      <td><span class="trace-route-host mono" title="${escapeHtml(it.host)}">${escapeHtml(it.host)}</span>${it.note ? ` <span class="muted sm">${escapeHtml(it.note)}</span>` : ''}</td>
+      <td class="mono">${escapeHtml(it.ip)}</td>
+      <td><span class="pill xs ${it.lossCls}">${escapeHtml(it.lossTxt)}</span></td>
+      <td class="mono">${escapeHtml(it.avgTxt)}</td>
+      <td class="mono">${escapeHtml(it.bestTxt)}</td>
+      <td class="mono">${escapeHtml(it.worstTxt)}</td>
+      <td><span class="trace-route-samples mono" title="${escapeHtml(it.samples)}">${escapeHtml(it.samples)}</span></td>
+    </tr>`);
+
+  bodyEl.innerHTML = rows.join('');
+  _traceRouteDrawChart(hops);
+}
+
+async function openTraceRouteModal(rawTarget){
+  const modal = q('traceRouteModal');
+  if(!modal) return;
+  const targetLabel = String(rawTarget || '').trim();
+  if(!targetLabel){
+    toast('目标为空，无法发起路由追踪', true);
+    return;
+  }
+  const nodeId = window.__NODE_ID__;
+  if(nodeId == null || nodeId === ''){
+    toast('缺少节点 ID', true);
+    return;
+  }
+
+  const reqId = ++TRACE_ROUTE_REQUEST_SEQ;
+  const titleEl = q('traceRouteTitle');
+  if(titleEl) titleEl.textContent = `路由追踪 · ${targetLabel}`;
+  const errEl = q('traceRouteError');
+  if(errEl) errEl.textContent = '';
+  const metaEl = q('traceRouteMeta');
+  if(metaEl){
+    metaEl.innerHTML = [
+      `<span class="pill xs ghost">目标 ${escapeHtml(targetLabel)}</span>`,
+      '<span class="pill xs ghost">执行中…</span>',
+    ].join('');
+  }
+  const bodyEl = q('traceRouteBody');
+  if(bodyEl) bodyEl.innerHTML = '<tr><td colspan="8" class="muted">正在追踪，请稍候…</td></tr>';
+  _traceRouteDrawChart([]);
+  modal.style.display = 'flex';
+
+  try{
+    const res = await fetchJSON(`/api/nodes/${encodeURIComponent(nodeId)}/trace`, {
+      method: 'POST',
+      body: JSON.stringify({
+        target: targetLabel,
+        max_hops: 20,
+        timeout: 1.0,
+        probes: 3,
+      }),
+    });
+    if(reqId !== TRACE_ROUTE_REQUEST_SEQ) return;
+    if(!res || res.ok !== true){
+      const msg = String((res && res.error) || '路由追踪失败');
+      if(errEl) errEl.textContent = msg;
+      _traceRouteSetMessageRow(msg);
+      _traceRouteDrawChart([]);
+      return;
+    }
+    _traceRouteRenderResult(targetLabel, res);
+  }catch(err){
+    if(reqId !== TRACE_ROUTE_REQUEST_SEQ) return;
+    const msg = formatRequestError(err, '路由追踪失败');
+    if(errEl) errEl.textContent = msg;
+    _traceRouteSetMessageRow(msg);
+    _traceRouteDrawChart([]);
+  }
+}
+
+function promptTraceRouteTarget(){
+  const fallback = String((window && window.__NODE_IP__) || '').trim();
+  const hint = fallback || '8.8.8.8';
+  const raw = window.prompt('输入要追踪的目标（域名 / IP / IP:端口）', hint);
+  if(raw == null) return;
+  const target = String(raw || '').trim();
+  if(!target){
+    toast('目标为空，无法发起路由追踪', true);
+    return;
+  }
+  openTraceRouteModal(target);
 }
 
 function normalizeNodeConfirmLabel(label, nodeId){
@@ -3164,10 +3713,14 @@ function fillCommonAdvancedFields(e){
   const ep = e || {};
   const net = (ep.network && typeof ep.network === 'object' && !Array.isArray(ep.network)) ? ep.network : {};
   const ex = (ep.extra_config && typeof ep.extra_config === 'object' && !Array.isArray(ep.extra_config)) ? ep.extra_config : {};
+  const hasSourceData = !!(ep && typeof ep === 'object' && Object.keys(ep).length > 0);
+  const sourceMode = hasSourceData ? wssMode(ep) : 'tcp';
+  const forwardTool = getForwardToolFromEndpoint(ep, (hasSourceData && sourceMode === 'tcp') ? 'realm' : 'iptables');
 
   if(q('f_through')) setField('f_through', ep.through || '');
   if(q('f_interface')) setField('f_interface', ep.interface || '');
   if(q('f_listen_interface')) setField('f_listen_interface', ep.listen_interface || '');
+  if(q('f_forward_tool')) setField('f_forward_tool', forwardTool);
 
   setTriBoolSelect('f_accept_proxy', ep.accept_proxy);
   if(q('f_accept_proxy_timeout')) setField('f_accept_proxy_timeout', ep.accept_proxy_timeout != null ? ep.accept_proxy_timeout : '');
@@ -3198,6 +3751,7 @@ function fillCommonAdvancedFields(e){
 function applyCommonAdvancedToEndpoint(endpoint){
   const ep = endpoint || {};
   let ex = (ep.extra_config && typeof ep.extra_config === 'object' && !Array.isArray(ep.extra_config)) ? {...ep.extra_config} : {};
+  const mode = q('f_type') ? String(q('f_type').value || 'tcp').trim() : 'tcp';
 
   // bind / route
   const through = _trim(q('f_through') ? q('f_through').value : '');
@@ -3243,6 +3797,13 @@ function applyCommonAdvancedToEndpoint(endpoint){
 
   const rtrans = _trim(q('f_remote_transport') ? q('f_remote_transport').value : '');
   if(rtrans) ep.remote_transport = rtrans; else delete ep.remote_transport;
+
+  // normal rules only: select forwarding engine
+  delete ep.forward_tool;
+  if(mode === 'tcp'){
+    const tool = normalizeForwardTool(q('f_forward_tool') ? q('f_forward_tool').value : 'iptables', 'iptables');
+    ex.forward_tool = tool;
+  }
 
   // endpoint.network overrides
   let net = (ep.network && typeof ep.network === 'object' && !Array.isArray(ep.network)) ? ep.network : {};
@@ -3322,6 +3883,7 @@ function showWssBox(){
   const mode = q('f_type').value;
   if(q('wssBox')) q('wssBox').style.display = (mode === 'wss') ? 'block' : 'none';
   if(q('intranetBox')) q('intranetBox').style.display = (mode === 'intranet') ? 'block' : 'none';
+  if(q('forwardToolBox')) q('forwardToolBox').style.display = (mode === 'tcp') ? '' : 'none';
 
   // Advanced sections (collapsed area)
   const commonAdv = document.getElementById('commonAdvancedBox');
@@ -3460,7 +4022,7 @@ function syncTunnelModeUI(){
     if(remEl) remEl.placeholder = '203.0.113.10:443\n198.51.100.8:443';
     if(portEl && !portEl.placeholder) portEl.placeholder = '443';
 
-    setText(baseHelp, '默认监听 0.0.0.0；协议/策略/监听 IP 在高级参数。');
+    setText(baseHelp, '默认监听 0.0.0.0；普通转发默认使用 iptables 工具，可在基础参数切换 realm。');
     setText(remoteHelp, '多目标时默认轮询；需要按来源 IP 固定落点可选 IP Hash。');
   }
 
@@ -3516,12 +4078,12 @@ function renderModeGuide(mode){
   } else {
     ico = '⚡';
     title = '普通转发（单机）';
-    desc = '当前节点监听端口，转发到一个或多个目标地址（多行=负载均衡）。';
+    desc = '当前节点监听端口，转发到一个或多个目标地址（多行=负载均衡）。默认工具为 iptables。';
     diagram = `客户端 → 当前节点 ${nodeName} Listen → 目标 Remotes`;
     steps = [
       '填 <b>监听端口</b>（默认 0.0.0.0 监听所有网卡）。',
       'Remote 每行一个目标地址（host:port）。',
-      '协议/策略/权重 在「高级参数」调整（可选）。',
+      '普通转发工具在「基础参数」切换；协议/策略/权重在「高级参数」调整。',
     ];
   }
 
@@ -3579,7 +4141,8 @@ function updateModePreview(){
     return;
   }
 
-  el.innerHTML = `预览：当前节点 <b>${escapeHtml(nodeName)}</b> 监听 <span class="mono">${escapeHtml(listen||'—')}</span> → 目标 <b>${n}</b> 个`;
+  const tool = normalizeForwardTool(q('f_forward_tool') ? q('f_forward_tool').value : 'iptables', 'iptables');
+  el.innerHTML = `预览：当前节点 <b>${escapeHtml(nodeName)}</b> 监听 <span class="mono">${escapeHtml(listen||'—')}</span> → 目标 <b>${n}</b> 个 · 工具 <span class="mono">${tool}</span>`;
 }
 
 window.setTunnelMode = setTunnelMode;
@@ -4763,6 +5326,14 @@ async function saveRule(){
   }catch(_e){}
 
   const protocol = q('f_protocol').value || 'tcp+udp';
+  const selectedForwardTool = normalizeForwardTool(
+    q('f_forward_tool') ? q('f_forward_tool').value : 'iptables',
+    'iptables',
+  );
+  if(typeSel === 'tcp' && selectedForwardTool === 'iptables' && balance === 'iphash'){
+    toast('iptables 工具暂不支持 IP Hash，请改用轮询或切换 realm', true);
+    return;
+  }
 
   // Listen port conflict validation (against current node pool)
   const skipIdx = getSkipIndexForPortCheck(typeSel);
@@ -6420,6 +6991,45 @@ async function loadPool(){
   }
 }
 
+function _nodePageAutoRestartFallback(){
+  let interval = parseInt(String(window.__NODE_AUTO_RESTART_INTERVAL__ ?? 1), 10);
+  if(!Number.isFinite(interval) || interval < 1) interval = 1;
+  if(interval > 365) interval = 365;
+
+  let hour = parseInt(String(window.__NODE_AUTO_RESTART_HOUR__ ?? 4), 10);
+  if(!Number.isFinite(hour)) hour = 4;
+  hour = Math.max(0, Math.min(23, hour));
+
+  let minute = parseInt(String(window.__NODE_AUTO_RESTART_MINUTE__ ?? 8), 10);
+  if(!Number.isFinite(minute)) minute = 8;
+  minute = Math.max(0, Math.min(59, minute));
+
+  const weekdays = _normalizeIntList(
+    Array.isArray(window.__NODE_AUTO_RESTART_WEEKDAYS__) ? window.__NODE_AUTO_RESTART_WEEKDAYS__ : [1,2,3,4,5,6,7],
+    1,
+    7,
+    [1,2,3,4,5,6,7]
+  );
+  const monthdays = _normalizeIntList(
+    Array.isArray(window.__NODE_AUTO_RESTART_MONTHDAYS__) ? window.__NODE_AUTO_RESTART_MONTHDAYS__ : [1],
+    1,
+    31,
+    [1]
+  );
+
+  return {
+    enabled: !!window.__NODE_AUTO_RESTART_ENABLED__,
+    schedule_type: String(window.__NODE_AUTO_RESTART_SCHEDULE__ || 'daily'),
+    interval,
+    hour,
+    minute,
+    weekdays,
+    monthdays,
+    source: 'panel',
+    stale: true
+  };
+}
+
 async function refreshSys(){
   try{
     const nodeId = window.__NODE_ID__ || window.NODE_ID || null;
@@ -6427,14 +7037,24 @@ async function refreshSys(){
     const res = await fetchJSON(`/api/nodes/${nodeId}/sys`);
     if(res && res.ok){
       CURRENT_SYS = res.sys;
+      CURRENT_AUTO_RESTART = (res.auto_restart && typeof res.auto_restart === 'object')
+        ? res.auto_restart
+        : ((res.sys && typeof res.sys.auto_restart === 'object') ? res.sys.auto_restart : null);
       renderSysCard(CURRENT_SYS);
+      renderAutoRestartCard(CURRENT_AUTO_RESTART);
     }else{
       CURRENT_SYS = { error: res?.error || '获取失败' };
+      CURRENT_AUTO_RESTART = (res && res.auto_restart && typeof res.auto_restart === 'object')
+        ? res.auto_restart
+        : _nodePageAutoRestartFallback();
       renderSysCard(null);
+      renderAutoRestartCard(CURRENT_AUTO_RESTART);
     }
   }catch(err){
     CURRENT_SYS = { error: String(err) };
+    CURRENT_AUTO_RESTART = _nodePageAutoRestartFallback();
     renderSysCard(null);
+    renderAutoRestartCard(CURRENT_AUTO_RESTART);
   }
 }
 
@@ -6492,7 +7112,7 @@ function initNodePage(){
   });
 
   // Update mode preview as you type/select
-  ['f_listen_port','f_listen_host','f_remotes','f_wss_receiver_node','f_wss_receiver_port','f_intranet_receiver_node','f_intranet_server_port','f_intranet_server_host'].forEach((id)=>{
+  ['f_listen_port','f_listen_host','f_remotes','f_wss_receiver_node','f_wss_receiver_port','f_intranet_receiver_node','f_intranet_server_port','f_intranet_server_host','f_forward_tool'].forEach((id)=>{
     const el = document.getElementById(id);
     if(!el) return;
     const fn = ()=>{ try{ updateModePreview(); }catch(_e){} };
@@ -6578,6 +7198,8 @@ window.restoreFromText = restoreFromText;
 window.refreshStats = refreshStats;
 window.openCommandModal = openCommandModal;
 window.closeCommandModal = closeCommandModal;
+window.openTraceRouteModal = openTraceRouteModal;
+window.closeTraceRouteModal = closeTraceRouteModal;
 window.randomizeWss = randomizeWss;
 
 // -------------------- Small UX enhancements --------------------
@@ -6768,12 +7390,61 @@ function openEditNodeModalFromCard(btn){
       verify_tls: String(ds.nodeVerifyTls || '0') === '1',
       is_private: String(ds.nodeIsPrivate || '0') === '1',
       role: ds.nodeRole || 'normal',
-      website_root_base: ds.nodeWebsiteRoot || ''
+      website_root_base: ds.nodeWebsiteRoot || '',
+      auto_restart_enabled: String(ds.nodeArEnabled || '1') === '1',
+      auto_restart_schedule_type: ds.nodeArSchedule || 'daily',
+      auto_restart_interval: ds.nodeArInterval || '1',
+      auto_restart_hour: ds.nodeArHour || '4',
+      auto_restart_minute: ds.nodeArMinute || '8',
+      auto_restart_weekdays: ds.nodeArWeekdays || '1,2,3,4,5,6,7',
+      auto_restart_monthdays: ds.nodeArMonthdays || '1'
     };
     openEditNodeModal(nodeObj);
   }catch(_e){}
 }
 window.openEditNodeModalFromCard = openEditNodeModalFromCard;
+
+function _normalizeIntList(v, lo, hi, fallback){
+  const out = [];
+  const seen = new Set();
+  const seq = Array.isArray(v) ? v : String(v || '').split(',');
+  for(const x of seq){
+    const n = parseInt(String(x || '').trim(), 10);
+    if(!Number.isFinite(n)) continue;
+    if(n < lo || n > hi) continue;
+    if(seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+  return out.length ? out : Array.from(fallback || []);
+}
+
+function _setWeekdayChecks(days){
+  const set = new Set(_normalizeIntList(days, 1, 7, [1,2,3,4,5,6,7]));
+  document.querySelectorAll('#editNodeModal [data-ar-weekday]').forEach((el)=>{
+    const v = parseInt(el.getAttribute('data-ar-weekday') || '0', 10);
+    el.checked = set.has(v);
+  });
+}
+
+function _getWeekdayChecks(){
+  const out = [];
+  document.querySelectorAll('#editNodeModal [data-ar-weekday]').forEach((el)=>{
+    if(!el.checked) return;
+    const v = parseInt(el.getAttribute('data-ar-weekday') || '0', 10);
+    if(Number.isFinite(v) && v >= 1 && v <= 7) out.push(v);
+  });
+  return _normalizeIntList(out, 1, 7, [1,2,3,4,5,6,7]);
+}
+
+function toggleAutoRestartEditor(){
+  const st = String(q('editNodeAutoRestartSchedule')?.value || 'daily').trim().toLowerCase();
+  const wb = q('editNodeAutoRestartWeeklyBox');
+  const mb = q('editNodeAutoRestartMonthlyBox');
+  if(wb) wb.style.display = (st === 'weekly') ? '' : 'none';
+  if(mb) mb.style.display = (st === 'monthly') ? '' : 'none';
+}
+window.toggleAutoRestartEditor = toggleAutoRestartEditor;
 
 // ---------------- Node: Edit Node Modal ----------------
 function openEditNodeModal(nodeObj){
@@ -6788,6 +7459,24 @@ function openEditNodeModal(nodeObj){
   const ipri = hasObj ? !!nodeObj.is_private : !!window.__NODE_IS_PRIVATE__;
   const role = hasObj ? (nodeObj.role || '') : (window.__NODE_ROLE__ || '');
   const websiteRoot = hasObj ? (nodeObj.website_root_base || nodeObj.website_root || '') : (window.__NODE_WEBSITE_ROOT__ || '');
+  const arEnabled = hasObj
+    ? !!nodeObj.auto_restart_enabled
+    : !!window.__NODE_AUTO_RESTART_ENABLED__;
+  const arSchedule = String(
+    hasObj
+      ? (nodeObj.auto_restart_schedule_type || 'daily')
+      : (window.__NODE_AUTO_RESTART_SCHEDULE__ || 'daily')
+  ).trim().toLowerCase();
+  const _vOr = (v, d) => (v === undefined || v === null || v === '' ? d : v);
+  const arInterval = parseInt(String(_vOr(hasObj ? nodeObj.auto_restart_interval : window.__NODE_AUTO_RESTART_INTERVAL__, 1)), 10);
+  const arHour = parseInt(String(_vOr(hasObj ? nodeObj.auto_restart_hour : window.__NODE_AUTO_RESTART_HOUR__, 4)), 10);
+  const arMinute = parseInt(String(_vOr(hasObj ? nodeObj.auto_restart_minute : window.__NODE_AUTO_RESTART_MINUTE__, 8)), 10);
+  const arWeekdays = hasObj
+    ? (nodeObj.auto_restart_weekdays || '1,2,3,4,5,6,7')
+    : (window.__NODE_AUTO_RESTART_WEEKDAYS__ || [1,2,3,4,5,6,7]);
+  const arMonthdays = hasObj
+    ? (nodeObj.auto_restart_monthdays || '1')
+    : (window.__NODE_AUTO_RESTART_MONTHDAYS__ || [1]);
 
   // Track current editing target (dashboard / node page share the same modal)
   const editId = hasObj ? nodeObj.id : window.__NODE_ID__;
@@ -6815,6 +7504,11 @@ function openEditNodeModal(nodeObj){
   const iprEl = document.getElementById('editNodeIsPrivate');
   const websiteEl = document.getElementById('editNodeIsWebsite');
   const websiteRootEl = document.getElementById('editNodeWebsiteRoot');
+  const arEnableEl = document.getElementById('editNodeAutoRestartEnabled');
+  const arScheduleEl = document.getElementById('editNodeAutoRestartSchedule');
+  const arIntervalEl = document.getElementById('editNodeAutoRestartInterval');
+  const arTimeEl = document.getElementById('editNodeAutoRestartTime');
+  const arMonthdaysEl = document.getElementById('editNodeAutoRestartMonthdays');
   const err = document.getElementById('editNodeError');
   const btn = document.getElementById('editNodeSubmit');
 
@@ -6828,6 +7522,25 @@ function openEditNodeModal(nodeObj){
   if(iprEl) iprEl.checked = !!ipri;
   if(websiteEl) websiteEl.checked = String(role || '').toLowerCase() === 'website';
   if(websiteRootEl) websiteRootEl.value = String(websiteRoot || '').trim() || '/www';
+  if(arEnableEl) arEnableEl.checked = !!arEnabled;
+  if(arScheduleEl){
+    arScheduleEl.value = ['daily','weekly','monthly'].includes(arSchedule) ? arSchedule : 'daily';
+  }
+  if(arIntervalEl){
+    const iv = Number.isFinite(arInterval) ? Math.max(1, Math.min(365, arInterval)) : 1;
+    arIntervalEl.value = String(iv);
+  }
+  if(arTimeEl){
+    const hh = Number.isFinite(arHour) ? Math.max(0, Math.min(23, arHour)) : 4;
+    const mm = Number.isFinite(arMinute) ? Math.max(0, Math.min(59, arMinute)) : 8;
+    arTimeEl.value = `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;
+  }
+  _setWeekdayChecks(arWeekdays);
+  if(arMonthdaysEl){
+    const mds = _normalizeIntList(arMonthdays, 1, 31, [1]);
+    arMonthdaysEl.value = mds.join(',');
+  }
+  toggleAutoRestartEditor();
 
   // Show host (append :port only when non-default and present)
   let ipVal = host;
@@ -6858,6 +7571,14 @@ function applyEditedNodeToPage(data, nodeId){
     const isPrivate = !!data.is_private;
     const role = String(data.role || data.node_role || data.nodeRole || 'normal').trim() || 'normal';
     const websiteRoot = String(data.website_root_base || data.website_root || '').trim();
+    const ar = (data.auto_restart_policy && typeof data.auto_restart_policy === 'object') ? data.auto_restart_policy : {};
+    const arEnabled = !!ar.enabled;
+    const arSchedule = String(ar.schedule_type || 'daily').trim().toLowerCase() || 'daily';
+    const arInterval = parseInt(String((ar.interval === undefined || ar.interval === null || ar.interval === '') ? 1 : ar.interval), 10);
+    const arHour = parseInt(String((ar.hour === undefined || ar.hour === null || ar.hour === '') ? 4 : ar.hour), 10);
+    const arMinute = parseInt(String((ar.minute === undefined || ar.minute === null || ar.minute === '') ? 8 : ar.minute), 10);
+    const arWeekdays = _normalizeIntList(ar.weekdays || [1,2,3,4,5,6,7], 1, 7, [1,2,3,4,5,6,7]);
+    const arMonthdays = _normalizeIntList(ar.monthdays || [1], 1, 31, [1]);
 
     const id = (nodeId !== undefined && nodeId !== null) ? String(nodeId) : String(window.__EDITING_NODE_ID__ || window.__NODE_ID__ || '');
 
@@ -6872,6 +7593,13 @@ function applyEditedNodeToPage(data, nodeId){
         card.dataset.nodeIsPrivate = isPrivate ? '1' : '0';
         card.dataset.nodeRole = role;
         card.dataset.nodeWebsiteRoot = websiteRoot;
+        card.dataset.nodeArEnabled = arEnabled ? '1' : '0';
+        card.dataset.nodeArSchedule = arSchedule;
+        card.dataset.nodeArInterval = String(Number.isFinite(arInterval) ? arInterval : 1);
+        card.dataset.nodeArHour = String(Number.isFinite(arHour) ? arHour : 4);
+        card.dataset.nodeArMinute = String(Number.isFinite(arMinute) ? arMinute : 8);
+        card.dataset.nodeArWeekdays = arWeekdays.join(',');
+        card.dataset.nodeArMonthdays = arMonthdays.join(',');
 
         const nm = card.querySelector('.node-name');
         if(nm && name){ nm.textContent = name; nm.title = name; }
@@ -6892,6 +7620,13 @@ function applyEditedNodeToPage(data, nodeId){
         row.dataset.nodeIsPrivate = isPrivate ? '1' : '0';
         row.dataset.nodeRole = role;
         row.dataset.nodeWebsiteRoot = websiteRoot;
+        row.dataset.nodeArEnabled = arEnabled ? '1' : '0';
+        row.dataset.nodeArSchedule = arSchedule;
+        row.dataset.nodeArInterval = String(Number.isFinite(arInterval) ? arInterval : 1);
+        row.dataset.nodeArHour = String(Number.isFinite(arHour) ? arHour : 4);
+        row.dataset.nodeArMinute = String(Number.isFinite(arMinute) ? arMinute : 8);
+        row.dataset.nodeArWeekdays = arWeekdays.join(',');
+        row.dataset.nodeArMonthdays = arMonthdays.join(',');
 
         const nm = row.querySelector('.node-name');
         if(nm){
@@ -6919,6 +7654,13 @@ function applyEditedNodeToPage(data, nodeId){
         window.__NODE_IS_PRIVATE__ = isPrivate ? 1 : 0;
         window.__NODE_ROLE__ = role;
         window.__NODE_WEBSITE_ROOT__ = websiteRoot;
+        window.__NODE_AUTO_RESTART_ENABLED__ = arEnabled ? 1 : 0;
+        window.__NODE_AUTO_RESTART_SCHEDULE__ = arSchedule;
+        window.__NODE_AUTO_RESTART_INTERVAL__ = Number.isFinite(arInterval) ? arInterval : 1;
+        window.__NODE_AUTO_RESTART_HOUR__ = Number.isFinite(arHour) ? arHour : 4;
+        window.__NODE_AUTO_RESTART_MINUTE__ = Number.isFinite(arMinute) ? arMinute : 8;
+        window.__NODE_AUTO_RESTART_WEEKDAYS__ = arWeekdays;
+        window.__NODE_AUTO_RESTART_MONTHDAYS__ = arMonthdays;
 
         // header title
         const titleEl = document.querySelector('.node-title');
@@ -6969,6 +7711,19 @@ async function saveEditNode(){
     const is_private = !!document.getElementById('editNodeIsPrivate')?.checked;
     const is_website = !!document.getElementById('editNodeIsWebsite')?.checked;
     const website_root_base = (document.getElementById('editNodeWebsiteRoot')?.value || '').trim();
+    const auto_restart_enabled = !!document.getElementById('editNodeAutoRestartEnabled')?.checked;
+    const auto_restart_schedule_type = String(document.getElementById('editNodeAutoRestartSchedule')?.value || 'daily').trim().toLowerCase();
+    let auto_restart_interval = parseInt(String(document.getElementById('editNodeAutoRestartInterval')?.value || '1').trim(), 10);
+    if(!Number.isFinite(auto_restart_interval) || auto_restart_interval < 1) auto_restart_interval = 1;
+    if(auto_restart_interval > 365) auto_restart_interval = 365;
+    const auto_restart_time = String(document.getElementById('editNodeAutoRestartTime')?.value || '04:08').trim() || '04:08';
+    const auto_restart_weekdays = _getWeekdayChecks();
+    const auto_restart_monthdays = _normalizeIntList(
+      (document.getElementById('editNodeAutoRestartMonthdays')?.value || '').split(','),
+      1,
+      31,
+      [1]
+    );
 
     if(!ip_address){
       if(err) err.textContent = '节点地址不能为空';
@@ -6984,7 +7739,22 @@ async function saveEditNode(){
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       credentials: 'same-origin',
-      body: JSON.stringify({ name, group_name, scheme, ip_address, verify_tls, is_private, is_website, website_root_base })
+      body: JSON.stringify({
+        name,
+        group_name,
+        scheme,
+        ip_address,
+        verify_tls,
+        is_private,
+        is_website,
+        website_root_base,
+        auto_restart_enabled,
+        auto_restart_schedule_type,
+        auto_restart_interval,
+        auto_restart_time,
+        auto_restart_weekdays,
+        auto_restart_monthdays
+      })
     });
     const data = await resp.json().catch(()=>({ok:false,error:'接口返回异常'}));
     if(!resp.ok || !data.ok){
@@ -7144,8 +7914,11 @@ function _stateText(st){
   const s = String(st || '').toLowerCase();
   if(s === 'done') return '已完成';
   if(s === 'failed') return '失败';
-  if(s === 'installing') return '安装中';
-  if(s === 'sent') return '已下发';
+  if(s === 'expired') return '已过期';
+  if(s === 'running' || s === 'installing') return '执行中';
+  if(s === 'accepted') return '已确认';
+  if(s === 'delivered' || s === 'sent') return '已投递';
+  if(s === 'retrying') return '重试等待';
   if(s === 'queued') return '排队中';
   if(s === 'offline') return '离线';
   return st || '—';
@@ -7154,9 +7927,11 @@ function _stateText(st){
 function _badgeClass(st){
   const s = String(st || '').toLowerCase();
   if(s === 'done') return 'ok';
-  if(s === 'failed') return 'bad';
-  if(s === 'installing') return 'warn';
-  if(s === 'sent') return 'info';
+  if(s === 'failed' || s === 'expired') return 'bad';
+  if(s === 'running' || s === 'installing') return 'warn';
+  if(s === 'retrying') return 'warn';
+  if(s === 'accepted') return 'info';
+  if(s === 'delivered' || s === 'sent') return 'info';
   if(s === 'queued') return 'muted';
   if(s === 'offline') return 'muted';
   return 'muted';
@@ -7164,13 +7939,15 @@ function _badgeClass(st){
 
 function _statusWeight(st){
   const s = String(st || '').toLowerCase();
-  if(s === 'failed') return 1;
-  if(s === 'installing') return 2;
-  if(s === 'sent') return 3;
-  if(s === 'queued') return 4;
-  if(s === 'offline') return 5;
-  if(s === 'done') return 6;
-  return 7;
+  if(s === 'failed' || s === 'expired') return 1;
+  if(s === 'running' || s === 'installing') return 2;
+  if(s === 'retrying') return 3;
+  if(s === 'delivered' || s === 'sent') return 4;
+  if(s === 'accepted') return 5;
+  if(s === 'queued') return 6;
+  if(s === 'offline') return 7;
+  if(s === 'done') return 8;
+  return 9;
 }
 
 function _renderSegBar(summary){
@@ -7184,10 +7961,12 @@ function _renderSegBar(summary){
   }
   const parts = [
     {k:'done', cls:'done', label:'完成'},
-    {k:'installing', cls:'installing', label:'安装中'},
+    {k:'running', cls:'running', label:'执行中'},
+    {k:'accepted', cls:'accepted', label:'已确认'},
+    {k:'delivered', cls:'delivered', label:'已投递'},
+    {k:'retrying', cls:'retrying', label:'重试中'},
     {k:'failed', cls:'failed', label:'失败'},
-    {k:'offline', cls:'offline', label:'离线'},
-    {k:'sent', cls:'sent', label:'已下发'},
+    {k:'expired', cls:'expired', label:'过期'},
     {k:'queued', cls:'queued', label:'排队'},
   ];
   const html = parts.map(p=>{
@@ -7209,8 +7988,11 @@ function _renderPills(summary){
     {state:'all', label:'全部', cls:'muted', val: total},
     {state:'done', label:'完成', cls:'ok', val: Number(s.done || 0)},
     {state:'failed', label:'失败', cls:'bad', val: Number(s.failed || 0)},
-    {state:'installing', label:'安装中', cls:'warn', val: Number(s.installing || 0)},
-    {state:'sent', label:'已下发', cls:'info', val: Number(s.sent || 0)},
+    {state:'expired', label:'过期', cls:'bad', val: Number(s.expired || 0)},
+    {state:'running', label:'执行中', cls:'warn', val: Number(s.running || s.installing || 0)},
+    {state:'accepted', label:'已确认', cls:'info', val: Number(s.accepted || 0)},
+    {state:'delivered', label:'已投递', cls:'info', val: Number(s.delivered || s.sent || 0)},
+    {state:'retrying', label:'重试中', cls:'warn', val: Number(s.retrying || 0)},
     {state:'queued', label:'排队', cls:'muted', val: Number(s.queued || 0)},
     {state:'offline', label:'离线', cls:'muted', val: Number(s.offline || 0)},
   ];
@@ -7221,11 +8003,14 @@ function _renderPills(summary){
 }
 
 function _countStates(rows){
-  const out = {done:0, failed:0, installing:0, sent:0, queued:0, offline:0, other:0};
+  const out = {done:0, failed:0, expired:0, running:0, accepted:0, delivered:0, retrying:0, queued:0, offline:0, other:0};
   (rows || []).forEach(n=>{
     const st = String((n && n.state) || '').toLowerCase();
-    if(out.hasOwnProperty(st)) out[st] += 1;
+    if(st === 'installing') out.running += 1;
+    else if(st === 'sent') out.delivered += 1;
+    else if(out.hasOwnProperty(st)) out[st] += 1;
     else out.other += 1;
+    if(n && n.online === false && st !== 'offline') out.offline += 1;
   });
   return out;
 }
@@ -7238,11 +8023,22 @@ function _renderRow(n){
   const cur = (n.agent_version || '-');
   const des = (n.desired_version || '-');
   const msg = String(n.msg || '').trim();
+  const reason = String(n.reason_code || '').trim();
   const online = !!n.online;
   const dotCls = online ? 'on' : 'off';
   const last = String(n.last_seen_at || '').trim();
   const lastTxt = last ? (`心跳 ${last}`) : '未上报';
-  const tail = msg ? (` · ${msg}`) : '';
+  const retryCnt = Number(n.retry_count || 0) || 0;
+  const retryMax = Number(n.max_retries || 0) || 0;
+  const nextRetryAt = String(n.next_retry_at || '').trim();
+  const tails = [];
+  if(reason) tails.push(`[${reason}]`);
+  if(msg) tails.push(msg);
+  if(retryCnt > 0 && retryMax > 0) tails.push(`尝试 ${retryCnt}/${retryMax}`);
+  if(nextRetryAt && (String(stRaw).toLowerCase() === 'retrying' || String(stRaw).toLowerCase() === 'delivered')){
+    tails.push(`下次 ${nextRetryAt}`);
+  }
+  const tail = tails.length ? (` · ${tails.join(' · ')}`) : '';
   const cell = `${lastTxt}${tail}`;
   const title = escapeHtml(cell);
 
@@ -7266,7 +8062,9 @@ function _renderList(rows){
 
   let view = arr.slice();
   const f = String(__AU_FILTER_STATE__ || 'all').toLowerCase();
-  if(f && f !== 'all'){
+  if(f === 'offline'){
+    view = view.filter(n=> !(n && n.online));
+  }else if(f && f !== 'all'){
     view = view.filter(n=> String((n && n.state) || '').toLowerCase() === f);
   }
 
@@ -7334,13 +8132,17 @@ async function _pollAgentUpdate(){
     const total = Number(s.total || 0) || 0;
     const done = Number(s.done || 0) || 0;
     const failed = Number(s.failed || 0) || 0;
+    const expired = Number(s.expired || 0) || 0;
     const offline = Number(s.offline || 0) || 0;
-    const installing = Number(s.installing || 0) || 0;
-    const sent = Number(s.sent || 0) || 0;
+    const running = Number(s.running || s.installing || 0) || 0;
+    const accepted = Number(s.accepted || 0) || 0;
+    const delivered = Number(s.delivered || s.sent || 0) || 0;
+    const retrying = Number(s.retrying || 0) || 0;
     const queued = Number(s.queued || 0) || 0;
 
     if(sumEl){
-      sumEl.textContent = `${done}/${total} 完成 · 安装中 ${installing} · 失败 ${failed} · 离线 ${offline} · 已下发 ${sent} · 排队 ${queued}`;
+      sumEl.textContent =
+        `${done}/${total} 完成 · 执行中 ${running} · 已确认 ${accepted} · 已投递 ${delivered} · 重试 ${retrying} · 失败 ${failed} · 过期 ${expired} · 离线 ${offline} · 排队 ${queued}`;
     }
 
     if(bar){
@@ -7357,8 +8159,8 @@ async function _pollAgentUpdate(){
 
     // Terminal states:
     // - no nodes to update, or
-    // - done/failed/offline only, no installing/sent/queued left.
-    if(total === 0 || (installing + sent + queued) === 0){
+    // - done/failed/expired only, no queued/delivered/accepted/running/retrying left.
+    if(total === 0 || (queued + delivered + accepted + running + retrying) === 0){
       if(__AGENT_UPDATE_TIMER__){
         clearInterval(__AGENT_UPDATE_TIMER__);
         __AGENT_UPDATE_TIMER__ = null;
@@ -7467,6 +8269,7 @@ function _renderFullBackupCounts(counts){
     ['site_files', '网站文件'],
     ['certificates', '证书'],
     ['netmon_monitors', '网络波动'],
+    ['panel_items', '面板状态'],
     ['files', '备份文件'],
   ];
   box.innerHTML = rows.map(([key, label])=>{
@@ -7721,6 +8524,7 @@ function _restoreFullStepsTemplate(){
     { key: 'rules', label: '恢复节点与规则', status: 'pending', detail: '' },
     { key: 'sites_files', label: '恢复网站与文件', status: 'pending', detail: '' },
     { key: 'certs_netmon', label: '恢复证书与网络波动', status: 'pending', detail: '' },
+    { key: 'panel_state', label: '恢复用户与面板状态', status: 'pending', detail: '' },
     { key: 'finalize', label: '收尾与校验', status: 'pending', detail: '' },
   ];
 }
@@ -7771,13 +8575,29 @@ function _buildRestoreFullSummary(result){
   const siteFiles = payload.site_files || {};
   const certs = payload.certificates || {};
   const netmon = payload.netmon || {};
+  const panelState = payload.panel_state || {};
+  const panelRoles = panelState.roles || {};
+  const panelUsers = panelState.users || {};
+  const panelTokens = panelState.user_tokens || {};
+  const panelOwners = panelState.rule_owner_map || {};
+  const panelFavs = panelState.site_file_favorites || {};
+  const panelLinks = panelState.site_file_share_short_links || {};
+  const panelRevoked = panelState.site_file_share_revocations || {};
+  const panelEvents = panelState.site_events || {};
+  const panelChecks = panelState.site_checks || {};
+  const panelErrors = Array.isArray(payload.panel_state_errors) ? payload.panel_state_errors : [];
   return (
     `节点 新增 ${Number(nodes.added||0)} / 更新 ${Number(nodes.updated||0)} / 跳过 ${Number(nodes.skipped||0)}\n` +
     `规则 恢复 ${Number(rules.restored||0)} / 未匹配 ${Number(rules.unmatched||0)} / 失败 ${Number(rules.failed||0)}\n` +
     `站点 新增 ${Number(sites.added||0)} / 更新 ${Number(sites.updated||0)} / 跳过 ${Number(sites.skipped||0)}\n` +
     `文件 恢复 ${Number(siteFiles.restored||0)} / 未匹配 ${Number(siteFiles.unmatched||0)} / 失败 ${Number(siteFiles.failed||0)} / 跳过 ${Number(siteFiles.skipped||0)}\n` +
+    `目录 恢复 ${Number(siteFiles.dirs_restored||0)} / 未匹配 ${Number(siteFiles.dirs_unmatched||0)} / 失败 ${Number(siteFiles.dirs_failed||0)} / 跳过 ${Number(siteFiles.dirs_skipped||0)}\n` +
     `证书 新增 ${Number(certs.added||0)} / 更新 ${Number(certs.updated||0)} / 跳过 ${Number(certs.skipped||0)}\n` +
-    `网络波动 新增 ${Number(netmon.added||0)} / 更新 ${Number(netmon.updated||0)} / 跳过 ${Number(netmon.skipped||0)}`
+    `网络波动 新增 ${Number(netmon.added||0)} / 更新 ${Number(netmon.updated||0)} / 跳过 ${Number(netmon.skipped||0)}\n` +
+    `面板状态 角色 +${Number(panelRoles.added||0)}/~${Number(panelRoles.updated||0)}，用户 +${Number(panelUsers.added||0)}/~${Number(panelUsers.updated||0)}，Token +${Number(panelTokens.added||0)}/~${Number(panelTokens.updated||0)}\n` +
+    `面板状态 规则归属 +${Number(panelOwners.added||0)}/~${Number(panelOwners.updated||0)}，收藏 +${Number(panelFavs.added||0)}/~${Number(panelFavs.updated||0)}，短链 +${Number(panelLinks.added||0)}/~${Number(panelLinks.updated||0)}，撤销 +${Number(panelRevoked.added||0)}/~${Number(panelRevoked.updated||0)}\n` +
+    `面板状态 站点事件 ${Number(panelEvents.restored||0)}，站点检查 ${Number(panelChecks.restored||0)}` +
+    (panelErrors.length ? (`\n面板状态警告 ${panelErrors.length} 条（已截断展示）`) : '')
   );
 }
 
@@ -8130,6 +8950,12 @@ document.addEventListener("click", (e)=>{
   if(e.target === m) closeRestoreFullModal();
 });
 
+document.addEventListener("click", (e)=>{
+  const m = document.getElementById("traceRouteModal");
+  if(!m || m.style.display === "none") return;
+  if(e.target === m) closeTraceRouteModal();
+});
+
 // ESC 关闭
 document.addEventListener("keydown", (e)=>{
   if(e.key === "Escape"){
@@ -8139,6 +8965,8 @@ document.addEventListener("keydown", (e)=>{
     if(b && b.style.display !== "none") closeFullBackupModal();
     const r = document.getElementById("restoreFullModal");
     if(r && r.style.display !== "none") closeRestoreFullModal();
+    const tr = document.getElementById("traceRouteModal");
+    if(tr && tr.style.display !== "none") closeTraceRouteModal();
   }
 });
 
@@ -8146,6 +8974,15 @@ document.addEventListener("keydown", (e)=>{
 // 说明：不要依赖 inline onclick（某些浏览器缓存/模板差异会导致 onclick 失效）
 // 统一使用事件委托，确保点击永远有效。
 document.addEventListener('click', (e)=>{
+  const tbtn = e.target.closest && e.target.closest('button.trace-target-btn');
+  if(tbtn){
+    e.preventDefault();
+    const target = String(tbtn.getAttribute('data-target') || '').trim();
+    if(target){
+      openTraceRouteModal(target);
+    }
+    return;
+  }
   const rbtn = e.target.closest && e.target.closest('button.remote-more');
   if(rbtn){
     e.preventDefault();

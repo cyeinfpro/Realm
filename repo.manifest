@@ -4,6 +4,8 @@ agent/app/__init__.py
 agent/app/auth.py
 agent/app/config.py
 agent/app/intranet_tunnel.py
+agent/app/iptables_cmd.py
+agent/app/ipt_forward.py
 agent/app/main.py
 agent/app/metrics.py
 agent/app/models.py
@@ -24,6 +26,7 @@ panel/app/clients/agent.py
 panel/app/core/__init__.py
 panel/app/core/deps.py
 panel/app/core/flash.py
+panel/app/core/logging_setup.py
 panel/app/core/paths.py
 panel/app/core/session.py
 panel/app/core/settings.py
@@ -38,6 +41,7 @@ panel/app/routers/api_netmon.py
 panel/app/routers/api_nodes.py
 panel/app/routers/api_sync.py
 panel/app/routers/auth.py
+panel/app/routers/logs.py
 panel/app/routers/pages.py
 panel/app/routers/scripts.py
 panel/app/routers/websites.py
@@ -50,12 +54,14 @@ panel/app/services/auth_service.py
 panel/app/services/backup.py
 panel/app/services/netmon.py
 panel/app/services/node_status.py
+panel/app/services/panel_config.py
 panel/app/services/pool_ops.py
 panel/app/services/site_monitor.py
 panel/app/services/stats_history.py
 panel/app/utils/__init__.py
 panel/app/utils/crypto.py
 panel/app/utils/normalize.py
+panel/app/utils/redact.py
 panel/app/utils/validate.py
 panel/requirements.txt
 panel/start.sh
@@ -68,6 +74,7 @@ panel/systemd/realm-panel.service
 panel/templates/base.html
 panel/templates/index.html
 panel/templates/login.html
+panel/templates/logs.html
 panel/templates/netmon.html
 panel/templates/netmon_view.html
 panel/templates/netmon_wall.html
@@ -75,6 +82,7 @@ panel/templates/node.html
 panel/templates/node_detail.html
 panel/templates/nodes.html
 panel/templates/nodes_new.html
+panel/templates/settings.html
 panel/templates/setup.html
 panel/templates/site_detail.html
 panel/templates/site_diagnose.html

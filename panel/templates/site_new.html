@@ -82,7 +82,7 @@
             <label class="label">网站机节点</label>
             <select class="select" name="node_id" required>
               {% for n in nodes %}
-                <option value="{{ n.id }}">{{ n.name }} · {{ n.base_url }}</option>
+                <option value="{{ n.id }}">{{ n.name }} · {{ (n.base_url|mask_url) if n.base_url else '-' }}</option>
               {% endfor %}
             </select>
             {% if not nodes %}

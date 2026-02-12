@@ -1,128 +1,679 @@
 {% extends "base.html" %}
 {% block content %}
+<style>
+.um-hero{
+  margin-bottom:12px;
+  padding:14px;
+  border-radius:18px;
+  border:1px solid rgba(var(--tone-line),0.16);
+  background:linear-gradient(180deg, rgba(var(--tone-1),0.72), rgba(var(--tone-0),0.68));
+  box-shadow: var(--glow);
+  animation: um-fade-up .24s ease-out both;
+}
+
+.um-hero-grid{
+  display:grid;
+  grid-template-columns:minmax(0, 1fr) auto;
+  gap:10px;
+  align-items:start;
+}
+
+.um-head-main{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  min-width:0;
+  align-items:flex-start;
+}
+
+.um-title-row{
+  display:flex;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:8px;
+}
+
+.um-head-sub{
+  color:rgba(var(--tone-text-mid),0.90);
+  max-width:940px;
+  line-height:1.42;
+  font-size:12px;
+}
+
+.um-stat-chips{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-top:2px;
+}
+
+.um-stat-chip{
+  display:inline-flex;
+  align-items:center;
+  gap:10px;
+  padding:8px 14px;
+  border-radius:999px;
+  border:1px solid rgba(var(--tone-line),0.18);
+  background:rgba(var(--tone-0),0.28);
+  color:rgba(var(--tone-text-mid),0.94);
+  font-size:12px;
+  font-weight:760;
+  line-height:1;
+  white-space:nowrap;
+}
+
+.um-stat-chip.primary{
+  border-color:rgba(96,165,250,0.56);
+  background:rgba(59,130,246,0.14);
+}
+
+.um-stat-chip strong{
+  font-size:18px;
+  line-height:1;
+  letter-spacing:0.2px;
+  color:var(--text);
+}
+
+.um-hero-actions{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  justify-content:flex-end;
+  align-self:flex-start;
+}
+
+.um-hero-actions .btn{
+  min-width:108px;
+}
+
+#umFormModal{
+  padding:14px;
+}
+
+.um-form-modal{
+  width:min(1280px, 100%);
+  max-width:100%;
+  max-height:min(94vh, calc(100vh - 20px));
+  border-radius:20px;
+  border:1px solid rgba(var(--tone-line),0.18);
+  background:
+    radial-gradient(740px 220px at 0% 0%, rgba(59,130,246,0.10), transparent 64%),
+    linear-gradient(180deg, rgba(var(--tone-1),0.84), rgba(var(--tone-0),0.84));
+  box-shadow:var(--shadow);
+}
+
+.um-form-modal .form{
+  margin-top:10px;
+  max-height:calc(100vh - 172px);
+  overflow:auto;
+  padding-right:6px;
+}
+
+.um-section{
+  border:1px solid rgba(var(--tone-line),0.14);
+  border-radius:14px;
+  background:rgba(var(--tone-1),0.36);
+  padding:12px;
+}
+
+.um-section + .um-section{
+  margin-top:10px;
+}
+
+.um-section-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:8px;
+  margin-bottom:9px;
+}
+
+.um-section-title{
+  font-size:13px;
+  font-weight:760;
+  letter-spacing:0.16px;
+}
+
+.um-switch{
+  display:inline-flex;
+  align-items:center;
+  gap:7px;
+  color:var(--text);
+  font-size:13px;
+}
+
+.um-inline-actions{
+  display:flex;
+  gap:6px;
+  flex-wrap:wrap;
+}
+
+.um-mode-grid{
+  display:grid;
+  grid-template-columns:repeat(3, minmax(0, 1fr));
+  gap:8px;
+  margin-top:8px;
+}
+
+.um-mode-card{
+  display:flex;
+  gap:8px;
+  align-items:flex-start;
+  border:1px solid rgba(var(--tone-line),0.16);
+  border-radius:11px;
+  padding:10px;
+  cursor:pointer;
+  background:rgba(var(--tone-2),0.26);
+  transition:border-color .16s ease, transform .16s ease, background .16s ease;
+}
+
+.um-mode-card:hover{
+  border-color:rgba(59,130,246,0.40);
+  background:rgba(var(--tone-2),0.42);
+  transform:translateY(-1px);
+}
+
+.um-mode-card.off{
+  opacity:0.56;
+}
+
+.um-mode-title{
+  font-size:13px;
+  font-weight:700;
+}
+
+.um-mode-sub{
+  margin-top:2px;
+  color:var(--muted);
+  font-size:12px;
+}
+
+.um-node-list{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  max-height:320px;
+  overflow:auto;
+  padding-right:2px;
+}
+
+.um-node-chip{
+  appearance:none;
+  border:1px solid rgba(var(--tone-line),0.16);
+  background:rgba(var(--tone-2),0.30);
+  color:var(--muted);
+  border-radius:999px;
+  padding:6px 10px;
+  font-size:12px;
+  cursor:pointer;
+  transition:all .15s ease;
+}
+
+.um-node-chip:hover{
+  color:var(--text);
+  border-color:rgba(59,130,246,0.38);
+}
+
+.um-node-chip.active{
+  color:var(--text);
+  border-color:rgba(59,130,246,0.42);
+  background:rgba(59,130,246,0.18);
+  box-shadow:0 0 0 1px rgba(59,130,246,0.22) inset;
+}
+
+.um-role-preview{
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+}
+
+.um-perm-tag{
+  display:inline-flex;
+  align-items:center;
+  padding:3px 8px;
+  border-radius:999px;
+  border:1px solid rgba(var(--tone-line),0.16);
+  color:var(--muted);
+  background:rgba(var(--tone-0),0.22);
+  font-size:11px;
+}
+
+.um-table-card{
+  margin-top:12px;
+  padding:14px;
+  border-radius:18px;
+  border:1px solid rgba(var(--tone-line),0.16);
+  background:
+    radial-gradient(880px 220px at 100% -6%, rgba(59,130,246,0.08), transparent 64%),
+    linear-gradient(180deg, rgba(var(--tone-1),0.76), rgba(var(--tone-0),0.72));
+  box-shadow:var(--glow);
+  animation: um-fade-up .32s ease-out both;
+  animation-delay:.05s;
+}
+
+.um-table-toolbar{
+  display:grid;
+  grid-template-columns:minmax(300px, 1.65fr) repeat(2, minmax(160px, 0.88fr));
+  gap:8px;
+  margin-bottom:10px;
+}
+
+.um-search{
+  position:relative;
+}
+
+.um-search::before{
+  content:"⌕";
+  position:absolute;
+  left:10px;
+  top:50%;
+  transform:translateY(-50%);
+  color:var(--muted);
+  font-size:12px;
+  pointer-events:none;
+}
+
+.um-search .input{
+  padding-left:30px;
+}
+
+.um-table-wrap{
+  border:1px solid rgba(var(--tone-line),0.14);
+  border-radius:14px;
+  background:rgba(var(--tone-0),0.18);
+}
+
+.um-table{
+  min-width:1080px;
+}
+
+.um-table thead th{
+  background:rgba(var(--tone-0),0.86);
+  color:rgba(var(--tone-text-mid),0.88);
+  font-size:12px;
+  font-weight:760;
+  letter-spacing:0.12px;
+}
+
+.um-table td{
+  vertical-align:middle;
+}
+
+.um-table-user{
+  display:flex;
+  flex-direction:column;
+  gap:2px;
+}
+
+.um-table-user-meta{
+  color:var(--muted);
+  font-size:11px;
+}
+
+.um-node-scope{
+  font-family:ui-monospace,Menlo,Monaco,Consolas,monospace;
+}
+
+.um-tunnel-badges{
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+}
+
+.um-tunnel-tag{
+  display:inline-flex;
+  align-items:center;
+  border-radius:999px;
+  border:1px solid rgba(var(--tone-line),0.14);
+  padding:2px 8px;
+  font-size:11px;
+  color:var(--muted);
+  background:rgba(var(--tone-2),0.26);
+}
+
+.um-tunnel-tag.ok{
+  color:var(--ok);
+  border-color:rgba(34,197,94,0.34);
+  background:rgba(34,197,94,0.12);
+}
+
+.um-tunnel-tag.bad{
+  color:var(--bad);
+  border-color:rgba(239,68,68,0.34);
+  background:rgba(239,68,68,0.12);
+}
+
+.um-row-actions{
+  display:flex;
+  gap:6px;
+  flex-wrap:wrap;
+}
+
+.um-msg{
+  min-height:18px;
+  color:var(--muted);
+}
+
+.um-msg.bad{
+  color:var(--bad);
+}
+
+.um-empty{
+  text-align:center;
+  color:var(--muted);
+  padding:20px 8px;
+}
+
+.um-quick-note{
+  line-height:1.6;
+}
+
+@keyframes um-fade-up{
+  from{ opacity:0; transform:translateY(5px); }
+  to{ opacity:1; transform:translateY(0); }
+}
+
+@media (max-width: 1180px){
+  .um-stat-chip strong{
+    font-size:17px;
+  }
+}
+
+@media (max-width: 980px){
+  .um-hero-grid{
+    grid-template-columns:1fr;
+  }
+  .um-hero-actions{
+    justify-content:flex-start;
+  }
+  .um-table-toolbar{
+    grid-template-columns:1fr;
+  }
+  .um-mode-grid{
+    grid-template-columns:1fr;
+  }
+}
+
+@media (max-width: 760px){
+  #umFormModal{
+    padding:10px;
+  }
+  .um-form-modal{
+    max-height:min(96vh, calc(100vh - 10px));
+    max-height:min(96vh, calc(100dvh - 10px));
+    padding:12px;
+  }
+  .um-form-modal .form{
+    max-height:calc(100vh - 140px);
+    max-height:calc(100dvh - 140px);
+  }
+  .um-stat-chip{
+    padding:8px 12px;
+  }
+  .um-stat-chip strong{
+    font-size:16px;
+  }
+  .um-table{
+    min-width:0;
+  }
+  .um-table thead{
+    display:none;
+  }
+  .um-table tbody{
+    display:block;
+    padding:8px;
+  }
+  .um-table tbody tr{
+    display:block;
+    padding:10px;
+    border-radius:12px;
+    border:1px solid rgba(var(--tone-line),0.12);
+    background:rgba(var(--tone-1),0.38);
+  }
+  .um-table tbody tr + tr{
+    margin-top:8px;
+  }
+  .um-table tbody td{
+    display:grid;
+    grid-template-columns:90px minmax(0, 1fr);
+    gap:10px;
+    align-items:start;
+    padding:6px 0;
+    border-bottom:1px dashed rgba(var(--tone-line),0.12);
+    font-size:12px;
+  }
+  .um-table tbody td:last-child{
+    border-bottom:none;
+    padding-bottom:0;
+  }
+  .um-table tbody td::before{
+    content:attr(data-label);
+    color:var(--muted);
+    font-size:11px;
+    line-height:1.4;
+    padding-top:1px;
+  }
+  .um-table tbody td[colspan]{
+    display:block;
+    text-align:center;
+    border-bottom:none;
+    padding:8px 2px;
+  }
+  .um-table tbody td[colspan]::before{
+    content:none;
+  }
+  .um-table-user,
+  .um-tunnel-badges,
+  .um-row-actions{
+    justify-content:flex-start;
+  }
+}
+
+@media (max-width: 540px){
+  .um-hero-actions .btn{
+    min-width:0;
+  }
+}
+</style>
+
 <div class="page-head">
-  <div>
+  <div class="page-title">
     <h1 class="h1">用户与权限</h1>
-    <div class="muted">子账户可按角色、机器、转发方式、月流量与有效期限制。</div>
+    <div class="meta">
+      <span class="meta-item">管理子账户权限、机器范围与转发方式。</span>
+    </div>
+  </div>
+  <div class="right">
+    <button class="btn sm" type="button" id="umOpenCreateBtn">创建子用户</button>
+    <button class="btn sm ghost" type="button" id="umRefreshBtn">刷新列表</button>
   </div>
 </div>
 
-<div class="grid">
-  <div class="card">
-    <div class="card-header">
+<div class="dashboard-toolbar" id="umStatsToolbar">
+  <div class="dash-filters" role="tablist" aria-label="账号统计">
+    <button class="chip" type="button" aria-selected="true">全部 <strong id="umStatTotal">0</strong></button>
+    <button class="chip" type="button">启用 <strong id="umStatEnabled">0</strong></button>
+    <button class="chip" type="button">受限 <strong id="umStatLimited">0</strong></button>
+    <button class="chip" type="button">到期 <strong id="umStatExpiring">0</strong></button>
+  </div>
+</div>
+
+<div id="umFormModal" class="modal" style="display:none;">
+  <div class="modal-inner um-form-modal">
+    <div class="row" style="justify-content:space-between; align-items:center;">
       <div>
-        <div class="card-title" id="umFormTitle">创建子账户</div>
-        <div class="card-sub">密码至少 6 位；用户名支持字母数字与 ._-</div>
+        <div class="h2" id="umFormTitle">创建子账户</div>
+        <div class="muted sm">用户名支持字母数字与 ._-；密码至少 6 位。</div>
+      </div>
+      <div class="right">
+        <button class="btn xs ghost" type="button" id="umCloseFormBtn">关闭</button>
       </div>
     </div>
+
     <form class="form" id="umForm">
       <input type="hidden" id="umUserId" value="">
-      <div class="form-grid">
-        <div class="col">
-          <label class="label">用户名</label>
-          <input class="input" id="umUsername" placeholder="例如: forwarder01" required>
+
+      <div class="um-section">
+        <div class="um-section-head">
+          <div class="um-section-title">账号信息</div>
         </div>
-        <div class="col">
-          <label class="label">密码 <span class="muted sm">编辑时留空=不改</span></label>
-          <input class="input" id="umPassword" type="password" placeholder="至少 6 位">
+        <div class="form-grid">
+          <div class="col">
+            <label class="label">用户名</label>
+            <input class="input" id="umUsername" placeholder="例如: forwarder01" required>
+          </div>
+          <div class="col">
+            <label class="label">密码 <span class="muted sm">编辑时留空=不改</span></label>
+            <input class="input" id="umPassword" type="password" placeholder="至少 6 位">
+          </div>
+        </div>
+
+        <div class="form-grid" style="margin-top:10px;">
+          <div class="col">
+            <label class="label">角色</label>
+            <select class="select" id="umRole"></select>
+            <div class="um-role-preview" id="umRolePreview" style="margin-top:8px;"></div>
+          </div>
+          <div class="col">
+            <label class="label">有效期</label>
+            <input class="input" id="umExpires" type="datetime-local">
+            <div class="help">留空表示永久有效。</div>
+          </div>
         </div>
       </div>
 
-      <div class="form-grid">
-        <div class="col">
-          <label class="label">角色</label>
-          <select class="select" id="umRole"></select>
+      <div class="um-section">
+        <div class="um-section-head">
+          <div class="um-section-title">机器范围</div>
+          <div class="um-inline-actions">
+            <button class="btn xs ghost" type="button" id="umAddAllNodesBtn">全部节点</button>
+            <button class="btn xs ghost" type="button" id="umClearNodesBtn">清空</button>
+          </div>
         </div>
-        <div class="col">
-          <label class="label">有效期</label>
-          <input class="input" id="umExpires" type="datetime-local">
+        <label class="label">允许机器 ID（逗号分隔，留空=不限制）</label>
+        <input class="input" id="umAllowedNodes" placeholder="例如: 1,2,8">
+      </div>
+
+      <div class="um-section">
+        <div class="um-section-head">
+          <div class="um-section-title">节点速选</div>
+          <div class="muted sm">点击节点可快速加入/移除“允许机器 ID”。</div>
+        </div>
+        <div class="um-node-list" id="umNodeQuickList">
+          {% for n in nodes %}
+          <button class="um-node-chip" type="button" data-node-id="{{ n.id }}" title="{{ n.name }} · {{ n.group_name or '默认分组' }}">#{{ n.id }} {{ n.name }}</button>
+          {% endfor %}
+        </div>
+        {% if not nodes %}
+        <div class="muted sm">暂无节点，可先在控制台接入节点后再做范围限制。</div>
+        {% endif %}
+      </div>
+
+      <div class="um-section">
+        <div class="um-section-head">
+          <div class="um-section-title">操作提示</div>
+        </div>
+        <div class="muted sm" style="line-height:1.62;">
+          1. 角色决定功能权限，策略决定可用转发类型。<br>
+          2. 更改后在下一次请求自动生效。
         </div>
       </div>
 
-      <div class="form-grid">
-        <div class="col">
-          <label class="label">允许机器 ID（逗号分隔，留空=不限制）</label>
-          <input class="input" id="umAllowedNodes" placeholder="例如: 1,2,8">
+      <div class="um-section">
+        <div class="um-section-head">
+          <div class="um-section-title">转发策略</div>
+          <label class="um-switch">
+            <input type="checkbox" id="umTunnelLimit" checked>
+            限制可用转发方式
+          </label>
         </div>
-        <div class="col">
-          <label class="label">月流量额度（GB，0=不限制）</label>
-          <input class="input" id="umQuotaGB" type="number" min="0" step="0.1" value="0">
+        <div class="um-mode-grid">
+          <label class="um-mode-card">
+            <input type="checkbox" id="umTunnelDirect" checked>
+            <div>
+              <div class="um-mode-title">直接转发</div>
+              <div class="um-mode-sub">单节点 TCP/UDP 监听与转发</div>
+            </div>
+          </label>
+          <label class="um-mode-card">
+            <input type="checkbox" id="umTunnelWss" checked>
+            <div>
+              <div class="um-mode-title">WSS 隧道</div>
+              <div class="um-mode-sub">发送机/接收机同步双端规则</div>
+            </div>
+          </label>
+          <label class="um-mode-card">
+            <input type="checkbox" id="umTunnelIntranet" checked>
+            <div>
+              <div class="um-mode-title">内网穿透</div>
+              <div class="um-mode-sub">公网入口对接内网出口</div>
+            </div>
+          </label>
         </div>
+        <div class="help" style="margin-top:8px;">关闭限制时，账号可使用全部转发方式。</div>
       </div>
 
-      <div class="form-grid">
-        <div class="col">
-          <label class="label">允许转发方式 <span class="muted sm">不选=全部禁用</span></label>
-          <div class="row" style="gap:12px; align-items:center;">
-            <label class="muted" style="display:inline-flex;gap:6px;align-items:center;">
-              <input type="checkbox" id="umTunnelWss" checked> WSS
-            </label>
-            <label class="muted" style="display:inline-flex;gap:6px;align-items:center;">
-              <input type="checkbox" id="umTunnelIntranet" checked> 内网穿透
+      <div class="um-section">
+        <div class="form-grid">
+          <div class="col">
+            <label class="label">月流量额度（GB，0=不限制）</label>
+            <input class="input" id="umQuotaGB" type="number" min="0" step="0.1" value="0">
+          </div>
+          <div class="col">
+            <label class="label">状态</label>
+            <label class="um-switch">
+              <input type="checkbox" id="umEnabled" checked>
+              启用账号
             </label>
           </div>
         </div>
-        <div class="col">
-          <label class="label">状态</label>
-          <label class="muted" style="display:inline-flex;gap:6px;align-items:center;">
-            <input type="checkbox" id="umEnabled" checked> 启用账号
-          </label>
-        </div>
       </div>
 
-      <div class="row" style="justify-content:flex-end; gap:8px;">
+      <div class="row" style="justify-content:flex-end; gap:8px; margin-top:2px;">
         <button class="btn sm ghost" type="button" id="umResetBtn">清空</button>
         <button class="btn sm" type="submit" id="umSubmitBtn">创建用户</button>
       </div>
-      <div class="muted sm" id="umMsg"></div>
+      <div class="um-msg sm" id="umMsg"></div>
     </form>
-  </div>
-
-  <div class="card">
-    <div class="card-header">
-      <div>
-        <div class="card-title">机器 ID 参考</div>
-        <div class="card-sub">用于配置“允许机器 ID”</div>
-      </div>
-    </div>
-    <div class="table-wrap">
-      <table class="table dense no-sticky">
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>名称</th>
-            <th>分组</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for n in nodes %}
-          <tr>
-            <td>{{ n.id }}</td>
-            <td>{{ n.name }}</td>
-            <td>{{ n.group_name or '默认分组' }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
   </div>
 </div>
 
-<div class="card" style="margin-top:12px;">
+<div class="card um-table-card">
   <div class="card-header">
     <div>
       <div class="card-title">账号列表</div>
-      <div class="card-sub">编辑后立即生效；已登录会话下次请求会按新权限校验。</div>
+      <div class="card-sub">支持按状态和转发策略筛选，编辑后立即生效。</div>
     </div>
   </div>
-  <div class="table-wrap">
-    <table class="table no-sticky">
+
+  <div class="um-table-toolbar">
+    <div class="um-search">
+      <input class="input" id="umSearch" placeholder="搜索用户名 / 角色 / 机器 ID">
+    </div>
+    <select class="select" id="umStatusFilter">
+      <option value="all">全部状态</option>
+      <option value="enabled">仅启用</option>
+      <option value="disabled">仅禁用</option>
+      <option value="expiring">7 天内到期</option>
+    </select>
+    <select class="select" id="umTunnelFilter">
+      <option value="all">全部转发策略</option>
+      <option value="nolimit">未限制方式</option>
+      <option value="direct">直接转发</option>
+      <option value="wss">WSS 隧道</option>
+      <option value="intranet">内网穿透</option>
+      <option value="none">已全部禁用</option>
+    </select>
+  </div>
+
+  <div class="table-wrap um-table-wrap">
+    <table class="table no-sticky um-table">
       <thead>
         <tr>
           <th>ID</th>
-          <th>用户名</th>
+          <th>账号</th>
           <th>角色</th>
-          <th>机器限制</th>
+          <th>机器范围</th>
           <th>转发方式</th>
           <th>额度(30d)</th>
           <th>有效期</th>
@@ -140,61 +691,158 @@
 <script>
 (function(){
   const ACTOR = {{ (user or '') | tojson }};
+  const TUNNEL_LABELS = {
+    direct: '直接转发',
+    wss: 'WSS 隧道',
+    intranet: '内网穿透'
+  };
+  const TUNNEL_ORDER = ['direct', 'wss', 'intranet'];
+
   let ROLES = [];
   let USERS = [];
   let EDITING_ID = 0;
+  const FILTER = {
+    search: '',
+    status: 'all',
+    tunnel: 'all'
+  };
 
   function q(id){ return document.getElementById(id); }
-  function esc(s){ return String(s == null ? '' : s).replace(/[&<>\"']/g, (c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c] || c)); }
+  function esc(s){
+    return String(s == null ? '' : s).replace(/[&<>\"']/g, function(c){
+      return ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'})[c] || c;
+    });
+  }
+
   function formatBytes(bytes){
     const n = Number(bytes || 0);
     if(!Number.isFinite(n) || n <= 0) return '0 B';
     const units = ['B','KB','MB','GB','TB'];
     let v = n;
     let i = 0;
-    while(v >= 1024 && i < units.length - 1){ v /= 1024; i += 1; }
-    return `${v.toFixed(v >= 100 ? 0 : (v >= 10 ? 1 : 2))} ${units[i]}`;
+    while(v >= 1024 && i < units.length - 1){
+      v /= 1024;
+      i += 1;
+    }
+    return v.toFixed(v >= 100 ? 0 : (v >= 10 ? 1 : 2)) + ' ' + units[i];
   }
+
   function toLocalInputValue(iso){
     const s = String(iso || '').trim();
     if(!s) return '';
     const d = new Date(s);
     if(Number.isNaN(d.getTime())) return '';
-    const pad = (n)=>String(n).padStart(2,'0');
-    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    const pad = function(n){ return String(n).padStart(2, '0'); };
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
   }
+
+  function formatTimeCell(iso){
+    const s = String(iso || '').trim();
+    if(!s) return '<span class="muted">永久</span>';
+    const d = new Date(s);
+    if(Number.isNaN(d.getTime())) return esc(s);
+    const now = Date.now();
+    const ts = d.getTime();
+    const text = d.toLocaleString('zh-CN', {hour12:false});
+    if(ts <= now) return '<span class="pill bad">已过期</span>';
+    return esc(text);
+  }
+
   function parseNodeIds(text){
-    const arr = String(text || '').split(',');
+    const parts = String(text || '').split(/[\s,，]+/);
     const out = [];
     const seen = new Set();
-    for(const item of arr){
-      const n = Number(String(item || '').trim());
+    for(const item of parts){
+      if(!item) continue;
+      const n = Number(item);
       if(!Number.isInteger(n) || n <= 0 || seen.has(n)) continue;
       seen.add(n);
       out.push(n);
     }
     return out;
   }
+
+  function normalizeTunnelName(value){
+    let s = String(value || '').trim().toLowerCase();
+    if(s === 'tcp' || s === 'normal') s = 'direct';
+    return s;
+  }
+
+  function normalizeTunnelList(raw){
+    const seq = Array.isArray(raw) ? raw : [];
+    const out = [];
+    const seen = new Set();
+    for(const item of seq){
+      const name = normalizeTunnelName(item);
+      if(!TUNNEL_LABELS[name] || seen.has(name)) continue;
+      seen.add(name);
+      out.push(name);
+    }
+    out.sort(function(a, b){ return TUNNEL_ORDER.indexOf(a) - TUNNEL_ORDER.indexOf(b); });
+    return out;
+  }
+
+  function isTunnelLimitEnabled(policy){
+    if(policy && typeof policy === 'object' && typeof policy.tunnel_limit_enabled === 'boolean'){
+      return policy.tunnel_limit_enabled;
+    }
+    return !!(policy && typeof policy === 'object' && Object.prototype.hasOwnProperty.call(policy, 'allowed_tunnel_types'));
+  }
+
   function setMsg(msg, bad){
     const el = q('umMsg');
     if(!el) return;
     el.textContent = String(msg || '');
-    el.style.color = bad ? 'var(--bad)' : 'var(--muted)';
+    el.classList.toggle('bad', !!bad);
   }
-  async function fetchJSON(url, options={}){
+
+  function isFormModalOpen(){
+    const modal = q('umFormModal');
+    return !!(modal && modal.style.display !== 'none');
+  }
+
+  function openUserFormModal(){
+    const modal = q('umFormModal');
+    if(!modal) return;
+    modal.style.display = 'flex';
+  }
+
+  function closeUserFormModal(){
+    const modal = q('umFormModal');
+    if(!modal) return;
+    modal.style.display = 'none';
+  }
+
+  function openCreateUserModal(){
+    resetForm();
+    openUserFormModal();
+    try{
+      const input = q('umUsername');
+      if(input && typeof input.focus === 'function'){
+        input.focus();
+      }
+    }catch(_e){}
+  }
+
+  async function fetchJSON(url, options){
     const res = await fetch(url, {
       headers: {'Content-Type':'application/json'},
       credentials: 'same-origin',
-      ...options
+      ...(options || {})
     });
     const text = await res.text();
     let data = {};
-    try{ data = text ? JSON.parse(text) : {}; }catch(_e){ data = {ok:false,error:text}; }
+    try{
+      data = text ? JSON.parse(text) : {};
+    }catch(_e){
+      data = {ok:false,error:text};
+    }
     if(!res.ok || data.ok === false){
-      throw new Error(String(data.error || `HTTP ${res.status}`));
+      throw new Error(String(data.error || ('HTTP ' + res.status)));
     }
     return data;
   }
+
   function fillRoleOptions(){
     const sel = q('umRole');
     if(!sel) return;
@@ -202,105 +850,313 @@
     for(const role of ROLES){
       const opt = document.createElement('option');
       opt.value = String(role.name || '');
-      opt.textContent = role.description ? `${role.name} - ${role.description}` : role.name;
+      opt.textContent = role.description ? (role.name + ' - ' + role.description) : String(role.name || '');
       sel.appendChild(opt);
     }
-    if(sel.options.length) sel.value = 'forwarder';
+    if(sel.options.length){
+      let preferred = sel.options[0].value;
+      for(const role of ROLES){
+        if(String(role.name || '') === 'forwarder'){
+          preferred = 'forwarder';
+          break;
+        }
+      }
+      sel.value = preferred;
+    }
+    renderRolePreview();
   }
+
+  function renderRolePreview(){
+    const box = q('umRolePreview');
+    const sel = q('umRole');
+    if(!box || !sel) return;
+    const roleName = String(sel.value || '');
+    const role = ROLES.find(function(r){ return String(r.name || '') === roleName; });
+    if(!role){
+      box.innerHTML = '<span class="muted sm">未找到角色定义</span>';
+      return;
+    }
+    const perms = Array.isArray(role.permissions) ? role.permissions : [];
+    if(!perms.length){
+      box.innerHTML = '<span class="muted sm">无权限定义</span>';
+      return;
+    }
+    const show = perms.slice(0, 8);
+    let html = show.map(function(p){ return '<span class="um-perm-tag">' + esc(p) + '</span>'; }).join('');
+    if(perms.length > show.length){
+      html += '<span class="um-perm-tag">+' + (perms.length - show.length) + '</span>';
+    }
+    box.innerHTML = html;
+  }
+
+  function syncTunnelModeState(){
+    const limitInput = q('umTunnelLimit');
+    const enabled = !!(limitInput && limitInput.checked);
+    const ids = ['umTunnelDirect', 'umTunnelWss', 'umTunnelIntranet'];
+    for(const id of ids){
+      const el = q(id);
+      if(el) el.disabled = !enabled;
+    }
+    const cards = document.querySelectorAll('.um-mode-card');
+    cards.forEach(function(card){ card.classList.toggle('off', !enabled); });
+  }
+
+  function refreshNodeQuickState(){
+    const selected = new Set(parseNodeIds(q('umAllowedNodes') ? q('umAllowedNodes').value : ''));
+    const list = q('umNodeQuickList');
+    if(!list) return;
+    const chips = list.querySelectorAll('[data-node-id]');
+    chips.forEach(function(btn){
+      const id = Number(btn.getAttribute('data-node-id') || 0);
+      btn.classList.toggle('active', selected.has(id));
+    });
+  }
+
   function resetForm(){
     EDITING_ID = 0;
-    q('umUserId').value = '';
-    q('umFormTitle').textContent = '创建子账户';
-    q('umSubmitBtn').textContent = '创建用户';
-    q('umUsername').value = '';
-    q('umPassword').value = '';
-    q('umEnabled').checked = true;
-    q('umExpires').value = '';
-    q('umAllowedNodes').value = '';
-    q('umTunnelWss').checked = true;
-    q('umTunnelIntranet').checked = true;
-    q('umQuotaGB').value = '0';
-    if(q('umRole') && q('umRole').options.length){ q('umRole').value = 'forwarder'; }
+    if(q('umUserId')) q('umUserId').value = '';
+    if(q('umFormTitle')) q('umFormTitle').textContent = '创建子账户';
+    if(q('umSubmitBtn')) q('umSubmitBtn').textContent = '创建用户';
+    if(q('umUsername')) q('umUsername').value = '';
+    if(q('umPassword')) q('umPassword').value = '';
+    if(q('umEnabled')) q('umEnabled').checked = true;
+    if(q('umExpires')) q('umExpires').value = '';
+    if(q('umAllowedNodes')) q('umAllowedNodes').value = '';
+    if(q('umTunnelLimit')) q('umTunnelLimit').checked = true;
+    if(q('umTunnelDirect')) q('umTunnelDirect').checked = true;
+    if(q('umTunnelWss')) q('umTunnelWss').checked = true;
+    if(q('umTunnelIntranet')) q('umTunnelIntranet').checked = true;
+    if(q('umQuotaGB')) q('umQuotaGB').value = '0';
+    if(q('umRole') && q('umRole').options.length){
+      const roleNames = ROLES.map(function(r){ return String(r.name || ''); });
+      q('umRole').value = roleNames.includes('forwarder') ? 'forwarder' : q('umRole').options[0].value;
+    }
+    syncTunnelModeState();
+    refreshNodeQuickState();
+    renderRolePreview();
     setMsg('');
   }
+
   function fillForm(user){
     EDITING_ID = Number(user.id || 0);
-    q('umUserId').value = String(EDITING_ID);
-    q('umFormTitle').textContent = `编辑用户 #${EDITING_ID}`;
-    q('umSubmitBtn').textContent = '保存修改';
-    q('umUsername').value = String(user.username || '');
-    q('umPassword').value = '';
-    q('umEnabled').checked = !!user.enabled;
-    q('umExpires').value = toLocalInputValue(user.expires_at);
+    if(q('umUserId')) q('umUserId').value = String(EDITING_ID);
+    if(q('umFormTitle')) q('umFormTitle').textContent = '编辑用户 #' + EDITING_ID;
+    if(q('umSubmitBtn')) q('umSubmitBtn').textContent = '保存修改';
+    if(q('umUsername')) q('umUsername').value = String(user.username || '');
+    if(q('umPassword')) q('umPassword').value = '';
+    if(q('umEnabled')) q('umEnabled').checked = !!user.enabled;
+    if(q('umExpires')) q('umExpires').value = toLocalInputValue(user.expires_at);
+
     const policy = (user && user.policy && typeof user.policy === 'object') ? user.policy : {};
     const nodeIds = Array.isArray(policy.allowed_node_ids) ? policy.allowed_node_ids : [];
-    q('umAllowedNodes').value = nodeIds.join(',');
-    const tunnels = Array.isArray(policy.allowed_tunnel_types) ? policy.allowed_tunnel_types : [];
-    const tunnelLimitEnabled = (typeof policy.tunnel_limit_enabled === 'boolean')
-      ? policy.tunnel_limit_enabled
-      : Object.prototype.hasOwnProperty.call(policy, 'allowed_tunnel_types');
-    if(tunnelLimitEnabled){
-      q('umTunnelWss').checked = tunnels.includes('wss');
-      q('umTunnelIntranet').checked = tunnels.includes('intranet');
+    if(q('umAllowedNodes')) q('umAllowedNodes').value = nodeIds.join(',');
+
+    const limitEnabled = isTunnelLimitEnabled(policy);
+    const tunnels = normalizeTunnelList(policy.allowed_tunnel_types);
+    if(q('umTunnelLimit')) q('umTunnelLimit').checked = limitEnabled;
+    if(limitEnabled){
+      if(q('umTunnelDirect')) q('umTunnelDirect').checked = tunnels.includes('direct');
+      if(q('umTunnelWss')) q('umTunnelWss').checked = tunnels.includes('wss');
+      if(q('umTunnelIntranet')) q('umTunnelIntranet').checked = tunnels.includes('intranet');
     }else{
-      q('umTunnelWss').checked = true;
-      q('umTunnelIntranet').checked = true;
+      if(q('umTunnelDirect')) q('umTunnelDirect').checked = true;
+      if(q('umTunnelWss')) q('umTunnelWss').checked = true;
+      if(q('umTunnelIntranet')) q('umTunnelIntranet').checked = true;
     }
+
     const limit = Number(policy.max_monthly_traffic_bytes || 0);
-    q('umQuotaGB').value = limit > 0 ? String((limit / (1024 ** 3)).toFixed(2)) : '0';
-    q('umRole').value = String(user.role_name || 'viewer');
+    if(q('umQuotaGB')) q('umQuotaGB').value = limit > 0 ? String((limit / (1024 ** 3)).toFixed(2)) : '0';
+    if(q('umRole')) q('umRole').value = String(user.role_name || 'viewer');
+
+    syncTunnelModeState();
+    refreshNodeQuickState();
+    renderRolePreview();
     setMsg('');
   }
+
+  function applyUserFilters(users){
+    const seq = Array.isArray(users) ? users : [];
+    const now = Date.now();
+    const soon = now + (7 * 24 * 3600 * 1000);
+
+    return seq.filter(function(u){
+      const policy = (u && u.policy && typeof u.policy === 'object') ? u.policy : {};
+      const nodes = Array.isArray(policy.allowed_node_ids) ? policy.allowed_node_ids : [];
+      const tunnels = normalizeTunnelList(policy.allowed_tunnel_types);
+      const limitEnabled = isTunnelLimitEnabled(policy);
+
+      if(FILTER.status === 'enabled' && !u.enabled) return false;
+      if(FILTER.status === 'disabled' && !!u.enabled) return false;
+      if(FILTER.status === 'expiring'){
+        const t = Date.parse(String(u.expires_at || ''));
+        if(!(Number.isFinite(t) && t > now && t <= soon)) return false;
+      }
+
+      if(FILTER.tunnel === 'nolimit' && limitEnabled) return false;
+      if(FILTER.tunnel === 'none'){
+        if(!limitEnabled || tunnels.length > 0) return false;
+      }
+      if(TUNNEL_LABELS[FILTER.tunnel]){
+        if(!limitEnabled || !tunnels.includes(FILTER.tunnel)) return false;
+      }
+
+      const keyword = String(FILTER.search || '').trim().toLowerCase();
+      if(keyword){
+        const hay = [
+          String(u.username || ''),
+          String(u.role_name || ''),
+          nodes.join(','),
+          limitEnabled ? tunnels.join('/') : 'all'
+        ].join(' ').toLowerCase();
+        if(!hay.includes(keyword)) return false;
+      }
+
+      return true;
+    });
+  }
+
+  function tunnelBadgesHtml(policy){
+    const limitEnabled = isTunnelLimitEnabled(policy);
+    const tunnels = normalizeTunnelList(policy.allowed_tunnel_types);
+    if(!limitEnabled){
+      return '<div class="um-tunnel-badges"><span class="um-tunnel-tag ok">全部允许</span></div>';
+    }
+    if(!tunnels.length){
+      return '<div class="um-tunnel-badges"><span class="um-tunnel-tag bad">全部禁用</span></div>';
+    }
+    const items = tunnels.map(function(name){
+      return '<span class="um-tunnel-tag">' + esc(TUNNEL_LABELS[name] || name) + '</span>';
+    }).join('');
+    return '<div class="um-tunnel-badges">' + items + '</div>';
+  }
+
   function renderUsers(){
     const tb = q('umTableBody');
     if(!tb) return;
+    const rows = applyUserFilters(USERS);
     tb.innerHTML = '';
-    for(const u of USERS){
+
+    if(!rows.length){
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td colspan="9"><div class="um-empty">没有匹配的账号</div></td>';
+      tb.appendChild(tr);
+      return;
+    }
+
+    for(const u of rows){
       const policy = (u && u.policy && typeof u.policy === 'object') ? u.policy : {};
       const nodes = Array.isArray(policy.allowed_node_ids) ? policy.allowed_node_ids : [];
-      const tunnels = Array.isArray(policy.allowed_tunnel_types) ? policy.allowed_tunnel_types : [];
-      const tunnelLimitEnabled = (typeof policy.tunnel_limit_enabled === 'boolean')
-        ? policy.tunnel_limit_enabled
-        : Object.prototype.hasOwnProperty.call(policy, 'allowed_tunnel_types');
       const quota = Number(policy.max_monthly_traffic_bytes || 0);
       const used = Number(u.traffic_used_bytes_30d || 0);
-      let tunnelText = '<span class="muted">全部</span>';
-      if(tunnelLimitEnabled){
-        tunnelText = tunnels.length ? esc(tunnels.join('/')) : '<span class="muted">禁用</span>';
-      }
+      const lastLogin = String(u.last_login_at || '').trim();
+
       const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td>${Number(u.id || 0)}</td>
-        <td>${esc(u.username)}</td>
-        <td>${esc(u.role_name)}</td>
-        <td>${nodes.length ? esc(nodes.join(',')) : '<span class="muted">全部</span>'}</td>
-        <td>${tunnelText}</td>
-        <td>${quota > 0 ? `${esc(formatBytes(used))} / ${esc(formatBytes(quota))}` : '<span class="muted">不限制</span>'}</td>
-        <td>${u.expires_at ? esc(String(u.expires_at)) : '<span class="muted">永久</span>'}</td>
-        <td>${u.enabled ? '<span class="pill ok">启用</span>' : '<span class="pill bad">禁用</span>'}</td>
-        <td>
-          <div class="row" style="gap:6px; flex-wrap:wrap;">
-            <button class="btn xs ghost" type="button" data-act="edit" data-id="${Number(u.id || 0)}">编辑</button>
-            <button class="btn xs danger" type="button" data-act="del" data-id="${Number(u.id || 0)}">删除</button>
-          </div>
-        </td>
-      `;
+      tr.innerHTML = '' +
+        '<td data-label="ID">' + Number(u.id || 0) + '</td>' +
+        '<td data-label="账号"><div class="um-table-user"><span>' + esc(u.username) + '</span>' +
+          '<span class="um-table-user-meta">' + (lastLogin ? ('上次登录 ' + esc(lastLogin)) : '从未登录') + '</span></div></td>' +
+        '<td data-label="角色"><span class="pill xs ghost">' + esc(u.role_name) + '</span></td>' +
+        '<td data-label="机器范围">' + (nodes.length ? ('<span class="um-node-scope">' + esc(nodes.join(',')) + '</span>') : '<span class="muted">全部</span>') + '</td>' +
+        '<td data-label="转发方式">' + tunnelBadgesHtml(policy) + '</td>' +
+        '<td data-label="额度(30d)">' + (quota > 0 ? (esc(formatBytes(used)) + ' / ' + esc(formatBytes(quota))) : '<span class="muted">不限制</span>') + '</td>' +
+        '<td data-label="有效期">' + formatTimeCell(u.expires_at) + '</td>' +
+        '<td data-label="状态">' + (u.enabled ? '<span class="pill ok">启用</span>' : '<span class="pill bad">禁用</span>') + '</td>' +
+        '<td data-label="操作"><div class="um-row-actions">' +
+          '<button class="btn xs ghost" type="button" data-act="edit" data-id="' + Number(u.id || 0) + '">编辑</button>' +
+          '<button class="btn xs danger" type="button" data-act="del" data-id="' + Number(u.id || 0) + '">删除</button>' +
+        '</div></td>';
       tb.appendChild(tr);
     }
   }
 
+  function renderStats(){
+    const total = USERS.length;
+    let enabled = 0;
+    let limited = 0;
+    let expiring = 0;
+    const now = Date.now();
+    const soon = now + (7 * 24 * 3600 * 1000);
+
+    for(const u of USERS){
+      if(u.enabled) enabled += 1;
+      const policy = (u && u.policy && typeof u.policy === 'object') ? u.policy : {};
+      if(isTunnelLimitEnabled(policy)) limited += 1;
+
+      const t = Date.parse(String(u.expires_at || ''));
+      if(Number.isFinite(t) && t > now && t <= soon) expiring += 1;
+    }
+
+    if(q('umStatTotal')) q('umStatTotal').textContent = String(total);
+    if(q('umStatEnabled')) q('umStatEnabled').textContent = String(enabled);
+    if(q('umStatLimited')) q('umStatLimited').textContent = String(limited);
+    if(q('umStatExpiring')) q('umStatExpiring').textContent = String(expiring);
+  }
+
+  function updateListView(){
+    renderUsers();
+    renderStats();
+  }
+
+  function collectAllowedTunnelTypes(){
+    const list = [];
+    if(q('umTunnelDirect') && q('umTunnelDirect').checked) list.push('direct');
+    if(q('umTunnelWss') && q('umTunnelWss').checked) list.push('wss');
+    if(q('umTunnelIntranet') && q('umTunnelIntranet').checked) list.push('intranet');
+    return list;
+  }
+
+  function allNodeIds(){
+    const list = q('umNodeQuickList');
+    if(!list) return [];
+    const ids = [];
+    const seen = new Set();
+    const chips = list.querySelectorAll('[data-node-id]');
+    chips.forEach(function(btn){
+      const id = Number(btn.getAttribute('data-node-id') || 0);
+      if(id > 0 && !seen.has(id)){
+        seen.add(id);
+        ids.push(id);
+      }
+    });
+    ids.sort(function(a, b){ return a - b; });
+    return ids;
+  }
+
+  function toggleNodeId(nid){
+    const id = Number(nid || 0);
+    if(id <= 0) return;
+    const input = q('umAllowedNodes');
+    if(!input) return;
+    const ids = parseNodeIds(input.value);
+    const set = new Set(ids);
+    if(set.has(id)){
+      set.delete(id);
+    }else{
+      set.add(id);
+    }
+    const out = Array.from(set).sort(function(a, b){ return a - b; });
+    input.value = out.join(',');
+    refreshNodeQuickState();
+  }
+
+  function fillAllNodes(){
+    const ids = allNodeIds();
+    if(q('umAllowedNodes')) q('umAllowedNodes').value = ids.join(',');
+    refreshNodeQuickState();
+  }
+
+  function clearNodes(){
+    if(q('umAllowedNodes')) q('umAllowedNodes').value = '';
+    refreshNodeQuickState();
+  }
+
   function handleEditUser(id){
     const uid = Number(id || 0);
-    const user = USERS.find((it)=>Number(it.id || 0) === uid);
+    const user = USERS.find(function(it){ return Number(it.id || 0) === uid; });
     if(!user) return;
     fillForm(user);
-    const form = q('umForm');
-    const card = form ? form.closest('.card') : null;
-    try{
-      if(card && typeof card.scrollIntoView === 'function'){
-        card.scrollIntoView({behavior:'smooth', block:'start'});
-      }
-    }catch(_e){}
+    openUserFormModal();
+
     try{
       const input = q('umUsername');
       if(input && typeof input.focus === 'function'){
@@ -308,16 +1164,17 @@
         if(typeof input.select === 'function') input.select();
       }
     }catch(_e){}
-    setMsg(`正在编辑用户：${user.username}`);
+
+    setMsg('正在编辑用户：' + user.username);
   }
 
   async function handleDeleteUser(id){
     const uid = Number(id || 0);
-    const target = USERS.find((it)=>Number(it.id || 0) === uid);
+    const target = USERS.find(function(it){ return Number(it.id || 0) === uid; });
     if(!target) return;
-    if(!confirm(`确认删除用户 ${target.username} 吗？`)) return;
+    if(!confirm('确认删除用户 ' + target.username + ' 吗？')) return;
     try{
-      await fetchJSON(`/api/users/${uid}/delete`, {method:'POST', body:'{}'});
+      await fetchJSON('/api/users/' + uid + '/delete', {method:'POST', body:'{}'});
       await loadUsers();
       if(EDITING_ID === uid) resetForm();
       setMsg('删除成功');
@@ -332,9 +1189,11 @@
     const btn = target.closest('button[data-act]');
     if(!btn) return;
     ev.preventDefault();
+
     const act = String(btn.getAttribute('data-act') || '').trim();
     const id = Number(btn.getAttribute('data-id') || 0);
     if(!(id > 0)) return;
+
     if(act === 'edit'){
       handleEditUser(id);
       return;
@@ -343,45 +1202,63 @@
       await handleDeleteUser(id);
     }
   }
+
   async function loadRoles(){
     const data = await fetchJSON('/api/roles');
     ROLES = Array.isArray(data.roles) ? data.roles : [];
     fillRoleOptions();
   }
+
   async function loadUsers(){
     const data = await fetchJSON('/api/users');
     USERS = Array.isArray(data.users) ? data.users : [];
-    renderUsers();
+    updateListView();
   }
+
+  async function refreshAll(silent){
+    await loadUsers();
+    if(!silent) setMsg('已刷新账号列表');
+  }
+
   async function submitForm(ev){
     ev.preventDefault();
-    const username = String(q('umUsername').value || '').trim();
-    const password = String(q('umPassword').value || '');
-    const roleName = String(q('umRole').value || '').trim();
-    const enabled = !!q('umEnabled').checked;
-    const expiresAt = String(q('umExpires').value || '').trim();
-    const allowedNodeIds = parseNodeIds(q('umAllowedNodes').value);
-    const allowedTunnelTypes = [];
-    if(q('umTunnelWss').checked) allowedTunnelTypes.push('wss');
-    if(q('umTunnelIntranet').checked) allowedTunnelTypes.push('intranet');
-    const quotaGb = Number(q('umQuotaGB').value || 0);
-    const payload = {
-      username,
-      role_name: roleName,
-      enabled,
-      expires_at: expiresAt || '',
-      allowed_node_ids: allowedNodeIds,
-      tunnel_limit_enabled: true,
-      allowed_tunnel_types: allowedTunnelTypes,
-      max_monthly_traffic_gb: Number.isFinite(quotaGb) ? Math.max(0, quotaGb) : 0
-    };
-    if(password.trim()) payload.password = password;
-    if(!EDITING_ID && !payload.password){
+
+    const username = String(q('umUsername') ? q('umUsername').value : '').trim();
+    const password = String(q('umPassword') ? q('umPassword').value : '');
+    const roleName = String(q('umRole') ? q('umRole').value : '').trim();
+    const enabled = !!(q('umEnabled') && q('umEnabled').checked);
+    const expiresAt = String(q('umExpires') ? q('umExpires').value : '').trim();
+    const allowedNodeIds = parseNodeIds(q('umAllowedNodes') ? q('umAllowedNodes').value : '');
+    const tunnelLimitEnabled = !!(q('umTunnelLimit') && q('umTunnelLimit').checked);
+    const allowedTunnelTypes = collectAllowedTunnelTypes();
+    const quotaGb = Number(q('umQuotaGB') ? q('umQuotaGB').value : 0);
+
+    if(!EDITING_ID && !password.trim()){
       setMsg('创建用户时必须输入密码', true);
       return;
     }
+
+    if(tunnelLimitEnabled && allowedTunnelTypes.length === 0){
+      setMsg('当前已启用转发方式限制，但未允许任何转发方式。', true);
+      return;
+    }
+
+    const payload = {
+      username: username,
+      role_name: roleName,
+      enabled: enabled,
+      expires_at: expiresAt || '',
+      allowed_node_ids: allowedNodeIds,
+      tunnel_limit_enabled: tunnelLimitEnabled,
+      allowed_tunnel_types: tunnelLimitEnabled ? allowedTunnelTypes : [],
+      max_monthly_traffic_gb: Number.isFinite(quotaGb) ? Math.max(0, quotaGb) : 0
+    };
+
+    if(password.trim()) payload.password = password;
+
     let url = '/api/users/create';
-    if(EDITING_ID > 0) url = `/api/users/${EDITING_ID}/update`;
+    if(EDITING_ID > 0) url = '/api/users/' + EDITING_ID + '/update';
+
     try{
       await fetchJSON(url, {method:'POST', body: JSON.stringify(payload)});
       await loadUsers();
@@ -393,16 +1270,110 @@
     }
   }
 
-  document.addEventListener('DOMContentLoaded', async ()=>{
+  function bindEvents(){
+    const form = q('umForm');
+    if(form) form.addEventListener('submit', submitForm);
+
+    const resetBtn = q('umResetBtn');
+    if(resetBtn) resetBtn.addEventListener('click', resetForm);
+
+    const openCreateBtn = q('umOpenCreateBtn');
+    if(openCreateBtn) openCreateBtn.addEventListener('click', openCreateUserModal);
+
+    const closeFormBtn = q('umCloseFormBtn');
+    if(closeFormBtn) closeFormBtn.addEventListener('click', closeUserFormModal);
+
+    const refreshBtn = q('umRefreshBtn');
+    if(refreshBtn){
+      refreshBtn.addEventListener('click', function(){
+        refreshAll(false).catch(function(err){
+          setMsg(err.message || '刷新失败', true);
+        });
+      });
+    }
+
+    const roleSel = q('umRole');
+    if(roleSel) roleSel.addEventListener('change', renderRolePreview);
+
+    const tunnelLimit = q('umTunnelLimit');
+    if(tunnelLimit) tunnelLimit.addEventListener('change', syncTunnelModeState);
+
+    const allowInput = q('umAllowedNodes');
+    if(allowInput){
+      allowInput.addEventListener('input', refreshNodeQuickState);
+      allowInput.addEventListener('blur', function(){
+        const normalized = parseNodeIds(allowInput.value).join(',');
+        allowInput.value = normalized;
+        refreshNodeQuickState();
+      });
+    }
+
+    const addAllBtn = q('umAddAllNodesBtn');
+    if(addAllBtn) addAllBtn.addEventListener('click', fillAllNodes);
+
+    const clearBtn = q('umClearNodesBtn');
+    if(clearBtn) clearBtn.addEventListener('click', clearNodes);
+
+    const nodeList = q('umNodeQuickList');
+    if(nodeList){
+      nodeList.addEventListener('click', function(ev){
+        const target = ev && ev.target ? ev.target : null;
+        if(!target || typeof target.closest !== 'function') return;
+        const btn = target.closest('[data-node-id]');
+        if(!btn) return;
+        ev.preventDefault();
+        if(!isFormModalOpen()) openCreateUserModal();
+        toggleNodeId(btn.getAttribute('data-node-id'));
+      });
+    }
+
+    const tb = q('umTableBody');
+    if(tb) tb.addEventListener('click', handleTableAction);
+
+    const searchInput = q('umSearch');
+    if(searchInput){
+      searchInput.addEventListener('input', function(){
+        FILTER.search = String(searchInput.value || '');
+        renderUsers();
+      });
+    }
+
+    const statusSel = q('umStatusFilter');
+    if(statusSel){
+      statusSel.addEventListener('change', function(){
+        FILTER.status = String(statusSel.value || 'all');
+        renderUsers();
+      });
+    }
+
+    const tunnelSel = q('umTunnelFilter');
+    if(tunnelSel){
+      tunnelSel.addEventListener('change', function(){
+        FILTER.tunnel = String(tunnelSel.value || 'all');
+        renderUsers();
+      });
+    }
+
+    document.addEventListener('click', function(ev){
+      const modal = q('umFormModal');
+      if(!modal || modal.style.display === 'none') return;
+      if(ev.target === modal) closeUserFormModal();
+    });
+
+    document.addEventListener('keydown', function(ev){
+      if(ev.key !== 'Escape') return;
+      const modal = q('umFormModal');
+      if(modal && modal.style.display !== 'none') closeUserFormModal();
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', async function(){
     try{
+      bindEvents();
       await loadRoles();
       await loadUsers();
       resetForm();
-      q('umForm').addEventListener('submit', submitForm);
-      q('umResetBtn').addEventListener('click', resetForm);
-      const tb = q('umTableBody');
-      if(tb) tb.addEventListener('click', handleTableAction);
-      setMsg(`当前登录：${ACTOR}`);
+      setMsg('当前登录：' + ACTOR);
     }catch(err){
       setMsg(err.message || '初始化失败', true);
     }

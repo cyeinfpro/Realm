@@ -38,6 +38,8 @@ def to_arr(x): if x==null then [] elif (x|type)=="array" then x elif (x|type)=="
       | map(select((.disabled//false)|not))
       # Intranet tunnel rules are handled by realm-agent, not realm binary.
       | map(select(((obj(.extra_config).intranet_role // "") == "")))
+      # iptables-forwarded normal rules are handled by realm-agent runtime, not realm binary.
+      | map(select((((obj(.extra_config).forward_tool // .forward_tool // "")|tostring|ascii_downcase) as $ft | ($ft != "ipt" and $ft != "iptables"))))
       | map(. as $e
           | ($e.extra_config//{}) as $x
           | ($e.remote//$e.remotes//null) as $r0

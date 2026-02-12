@@ -28,6 +28,9 @@ def _path_permissions(path: str, method: str) -> List[str]:
             return ["netmon.read"]
         return ["netmon.write"]
 
+    if p.startswith("/api/logs/"):
+        return ["panel.view"]
+
     if p.startswith("/api/wss_tunnel/"):
         if "delete" in p:
             return ["publish.apply", "sync.wss", "sync.delete"]
@@ -53,6 +56,8 @@ def _path_permissions(path: str, method: str) -> List[str]:
         return ["nodes.write"]
 
     if p.startswith("/api/nodes/"):
+        if p.endswith("/trace"):
+            return ["nodes.read"]
         if "/restore" in p:
             return ["restore.manage"]
         if p.endswith("/backup"):
@@ -96,6 +101,12 @@ def _path_permissions(path: str, method: str) -> List[str]:
         if m == "GET":
             return ["netmon.read"]
         return ["netmon.write"]
+
+    if p.startswith("/logs"):
+        return ["panel.view"]
+
+    if p.startswith("/settings"):
+        return ["users.manage"]
 
     return []
 

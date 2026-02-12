@@ -7,7 +7,7 @@ import shutil
 import threading
 import time
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import httpx
 
@@ -73,6 +73,70 @@ def _retry_backoff_sec(attempt_no: int) -> float:
     return min(2.5, _TRANSPORT_RETRY_BACKOFF_BASE_SEC * (2 ** (n - 1)))
 
 
+def _normalize_base_url(base_url: str) -> str:
+    raw = (base_url or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = f"http://{raw}"
+    return raw.rstrip("/")
+
+
+def _base_url_with_port(base_url: str, target_port: int) -> str:
+    target = _normalize_base_url(base_url)
+    if not target:
+        return ""
+    try:
+        parsed = urlsplit(target)
+    except Exception:
+        return target
+
+    host = parsed.hostname or ""
+    if not host:
+        return target
+
+    userinfo = ""
+    if parsed.username:
+        userinfo = parsed.username
+        if parsed.password:
+            userinfo += f":{parsed.password}"
+        userinfo += "@"
+
+    host_for_url = f"[{host}]" if ":" in host else host
+    netloc = f"{userinfo}{host_for_url}:{int(target_port)}"
+    with_port = urlunsplit((parsed.scheme or "http", netloc, parsed.path or "", parsed.query or "", parsed.fragment or ""))
+    return with_port.rstrip("/")
+
+
+def _looks_like_nginx_html_404(response: httpx.Response) -> bool:
+    raw_text = (response.text or "").lower()
+    content_type = str(response.headers.get("content-type") or "").lower()
+    return int(response.status_code or 0) == 404 and ("<html" in raw_text or "text/html" in content_type) and "nginx" in raw_text
+
+
+def _build_request_urls(base_url: str, path: str) -> Tuple[str, str]:
+    normalized_base = _normalize_base_url(base_url)
+    if not normalized_base:
+        return "", ""
+    primary_url = f"{normalized_base}{path}"
+    fallback_url = ""
+
+    # Compat fallback targets:
+    # - missing port (hits 80/443 implicitly)
+    # - explicit common web ports 80/443 (common misconfig for agent endpoint)
+    explicit_port: Optional[int] = None
+    try:
+        explicit_port = urlparse(normalized_base).port
+    except Exception:
+        explicit_port = None
+    should_fallback = (explicit_port is None) or (int(explicit_port) in (80, 443))
+    if should_fallback:
+        fallback_base = _base_url_with_port(normalized_base, DEFAULT_AGENT_PORT)
+        if fallback_base and fallback_base != normalized_base:
+            fallback_url = f"{fallback_base}{path}"
+    return primary_url, fallback_url
+
+
 async def _agent_request(
     method: str,
     base_url: str,
@@ -83,24 +147,56 @@ async def _agent_request(
     timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
     headers = {"X-API-Key": api_key}
-    url = f"{base_url.rstrip('/')}{path}"
+    url, fallback_url = _build_request_urls(base_url, path)
+    if not url:
+        raise AgentError("Agent 请求失败：节点地址为空")
     req_timeout = float(timeout or DEFAULT_TIMEOUT)
     method_u = str(method or "GET").upper()
 
     # Retry transient transport errors (stale keep-alive / short network jitter).
     for attempt in range(_TRANSPORT_RETRY_COUNT):
         client = await _get_client(verify_tls)
+        r: Optional[httpx.Response] = None
+        primary_transport_exc: Optional[Exception] = None
         try:
             if method_u == "GET":
                 r = await client.get(url, headers=headers, timeout=req_timeout)
             else:
                 r = await client.post(url, headers=headers, json=data, timeout=req_timeout)
-        except httpx.TransportError:
+        except httpx.TransportError as exc:
+            primary_transport_exc = exc
+
+        # Compat fallback:
+        # Some older node records may miss ":18700" and accidentally hit website nginx on 80/443.
+        # Retry once against default agent port when primary transport failed or nginx html 404 is detected.
+        if fallback_url and (r is None or _looks_like_nginx_html_404(r)):
+            try:
+                if method_u == "GET":
+                    r2 = await client.get(fallback_url, headers=headers, timeout=req_timeout)
+                else:
+                    r2 = await client.post(fallback_url, headers=headers, json=data, timeout=req_timeout)
+                if 200 <= r2.status_code < 300:
+                    return _parse_agent_json(r2)
+                r = r2
+            except httpx.TransportError:
+                # Keep original nginx-404 response if present (more actionable than a generic transport error).
+                if r is None:
+                    if attempt + 1 < _TRANSPORT_RETRY_COUNT:
+                        await _drop_client(verify_tls)
+                        await asyncio.sleep(_retry_backoff_sec(attempt + 1))
+                        continue
+                    if primary_transport_exc is not None:
+                        raise primary_transport_exc
+                    raise
+
+        if r is None:
             if attempt + 1 < _TRANSPORT_RETRY_COUNT:
                 await _drop_client(verify_tls)
                 await asyncio.sleep(_retry_backoff_sec(attempt + 1))
                 continue
-            raise
+            if primary_transport_exc is not None:
+                raise primary_transport_exc
+            raise AgentError("Agent 请求失败：节点不可达")
 
         if not (200 <= r.status_code < 300):
             raise AgentError(_format_agent_error(r))
@@ -118,20 +214,43 @@ async def agent_get_raw(
     timeout: Optional[float] = None,
 ) -> httpx.Response:
     headers = {"X-API-Key": api_key}
-    url = f"{base_url.rstrip('/')}{path}"
+    url, fallback_url = _build_request_urls(base_url, path)
+    if not url:
+        raise RuntimeError("Agent raw request failed: empty base_url")
     req_timeout = float(timeout or DEFAULT_TIMEOUT)
     query = params or {}
 
     for attempt in range(_TRANSPORT_RETRY_COUNT):
         client = await _get_client(verify_tls)
+        primary_transport_exc: Optional[Exception] = None
+        r: Optional[httpx.Response] = None
         try:
-            return await client.get(url, params=query, headers=headers, timeout=req_timeout)
-        except httpx.TransportError:
-            if attempt + 1 < _TRANSPORT_RETRY_COUNT:
-                await _drop_client(verify_tls)
-                await asyncio.sleep(_retry_backoff_sec(attempt + 1))
-                continue
-            raise
+            r = await client.get(url, params=query, headers=headers, timeout=req_timeout)
+        except httpx.TransportError as exc:
+            primary_transport_exc = exc
+
+        if fallback_url and (r is None or _looks_like_nginx_html_404(r)):
+            try:
+                r2 = await client.get(fallback_url, params=query, headers=headers, timeout=req_timeout)
+                r = r2
+            except httpx.TransportError:
+                if r is None:
+                    if attempt + 1 < _TRANSPORT_RETRY_COUNT:
+                        await _drop_client(verify_tls)
+                        await asyncio.sleep(_retry_backoff_sec(attempt + 1))
+                        continue
+                    if primary_transport_exc is not None:
+                        raise primary_transport_exc
+                    raise
+
+        if r is not None:
+            return r
+        if attempt + 1 < _TRANSPORT_RETRY_COUNT:
+            await _drop_client(verify_tls)
+            await asyncio.sleep(_retry_backoff_sec(attempt + 1))
+            continue
+        if primary_transport_exc is not None:
+            raise primary_transport_exc
     raise RuntimeError("Agent raw request failed")
 
 
@@ -144,21 +263,45 @@ async def agent_get_raw_stream(
     timeout: Optional[float] = None,
 ) -> httpx.Response:
     headers = {"X-API-Key": api_key}
-    url = f"{base_url.rstrip('/')}{path}"
+    url, fallback_url = _build_request_urls(base_url, path)
+    if not url:
+        raise RuntimeError("Agent raw stream request failed: empty base_url")
     req_timeout = float(timeout or DEFAULT_TIMEOUT)
     query = params or {}
 
     for attempt in range(_TRANSPORT_RETRY_COUNT):
         client = await _get_client(verify_tls)
+        primary_transport_exc: Optional[Exception] = None
+        r: Optional[httpx.Response] = None
         try:
             req = client.build_request("GET", url, params=query, headers=headers, timeout=req_timeout)
-            return await client.send(req, stream=True)
-        except httpx.TransportError:
-            if attempt + 1 < _TRANSPORT_RETRY_COUNT:
-                await _drop_client(verify_tls)
-                await asyncio.sleep(_retry_backoff_sec(attempt + 1))
-                continue
-            raise
+            r = await client.send(req, stream=True)
+        except httpx.TransportError as exc:
+            primary_transport_exc = exc
+
+        if fallback_url and (r is None or _looks_like_nginx_html_404(r)):
+            try:
+                req2 = client.build_request("GET", fallback_url, params=query, headers=headers, timeout=req_timeout)
+                r2 = await client.send(req2, stream=True)
+                r = r2
+            except httpx.TransportError:
+                if r is None:
+                    if attempt + 1 < _TRANSPORT_RETRY_COUNT:
+                        await _drop_client(verify_tls)
+                        await asyncio.sleep(_retry_backoff_sec(attempt + 1))
+                        continue
+                    if primary_transport_exc is not None:
+                        raise primary_transport_exc
+                    raise
+
+        if r is not None:
+            return r
+        if attempt + 1 < _TRANSPORT_RETRY_COUNT:
+            await _drop_client(verify_tls)
+            await asyncio.sleep(_retry_backoff_sec(attempt + 1))
+            continue
+        if primary_transport_exc is not None:
+            raise primary_transport_exc
     raise RuntimeError("Agent raw stream request failed")
 
 

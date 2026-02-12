@@ -607,6 +607,25 @@
       }
     }
 
+    @media (max-width: 520px) {
+      .mast {
+        flex-wrap: wrap;
+      }
+
+      .release {
+        width: 100%;
+        text-align: center;
+      }
+
+      .brand span {
+        white-space: normal;
+      }
+
+      .hero::after {
+        display: none;
+      }
+    }
+
     @keyframes flow {
       0%, 100% { transform: translateX(-2%); }
       50% { transform: translateX(2%); }

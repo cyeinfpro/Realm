@@ -7,7 +7,71 @@ import string
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
-DEFAULT_DB_PATH = os.getenv("REALM_PANEL_DB", "/etc/realm-panel/panel.db")
+def ensure_parent_dir(path: str) -> None:
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+
+def _db_path_candidates() -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+
+    def _add(path: Any) -> None:
+        p = str(path or "").strip()
+        if not p or p in seen:
+            return
+        seen.add(p)
+        out.append(p)
+
+    env_db = (os.getenv("REALM_PANEL_DB") or "").strip()
+    if env_db:
+        _add(env_db)
+    else:
+        _add("/etc/realm-panel/panel.db")
+
+    runtime_dir = (os.getenv("XDG_RUNTIME_DIR") or "").strip()
+    if runtime_dir:
+        _add(os.path.join(runtime_dir, "realm-panel", "panel.db"))
+
+    state_home = (os.getenv("XDG_STATE_HOME") or "").strip()
+    if state_home:
+        _add(os.path.join(state_home, "realm-panel", "panel.db"))
+
+    home = os.path.expanduser("~")
+    if home and home != "~":
+        _add(os.path.join(home, ".local", "state", "realm-panel", "panel.db"))
+
+    _add("/tmp/realm-panel/panel.db")
+    return out
+
+
+def _is_db_path_usable(path: str) -> bool:
+    p = str(path or "").strip()
+    if not p:
+        return False
+    try:
+        ensure_parent_dir(p)
+    except Exception:
+        return False
+    try:
+        with sqlite3.connect(p) as conn:
+            conn.execute("PRAGMA busy_timeout=1000")
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_default_db_path() -> str:
+    candidates = _db_path_candidates()
+    for p in candidates:
+        if _is_db_path_usable(p):
+            return p
+    # Last resort: keep process alive with a tmp path even on unusual environments.
+    return "/tmp/realm-panel/panel.db"
+
+
+DEFAULT_DB_PATH = _resolve_default_db_path()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
@@ -40,10 +104,32 @@ CREATE TABLE IF NOT EXISTS nodes (
   -- Agent software update (panel -> agent)
   desired_agent_version TEXT NOT NULL DEFAULT '',
   desired_agent_update_id TEXT NOT NULL DEFAULT '',
+  desired_agent_command_id TEXT NOT NULL DEFAULT '',
   agent_reported_version TEXT NOT NULL DEFAULT '',
+  agent_capabilities_json TEXT NOT NULL DEFAULT '{}',
   agent_update_state TEXT NOT NULL DEFAULT '',
   agent_update_msg TEXT NOT NULL DEFAULT '',
+  agent_update_reason_code TEXT NOT NULL DEFAULT '',
+  agent_update_retry_count INTEGER NOT NULL DEFAULT 0,
+  agent_update_max_retries INTEGER NOT NULL DEFAULT 0,
+  agent_update_next_retry_at TEXT,
+  agent_update_delivered_at TEXT,
+  agent_update_accepted_at TEXT,
+  agent_update_started_at TEXT,
+  agent_update_finished_at TEXT,
   agent_update_at TEXT,
+
+  -- Node-level auto-restart policy (panel -> agent)
+  auto_restart_enabled INTEGER NOT NULL DEFAULT 1,
+  auto_restart_schedule_type TEXT NOT NULL DEFAULT 'daily',
+  auto_restart_interval INTEGER NOT NULL DEFAULT 1,
+  auto_restart_hour INTEGER NOT NULL DEFAULT 4,
+  auto_restart_minute INTEGER NOT NULL DEFAULT 8,
+  auto_restart_weekdays_json TEXT NOT NULL DEFAULT '[1,2,3,4,5,6,7]',
+  auto_restart_monthdays_json TEXT NOT NULL DEFAULT '[1]',
+  desired_auto_restart_policy_version INTEGER NOT NULL DEFAULT 0,
+  agent_auto_restart_policy_ack_version INTEGER NOT NULL DEFAULT 0,
+  auto_restart_updated_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -122,6 +208,19 @@ CREATE TABLE IF NOT EXISTS site_file_share_short_links (
 );
 CREATE INDEX IF NOT EXISTS idx_site_file_share_short_links_site_ts ON site_file_share_short_links(site_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_site_file_share_short_links_token ON site_file_share_short_links(token_sha256);
+
+CREATE TABLE IF NOT EXISTS site_file_favorites (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id INTEGER NOT NULL,
+  owner TEXT NOT NULL DEFAULT '',
+  path TEXT NOT NULL,
+  is_dir INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(site_id, owner, path)
+);
+CREATE INDEX IF NOT EXISTS idx_site_file_favorites_owner_updated ON site_file_favorites(owner, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_site_file_favorites_site_owner ON site_file_favorites(site_id, owner, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS certificates (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -260,6 +359,13 @@ CREATE TABLE IF NOT EXISTS user_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_user_tokens_user_id ON user_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_tokens_expires_at ON user_tokens(expires_at);
+
+-- Panel runtime settings (editable in UI, not only env vars)
+CREATE TABLE IF NOT EXISTS panel_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 BUILTIN_ROLE_DEFS: Dict[str, Dict[str, Any]] = {
@@ -345,12 +451,6 @@ def _normalize_permissions(perms: Any) -> List[str]:
     return out
 
 
-def ensure_parent_dir(path: str) -> None:
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-
-
 def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
     ensure_parent_dir(db_path)
     with sqlite3.connect(db_path) as conn:
@@ -414,14 +514,54 @@ def ensure_db(db_path: str = DEFAULT_DB_PATH) -> None:
             conn.execute("ALTER TABLE nodes ADD COLUMN desired_agent_version TEXT NOT NULL DEFAULT ''")
         if "desired_agent_update_id" not in columns:
             conn.execute("ALTER TABLE nodes ADD COLUMN desired_agent_update_id TEXT NOT NULL DEFAULT ''")
+        if "desired_agent_command_id" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN desired_agent_command_id TEXT NOT NULL DEFAULT ''")
         if "agent_reported_version" not in columns:
             conn.execute("ALTER TABLE nodes ADD COLUMN agent_reported_version TEXT NOT NULL DEFAULT ''")
+        if "agent_capabilities_json" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN agent_capabilities_json TEXT NOT NULL DEFAULT '{}'")
         if "agent_update_state" not in columns:
             conn.execute("ALTER TABLE nodes ADD COLUMN agent_update_state TEXT NOT NULL DEFAULT ''")
         if "agent_update_msg" not in columns:
             conn.execute("ALTER TABLE nodes ADD COLUMN agent_update_msg TEXT NOT NULL DEFAULT ''")
+        if "agent_update_reason_code" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN agent_update_reason_code TEXT NOT NULL DEFAULT ''")
+        if "agent_update_retry_count" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN agent_update_retry_count INTEGER NOT NULL DEFAULT 0")
+        if "agent_update_max_retries" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN agent_update_max_retries INTEGER NOT NULL DEFAULT 0")
+        if "agent_update_next_retry_at" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN agent_update_next_retry_at TEXT")
+        if "agent_update_delivered_at" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN agent_update_delivered_at TEXT")
+        if "agent_update_accepted_at" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN agent_update_accepted_at TEXT")
+        if "agent_update_started_at" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN agent_update_started_at TEXT")
+        if "agent_update_finished_at" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN agent_update_finished_at TEXT")
         if "agent_update_at" not in columns:
             conn.execute("ALTER TABLE nodes ADD COLUMN agent_update_at TEXT")
+        if "auto_restart_enabled" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN auto_restart_enabled INTEGER NOT NULL DEFAULT 1")
+        if "auto_restart_schedule_type" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN auto_restart_schedule_type TEXT NOT NULL DEFAULT 'daily'")
+        if "auto_restart_interval" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN auto_restart_interval INTEGER NOT NULL DEFAULT 1")
+        if "auto_restart_hour" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN auto_restart_hour INTEGER NOT NULL DEFAULT 4")
+        if "auto_restart_minute" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN auto_restart_minute INTEGER NOT NULL DEFAULT 8")
+        if "auto_restart_weekdays_json" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN auto_restart_weekdays_json TEXT NOT NULL DEFAULT '[1,2,3,4,5,6,7]'")
+        if "auto_restart_monthdays_json" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN auto_restart_monthdays_json TEXT NOT NULL DEFAULT '[1]'")
+        if "desired_auto_restart_policy_version" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN desired_auto_restart_policy_version INTEGER NOT NULL DEFAULT 0")
+        if "agent_auto_restart_policy_ack_version" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN agent_auto_restart_policy_ack_version INTEGER NOT NULL DEFAULT 0")
+        if "auto_restart_updated_at" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN auto_restart_updated_at TEXT")
 
 
         # NetMon tables migrations (older DBs may miss columns)
@@ -500,6 +640,35 @@ def ensure_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 ")"
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_site_checks_site_ts ON site_checks(site_id, checked_at DESC)")
+        except Exception:
+            pass
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS site_file_favorites ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "site_id INTEGER NOT NULL,"
+                "owner TEXT NOT NULL DEFAULT '',"
+                "path TEXT NOT NULL,"
+                "is_dir INTEGER NOT NULL DEFAULT 0,"
+                "created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+                "updated_at TEXT NOT NULL DEFAULT (datetime('now')),"
+                "UNIQUE(site_id, owner, path)"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_site_file_favorites_owner_updated "
+                "ON site_file_favorites(owner, updated_at DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_site_file_favorites_site_owner "
+                "ON site_file_favorites(site_id, owner, updated_at DESC)"
+            )
+            fcols = {row[1] for row in conn.execute("PRAGMA table_info(site_file_favorites)").fetchall()}
+            if fcols:
+                if "is_dir" not in fcols:
+                    conn.execute("ALTER TABLE site_file_favorites ADD COLUMN is_dir INTEGER NOT NULL DEFAULT 0")
+                if "updated_at" not in fcols:
+                    conn.execute("ALTER TABLE site_file_favorites ADD COLUMN updated_at TEXT")
         except Exception:
             pass
 
@@ -623,6 +792,7 @@ def set_agent_rollout_all(
     update_id: str,
     state: str = "queued",
     msg: str = "",
+    max_retries: int = 4,
     db_path: str = DEFAULT_DB_PATH,
 ) -> int:
     """Set desired agent version for all nodes, returns affected row count."""
@@ -630,10 +800,16 @@ def set_agent_rollout_all(
     uid = (update_id or "").strip()
     st = (state or "").strip()
     m = (msg or "").strip()
+    retries = max(1, int(max_retries or 1))
     with connect(db_path) as conn:
         cur = conn.execute(
-            "UPDATE nodes SET desired_agent_version=?, desired_agent_update_id=?, agent_update_state=?, agent_update_msg=?, agent_update_at=datetime('now')",
-            (ver, uid, st, m),
+            "UPDATE nodes SET "
+            "desired_agent_version=?, desired_agent_update_id=?, desired_agent_command_id='', "
+            "agent_update_state=?, agent_update_msg=?, agent_update_reason_code='', "
+            "agent_update_retry_count=0, agent_update_max_retries=?, agent_update_next_retry_at=NULL, "
+            "agent_update_delivered_at=NULL, agent_update_accepted_at=NULL, agent_update_started_at=NULL, "
+            "agent_update_finished_at=NULL, agent_update_at=datetime('now')",
+            (ver, uid, st, m, retries),
         )
         conn.commit()
         return int(cur.rowcount or 0)
@@ -644,27 +820,73 @@ def update_agent_status(
     agent_reported_version: Optional[str] = None,
     state: Optional[str] = None,
     msg: Optional[str] = None,
+    reason_code: Optional[str] = None,
+    extra_updates: Optional[Dict[str, Any]] = None,
+    touch_update_at: Optional[bool] = None,
     db_path: str = DEFAULT_DB_PATH,
 ) -> None:
-    fields = []
-    vals = []
+    fields: List[str] = []
+    vals: List[Any] = []
     if agent_reported_version is not None:
         fields.append("agent_reported_version=?")
         vals.append(str(agent_reported_version))
     if state is not None:
         fields.append("agent_update_state=?")
         vals.append(str(state))
-        fields.append("agent_update_at=datetime('now')")
     if msg is not None:
         fields.append("agent_update_msg=?")
         vals.append(str(msg))
+    if reason_code is not None:
+        fields.append("agent_update_reason_code=?")
+        vals.append(str(reason_code))
+
+    if isinstance(extra_updates, dict):
+        _allowed_extra = {
+            "desired_agent_command_id",
+            "agent_capabilities_json",
+            "agent_update_retry_count",
+            "agent_update_max_retries",
+            "agent_update_next_retry_at",
+            "agent_update_delivered_at",
+            "agent_update_accepted_at",
+            "agent_update_started_at",
+            "agent_update_finished_at",
+        }
+        for k, v in extra_updates.items():
+            col = str(k or "").strip()
+            if not col:
+                continue
+            if col not in _allowed_extra:
+                raise ValueError(f"invalid extra update column: {col}")
+            fields.append(f"{col}=?")
+            vals.append(v)
+
+    if touch_update_at is None:
+        touch_update_at = bool(state is not None or msg is not None or reason_code is not None)
+    if touch_update_at:
         fields.append("agent_update_at=datetime('now')")
+
     if not fields:
         return
     vals.append(int(node_id))
     with connect(db_path) as conn:
         # Whitelist validation to avoid accidental SQL injection if this code is modified.
-        _allowed = {'agent_reported_version', 'agent_update_state', 'agent_update_msg', 'agent_update_at'}
+        _allowed = {
+            "agent_reported_version",
+            "agent_update_state",
+            "agent_update_msg",
+            "agent_update_reason_code",
+            "agent_update_retry_count",
+            "agent_update_max_retries",
+            "agent_update_next_retry_at",
+            "agent_update_delivered_at",
+            "agent_update_accepted_at",
+            "agent_update_started_at",
+            "agent_update_finished_at",
+            "desired_agent_command_id",
+            "agent_capabilities_json",
+            "agent_update_at",
+        }
         for _f in fields:
             _col = str(_f).split('=', 1)[0].strip()
             if _col not in _allowed:
@@ -679,6 +901,7 @@ def update_node_report(
     last_seen_at: str,
     agent_ack_version: Optional[int] = None,
     traffic_ack_version: Optional[int] = None,
+    auto_restart_ack_version: Optional[int] = None,
     db_path: str = DEFAULT_DB_PATH,
 ) -> None:
     """Persist last report from an agent (push mode)."""
@@ -694,6 +917,10 @@ def update_node_report(
             fields.append('agent_traffic_reset_ack_version=?')
             vals.append(int(traffic_ack_version))
 
+        if auto_restart_ack_version is not None:
+            fields.append('agent_auto_restart_policy_ack_version=?')
+            vals.append(int(auto_restart_ack_version))
+
         vals.append(int(node_id))
         conn.execute(
             f"UPDATE nodes SET {', '.join(fields)} WHERE id=?",
@@ -703,16 +930,106 @@ def update_node_report(
 
 
 def get_last_report(node_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
-    node = get_node(node_id, db_path=db_path)
-    if not node:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT last_report_json FROM nodes WHERE id=?", (int(node_id),)).fetchone()
+    if not row:
         return None
-    raw = node.get("last_report_json")
+    raw = row["last_report_json"]
     if not raw:
         return None
     try:
         return json.loads(raw)
     except Exception:
         return None
+
+
+def set_node_auto_restart_policy(
+    node_id: int,
+    *,
+    enabled: bool,
+    schedule_type: str,
+    interval: int,
+    hour: int,
+    minute: int,
+    weekdays: List[int],
+    monthdays: List[int],
+    db_path: str = DEFAULT_DB_PATH,
+) -> Tuple[int, Dict[str, Any]]:
+    st = str(schedule_type or "daily").strip().lower()
+    if st not in ("daily", "weekly", "monthly"):
+        st = "daily"
+    itv = int(interval or 1)
+    if itv < 1:
+        itv = 1
+    if itv > 365:
+        itv = 365
+    hh = int(hour or 0)
+    if hh < 0:
+        hh = 0
+    if hh > 23:
+        hh = 23
+    mm = int(minute or 0)
+    if mm < 0:
+        mm = 0
+    if mm > 59:
+        mm = 59
+    wds = _norm_int_seq(weekdays, 1, 7)
+    if not wds:
+        wds = [1, 2, 3, 4, 5, 6, 7]
+    mds = _norm_int_seq(monthdays, 1, 31)
+    if not mds:
+        mds = [1]
+    wj = json.dumps(wds, ensure_ascii=False, separators=(",", ":"))
+    mj = json.dumps(mds, ensure_ascii=False, separators=(",", ":"))
+
+    with connect(db_path) as conn:
+        try:
+            row = conn.execute(
+                "UPDATE nodes SET "
+                "auto_restart_enabled=?, auto_restart_schedule_type=?, auto_restart_interval=?, "
+                "auto_restart_hour=?, auto_restart_minute=?, "
+                "auto_restart_weekdays_json=?, auto_restart_monthdays_json=?, "
+                "desired_auto_restart_policy_version=desired_auto_restart_policy_version+1, "
+                "auto_restart_updated_at=datetime('now') "
+                "WHERE id=? RETURNING desired_auto_restart_policy_version",
+                (1 if enabled else 0, st, itv, hh, mm, wj, mj, int(node_id)),
+            ).fetchone()
+            conn.commit()
+            new_ver = int(row[0]) if row else 0
+        except sqlite3.OperationalError:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except Exception:
+                pass
+            row2 = conn.execute(
+                "SELECT desired_auto_restart_policy_version FROM nodes WHERE id=?",
+                (int(node_id),),
+            ).fetchone()
+            cur_ver = int(row2[0]) if row2 else 0
+            new_ver = cur_ver + 1
+            conn.execute(
+                "UPDATE nodes SET "
+                "auto_restart_enabled=?, auto_restart_schedule_type=?, auto_restart_interval=?, "
+                "auto_restart_hour=?, auto_restart_minute=?, "
+                "auto_restart_weekdays_json=?, auto_restart_monthdays_json=?, "
+                "desired_auto_restart_policy_version=?, "
+                "auto_restart_updated_at=datetime('now') "
+                "WHERE id=?",
+                (1 if enabled else 0, st, itv, hh, mm, wj, mj, new_ver, int(node_id)),
+            )
+            conn.commit()
+
+    policy = {
+        "enabled": bool(enabled),
+        "schedule_type": st,
+        "interval": int(itv),
+        "hour": int(hh),
+        "minute": int(mm),
+        "weekdays": list(wds),
+        "monthdays": list(mds),
+        "version": int(new_ver),
+    }
+    return int(new_ver), policy
 
 
 def set_desired_pool(
@@ -836,11 +1153,15 @@ def bump_traffic_reset_version(
 
 
 def get_desired_pool(node_id: int, db_path: str = DEFAULT_DB_PATH) -> Tuple[int, Optional[Dict[str, Any]]]:
-    node = get_node(node_id, db_path=db_path)
-    if not node:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT desired_pool_version, desired_pool_json FROM nodes WHERE id=?",
+            (int(node_id),),
+        ).fetchone()
+    if not row:
         return 0, None
-    ver = int(node.get("desired_pool_version") or 0)
-    raw = node.get("desired_pool_json")
+    ver = int(row["desired_pool_version"] or 0)
+    raw = row["desired_pool_json"]
     if not raw:
         return ver, None
     try:
@@ -884,12 +1205,91 @@ def _json_loads(raw: str, default: Any) -> Any:
         return default
 
 
+def _norm_int_seq(raw: Any, lo: int, hi: int) -> List[int]:
+    out: List[int] = []
+    seen: set[int] = set()
+    seq = raw if isinstance(raw, list) else []
+    for x in seq:
+        try:
+            v = int(x)
+        except Exception:
+            continue
+        if v < int(lo) or v > int(hi):
+            continue
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
+
+
+def _node_auto_restart_policy_from_row_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+    def _to_int(v: Any, default: int) -> int:
+        try:
+            return int(v)
+        except Exception:
+            try:
+                return int(float(str(v).strip()))
+            except Exception:
+                return int(default)
+
+    schedule_type = str(d.get("auto_restart_schedule_type") or "daily").strip().lower()
+    if schedule_type not in ("daily", "weekly", "monthly"):
+        schedule_type = "daily"
+    interval = _to_int(d.get("auto_restart_interval"), 1)
+    if interval < 1:
+        interval = 1
+    if interval > 365:
+        interval = 365
+    hour = _to_int(d.get("auto_restart_hour"), 4)
+    if hour < 0:
+        hour = 0
+    if hour > 23:
+        hour = 23
+    minute = _to_int(d.get("auto_restart_minute"), 8)
+    if minute < 0:
+        minute = 0
+    if minute > 59:
+        minute = 59
+
+    weekdays = _norm_int_seq(_json_loads(str(d.get("auto_restart_weekdays_json") or "[]"), []), 1, 7)
+    if not weekdays:
+        weekdays = [1, 2, 3, 4, 5, 6, 7]
+
+    monthdays = _norm_int_seq(_json_loads(str(d.get("auto_restart_monthdays_json") or "[]"), []), 1, 31)
+    if not monthdays:
+        monthdays = [1]
+
+    return {
+        "enabled": bool(_to_int(d.get("auto_restart_enabled"), 0)),
+        "schedule_type": schedule_type,
+        "interval": int(interval),
+        "hour": int(hour),
+        "minute": int(minute),
+        "weekdays": weekdays,
+        "monthdays": monthdays,
+        "desired_version": _to_int(d.get("desired_auto_restart_policy_version"), 0),
+        "ack_version": _to_int(d.get("agent_auto_restart_policy_ack_version"), 0),
+        "updated_at": str(d.get("auto_restart_updated_at") or ""),
+    }
+
+
+def node_auto_restart_policy_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    d = dict(row or {})
+    return _node_auto_restart_policy_from_row_dict(d)
+
+
 def _parse_node_row(row: sqlite3.Row) -> Dict[str, Any]:
     d = dict(row)
     caps = _json_loads(str(d.get("capabilities_json") or "{}"), {})
     if not isinstance(caps, dict):
         caps = {}
     d["capabilities"] = caps
+    agent_caps = _json_loads(str(d.get("agent_capabilities_json") or "{}"), {})
+    if not isinstance(agent_caps, dict):
+        agent_caps = {}
+    d["agent_capabilities"] = agent_caps
+    d["auto_restart_policy"] = _node_auto_restart_policy_from_row_dict(d)
     return d
 
 
@@ -904,8 +1304,15 @@ def list_nodes(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
         "last_seen_at, desired_pool_version, agent_ack_version, "
         "desired_traffic_reset_version, agent_traffic_reset_ack_version, "
         "traffic_reset_at, traffic_reset_msg, "
-        "desired_agent_version, desired_agent_update_id, "
-        "agent_reported_version, agent_update_state, agent_update_msg, agent_update_at, "
+        "desired_agent_version, desired_agent_update_id, desired_agent_command_id, "
+        "agent_reported_version, agent_capabilities_json, "
+        "agent_update_state, agent_update_msg, agent_update_reason_code, "
+        "agent_update_retry_count, agent_update_max_retries, agent_update_next_retry_at, "
+        "agent_update_delivered_at, agent_update_accepted_at, agent_update_started_at, agent_update_finished_at, "
+        "agent_update_at, "
+        "auto_restart_enabled, auto_restart_schedule_type, auto_restart_interval, "
+        "auto_restart_hour, auto_restart_minute, auto_restart_weekdays_json, auto_restart_monthdays_json, "
+        "desired_auto_restart_policy_version, agent_auto_restart_policy_ack_version, auto_restart_updated_at, "
         "created_at "
         "FROM nodes ORDER BY id DESC"
     )
@@ -944,9 +1351,86 @@ def upsert_group_order(group_name: str, sort_order: int, db_path: str = DEFAULT_
         conn.commit()
 
 
+def get_panel_setting(key: str, default: Optional[str] = None, db_path: str = DEFAULT_DB_PATH) -> Optional[str]:
+    k = (key or "").strip()
+    if not k:
+        return default
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT value FROM panel_settings WHERE key=? LIMIT 1", (k,)).fetchone()
+    if not row:
+        return default
+    try:
+        return str(row["value"] or "")
+    except Exception:
+        return default
+
+
+def set_panel_setting(key: str, value: Optional[str], db_path: str = DEFAULT_DB_PATH) -> None:
+    k = (key or "").strip()
+    if not k:
+        return
+    v = "" if value is None else str(value)
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE panel_settings SET value=?, updated_at=datetime('now') WHERE key=?",
+            (v, k),
+        )
+        if int(cur.rowcount or 0) <= 0:
+            conn.execute(
+                "INSERT INTO panel_settings(key, value, updated_at) VALUES(?,?,datetime('now'))",
+                (k, v),
+            )
+        conn.commit()
+
+
+def list_panel_settings(db_path: str = DEFAULT_DB_PATH) -> Dict[str, str]:
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT key, value FROM panel_settings ORDER BY key ASC").fetchall()
+    out: Dict[str, str] = {}
+    for r in rows:
+        try:
+            k = str(r["key"] or "").strip()
+        except Exception:
+            k = ""
+        if not k:
+            continue
+        try:
+            out[k] = str(r["value"] or "")
+        except Exception:
+            out[k] = ""
+    return out
+
+
 def get_node(node_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
     with connect(db_path) as conn:
         row = conn.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
+    return _parse_node_row(row) if row else None
+
+
+def get_node_runtime(node_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    """Get node runtime metadata without loading large JSON blobs."""
+    sql = (
+        "SELECT "
+        "id, name, base_url, api_key, verify_tls, is_private, group_name, role, "
+        "capabilities_json, website_root_base, "
+        "last_seen_at, desired_pool_version, agent_ack_version, "
+        "desired_traffic_reset_version, agent_traffic_reset_ack_version, "
+        "traffic_reset_at, traffic_reset_msg, "
+        "desired_agent_version, desired_agent_update_id, desired_agent_command_id, "
+        "agent_reported_version, agent_capabilities_json, "
+        "agent_update_state, agent_update_msg, agent_update_reason_code, "
+        "agent_update_retry_count, agent_update_max_retries, agent_update_next_retry_at, "
+        "agent_update_delivered_at, agent_update_accepted_at, agent_update_started_at, agent_update_finished_at, "
+        "agent_update_at, "
+        "auto_restart_enabled, auto_restart_schedule_type, auto_restart_interval, "
+        "auto_restart_hour, auto_restart_minute, auto_restart_weekdays_json, auto_restart_monthdays_json, "
+        "desired_auto_restart_policy_version, agent_auto_restart_policy_ack_version, auto_restart_updated_at, "
+        "created_at, "
+        "CASE WHEN COALESCE(desired_pool_json, '') <> '' THEN 1 ELSE 0 END AS desired_pool_present "
+        "FROM nodes WHERE id=?"
+    )
+    with connect(db_path) as conn:
+        row = conn.execute(sql, (int(node_id),)).fetchone()
     return _parse_node_row(row) if row else None
 
 
@@ -1035,6 +1519,7 @@ def add_node(
     role: str = 'normal',
     capabilities: Optional[Dict[str, Any]] = None,
     website_root_base: str = '',
+    preferred_id: Optional[int] = None,
     db_path: str = DEFAULT_DB_PATH,
 ) -> int:
     role_val = (role or "").strip().lower() or "normal"
@@ -1044,22 +1529,47 @@ def add_node(
         caps_json = json.dumps(capabilities or {}, ensure_ascii=False)
     except Exception:
         caps_json = "{}"
+    pref_id = 0
+    try:
+        pref_id = int(preferred_id or 0)
+    except Exception:
+        pref_id = 0
     with connect(db_path) as conn:
-        cur = conn.execute(
-            "INSERT INTO nodes(name, base_url, api_key, verify_tls, is_private, group_name, role, capabilities_json, website_root_base) VALUES(?,?,?,?,?,?,?,?,?)",
-            (
-                name.strip(),
-                base_url.strip().rstrip('/'),
-                api_key.strip(),
-                1 if verify_tls else 0,
-                1 if is_private else 0,
-                (group_name or '默认分组').strip() or '默认分组',
-                role_val,
-                caps_json,
-                (website_root_base or "").strip(),
-            ),
-        )
+        if pref_id > 0:
+            cur = conn.execute(
+                "INSERT INTO nodes(id, name, base_url, api_key, verify_tls, is_private, group_name, role, capabilities_json, website_root_base) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    int(pref_id),
+                    name.strip(),
+                    base_url.strip().rstrip('/'),
+                    api_key.strip(),
+                    1 if verify_tls else 0,
+                    1 if is_private else 0,
+                    (group_name or '默认分组').strip() or '默认分组',
+                    role_val,
+                    caps_json,
+                    (website_root_base or "").strip(),
+                ),
+            )
+        else:
+            cur = conn.execute(
+                "INSERT INTO nodes(name, base_url, api_key, verify_tls, is_private, group_name, role, capabilities_json, website_root_base) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    name.strip(),
+                    base_url.strip().rstrip('/'),
+                    api_key.strip(),
+                    1 if verify_tls else 0,
+                    1 if is_private else 0,
+                    (group_name or '默认分组').strip() or '默认分组',
+                    role_val,
+                    caps_json,
+                    (website_root_base or "").strip(),
+                ),
+            )
         conn.commit()
+        if pref_id > 0:
+            return int(pref_id)
         return int(cur.lastrowid)
 
 
@@ -1947,6 +2457,143 @@ def list_site_checks(site_id: int, limit: int = 60, db_path: str = DEFAULT_DB_PA
     return [dict(r) for r in rows]
 
 
+def _normalize_site_file_favorite_owner(owner: Any) -> str:
+    return str(owner or "").strip()
+
+
+def _normalize_site_file_favorite_path(path: Any) -> str:
+    text = str(path or "").replace("\\", "/").strip().lstrip("/")
+    if not text:
+        return ""
+    segs: List[str] = []
+    for seg in text.split("/"):
+        p = str(seg or "").strip()
+        if not p or p == ".":
+            continue
+        if p == "..":
+            continue
+        segs.append(p)
+    return "/".join(segs)
+
+
+def upsert_site_file_favorite(
+    site_id: int,
+    owner: str,
+    path: str,
+    is_dir: bool = False,
+    db_path: str = DEFAULT_DB_PATH,
+) -> Dict[str, Any]:
+    owner_key = _normalize_site_file_favorite_owner(owner)
+    rel_path = _normalize_site_file_favorite_path(path)
+    if not owner_key:
+        raise ValueError("owner 不能为空")
+    if not rel_path:
+        raise ValueError("path 不能为空")
+
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT id, site_id, owner, path, is_dir, created_at, updated_at "
+            "FROM site_file_favorites WHERE site_id=? AND owner=? AND path=? LIMIT 1",
+            (int(site_id), owner_key, rel_path),
+        ).fetchone()
+        if row:
+            keep_dir = bool(row["is_dir"]) or bool(is_dir)
+            conn.execute(
+                "UPDATE site_file_favorites SET is_dir=?, updated_at=datetime('now') WHERE id=?",
+                (1 if keep_dir else 0, int(row["id"])),
+            )
+            ret = conn.execute(
+                "SELECT id, site_id, owner, path, is_dir, created_at, updated_at "
+                "FROM site_file_favorites WHERE id=? LIMIT 1",
+                (int(row["id"]),),
+            ).fetchone()
+        else:
+            cur = conn.execute(
+                "INSERT INTO site_file_favorites(site_id, owner, path, is_dir, created_at, updated_at) "
+                "VALUES(?,?,?,?,datetime('now'),datetime('now'))",
+                (int(site_id), owner_key, rel_path, 1 if is_dir else 0),
+            )
+            ret = conn.execute(
+                "SELECT id, site_id, owner, path, is_dir, created_at, updated_at "
+                "FROM site_file_favorites WHERE id=? LIMIT 1",
+                (int(cur.lastrowid or 0),),
+            ).fetchone()
+        conn.commit()
+    if not ret:
+        return {
+            "id": 0,
+            "site_id": int(site_id),
+            "owner": owner_key,
+            "path": rel_path,
+            "is_dir": bool(is_dir),
+            "created_at": "",
+            "updated_at": "",
+        }
+    out = dict(ret)
+    out["is_dir"] = bool(out.get("is_dir") or 0)
+    return out
+
+
+def delete_site_file_favorite(
+    site_id: int,
+    owner: str,
+    path: str,
+    db_path: str = DEFAULT_DB_PATH,
+) -> bool:
+    owner_key = _normalize_site_file_favorite_owner(owner)
+    rel_path = _normalize_site_file_favorite_path(path)
+    if not owner_key or not rel_path:
+        return False
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "DELETE FROM site_file_favorites WHERE site_id=? AND owner=? AND path=?",
+            (int(site_id), owner_key, rel_path),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0) > 0
+
+
+def list_site_file_favorites(
+    owner: str,
+    site_id: Optional[int] = None,
+    limit: int = 200,
+    db_path: str = DEFAULT_DB_PATH,
+) -> List[Dict[str, Any]]:
+    owner_key = _normalize_site_file_favorite_owner(owner)
+    if not owner_key:
+        return []
+    n = int(limit or 200)
+    if n < 1:
+        n = 1
+    if n > 1000:
+        n = 1000
+    params: List[Any] = [owner_key]
+    sql = (
+        "SELECT id, site_id, owner, path, is_dir, created_at, updated_at "
+        "FROM site_file_favorites WHERE owner=?"
+    )
+    if site_id is not None:
+        sql += " AND site_id=?"
+        params.append(int(site_id))
+    sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+    params.append(int(n))
+    with connect(db_path) as conn:
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        d = dict(row)
+        d["is_dir"] = bool(d.get("is_dir") or 0)
+        out.append(d)
+    return out
+
+
+def delete_site_file_favorites(site_id: int, db_path: str = DEFAULT_DB_PATH) -> int:
+    with connect(db_path) as conn:
+        cur = conn.execute("DELETE FROM site_file_favorites WHERE site_id=?", (int(site_id),))
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
 def revoke_site_file_share_token(
     site_id: int,
     token_sha256: str,
@@ -2100,6 +2747,7 @@ def prune_site_checks(days: int = 7, db_path: str = DEFAULT_DB_PATH) -> int:
 
 def delete_site(site_id: int, db_path: str = DEFAULT_DB_PATH) -> None:
     with connect(db_path) as conn:
+        conn.execute("DELETE FROM site_file_favorites WHERE site_id=?", (int(site_id),))
         conn.execute("DELETE FROM sites WHERE id=?", (int(site_id),))
         conn.commit()
 
@@ -2129,6 +2777,7 @@ def delete_sites_by_node(node_id: int, db_path: str = DEFAULT_DB_PATH) -> int:
                 continue
             conn.execute("DELETE FROM site_events WHERE site_id=?", (sid,))
             conn.execute("DELETE FROM site_checks WHERE site_id=?", (sid,))
+            conn.execute("DELETE FROM site_file_favorites WHERE site_id=?", (sid,))
         cur = conn.execute("DELETE FROM sites WHERE node_id=?", (int(node_id),))
         conn.commit()
         return int(cur.rowcount or 0)

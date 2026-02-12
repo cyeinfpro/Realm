@@ -91,6 +91,7 @@ apt_install(){
   command_exists curl || deps_ok="0"
   command_exists unzip || deps_ok="0"
   command_exists jq || deps_ok="0"
+  command_exists openssl || deps_ok="0"
   command_exists python3 || deps_ok="0"
   command_exists rsync || deps_ok="0"
   dpkg-query -W -f='${Status}' python3-venv 2>/dev/null | grep -q "install ok installed" || deps_ok="0"
@@ -123,11 +124,11 @@ apt_install(){
   fi
   # rsync 用于更稳的覆盖更新（避免部分文件未更新）
   if ! apt-get install -y --no-install-recommends \
-    curl ca-certificates unzip jq python3 python3-venv python3-pip rsync; then
+    curl ca-certificates unzip jq openssl python3 python3-venv python3-pip rsync; then
     err "依赖安装失败，尝试自动修复后重试..."
     apt-get -f install -y || true
     apt-get install -y --no-install-recommends \
-      curl ca-certificates unzip jq python3 python3-venv python3-pip rsync
+      curl ca-certificates unzip jq openssl python3 python3-venv python3-pip rsync
   fi
 
   if ! probe_python_runtime "python3"; then

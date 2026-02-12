@@ -80,7 +80,14 @@
       data-node-verify-tls="{{ '1' if n.verify_tls else '0' }}"
       data-node-is-private="{{ '1' if n.is_private else '0' }}"
       data-node-role="{{ n.role or 'normal' }}"
-      data-node-website-root="{{ n.website_root_base or '' }}">
+      data-node-website-root="{{ n.website_root_base or '' }}"
+      data-node-ar-enabled="{{ 1 if (n.auto_restart_policy.enabled if n.auto_restart_policy else 1) else 0 }}"
+      data-node-ar-schedule="{{ (n.auto_restart_policy.schedule_type if n.auto_restart_policy else 'daily')|e }}"
+      data-node-ar-interval="{{ (n.auto_restart_policy.interval if n.auto_restart_policy else 1) }}"
+      data-node-ar-hour="{{ (n.auto_restart_policy.hour if n.auto_restart_policy else 4) }}"
+      data-node-ar-minute="{{ (n.auto_restart_policy.minute if n.auto_restart_policy else 8) }}"
+      data-node-ar-weekdays="{{ ((n.auto_restart_policy.weekdays if n.auto_restart_policy else [1,2,3,4,5,6,7])|join(','))|e }}"
+      data-node-ar-monthdays="{{ ((n.auto_restart_policy.monthdays if n.auto_restart_policy else [1])|join(','))|e }}">
       <div class="node-top">
         <div class="node-left" style="min-width:0;">
           <div class="node-name" title="{{ n.name or ("节点-" ~ n.id) }}">{{ n.name or ("节点-" ~ n.id) }}</div>
@@ -242,6 +249,60 @@
       <input class="input" id="editNodeWebsiteRoot" placeholder="/www">
       <div class="help">仅对网站机生效，用于文件管理根目录限制。</div>
 
+      <details class="advanced-details" style="margin-top:10px;" open>
+        <summary>
+          <div class="adv-summary-left">
+            <div class="adv-title">自动重启策略</div>
+            <div class="adv-hint">按节点独立设置（每日/每周/每月）</div>
+          </div>
+          <div class="adv-summary-right">
+            <span class="pill xs ghost">可选</span>
+          </div>
+        </summary>
+        <div class="adv-body">
+          <label class="help"><input type="checkbox" id="editNodeAutoRestartEnabled" style="transform:translateY(1px);"> 启用自动重启</label>
+
+          <div class="row" style="gap:12px; margin-top:8px;">
+            <div class="col" style="max-width:160px;">
+              <label class="label">周期</label>
+              <select class="select" id="editNodeAutoRestartSchedule" onchange="toggleAutoRestartEditor()">
+                <option value="daily">每天</option>
+                <option value="weekly">每周</option>
+                <option value="monthly">每月</option>
+              </select>
+            </div>
+            <div class="col" style="max-width:130px;">
+              <label class="label">间隔</label>
+              <input class="input" id="editNodeAutoRestartInterval" type="number" min="1" max="365" value="1" placeholder="1">
+              <div class="help">每 N 个周期</div>
+            </div>
+            <div class="col" style="max-width:160px;">
+              <label class="label">时间</label>
+              <input class="input" id="editNodeAutoRestartTime" type="time" value="04:08">
+            </div>
+          </div>
+
+          <div id="editNodeAutoRestartWeeklyBox" style="margin-top:8px; display:none;">
+            <label class="label">每周几执行</label>
+            <div class="row" style="gap:8px;flex-wrap:wrap;">
+              <label class="help"><input type="checkbox" data-ar-weekday="1"> 周一</label>
+              <label class="help"><input type="checkbox" data-ar-weekday="2"> 周二</label>
+              <label class="help"><input type="checkbox" data-ar-weekday="3"> 周三</label>
+              <label class="help"><input type="checkbox" data-ar-weekday="4"> 周四</label>
+              <label class="help"><input type="checkbox" data-ar-weekday="5"> 周五</label>
+              <label class="help"><input type="checkbox" data-ar-weekday="6"> 周六</label>
+              <label class="help"><input type="checkbox" data-ar-weekday="7"> 周日</label>
+            </div>
+          </div>
+
+          <div id="editNodeAutoRestartMonthlyBox" style="margin-top:8px; display:none;">
+            <label class="label">每月日期</label>
+            <input class="input" id="editNodeAutoRestartMonthdays" placeholder="例如：1,15,28">
+            <div class="help">支持多个日期（1-31，逗号分隔）</div>
+          </div>
+        </div>
+      </details>
+
       <div id="editNodeError" class="muted" style="margin-top:8px;color:var(--bad);"></div>
 
       <div class="row" style="gap:10px; justify-content:flex-end; margin-top:14px;">
@@ -351,7 +412,7 @@
     <div class="modal-head">
       <div class="title-wrap">
         <div class="h2">全量恢复</div>
-        <div class="muted sm">恢复节点、规则、网站配置与网站文件、证书、网络波动配置。</div>
+        <div class="muted sm">恢复节点、规则、网站配置与网站文件（含目录）、证书、网络波动，以及用户权限与面板状态数据。</div>
       </div>
       <button class="btn xs ghost" type="button" onclick="closeRestoreFullModal()">关闭</button>
     </div>
@@ -398,5 +459,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js?v=90.0"></script>
+<script src="/static/app.js?v=100.0"></script>
 {% endblock %}

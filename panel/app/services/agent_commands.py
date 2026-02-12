@@ -37,6 +37,11 @@ def single_rule_ops(base_pool: Dict[str, Any], desired_pool: Dict[str, Any]) -> 
 
     If there are 0 changes -> returns []
     If changes > 1 -> returns None
+
+    Notes:
+      - This fast-path is keyed by endpoint.listen for protocol compatibility.
+      - If either pool contains duplicate listen keys, fallback to full sync (None),
+        otherwise collisions can make incremental diff unsafe.
     """
 
     def key_of(ep: Any) -> str:
@@ -44,9 +49,25 @@ def single_rule_ops(base_pool: Dict[str, Any], desired_pool: Dict[str, Any]) -> 
             return ""
         return str(ep.get("listen") or "").strip()
 
+    def has_duplicate_listen(eps: List[Any]) -> bool:
+        seen: set[str] = set()
+        for e in eps:
+            k = key_of(e)
+            if not k:
+                continue
+            if k in seen:
+                return True
+            seen.add(k)
+        return False
+
     base_eps = base_pool.get("endpoints") if isinstance(base_pool, dict) else None
     desired_eps = desired_pool.get("endpoints") if isinstance(desired_pool, dict) else None
     if not isinstance(base_eps, list) or not isinstance(desired_eps, list):
+        return None
+
+    # Duplicate listen keys (e.g. intranet client placeholders 0.0.0.0:0) are
+    # not patch-safe under listen-keyed diff. Force full sync_pool in this case.
+    if has_duplicate_listen(base_eps) or has_duplicate_listen(desired_eps):
         return None
 
     base_map = {key_of(e): e for e in base_eps if key_of(e)}

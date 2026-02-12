@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/realm-panel/panel.env
-WorkingDirectory=/opt/realm-panel
-ExecStart=/opt/realm-panel/start.sh
+EnvironmentFile=-/etc/realm-panel/panel.env
+WorkingDirectory=/opt/realm-panel/panel
+ExecStart=/bin/bash -lc 'set -e; if [[ -x /opt/realm-panel/panel/start.sh ]]; then exec /opt/realm-panel/panel/start.sh; fi; if [[ -x /opt/realm-panel/start.sh ]]; then exec /opt/realm-panel/start.sh; fi; echo "panel start script missing under /opt/realm-panel" >&2; exit 1'
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576

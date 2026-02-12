@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div class="page-title">
+    <h1 class="h1">系统日志</h1>
+    <div class="meta">
+      <span class="meta-item">查看面板运行日志与崩溃堆栈，定位异常触发位置。</span>
+    </div>
+  </div>
+  <div class="right">
+    <button class="btn sm ghost" type="button" id="logRefreshBtn">刷新</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row" style="gap:10px; align-items:end; flex-wrap:wrap;">
+    <div class="col" style="min-width:220px;">
+      <label class="label">日志源</label>
+      <select class="select" id="logSource">
+        {% for s in (log_sources or []) %}
+        <option value="{{ s.key }}" {% if s.key == default_source %}selected{% endif %}>{{ s.title }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col" style="max-width:180px;">
+      <label class="label">行数</label>
+      <input class="input" id="logLines" type="number" min="20" max="2000" value="{{ default_lines or 300 }}">
+    </div>
+    <div class="col" style="max-width:220px;">
+      <label class="label">自动刷新（秒）</label>
+      <select class="select" id="logAutoRefresh">
+        <option value="0">关闭</option>
+        <option value="2">2</option>
+        <option value="5" selected>5</option>
+        <option value="10">10</option>
+        <option value="30">30</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="muted sm" id="logMeta" style="margin-top:10px;"></div>
+  <pre id="logText" class="mono" style="margin-top:10px; min-height:380px; max-height:70vh; overflow:auto; border:1px solid var(--border); border-radius:10px; padding:12px; background:rgba(10,14,20,.55);"></pre>
+</div>
+
+<script>
+(function(){
+  var btn = document.getElementById('logRefreshBtn');
+  var src = document.getElementById('logSource');
+  var lines = document.getElementById('logLines');
+  var auto = document.getElementById('logAutoRefresh');
+  var meta = document.getElementById('logMeta');
+  var box = document.getElementById('logText');
+  var timer = null;
+
+  function fmtTime(ts){
+    var n = Number(ts || 0);
+    if(!n) return '-';
+    try{
+      return new Date(n * 1000).toLocaleString();
+    }catch(_e){
+      return '-';
+    }
+  }
+
+  async function loadLogs(){
+    var source = (src && src.value) ? src.value : 'panel';
+    var lineN = parseInt((lines && lines.value) || '300', 10);
+    if(!Number.isFinite(lineN) || lineN < 20) lineN = 20;
+    if(lineN > 2000) lineN = 2000;
+    if(lines) lines.value = String(lineN);
+
+    if(btn){ btn.disabled = true; btn.textContent = '加载中...'; }
+    try{
+      var url = '/api/logs/tail?source=' + encodeURIComponent(source) + '&lines=' + encodeURIComponent(String(lineN));
+      var r = await fetch(url, { cache: 'no-store', credentials: 'same-origin' });
+      var j = await r.json();
+      if(!r.ok || !j || j.ok !== true){
+        throw new Error((j && (j.error || j.detail)) || ('HTTP ' + r.status));
+      }
+      if(box){
+        box.textContent = j.text || '';
+        box.scrollTop = box.scrollHeight;
+      }
+      if(meta){
+        var warn = [];
+        if(j.truncated) warn.push('内容已截断');
+        if(j.read_error) warn.push('读取异常: ' + j.read_error);
+        var info = [
+          '文件: ' + (j.path || '-'),
+          '大小: ' + (j.size_bytes || 0) + ' bytes',
+          '更新时间: ' + fmtTime(j.mtime)
+        ];
+        if(warn.length) info.push('提示: ' + warn.join('；'));
+        meta.textContent = info.join(' | ');
+      }
+    }catch(err){
+      if(meta) meta.textContent = '加载失败: ' + (err && err.message ? err.message : String(err));
+    }finally{
+      if(btn){ btn.disabled = false; btn.textContent = '刷新'; }
+    }
+  }
+
+  function resetTimer(){
+    if(timer){ clearInterval(timer); timer = null; }
+    var sec = parseInt((auto && auto.value) || '0', 10);
+    if(Number.isFinite(sec) && sec > 0){
+      timer = setInterval(loadLogs, sec * 1000);
+    }
+  }
+
+  if(btn) btn.addEventListener('click', loadLogs);
+  if(src) src.addEventListener('change', loadLogs);
+  if(lines) lines.addEventListener('change', loadLogs);
+  if(auto) auto.addEventListener('change', resetTimer);
+
+  resetTimer();
+  loadLogs();
+})();
+</script>
+{% endblock %}
+

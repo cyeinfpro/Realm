@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from .clients.agent import close_agent_clients
+from .core.logging_setup import configure_runtime_logging, install_asyncio_exception_logging
 from .core.paths import STATIC_DIR
 from .core.session import SECRET_KEY, SESSION_COOKIE_NAME
 from .core.settings import APP_TITLE, APP_VERSION
 from .db import ensure_db
+from .utils.redact import redact_log_text
 from .routers import (
     api_agents,
     api_groups,
@@ -17,6 +21,7 @@ from .routers import (
     api_nodes,
     api_sync,
     auth,
+    logs,
     pages,
     scripts,
     websites,
@@ -24,9 +29,16 @@ from .routers import (
 from .services.netmon import start_background as start_netmon_background
 from .services.site_monitor import start_background as start_site_monitor_background
 
+configure_runtime_logging()
+logger = logging.getLogger(__name__)
+crash_logger = logging.getLogger("realm.panel.crash")
 
 # Ensure DB exists before serving.
-ensure_db()
+try:
+    ensure_db()
+except Exception:
+    logger.exception("database init failed")
+    raise
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
@@ -46,7 +58,15 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 @app.middleware("http")
 async def _static_app_js_no_cache(request: Request, call_next):
     """Prevent stale app.js / html from browser/proxy cache after hotfix releases."""
-    resp = await call_next(request)
+    try:
+        resp = await call_next(request)
+    except Exception:
+        crash_logger.exception(
+            "unhandled request exception method=%s path=%s",
+            request.method,
+            redact_log_text(str(request.url.path or "")),
+        )
+        raise
     path = str(request.url.path or "")
     ct = str(resp.headers.get("content-type") or "").lower()
     if path == "/static/app.js" or "text/html" in ct:
@@ -66,21 +86,25 @@ app.include_router(api_groups.router)
 app.include_router(api_sync.router)
 app.include_router(api_netmon.router)
 app.include_router(websites.router)
+app.include_router(logs.router)
 
 
 @app.on_event("startup")
 async def _startup() -> None:
+    try:
+        install_asyncio_exception_logging()
+    except Exception:
+        logger.exception("failed to install asyncio exception handler")
     # Background NetMon collector (configurable via env).
     try:
         await start_netmon_background(app)
     except Exception:
-        # Never fail panel startup due to bg worker.
-        pass
+        logger.exception("netmon background startup failed")
     # Background site monitor
     try:
         await start_site_monitor_background(app)
     except Exception:
-        pass
+        logger.exception("site monitor background startup failed")
 
 
 @app.on_event("shutdown")
@@ -88,4 +112,4 @@ async def _shutdown() -> None:
     try:
         await close_agent_clients()
     except Exception:
-        pass
+        logger.exception("failed to close shared agent clients")

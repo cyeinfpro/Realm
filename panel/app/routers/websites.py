@@ -30,6 +30,7 @@ from ..db import (
     add_site_event,
     add_task,
     create_site_file_share_short_link,
+    delete_site_file_favorite,
     delete_site_file_share_short_links,
     delete_certificates_by_node,
     delete_certificates_by_site,
@@ -42,6 +43,7 @@ from ..db import (
     list_certificates,
     list_site_checks,
     list_site_events,
+    list_site_file_favorites,
     list_site_file_share_short_links,
     list_tasks,
     list_nodes,
@@ -49,6 +51,7 @@ from ..db import (
     get_site_file_share_short_link,
     is_site_file_share_token_revoked,
     revoke_site_file_share_token,
+    upsert_site_file_favorite,
     update_node_basic,
     update_certificate,
     update_site,
@@ -57,6 +60,65 @@ from ..db import (
 )
 from ..services.apply import node_verify_tls
 from ..services.assets import panel_public_base_url
+try:
+    from ..services.panel_config import setting_bool, setting_float, setting_int
+except Exception:
+    _TRUE_SET = {"1", "true", "yes", "on", "y"}
+    _FALSE_SET = {"0", "false", "no", "off", "n"}
+
+    def _cfg_env(names: Optional[list[str]]) -> str:
+        for n in (names or []):
+            name = str(n or "").strip()
+            if not name:
+                continue
+            v = str(os.getenv(name) or "").strip()
+            if v:
+                return v
+        return ""
+
+    def setting_bool(key: str, default: bool = False, env_names: Optional[list[str]] = None) -> bool:
+        s = _cfg_env(env_names).lower()
+        if s in _TRUE_SET:
+            return True
+        if s in _FALSE_SET:
+            return False
+        return bool(default)
+
+    def setting_int(
+        key: str,
+        default: int,
+        lo: int,
+        hi: int,
+        env_names: Optional[list[str]] = None,
+    ) -> int:
+        raw = _cfg_env(env_names)
+        try:
+            v = int(float(raw if raw else default))
+        except Exception:
+            v = int(default)
+        if v < int(lo):
+            v = int(lo)
+        if v > int(hi):
+            v = int(hi)
+        return int(v)
+
+    def setting_float(
+        key: str,
+        default: float,
+        lo: float,
+        hi: float,
+        env_names: Optional[list[str]] = None,
+    ) -> float:
+        raw = _cfg_env(env_names)
+        try:
+            v = float(raw if raw else default)
+        except Exception:
+            v = float(default)
+        if v < float(lo):
+            v = float(lo)
+        if v > float(hi):
+            v = float(hi)
+        return float(v)
 
 router = APIRouter()
 UPLOAD_CHUNK_SIZE = 1024 * 512
@@ -142,6 +204,16 @@ _SITE_BG_TASKS: set[asyncio.Task[Any]] = set()
 _SITE_BG_TASKS_LOCK = threading.Lock()
 
 
+def _ssl_direct_strategy() -> Dict[str, Any]:
+    """Runtime strategy for SSL issue/renew direct execution and queue fallback."""
+    return {
+        "direct_first": bool(setting_bool("ssl_direct_first", default=True)),
+        "direct_timeout_sec": float(setting_float("ssl_direct_timeout_sec", default=240.0, lo=30.0, hi=1200.0)),
+        "direct_max_attempts": int(setting_int("ssl_direct_max_attempts", default=1, lo=1, hi=30)),
+        "fallback_to_queue": bool(setting_bool("ssl_fallback_to_queue", default=True)),
+    }
+
+
 class _WebsiteTaskFatalError(RuntimeError):
     """Unrecoverable website background task error (do not retry)."""
 
@@ -202,19 +274,45 @@ def _to_flag(value: Any) -> bool:
     return s in ("1", "true", "yes", "on", "y")
 
 
+def _append_modal_query(url: str, enabled: bool) -> str:
+    if not enabled:
+        return str(url or "")
+    base = str(url or "")
+    return f"{base}&modal=1" if "?" in base else f"{base}?modal=1"
+
+
+def _site_node_id(site: Any) -> int:
+    try:
+        return int((site or {}).get("node_id") or 0)
+    except Exception:
+        return 0
+
+
+def _can_access_site(user: str, site: Any) -> bool:
+    nid = _site_node_id(site)
+    if nid <= 0:
+        return False
+    try:
+        return bool(can_access_node(str(user or ""), int(nid)))
+    except Exception:
+        return False
+
+
 async def _run_site_task_with_retry(
     task_id: int,
     op_name: str,
     runner: Callable[[], Awaitable[Any]],
+    max_attempts: Optional[int] = None,
 ) -> Tuple[Any, int]:
     last_exc: Optional[Exception] = None
-    for attempt in range(1, _SITE_OP_MAX_ATTEMPTS + 1):
+    total_attempts = max(1, min(30, int(max_attempts or _SITE_OP_MAX_ATTEMPTS)))
+    for attempt in range(1, total_attempts + 1):
         update_task(
             int(task_id),
             status="running",
-            progress=_site_task_progress_for_attempt(attempt, _SITE_OP_MAX_ATTEMPTS),
+            progress=_site_task_progress_for_attempt(attempt, total_attempts),
             error="",
-            result={"op": str(op_name or ""), "attempt": int(attempt), "max_attempts": int(_SITE_OP_MAX_ATTEMPTS)},
+            result={"op": str(op_name or ""), "attempt": int(attempt), "max_attempts": int(total_attempts)},
         )
         try:
             async with _site_op_semaphore():
@@ -225,18 +323,18 @@ async def _run_site_task_with_retry(
             break
         except Exception as exc:
             last_exc = exc
-            if attempt >= _SITE_OP_MAX_ATTEMPTS:
+            if attempt >= total_attempts:
                 break
             wait_s = _site_task_backoff_sec(attempt)
             update_task(
                 int(task_id),
                 status="queued",
-                progress=_site_task_progress_for_attempt(attempt, _SITE_OP_MAX_ATTEMPTS),
+                progress=_site_task_progress_for_attempt(attempt, total_attempts),
                 error=str(exc),
                 result={
                     "op": str(op_name or ""),
                     "attempt": int(attempt),
-                    "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+                    "max_attempts": int(total_attempts),
                     "retry_in_sec": float(wait_s),
                 },
             )
@@ -882,6 +980,10 @@ def _parse_domains(raw: str) -> List[str]:
     return cleaned
 
 
+def _norm_domain(d: Any) -> str:
+    return str(d or "").strip().lower().strip(".")
+
+
 def _normalize_proxy_target(target: str) -> str:
     t = (target or "").strip()
     if not t:
@@ -912,6 +1014,22 @@ def _is_agent_unreachable_error(err: Any) -> bool:
         "ssl:",
     )
     return any(t in msg for t in tokens)
+
+
+def _is_ssl_renew_skip_error(err: Any) -> bool:
+    msg = str(err or "").strip().lower()
+    if not msg:
+        return False
+    signs = (
+        "domains not changed",
+        "next renewal time is",
+        "force renewal",
+        "--force",
+        "not yet time to renew",
+        "skip, next renewal time is",
+        "skipping. next renewal time is",
+    )
+    return any(s in msg for s in signs)
 
 
 def _format_bytes(num: int) -> str:
@@ -1067,6 +1185,61 @@ def _ensure_certificate_pending(site_id: int, node_id: int, domains: List[str]) 
     )
 
 
+def _enqueue_website_ssl_task(
+    site_id: int,
+    node_id: int,
+    cert_id: int,
+    domains: List[str],
+    actor: str,
+    action: str,
+    fallback_reason: str = "",
+) -> int:
+    act = str(action or "").strip().lower()
+    if act not in ("issue", "renew"):
+        raise ValueError("invalid ssl task action")
+    task_type = f"website_ssl_{act}"
+    reason = str(fallback_reason or "").strip()
+    payload: Dict[str, Any] = {
+        "site_id": int(site_id),
+        "cert_id": int(cert_id),
+        "domains": list(domains or []),
+        "actor": str(actor or ""),
+        "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+    }
+    if reason:
+        payload["fallback_reason"] = reason
+    result: Dict[str, Any] = {
+        "queued": True,
+        "op": task_type,
+        "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+        "attempt": 0,
+    }
+    if reason:
+        result["fallback_reason"] = reason
+    task_id = add_task(
+        node_id=int(node_id),
+        task_type=task_type,
+        payload=payload,
+        status="queued",
+        progress=0,
+        result=result,
+    )
+    event_payload: Dict[str, Any] = {
+        "domains": list(domains or []),
+        "task_id": int(task_id),
+    }
+    if reason:
+        event_payload["fallback_reason"] = reason
+    add_site_event(
+        int(site_id),
+        f"ssl_{act}",
+        status="queued",
+        actor=str(actor or ""),
+        payload=event_payload,
+    )
+    return int(task_id)
+
+
 async def _bg_website_env_ensure(task_id: int, node_id: int, include_php: bool) -> None:
     try:
         async def _runner() -> Dict[str, Any]:
@@ -1153,7 +1326,16 @@ async def _bg_website_env_uninstall(task_id: int, node_id: int, purge_data: bool
         )
 
 
-async def _bg_website_ssl_task(task_id: int, site_id: int, cert_id: int, actor: str, action: str) -> None:
+async def _bg_website_ssl_task(
+    task_id: int,
+    site_id: int,
+    cert_id: int,
+    actor: str,
+    action: str,
+    direct_timeout_sec: float = 240.0,
+    direct_max_attempts: int = 1,
+    fallback_to_push: bool = False,
+) -> None:
     act = str(action or "").strip().lower()
     if act not in ("issue", "renew"):
         update_task(
@@ -1208,11 +1390,15 @@ async def _bg_website_ssl_task(task_id: int, site_id: int, cert_id: int, actor: 
                 path,
                 req_payload,
                 node_verify_tls(node),
-                timeout=240,
+                timeout=float(max(30.0, min(1200.0, float(direct_timeout_sec or 240.0)))),
             )
             if not data.get("ok", True):
                 err = str(data.get("error") or ("证书申请失败" if act == "issue" else "证书续期失败"))
-                if "未安装" in err and "acme.sh" in err:
+                if act == "renew" and _is_ssl_renew_skip_error(err):
+                    # acme.sh may return a non-zero code when renewal is skipped (not due yet).
+                    # This is a successful no-op for panel state.
+                    data = {"ok": True, "renew_skipped": True, "message": "证书未到续期时间，已保持当前证书"}
+                elif "未安装" in err and "acme.sh" in err:
                     env_payload = {
                         "need_nginx": True,
                         "need_php": bool((site.get("type") or "") == "php"),
@@ -1235,7 +1421,7 @@ async def _bg_website_ssl_task(task_id: int, site_id: int, cert_id: int, actor: 
                         path,
                         req_payload,
                         node_verify_tls(node),
-                        timeout=240,
+                        timeout=float(max(30.0, min(1200.0, float(direct_timeout_sec or 240.0)))),
                     )
                     if not data.get("ok", True):
                         raise AgentError(str(data.get("error") or err))
@@ -1243,7 +1429,8 @@ async def _bg_website_ssl_task(task_id: int, site_id: int, cert_id: int, actor: 
                     raise AgentError(err)
             return {"site": site, "domains": domains, "data": data}
 
-        ret, attempts = await _run_site_task_with_retry(int(task_id), task_op, _runner)
+        direct_attempts = max(1, min(30, int(direct_max_attempts or 1)))
+        ret, attempts = await _run_site_task_with_retry(int(task_id), task_op, _runner, max_attempts=direct_attempts)
         site = ret.get("site") if isinstance(ret, dict) else {}
         domains = (ret.get("domains") if isinstance(ret, dict) else []) or []
         data = (ret.get("data") if isinstance(ret, dict) else {}) or {}
@@ -1277,6 +1464,52 @@ async def _bg_website_ssl_task(task_id: int, site_id: int, cert_id: int, actor: 
         add_site_event(int(site_id), event_action, status="success", actor=str(actor or ""), result=data)
     except Exception as exc:
         err_text = str(exc)
+        if bool(fallback_to_push):
+            site = get_site(int(site_id))
+            node_id = int((site or {}).get("node_id") or 0) if isinstance(site, dict) else 0
+            domains = list((site or {}).get("domains") or []) if isinstance(site, dict) else []
+            fallback_task_id = 0
+            fallback_err = f"直连执行失败，已回退到节点上报队列：{err_text}"
+            if int(cert_id) > 0:
+                update_certificate(int(cert_id), status="pending", last_error=fallback_err)
+            elif node_id > 0 and domains:
+                add_certificate(
+                    node_id=node_id,
+                    site_id=int(site_id),
+                    domains=list(domains),
+                    status="pending",
+                    last_error=fallback_err,
+                )
+            if node_id > 0 and domains:
+                try:
+                    fallback_task_id = _enqueue_website_ssl_task(
+                        site_id=int(site_id),
+                        node_id=int(node_id),
+                        cert_id=int(cert_id),
+                        domains=list(domains),
+                        actor=str(actor or ""),
+                        action=str(act),
+                        fallback_reason=str(err_text),
+                    )
+                except Exception:
+                    fallback_task_id = 0
+            fallback_msg = fallback_err
+            if fallback_task_id > 0:
+                fallback_msg = f"{fallback_err}（任务 #{fallback_task_id}）"
+            update_task(
+                int(task_id),
+                status="failed",
+                progress=100,
+                error=fallback_msg,
+                result={
+                    "op": task_op,
+                    "mode": "direct",
+                    "fallback_queued": bool(fallback_task_id > 0),
+                    "fallback_task_id": int(fallback_task_id),
+                },
+            )
+            add_site_event(int(site_id), event_action, status="failed", actor=str(actor or ""), error=fallback_msg)
+            return
         if int(cert_id) > 0:
             update_certificate(int(cert_id), status="failed", last_error=err_text)
         else:
@@ -1507,6 +1740,47 @@ async def websites_index(request: Request, user: str = Depends(require_login_pag
         s["domains_text"] = ", ".join(s.get("domains") or [])
         visible_sites.append(s)
 
+    visible_site_map: Dict[int, Dict[str, Any]] = {}
+    for s in visible_sites:
+        try:
+            sid = int(s.get("id") or 0)
+        except Exception:
+            sid = 0
+        if sid > 0:
+            visible_site_map[sid] = s
+
+    favorite_cards: List[Dict[str, Any]] = []
+    try:
+        fav_rows = list_site_file_favorites(str(user or ""), limit=500)
+    except Exception:
+        fav_rows = []
+    for row in fav_rows:
+        try:
+            sid = int(row.get("site_id") or 0)
+        except Exception:
+            sid = 0
+        if sid <= 0:
+            continue
+        site = visible_site_map.get(sid)
+        if not site:
+            continue
+        rel = str(row.get("path") or "").replace("\\", "/").strip().lstrip("/")
+        if not rel:
+            continue
+        leaf = rel.split("/")[-1] if "/" in rel else rel
+        domains = site.get("domains") if isinstance(site.get("domains"), list) else []
+        favorite_cards.append(
+            {
+                "site_id": sid,
+                "site_name": str(site.get("name") or f"站点#{sid}"),
+                "site_domain": str(domains[0]) if domains else "",
+                "path": rel,
+                "name": leaf or rel,
+                "is_dir": bool(row.get("is_dir")),
+                "updated_at": str(row.get("updated_at") or row.get("created_at") or ""),
+            }
+        )
+
     return templates.TemplateResponse(
         "websites.html",
         {
@@ -1517,6 +1791,7 @@ async def websites_index(request: Request, user: str = Depends(require_login_pag
             "nodes": nodes,
             "sites": visible_sites,
             "open_create": open_create,
+            "file_favorites": favorite_cards,
         },
     )
 
@@ -1568,14 +1843,14 @@ async def websites_new_action(
     for s in existing:
         if str(s.get("status") or "").strip().lower() == "error":
             continue
-        s_domains = set([str(x).lower() for x in (s.get("domains") or [])])
+        s_domains = {_norm_domain(x) for x in (s.get("domains") or []) if _norm_domain(x)}
         if s_domains.intersection(set(domains_list)):
             set_flash(request, "该节点已有重复域名的站点")
             return RedirectResponse(url="/websites?create=1", status_code=303)
 
     root_base = str(node.get("website_root_base") or "").strip() or "/www"
     root_path = (root_path or "").strip()
-    if not root_path and site_type != "reverse_proxy":
+    if not root_path:
         root_path = f"{root_base.rstrip('/')}/wwwroot/{domains_list[0]}"
     proxy_target = _normalize_proxy_target(proxy_target or "")
     if site_type == "reverse_proxy" and not proxy_target.strip():
@@ -1814,22 +2089,7 @@ async def website_edit_post(
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
     # -------- Parse & validate --------
-    raw = (domains or "").strip()
-    parts = []
-    for token in raw.replace("\n", ",").replace("\t", ",").split(","):
-        t = (token or "").strip()
-        if not t:
-            continue
-        parts.append(t)
-    # de-dup, keep order
-    seen = set()
-    domains_list: List[str] = []
-    for d in parts:
-        dl = d.strip()
-        if not dl or dl in seen:
-            continue
-        seen.add(dl)
-        domains_list.append(dl)
+    domains_list = _parse_domains(domains or "")
 
     if not domains_list:
         set_flash(request, "域名不能为空")
@@ -1854,6 +2114,9 @@ async def website_edit_post(
         if not proxy_target:
             set_flash(request, "反向代理站点必须填写代理目标")
             return RedirectResponse(url=f"/websites/{site_id}/edit", status_code=303)
+        if not root_path:
+            rb = _node_root_base(node)
+            root_path = os.path.join(rb, "wwwroot", domains_list[0])
 
     # Domain collision on the same node (exclude self)
     try:
@@ -1865,7 +2128,9 @@ async def website_edit_post(
             if s.get("status") == "error":
                 continue
             for d in (s.get("domains") or []):
-                other_domains.add(str(d).strip())
+                nd = _norm_domain(d)
+                if nd:
+                    other_domains.add(nd)
         dup = [d for d in domains_list if d in other_domains]
         if dup:
             set_flash(request, f"域名冲突：{', '.join(dup)}")
@@ -1876,8 +2141,8 @@ async def website_edit_post(
 
     # -------- Apply on node --------
     old_domains = site.get("domains") or []
-    old_primary = str(old_domains[0]) if old_domains else ""
-    new_primary = str(domains_list[0])
+    old_primary = _norm_domain(old_domains[0]) if old_domains else ""
+    new_primary = _norm_domain(domains_list[0])
 
     task_id = add_task(
         node_id=int(site.get("node_id") or 0),
@@ -1989,7 +2254,7 @@ async def website_edit_post(
             int(site_id),
             name=(name or site.get("name") or domains_list[0]).strip(),
             domains=domains_list,
-            type=site_type,
+            site_type=site_type,
             root_path=root_path if site_type != "reverse_proxy" else (root_path or ""),
             proxy_target=proxy_target,
             https_redirect=1 if https_flag else 0,
@@ -2011,7 +2276,9 @@ async def website_edit_post(
 
         # If domains changed, mark cert record as pending to nudge re-issue
         try:
-            if set(map(str, old_domains)) != set(map(str, domains_list)):
+            old_set = {_norm_domain(x) for x in old_domains if _norm_domain(x)}
+            new_set = {_norm_domain(x) for x in domains_list if _norm_domain(x)}
+            if old_set != new_set:
                 certs = list_certificates(site_id=int(site_id))
                 if certs:
                     update_certificate(
@@ -2141,28 +2408,91 @@ async def website_ssl_issue(request: Request, site_id: int, user: str = Depends(
         set_flash(request, "站点域名为空")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
     cert_id = _ensure_certificate_pending(int(site_id), int(site.get("node_id") or 0), domains)
+    strategy = _ssl_direct_strategy()
+    if not bool(strategy.get("direct_first")):
+        queued_task_id = _enqueue_website_ssl_task(
+            site_id=int(site_id),
+            node_id=int(site.get("node_id") or 0),
+            cert_id=int(cert_id),
+            domains=list(domains or []),
+            actor=str(user or ""),
+            action="issue",
+            fallback_reason="direct_disabled_by_panel_setting",
+        )
+        set_flash(request, f"已按设置直接进入队列模式，任务 #{queued_task_id}（节点上报后自动执行）。")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    direct_timeout_sec = float(strategy.get("direct_timeout_sec") or 240.0)
+    direct_max_attempts = int(strategy.get("direct_max_attempts") or 1)
+    fallback_to_queue = bool(strategy.get("fallback_to_queue"))
     task_id = add_task(
         node_id=int(site.get("node_id") or 0),
-        task_type="website_ssl_issue",
+        task_type="website_ssl_issue_direct",
         payload={
             "site_id": int(site_id),
             "cert_id": int(cert_id),
             "domains": domains,
             "actor": str(user or ""),
-            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+            "max_attempts": int(direct_max_attempts),
+            "direct_first": True,
+            "direct_timeout_sec": float(direct_timeout_sec),
+            "fallback_to_queue": bool(fallback_to_queue),
         },
-        status="queued",
-        progress=0,
-        result={"queued": True, "op": "website_ssl_issue", "max_attempts": int(_SITE_OP_MAX_ATTEMPTS), "attempt": 0},
+        status="running",
+        progress=5,
+        result={
+            "op": "website_ssl_issue",
+            "mode": "direct",
+            "attempt": 0,
+            "max_attempts": int(direct_max_attempts),
+            "direct_timeout_sec": float(direct_timeout_sec),
+        },
     )
-    add_site_event(
-        int(site_id),
-        "ssl_issue",
-        status="queued",
-        actor=str(user or ""),
-        payload={"domains": domains, "task_id": int(task_id)},
+    launched = _launch_site_bg_job(
+        _bg_website_ssl_task(
+            int(task_id),
+            int(site_id),
+            int(cert_id),
+            str(user or ""),
+            "issue",
+            direct_timeout_sec=float(direct_timeout_sec),
+            direct_max_attempts=int(direct_max_attempts),
+            fallback_to_push=bool(fallback_to_queue),
+        )
     )
-    set_flash(request, f"已创建 SSL 申请任务 #{task_id}，等待节点上报后自动执行（支持内网节点）。")
+    if launched:
+        if fallback_to_queue:
+            set_flash(request, f"已创建 SSL 申请任务 #{task_id}，优先直连节点执行；失败将自动回退到节点上报队列。")
+        else:
+            set_flash(request, f"已创建 SSL 申请任务 #{task_id}，仅执行直连模式（失败不回退队列）。")
+    else:
+        update_task(
+            int(task_id),
+            status="failed",
+            progress=100,
+            error=("后台调度失败，已改为排队等待节点上报" if fallback_to_queue else "后台调度失败"),
+            result={"op": "website_ssl_issue", "mode": "direct", "fallback_queued": bool(fallback_to_queue)},
+        )
+        add_site_event(
+            int(site_id),
+            "ssl_issue",
+            status="failed",
+            actor=str(user or ""),
+            error=("后台调度失败，已改为排队等待节点上报" if fallback_to_queue else "后台调度失败"),
+        )
+        if fallback_to_queue:
+            queued_task_id = _enqueue_website_ssl_task(
+                site_id=int(site_id),
+                node_id=int(site.get("node_id") or 0),
+                cert_id=int(cert_id),
+                domains=list(domains or []),
+                actor=str(user or ""),
+                action="issue",
+                fallback_reason="direct_scheduler_unavailable",
+            )
+            set_flash(request, f"直连执行器不可用，已创建队列任务 #{queued_task_id}，等待节点上报后自动执行。")
+        else:
+            set_flash(request, "直连执行器不可用，且当前设置未开启队列回退。")
     return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
 
@@ -2182,28 +2512,91 @@ async def website_ssl_renew(request: Request, site_id: int, user: str = Depends(
         set_flash(request, "站点域名为空")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
     cert_id = _ensure_certificate_pending(int(site_id), int(site.get("node_id") or 0), domains)
+    strategy = _ssl_direct_strategy()
+    if not bool(strategy.get("direct_first")):
+        queued_task_id = _enqueue_website_ssl_task(
+            site_id=int(site_id),
+            node_id=int(site.get("node_id") or 0),
+            cert_id=int(cert_id),
+            domains=list(domains or []),
+            actor=str(user or ""),
+            action="renew",
+            fallback_reason="direct_disabled_by_panel_setting",
+        )
+        set_flash(request, f"已按设置直接进入队列模式，任务 #{queued_task_id}（节点上报后自动执行）。")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
+
+    direct_timeout_sec = float(strategy.get("direct_timeout_sec") or 240.0)
+    direct_max_attempts = int(strategy.get("direct_max_attempts") or 1)
+    fallback_to_queue = bool(strategy.get("fallback_to_queue"))
     task_id = add_task(
         node_id=int(site.get("node_id") or 0),
-        task_type="website_ssl_renew",
+        task_type="website_ssl_renew_direct",
         payload={
             "site_id": int(site_id),
             "cert_id": int(cert_id),
             "domains": domains,
             "actor": str(user or ""),
-            "max_attempts": int(_SITE_OP_MAX_ATTEMPTS),
+            "max_attempts": int(direct_max_attempts),
+            "direct_first": True,
+            "direct_timeout_sec": float(direct_timeout_sec),
+            "fallback_to_queue": bool(fallback_to_queue),
         },
-        status="queued",
-        progress=0,
-        result={"queued": True, "op": "website_ssl_renew", "max_attempts": int(_SITE_OP_MAX_ATTEMPTS), "attempt": 0},
+        status="running",
+        progress=5,
+        result={
+            "op": "website_ssl_renew",
+            "mode": "direct",
+            "attempt": 0,
+            "max_attempts": int(direct_max_attempts),
+            "direct_timeout_sec": float(direct_timeout_sec),
+        },
     )
-    add_site_event(
-        int(site_id),
-        "ssl_renew",
-        status="queued",
-        actor=str(user or ""),
-        payload={"domains": domains, "task_id": int(task_id)},
+    launched = _launch_site_bg_job(
+        _bg_website_ssl_task(
+            int(task_id),
+            int(site_id),
+            int(cert_id),
+            str(user or ""),
+            "renew",
+            direct_timeout_sec=float(direct_timeout_sec),
+            direct_max_attempts=int(direct_max_attempts),
+            fallback_to_push=bool(fallback_to_queue),
+        )
     )
-    set_flash(request, f"已创建 SSL 续期任务 #{task_id}，等待节点上报后自动执行（支持内网节点）。")
+    if launched:
+        if fallback_to_queue:
+            set_flash(request, f"已创建 SSL 续期任务 #{task_id}，优先直连节点执行；失败将自动回退到节点上报队列。")
+        else:
+            set_flash(request, f"已创建 SSL 续期任务 #{task_id}，仅执行直连模式（失败不回退队列）。")
+    else:
+        update_task(
+            int(task_id),
+            status="failed",
+            progress=100,
+            error=("后台调度失败，已改为排队等待节点上报" if fallback_to_queue else "后台调度失败"),
+            result={"op": "website_ssl_renew", "mode": "direct", "fallback_queued": bool(fallback_to_queue)},
+        )
+        add_site_event(
+            int(site_id),
+            "ssl_renew",
+            status="failed",
+            actor=str(user or ""),
+            error=("后台调度失败，已改为排队等待节点上报" if fallback_to_queue else "后台调度失败"),
+        )
+        if fallback_to_queue:
+            queued_task_id = _enqueue_website_ssl_task(
+                site_id=int(site_id),
+                node_id=int(site.get("node_id") or 0),
+                cert_id=int(cert_id),
+                domains=list(domains or []),
+                actor=str(user or ""),
+                action="renew",
+                fallback_reason="direct_scheduler_unavailable",
+            )
+            set_flash(request, f"直连执行器不可用，已创建队列任务 #{queued_task_id}，等待节点上报后自动执行。")
+        else:
+            set_flash(request, "直连执行器不可用，且当前设置未开启队列回退。")
     return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
 
@@ -2421,12 +2814,21 @@ async def website_env_ensure(
 
 
 @router.get("/websites/{site_id}/files", response_class=HTMLResponse)
-async def website_files(request: Request, site_id: int, path: str = "", user: str = Depends(require_login_page)):
+async def website_files(
+    request: Request,
+    site_id: int,
+    path: str = "",
+    modal: str = "",
+    user: str = Depends(require_login_page),
+):
     site = get_site(int(site_id))
     if not site:
         set_flash(request, "站点不存在")
         return RedirectResponse(url="/websites", status_code=303)
-    node = get_node(int(site.get("node_id") or 0))
+    if not _can_access_site(user, site):
+        set_flash(request, "无权访问该站点")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(_site_node_id(site))
     if not node:
         set_flash(request, "节点不存在")
         return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
@@ -2453,8 +2855,27 @@ async def website_files(request: Request, site_id: int, path: str = "", user: st
     except Exception as exc:
         err_msg = str(exc)
 
+    favorite_paths: set[str] = set()
+    try:
+        fav_rows = list_site_file_favorites(str(user or ""), site_id=int(site_id), limit=2000)
+    except Exception:
+        fav_rows = []
+    for row in fav_rows:
+        try:
+            p = _normalize_rel_path(row.get("path") or "")
+        except Exception:
+            p = ""
+        if p:
+            favorite_paths.add(p)
+
     for it in items:
+        rel_path = ""
+        try:
+            rel_path = _normalize_rel_path(it.get("path") or "")
+        except Exception:
+            rel_path = ""
         it["size_h"] = _format_bytes(int(it.get("size") or 0))
+        it["favorite"] = rel_path in favorite_paths
 
     # build breadcrumbs
     crumbs: List[Tuple[str, str]] = [("根目录", "")]
@@ -2485,8 +2906,72 @@ async def website_files(request: Request, site_id: int, path: str = "", user: st
             "file_share_min_ttl_sec": FILE_SHARE_MIN_TTL_SEC,
             "file_share_max_ttl_sec": FILE_SHARE_MAX_TTL_SEC,
             "file_share_max_items": FILE_SHARE_MAX_ITEMS,
+            "embed_mode": _to_flag(modal),
         },
     )
+
+
+@router.post("/websites/{site_id}/files/favorite")
+async def website_files_favorite_toggle(
+    request: Request,
+    site_id: int,
+    user: str = Depends(require_login_page),
+):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    site = get_site(int(site_id))
+    if not site:
+        return JSONResponse({"ok": False, "error": "站点不存在"}, status_code=404)
+    if not _can_access_site(user, site):
+        return JSONResponse({"ok": False, "error": "无权访问该站点"}, status_code=403)
+    node = get_node(_site_node_id(site))
+
+    raw_path = (data or {}).get("path") if isinstance(data, dict) else ""
+    try:
+        rel_path = _normalize_rel_path(raw_path)
+    except Exception:
+        return JSONResponse({"ok": False, "error": "文件路径不合法"}, status_code=400)
+    if not rel_path:
+        return JSONResponse({"ok": False, "error": "文件路径不能为空"}, status_code=400)
+
+    favorite_raw = (data or {}).get("favorite") if isinstance(data, dict) else True
+    favorite = bool(favorite_raw) if isinstance(favorite_raw, bool) else _to_flag(favorite_raw)
+    type_raw = str((data or {}).get("type") or "").strip().lower() if isinstance(data, dict) else ""
+    is_dir = bool((data or {}).get("is_dir")) if isinstance(data, dict) else False
+    if type_raw == "dir":
+        is_dir = True
+
+    try:
+        if favorite:
+            if not node:
+                return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+            root = _agent_payload_root(site, node)
+            if not root:
+                return JSONResponse({"ok": False, "error": "该站点没有可管理的根目录"}, status_code=400)
+            row = upsert_site_file_favorite(
+                int(site_id),
+                str(user or ""),
+                rel_path,
+                is_dir=bool(is_dir),
+            )
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "favorite": True,
+                    "item": {
+                        "site_id": int(site_id),
+                        "path": str(row.get("path") or rel_path),
+                        "is_dir": bool(row.get("is_dir")),
+                        "updated_at": str(row.get("updated_at") or ""),
+                    },
+                }
+            )
+        deleted = delete_site_file_favorite(int(site_id), str(user or ""), rel_path)
+        return JSONResponse({"ok": True, "favorite": False, "deleted": bool(deleted), "path": rel_path})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
 
 @router.post("/websites/{site_id}/files/upload_chunk")
@@ -2500,9 +2985,13 @@ async def website_files_upload_chunk(
     except Exception:
         data = {}
     site = get_site(int(site_id))
-    node = get_node(int(site.get("node_id") or 0)) if site else None
-    if not site or not node:
-        return {"ok": False, "error": "站点不存在"}
+    if not site:
+        return JSONResponse({"ok": False, "error": "站点不存在"}, status_code=404)
+    if not _can_access_site(user, site):
+        return JSONResponse({"ok": False, "error": "无权访问该站点"}, status_code=403)
+    node = get_node(_site_node_id(site))
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
 
     root = _agent_payload_root(site, node)
     if not root:
@@ -2553,9 +3042,13 @@ async def website_files_upload_status(
     except Exception:
         data = {}
     site = get_site(int(site_id))
-    node = get_node(int(site.get("node_id") or 0)) if site else None
-    if not site or not node:
-        return {"ok": False, "error": "站点不存在"}
+    if not site:
+        return JSONResponse({"ok": False, "error": "站点不存在"}, status_code=404)
+    if not _can_access_site(user, site):
+        return JSONResponse({"ok": False, "error": "无权访问该站点"}, status_code=403)
+    node = get_node(_site_node_id(site))
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
 
     root = _agent_payload_root(site, node)
     if not root:
@@ -2588,13 +3081,21 @@ async def website_files_mkdir(
     site_id: int,
     path: str = Form(""),
     name: str = Form(""),
+    modal: str = Form(""),
     user: str = Depends(require_login_page),
 ):
+    modal_flag = _to_flag(modal)
     site = get_site(int(site_id))
-    node = get_node(int(site.get("node_id") or 0)) if site else None
-    if not site or not node:
+    if not site:
         set_flash(request, "站点不存在")
         return RedirectResponse(url="/websites", status_code=303)
+    if not _can_access_site(user, site):
+        set_flash(request, "无权访问该站点")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(_site_node_id(site))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
     root = _agent_payload_root(site, node)
     if not root:
@@ -2604,7 +3105,7 @@ async def website_files_mkdir(
     name = (name or "").strip()
     if not name:
         set_flash(request, "目录名不能为空")
-        return RedirectResponse(url=f"/websites/{site_id}/files?path={path}", status_code=303)
+        return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
 
     try:
         await agent_post(
@@ -2618,7 +3119,7 @@ async def website_files_mkdir(
         set_flash(request, "目录创建成功")
     except Exception as exc:
         set_flash(request, f"创建目录失败：{exc}")
-    return RedirectResponse(url=f"/websites/{site_id}/files?path={path}", status_code=303)
+    return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
 
 
 @router.post("/websites/{site_id}/files/upload")
@@ -2626,16 +3127,24 @@ async def website_files_upload(
     request: Request,
     site_id: int,
     path: str = Form(""),
+    modal: str = Form(""),
     files: Optional[List[UploadFile]] = File(None),
     folder: Optional[List[UploadFile]] = File(None),
     file: Optional[UploadFile] = File(None),
     user: str = Depends(require_login_page),
 ):
+    modal_flag = _to_flag(modal)
     site = get_site(int(site_id))
-    node = get_node(int(site.get("node_id") or 0)) if site else None
-    if not site or not node:
+    if not site:
         set_flash(request, "站点不存在")
         return RedirectResponse(url="/websites", status_code=303)
+    if not _can_access_site(user, site):
+        set_flash(request, "无权访问该站点")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(_site_node_id(site))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
     root = _agent_payload_root(site, node)
     if not root:
@@ -2731,7 +3240,7 @@ async def website_files_upload(
 
     if not uploads:
         set_flash(request, "请选择文件或文件夹")
-        return RedirectResponse(url=f"/websites/{site_id}/files?path={path}", status_code=303)
+        return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
 
     ok_count = 0
     try:
@@ -2789,7 +3298,7 @@ async def website_files_upload(
             except Exception:
                 pass
 
-    return RedirectResponse(url=f"/websites/{site_id}/files?path={path}", status_code=303)
+    return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={path}", modal_flag), status_code=303)
 
 
 @router.get("/websites/{site_id}/files/edit", response_class=HTMLResponse)
@@ -2797,13 +3306,20 @@ async def website_files_edit(
     request: Request,
     site_id: int,
     path: str,
+    modal: str = "",
     user: str = Depends(require_login_page),
 ):
     site = get_site(int(site_id))
-    node = get_node(int(site.get("node_id") or 0)) if site else None
-    if not site or not node:
+    if not site:
         set_flash(request, "站点不存在")
         return RedirectResponse(url="/websites", status_code=303)
+    if not _can_access_site(user, site):
+        set_flash(request, "无权访问该站点")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(_site_node_id(site))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
     root = _agent_payload_root(site, node)
     if not root:
@@ -2839,6 +3355,7 @@ async def website_files_edit(
             "path": path,
             "content": content,
             "error": error,
+            "embed_mode": _to_flag(modal),
         },
     )
 
@@ -2849,13 +3366,21 @@ async def website_files_save(
     site_id: int,
     path: str = Form(""),
     content: str = Form(""),
+    modal: str = Form(""),
     user: str = Depends(require_login_page),
 ):
+    modal_flag = _to_flag(modal)
     site = get_site(int(site_id))
-    node = get_node(int(site.get("node_id") or 0)) if site else None
-    if not site or not node:
+    if not site:
         set_flash(request, "站点不存在")
         return RedirectResponse(url="/websites", status_code=303)
+    if not _can_access_site(user, site):
+        set_flash(request, "无权访问该站点")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(_site_node_id(site))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
     root = _agent_payload_root(site, node)
     if not root:
@@ -2874,7 +3399,10 @@ async def website_files_save(
         set_flash(request, "保存成功")
     except Exception as exc:
         set_flash(request, f"保存失败：{exc}")
-    return RedirectResponse(url=f"/websites/{site_id}/files?path={'/'.join(path.split('/')[:-1])}", status_code=303)
+    return RedirectResponse(
+        url=_append_modal_query(f"/websites/{site_id}/files?path={'/'.join(path.split('/')[:-1])}", modal_flag),
+        status_code=303,
+    )
 
 
 @router.post("/websites/{site_id}/files/delete")
@@ -2882,13 +3410,21 @@ async def website_files_delete(
     request: Request,
     site_id: int,
     path: str = Form(""),
+    modal: str = Form(""),
     user: str = Depends(require_login_page),
 ):
+    modal_flag = _to_flag(modal)
     site = get_site(int(site_id))
-    node = get_node(int(site.get("node_id") or 0)) if site else None
-    if not site or not node:
+    if not site:
         set_flash(request, "站点不存在")
         return RedirectResponse(url="/websites", status_code=303)
+    if not _can_access_site(user, site):
+        set_flash(request, "无权访问该站点")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(_site_node_id(site))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
     root = _agent_payload_root(site, node)
     if not root:
@@ -2907,7 +3443,10 @@ async def website_files_delete(
         set_flash(request, "删除成功")
     except Exception as exc:
         set_flash(request, f"删除失败：{exc}")
-    return RedirectResponse(url=f"/websites/{site_id}/files?path={'/'.join(path.split('/')[:-1])}", status_code=303)
+    return RedirectResponse(
+        url=_append_modal_query(f"/websites/{site_id}/files?path={'/'.join(path.split('/')[:-1])}", modal_flag),
+        status_code=303,
+    )
 
 
 @router.post("/websites/{site_id}/files/unzip")
@@ -2916,13 +3455,21 @@ async def website_files_unzip(
     site_id: int,
     path: str = Form(""),
     dest: str = Form(""),
+    modal: str = Form(""),
     user: str = Depends(require_login_page),
 ):
+    modal_flag = _to_flag(modal)
     site = get_site(int(site_id))
-    node = get_node(int(site.get("node_id") or 0)) if site else None
-    if not site or not node:
+    if not site:
         set_flash(request, "站点不存在")
         return RedirectResponse(url="/websites", status_code=303)
+    if not _can_access_site(user, site):
+        set_flash(request, "无权访问该站点")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(_site_node_id(site))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
     root = _agent_payload_root(site, node)
     if not root:
@@ -2941,7 +3488,7 @@ async def website_files_unzip(
         set_flash(request, "解压成功")
     except Exception as exc:
         set_flash(request, f"解压失败：{exc}")
-    return RedirectResponse(url=f"/websites/{site_id}/files?path={dest}", status_code=303)
+    return RedirectResponse(url=_append_modal_query(f"/websites/{site_id}/files?path={dest}", modal_flag), status_code=303)
 
 
 @router.get("/websites/{site_id}/files/download")
@@ -2949,13 +3496,20 @@ async def website_files_download(
     request: Request,
     site_id: int,
     path: str,
+    modal: str = "",
     user: str = Depends(require_login_page),
 ):
     site = get_site(int(site_id))
-    node = get_node(int(site.get("node_id") or 0)) if site else None
-    if not site or not node:
+    if not site:
         set_flash(request, "站点不存在")
         return RedirectResponse(url="/websites", status_code=303)
+    if not _can_access_site(user, site):
+        set_flash(request, "无权访问该站点")
+        return RedirectResponse(url="/websites", status_code=303)
+    node = get_node(_site_node_id(site))
+    if not node:
+        set_flash(request, "节点不存在")
+        return RedirectResponse(url=f"/websites/{site_id}", status_code=303)
 
     root = _agent_payload_root(site, node)
     if not root:
@@ -2964,9 +3518,13 @@ async def website_files_download(
 
     rel_path = str(path or "").replace("\\", "/").strip().lstrip("/")
     parent_path = "/".join(rel_path.split("/")[:-1]) if rel_path else ""
+    modal_flag = _to_flag(modal)
     if not rel_path:
         set_flash(request, "请选择要下载的文件或目录")
-        return RedirectResponse(url=f"/websites/{site_id}/files?path={parent_path}", status_code=303)
+        return RedirectResponse(
+            url=_append_modal_query(f"/websites/{site_id}/files?path={parent_path}", modal_flag),
+            status_code=303,
+        )
 
     # Directory download: stream as zip.
     try:
@@ -2986,10 +3544,16 @@ async def website_files_download(
         upstream, status_code, _detail = await _open_agent_file_stream(node, root, rel_path, timeout=600)
     except Exception as exc:
         set_flash(request, f"下载失败：{exc}")
-        return RedirectResponse(url=f"/websites/{site_id}/files?path={parent_path}", status_code=303)
+        return RedirectResponse(
+            url=_append_modal_query(f"/websites/{site_id}/files?path={parent_path}", modal_flag),
+            status_code=303,
+        )
     if upstream is None:
         set_flash(request, f"下载失败（HTTP {status_code}）")
-        return RedirectResponse(url=f"/websites/{site_id}/files?path={parent_path}", status_code=303)
+        return RedirectResponse(
+            url=_append_modal_query(f"/websites/{site_id}/files?path={parent_path}", modal_flag),
+            status_code=303,
+        )
     return _stream_file_download_response(upstream, filename)
 
 @router.post("/websites/{site_id}/files/share")
@@ -2998,11 +3562,14 @@ async def website_files_share_link(
     site_id: int,
     user: str = Depends(require_login_page),
 ):
-    _ = user
     site = get_site(int(site_id))
-    node = get_node(int(site.get("node_id") or 0)) if site else None
-    if not site or not node:
-        return {"ok": False, "error": "站点不存在"}
+    if not site:
+        return JSONResponse({"ok": False, "error": "站点不存在"}, status_code=404)
+    if not _can_access_site(user, site):
+        return JSONResponse({"ok": False, "error": "无权访问该站点"}, status_code=403)
+    node = get_node(_site_node_id(site))
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
 
     root = _agent_payload_root(site, node)
     if not root:
@@ -3056,10 +3623,11 @@ async def website_files_share_list(
     limit: int = 50,
     user: str = Depends(require_login_page),
 ):
-    _ = user
     site = get_site(int(site_id))
     if not site:
-        return {"ok": False, "error": "站点不存在"}
+        return JSONResponse({"ok": False, "error": "站点不存在"}, status_code=404)
+    if not _can_access_site(user, site):
+        return JSONResponse({"ok": False, "error": "无权访问该站点"}, status_code=403)
 
     # Auto-clean short links that have already been revoked.
     try:
@@ -3151,7 +3719,9 @@ async def website_files_share_revoke(
 ):
     site = get_site(int(site_id))
     if not site:
-        return {"ok": False, "error": "站点不存在"}
+        return JSONResponse({"ok": False, "error": "站点不存在"}, status_code=404)
+    if not _can_access_site(user, site):
+        return JSONResponse({"ok": False, "error": "无权访问该站点"}, status_code=403)
 
     try:
         data = await request.json()

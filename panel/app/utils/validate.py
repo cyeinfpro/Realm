@@ -345,6 +345,40 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> List[PoolValidationIssue]:
             ex = {}
             ep["extra_config"] = ex
 
+        # forward tool (normal forwarding): realm | iptables
+        fwd_raw = ex.get("forward_tool")
+        if fwd_raw is None and ep.get("forward_tool") is not None:
+            fwd_raw = ep.get("forward_tool")
+        if fwd_raw is not None:
+            fwd = str(fwd_raw or "").strip().lower()
+            if fwd == "realm":
+                ex["forward_tool"] = "realm"
+            elif fwd in ("ipt", "iptables"):
+                ex["forward_tool"] = "iptables"
+            elif fwd:
+                issues.append(
+                    PoolValidationIssue(
+                        path=f"endpoints[{idx}].extra_config.forward_tool",
+                        message="forward_tool 仅支持 realm 或 iptables",
+                    )
+                )
+            else:
+                ex.pop("forward_tool", None)
+
+        if str(ex.get("forward_tool") or "").strip().lower() == "iptables":
+            bal_head = str(ep.get("balance") or "").strip().lower()
+            if ":" in bal_head:
+                bal_head = bal_head.split(":", 1)[0].strip()
+            for ch in ("_", "-", " "):
+                bal_head = bal_head.replace(ch, "")
+            if bal_head == "iphash":
+                issues.append(
+                    PoolValidationIssue(
+                        path=f"endpoints[{idx}].balance",
+                        message="iptables 工具不支持 IP Hash，请改用 roundrobin 或切换 realm 工具",
+                    )
+                )
+
         intranet_role = str(ex.get("intranet_role") or "").strip()
         allow_zero_listen = intranet_role == "client"
 
@@ -544,8 +578,11 @@ def validate_pool_inplace(pool: Dict[str, Any]) -> List[PoolValidationIssue]:
         ex_qos = ex.get("qos") if isinstance(ex.get("qos"), dict) else {}
         net_qos = net_obj.get("qos") if isinstance(net_obj.get("qos"), dict) else {}
 
-        def _pick_qos_raw(keys: Tuple[str, ...]) -> Any:
-            for src in (ex_qos, net_qos, ex, net_obj, ep):
+        def _pick_qos_raw(
+            keys: Tuple[str, ...],
+            sources: Tuple[Any, ...] = (ex_qos, net_qos, ex, net_obj, ep),
+        ) -> Any:
+            for src in sources:
                 if not isinstance(src, dict):
                     continue
                 for k in keys:

@@ -8,6 +8,7 @@ import io
 import json
 import os
 import random
+import re
 import threading
 import time
 import uuid
@@ -35,24 +36,37 @@ from ..db import (
     add_node,
     add_site,
     bump_traffic_reset_version,
+    connect,
+    create_user_record,
+    get_role_by_name,
     get_desired_pool,
     get_group_orders,
     get_last_report,
     get_node,
     get_node_by_api_key,
     get_node_by_base_url,
+    insert_netmon_samples,
+    node_auto_restart_policy_from_row,
     list_certificates,
     list_netmon_monitors,
+    list_netmon_samples,
+    list_roles,
+    list_panel_settings,
     list_rule_stats_series,
     list_sites,
+    upsert_role,
+    upsert_site_file_favorite,
     clear_rule_stats_samples,
     list_nodes,
     set_desired_pool,
+    set_panel_setting,
+    set_node_auto_restart_policy,
     upsert_rule_owner_map,
     upsert_group_order,
     update_certificate,
     update_netmon_monitor,
     update_node_basic,
+    update_user_record,
     update_site,
     update_site_health,
 )
@@ -60,6 +74,65 @@ from ..services.apply import node_verify_tls, schedule_apply_pool
 from ..services.backup import get_pool_for_backup
 from ..services.assets import panel_public_base_url
 from ..services.node_status import is_report_fresh
+try:
+    from ..services.panel_config import setting_bool, setting_float, setting_int
+except Exception:
+    _TRUE_SET = {"1", "true", "yes", "on", "y"}
+    _FALSE_SET = {"0", "false", "no", "off", "n"}
+
+    def _cfg_env(names: Optional[list[str]]) -> str:
+        for n in (names or []):
+            name = str(n or "").strip()
+            if not name:
+                continue
+            v = str(os.getenv(name) or "").strip()
+            if v:
+                return v
+        return ""
+
+    def setting_bool(key: str, default: bool = False, env_names: Optional[list[str]] = None) -> bool:
+        s = _cfg_env(env_names).lower()
+        if s in _TRUE_SET:
+            return True
+        if s in _FALSE_SET:
+            return False
+        return bool(default)
+
+    def setting_int(
+        key: str,
+        default: int,
+        lo: int,
+        hi: int,
+        env_names: Optional[list[str]] = None,
+    ) -> int:
+        raw = _cfg_env(env_names)
+        try:
+            v = int(float(raw if raw else default))
+        except Exception:
+            v = int(default)
+        if v < int(lo):
+            v = int(lo)
+        if v > int(hi):
+            v = int(hi)
+        return int(v)
+
+    def setting_float(
+        key: str,
+        default: float,
+        lo: float,
+        hi: float,
+        env_names: Optional[list[str]] = None,
+    ) -> float:
+        raw = _cfg_env(env_names)
+        try:
+            v = float(raw if raw else default)
+        except Exception:
+            v = float(default)
+        if v < float(lo):
+            v = float(lo)
+        if v > float(hi):
+            v = float(hi)
+        return float(v)
 from ..services.pool_ops import load_pool_for_node, remove_endpoints_by_sync_id
 from ..services.stats_history import config as stats_history_config, ingest_stats_snapshot
 from ..utils.crypto import generate_api_key
@@ -97,8 +170,8 @@ def _parse_restore_upload_max_bytes() -> int:
             return max(1, int(float(str(raw_mb).strip()))) * 1024 * 1024
     except Exception:
         pass
-    # default 512MB
-    return 512 * 1024 * 1024
+    # default 5GB
+    return 5 * 1024 * 1024 * 1024
 
 
 def _format_bytes(num: int) -> str:
@@ -146,10 +219,22 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
     return int(v)
 
 
+_BACKUP_SITE_FILE_FETCH_BASE_TIMEOUT = _env_float("REALM_BACKUP_SITE_FILE_FETCH_BASE_TIMEOUT", 45.0, 20.0, 600.0)
+_BACKUP_SITE_FILE_FETCH_PER_MB_SEC = _env_float("REALM_BACKUP_SITE_FILE_FETCH_PER_MB_SEC", 1.5, 0.0, 20.0)
+_BACKUP_SITE_FILE_FETCH_MAX_TIMEOUT = _env_float("REALM_BACKUP_SITE_FILE_FETCH_MAX_TIMEOUT", 1800.0, 60.0, 7200.0)
+_FULL_RESTORE_EXEC_TIMEOUT_SEC = _env_float(
+    "REALM_FULL_RESTORE_EXEC_TIMEOUT_SEC",
+    3600.0,
+    120.0,
+    172800.0,
+)
+
+
 _SAVE_PRECHECK_ENABLED = _env_flag("REALM_SAVE_PRECHECK_ENABLED", True)
 _SAVE_PRECHECK_HTTP_TIMEOUT = _env_float("REALM_SAVE_PRECHECK_HTTP_TIMEOUT", 4.5, 2.0, 20.0)
 _SAVE_PRECHECK_PROBE_TIMEOUT = _env_float("REALM_SAVE_PRECHECK_PROBE_TIMEOUT", 1.2, 0.2, 6.0)
 _SAVE_PRECHECK_MAX_ISSUES = _env_int("REALM_SAVE_PRECHECK_MAX_ISSUES", 24, 5, 120)
+_TRACE_ROUTE_HTTP_TIMEOUT = _env_float("REALM_TRACE_ROUTE_HTTP_TIMEOUT", 28.0, 6.0, 90.0)
 _POOL_JOB_TTL_SEC = _env_int("REALM_POOL_JOB_TTL_SEC", 1800, 120, 7 * 24 * 3600)
 _POOL_JOB_MAX_ATTEMPTS = _env_int("REALM_POOL_JOB_MAX_ATTEMPTS", 3, 1, 10)
 _POOL_JOB_RETRY_BASE_SEC = _env_float("REALM_POOL_JOB_RETRY_BASE_SEC", 1.2, 0.2, 30.0)
@@ -161,6 +246,197 @@ _POOL_JOB_REQUIRE_ACK = _env_flag("REALM_POOL_JOB_REQUIRE_ACK", True)
 _POOL_JOBS: Dict[str, Dict[str, Any]] = {}
 _POOL_JOBS_LOCK = threading.Lock()
 _POOL_JOB_EXEC_LOCK = asyncio.Lock()
+
+
+def _save_precheck_enabled() -> bool:
+    return bool(setting_bool("save_precheck_enabled", default=bool(_SAVE_PRECHECK_ENABLED)))
+
+
+def _save_precheck_http_timeout() -> float:
+    return float(
+        setting_float(
+            "save_precheck_http_timeout",
+            default=float(_SAVE_PRECHECK_HTTP_TIMEOUT),
+            lo=2.0,
+            hi=20.0,
+        )
+    )
+
+
+def _save_precheck_probe_timeout() -> float:
+    return float(
+        setting_float(
+            "save_precheck_probe_timeout",
+            default=float(_SAVE_PRECHECK_PROBE_TIMEOUT),
+            lo=0.2,
+            hi=6.0,
+        )
+    )
+
+
+def _save_precheck_max_issues() -> int:
+    return int(
+        setting_int(
+            "save_precheck_max_issues",
+            default=int(_SAVE_PRECHECK_MAX_ISSUES),
+            lo=5,
+            hi=120,
+        )
+    )
+
+
+def _to_bool_loose(v: Any, default: bool = False) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return bool(default)
+    if isinstance(v, (int, float)):
+        return bool(int(v))
+    s = str(v).strip().lower()
+    if not s:
+        return bool(default)
+    if s in ("1", "true", "yes", "on", "y"):
+        return True
+    if s in ("0", "false", "no", "off", "n"):
+        return False
+    return bool(default)
+
+
+def _to_int_loose(v: Any, default: int) -> int:
+    try:
+        return int(v)
+    except Exception:
+        try:
+            return int(float(str(v).strip()))
+        except Exception:
+            return int(default)
+
+
+def _norm_int_seq(values: Any, lo: int, hi: int) -> List[int]:
+    out: List[int] = []
+    seen: set[int] = set()
+    seq = values if isinstance(values, list) else []
+    for x in seq:
+        v = _to_int_loose(x, -1)
+        if v < int(lo) or v > int(hi):
+            continue
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
+
+
+def _parse_weekday_list(v: Any) -> List[int]:
+    if isinstance(v, list):
+        out = _norm_int_seq(v, 1, 7)
+        if out:
+            return out
+    s = str(v or "").strip()
+    if not s:
+        return []
+    parts = [p.strip() for p in s.split(",")]
+    return _norm_int_seq(parts, 1, 7)
+
+
+def _parse_monthday_list(v: Any) -> List[int]:
+    if isinstance(v, list):
+        out = _norm_int_seq(v, 1, 31)
+        if out:
+            return out
+    s = str(v or "").strip()
+    if not s:
+        return []
+    parts = [p.strip() for p in s.split(",")]
+    return _norm_int_seq(parts, 1, 31)
+
+
+def _normalize_auto_restart_policy_from_payload(data: Dict[str, Any], node: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    keys = {
+        "auto_restart_enabled",
+        "auto_restart_schedule_type",
+        "auto_restart_interval",
+        "auto_restart_hour",
+        "auto_restart_minute",
+        "auto_restart_time",
+        "auto_restart_weekdays",
+        "auto_restart_monthdays",
+    }
+    has_any = any(k in data for k in keys)
+    base = node_auto_restart_policy_from_row(node if isinstance(node, dict) else {})
+    base_interval_raw = base.get("interval", 1)
+    if base_interval_raw is None:
+        base_interval_raw = 1
+    base_hour_raw = base.get("hour", 4)
+    if base_hour_raw is None:
+        base_hour_raw = 4
+    base_minute_raw = base.get("minute", 8)
+    if base_minute_raw is None:
+        base_minute_raw = 8
+
+    policy = {
+        "enabled": bool(base.get("enabled", True)),
+        "schedule_type": str(base.get("schedule_type") or "daily").strip().lower(),
+        "interval": _to_int_loose(base_interval_raw, 1),
+        "hour": _to_int_loose(base_hour_raw, 4),
+        "minute": _to_int_loose(base_minute_raw, 8),
+        "weekdays": list(base.get("weekdays") or [1, 2, 3, 4, 5, 6, 7]),
+        "monthdays": list(base.get("monthdays") or [1]),
+    }
+    if policy["schedule_type"] not in ("daily", "weekly", "monthly"):
+        policy["schedule_type"] = "daily"
+    if policy["interval"] < 1:
+        policy["interval"] = 1
+    if policy["interval"] > 365:
+        policy["interval"] = 365
+    policy["hour"] = max(0, min(23, int(policy["hour"])))
+    policy["minute"] = max(0, min(59, int(policy["minute"])))
+
+    if "auto_restart_enabled" in data:
+        policy["enabled"] = _to_bool_loose(data.get("auto_restart_enabled"), bool(policy["enabled"]))
+    if "auto_restart_schedule_type" in data:
+        st = str(data.get("auto_restart_schedule_type") or "").strip().lower()
+        if st in ("daily", "weekly", "monthly"):
+            policy["schedule_type"] = st
+    if "auto_restart_interval" in data:
+        itv = _to_int_loose(data.get("auto_restart_interval"), int(policy["interval"]))
+        if itv < 1:
+            itv = 1
+        if itv > 365:
+            itv = 365
+        policy["interval"] = int(itv)
+    if "auto_restart_time" in data:
+        tt = str(data.get("auto_restart_time") or "").strip()
+        m = re.match(r"^\s*([0-9]{1,2})\s*:\s*([0-9]{1,2})\s*$", tt)
+        if m:
+            hh = _to_int_loose(m.group(1), int(policy["hour"]))
+            mm = _to_int_loose(m.group(2), int(policy["minute"]))
+            policy["hour"] = max(0, min(23, hh))
+            policy["minute"] = max(0, min(59, mm))
+    if "auto_restart_hour" in data:
+        hh = _to_int_loose(data.get("auto_restart_hour"), int(policy["hour"]))
+        policy["hour"] = max(0, min(23, hh))
+    if "auto_restart_minute" in data:
+        mm = _to_int_loose(data.get("auto_restart_minute"), int(policy["minute"]))
+        policy["minute"] = max(0, min(59, mm))
+    if "auto_restart_weekdays" in data:
+        wd = _parse_weekday_list(data.get("auto_restart_weekdays"))
+        if wd:
+            policy["weekdays"] = wd
+        elif policy["schedule_type"] == "weekly":
+            policy["weekdays"] = [1, 2, 3, 4, 5, 6, 7]
+    if "auto_restart_monthdays" in data:
+        md = _parse_monthday_list(data.get("auto_restart_monthdays"))
+        if md:
+            policy["monthdays"] = md
+        elif policy["schedule_type"] == "monthly":
+            policy["monthdays"] = [1]
+
+    if not policy["weekdays"]:
+        policy["weekdays"] = [1, 2, 3, 4, 5, 6, 7]
+    if not policy["monthdays"]:
+        policy["monthdays"] = [1]
+    return has_any, policy
 
 
 def _pool_job_now() -> float:
@@ -653,6 +929,7 @@ def _backup_steps_template() -> List[Dict[str, Any]]:
         {"key": "site_files", "label": "网站文件", "status": "pending", "detail": ""},
         {"key": "certs", "label": "证书信息", "status": "pending", "detail": ""},
         {"key": "netmon", "label": "网络波动配置", "status": "pending", "detail": ""},
+        {"key": "panel_state", "label": "面板状态数据", "status": "pending", "detail": ""},
         {"key": "package", "label": "打包压缩", "status": "pending", "detail": ""},
     ]
 
@@ -777,6 +1054,20 @@ def _site_pkg_dir_name(site: Dict[str, Any]) -> str:
     return f"site-{sid}-{safe}"
 
 
+def _site_file_fetch_timeout(size_hint_bytes: int) -> float:
+    try:
+        sz = max(0, int(size_hint_bytes or 0))
+    except Exception:
+        sz = 0
+    extra = (float(sz) / float(1024 * 1024)) * float(_BACKUP_SITE_FILE_FETCH_PER_MB_SEC)
+    timeout = float(_BACKUP_SITE_FILE_FETCH_BASE_TIMEOUT) + extra
+    if timeout > float(_BACKUP_SITE_FILE_FETCH_MAX_TIMEOUT):
+        timeout = float(_BACKUP_SITE_FILE_FETCH_MAX_TIMEOUT)
+    if timeout < 20.0:
+        timeout = 20.0
+    return float(timeout)
+
+
 async def _collect_site_file_index(site: Dict[str, Any], node: Dict[str, Any]) -> Dict[str, Any]:
     root = str(site.get("root_path") or "").strip()
     out: Dict[str, Any] = {
@@ -785,6 +1076,8 @@ async def _collect_site_file_index(site: Dict[str, Any], node: Dict[str, Any]) -
         "node_base_url": str(site.get("node_base_url") or node.get("base_url") or ""),
         "root_path": root,
         "package_dir": _site_pkg_dir_name(site),
+        "dirs": [],
+        "dir_count": 0,
         "files": [],
         "file_count": 0,
         "total_bytes": 0,
@@ -797,6 +1090,7 @@ async def _collect_site_file_index(site: Dict[str, Any], node: Dict[str, Any]) -
     root_base = str(node.get("website_root_base") or "").strip()
     queue: List[str] = [""]
     seen_dirs = set([""])
+    dirs: List[str] = []
     files: List[Dict[str, Any]] = []
 
     while queue:
@@ -827,6 +1121,7 @@ async def _collect_site_file_index(site: Dict[str, Any], node: Dict[str, Any]) -
             if bool(it.get("is_dir")):
                 if p not in seen_dirs:
                     seen_dirs.add(p)
+                    dirs.append(p)
                     queue.append(p)
                 continue
             try:
@@ -849,6 +1144,8 @@ async def _collect_site_file_index(site: Dict[str, Any], node: Dict[str, Any]) -
         cleaned.append({"path": p, "size": sz})
 
     out["files"] = cleaned
+    out["dirs"] = sorted(dirs)
+    out["dir_count"] = len(out["dirs"])
     out["file_count"] = len(cleaned)
     out["total_bytes"] = int(total_bytes)
     return out
@@ -870,9 +1167,18 @@ async def _build_full_backup_bundle(
     sites = list_sites()
     certs = list_certificates()
     monitors = list_netmon_monitors()
+    monitor_ids: List[int] = []
+    for m in monitors:
+        try:
+            mid = int(m.get("id") or 0)
+        except Exception:
+            mid = 0
+        if mid > 0:
+            monitor_ids.append(mid)
+    netmon_samples = list_netmon_samples(monitor_ids, 0) if monitor_ids else []
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    fixed_zip_files = 7  # backup_meta + nodes + sites + certs + site_files_manifest + netmon + README
+    fixed_zip_files = 9  # + panel/state.json + netmon/samples.json
     await _emit_backup_progress(
         progress_callback,
         {
@@ -888,6 +1194,8 @@ async def _build_full_backup_bundle(
                 "site_files": 0,
                 "certificates": len(certs),
                 "netmon_monitors": len(monitors),
+                "netmon_samples": len(netmon_samples),
+                "panel_items": 0,
                 "files": fixed_zip_files + len(nodes),
             },
         },
@@ -971,8 +1279,10 @@ async def _build_full_backup_bundle(
                 "base_url": n.get("base_url"),
                 "api_key": n.get("api_key"),
                 "verify_tls": bool(n.get("verify_tls", 0)),
+                "is_private": bool(n.get("is_private", 0)),
                 "group_name": n.get("group_name") or "默认分组",
                 "role": n.get("role") or "normal",
+                "capabilities": n.get("capabilities") if isinstance(n.get("capabilities"), dict) else {},
                 "website_root_base": n.get("website_root_base") or "",
             }
             for n in nodes
@@ -1039,6 +1349,8 @@ async def _build_full_backup_bundle(
                     "node_base_url": str(s.get("node_base_url") or ""),
                     "root_path": str(s.get("root_path") or ""),
                     "package_dir": _site_pkg_dir_name(s),
+                    "dirs": [],
+                    "dir_count": 0,
                     "files": [],
                     "file_count": 0,
                     "total_bytes": 0,
@@ -1048,6 +1360,16 @@ async def _build_full_backup_bundle(
                 entry = await _collect_site_file_index(s, node)
 
             pkg_dir = str(entry.get("package_dir") or _site_pkg_dir_name(s))
+            dirs_idx = entry.get("dirs") if isinstance(entry.get("dirs"), list) else []
+            cleaned_dirs: List[str] = []
+            seen_dirs: set[str] = set()
+            for d in dirs_idx:
+                rel_dir = _clean_site_rel_path(d)
+                if not rel_dir or rel_dir in seen_dirs:
+                    continue
+                seen_dirs.add(rel_dir)
+                cleaned_dirs.append(rel_dir)
+            cleaned_dirs.sort()
             files_idx = entry.get("files") if isinstance(entry.get("files"), list) else []
             cleaned_files = []
             for f in files_idx:
@@ -1064,6 +1386,8 @@ async def _build_full_backup_bundle(
                         "zip_path": f"websites/files/{pkg_dir}/{rel_path}",
                     }
                 )
+            entry["dirs"] = cleaned_dirs
+            entry["dir_count"] = len(cleaned_dirs)
             entry["files"] = cleaned_files
             entry["file_count"] = len(cleaned_files)
             entry["total_bytes"] = int(sum(int(x.get("size") or 0) for x in cleaned_files))
@@ -1089,6 +1413,8 @@ async def _build_full_backup_bundle(
                         "site_files": site_file_total,
                         "certificates": len(certs),
                         "netmon_monitors": len(monitors),
+                        "netmon_samples": len(netmon_samples),
+                        "panel_items": 0,
                         "files": fixed_zip_files + len(rules_entries) + site_file_total,
                     },
                 },
@@ -1115,6 +1441,8 @@ async def _build_full_backup_bundle(
                 "site_files": site_file_total,
                 "certificates": len(certs),
                 "netmon_monitors": len(monitors),
+                "netmon_samples": len(netmon_samples),
+                "panel_items": 0,
                 "files": fixed_zip_files + len(rules_entries) + site_file_total,
             },
         },
@@ -1183,9 +1511,348 @@ async def _build_full_backup_bundle(
             for m in monitors
         ],
     }
+    netmon_samples_payload = {
+        "kind": "realm_netmon_samples_backup",
+        "created_at": nodes_payload["created_at"],
+        "samples": [],
+        "summary": {"samples": 0},
+    }
+    for s in netmon_samples:
+        try:
+            src_mid = int(s.get("monitor_id") or 0)
+        except Exception:
+            src_mid = 0
+        try:
+            src_nid = int(s.get("node_id") or 0)
+        except Exception:
+            src_nid = 0
+        latency_val: Optional[float] = None
+        lat_raw = s.get("latency_ms")
+        if lat_raw is not None and str(lat_raw).strip() != "":
+            try:
+                latency_val = float(lat_raw)
+            except Exception:
+                latency_val = None
+        try:
+            ts_ms_i = int(s.get("ts_ms") or 0)
+        except Exception:
+            ts_ms_i = 0
+        netmon_samples_payload["samples"].append(
+            {
+                "source_monitor_id": src_mid,
+                "source_node_id": src_nid,
+                "node_base_url": str((node_map.get(src_nid) or {}).get("base_url") or ""),
+                "ts_ms": ts_ms_i,
+                "ok": bool(s.get("ok") or 0),
+                "latency_ms": latency_val,
+                "error": str(s.get("error") or ""),
+            }
+        )
+    netmon_samples_payload["summary"] = {"samples": len(netmon_samples_payload["samples"])}
     await _emit_backup_progress(
         progress_callback,
-        {"progress": 90, "stage": "网络波动配置完成", "step_key": "netmon", "step_status": "done", "step_detail": f"{len(monitors_payload['monitors'])} 条"},
+        {
+            "progress": 90,
+            "stage": "网络波动配置完成",
+            "step_key": "netmon",
+            "step_status": "done",
+            "step_detail": f"{len(monitors_payload['monitors'])} 个监控 · {len(netmon_samples_payload['samples'])} 条样本",
+            "counts": {
+                "nodes": len(nodes),
+                "rules": len(rules_entries),
+                "sites": len(sites_payload["sites"]),
+                "site_files": site_file_total,
+                "certificates": len(certs),
+                "netmon_monitors": len(monitors),
+                "netmon_samples": len(netmon_samples),
+                "panel_items": 0,
+                "files": fixed_zip_files + len(rules_entries) + site_file_total,
+            },
+        },
+    )
+
+    await _emit_backup_progress(
+        progress_callback,
+        {"progress": 91, "stage": "整理面板状态数据", "step_key": "panel_state", "step_status": "running", "step_detail": "角色/用户/分享/诊断记录"},
+    )
+
+    def _safe_json_loads(raw: Any, default: Any) -> Any:
+        try:
+            return json.loads(str(raw or "")) if str(raw or "").strip() else default
+        except Exception:
+            return default
+
+    panel_state_payload: Dict[str, Any] = {
+        "kind": "realm_panel_state_backup",
+        "created_at": nodes_payload["created_at"],
+        "panel_settings": [],
+        "roles": [],
+        "users": [],
+        "user_tokens": [],
+        "rule_owner_map": [],
+        "site_file_favorites": [],
+        "site_file_share_short_links": [],
+        "site_file_share_revocations": [],
+        "site_events": [],
+        "site_checks": [],
+        "summary": {},
+        "errors": [],
+    }
+    try:
+        panel_settings_map = list_panel_settings()
+        for skey, sval in sorted(panel_settings_map.items(), key=lambda kv: str(kv[0])):
+            key_s = str(skey or "").strip()
+            if not key_s:
+                continue
+            panel_state_payload["panel_settings"].append(
+                {
+                    "key": key_s,
+                    "value": str(sval or ""),
+                }
+            )
+
+        roles = list_roles()
+        role_name_by_id: Dict[int, str] = {}
+        for r in roles:
+            rid = int(r.get("id") or 0)
+            role_name = str(r.get("name") or "").strip()
+            if rid > 0 and role_name:
+                role_name_by_id[rid] = role_name
+            panel_state_payload["roles"].append(
+                {
+                    "source_id": rid,
+                    "name": role_name,
+                    "description": str(r.get("description") or ""),
+                    "permissions": [str(x).strip() for x in (r.get("permissions") or []) if str(x).strip()],
+                    "builtin": bool(r.get("builtin") or 0),
+                    "created_at": r.get("created_at"),
+                    "updated_at": r.get("updated_at"),
+                }
+            )
+
+        with connect() as conn:
+            user_rows = conn.execute(
+                "SELECT id, username, salt_b64, hash_b64, iterations, role_id, enabled, expires_at, policy_json, "
+                "last_login_at, created_by, created_at, updated_at FROM users ORDER BY id ASC"
+            ).fetchall()
+            user_name_by_id: Dict[int, str] = {}
+            for row in user_rows:
+                d = dict(row)
+                src_uid = int(d.get("id") or 0)
+                username = str(d.get("username") or "").strip()
+                policy = _safe_json_loads(d.get("policy_json"), {})
+                if not isinstance(policy, dict):
+                    policy = {}
+                if src_uid > 0 and username:
+                    user_name_by_id[src_uid] = username
+                panel_state_payload["users"].append(
+                    {
+                        "source_id": src_uid,
+                        "username": username,
+                        "salt_b64": str(d.get("salt_b64") or ""),
+                        "hash_b64": str(d.get("hash_b64") or ""),
+                        "iterations": int(d.get("iterations") or 120000),
+                        "source_role_id": int(d.get("role_id") or 0),
+                        "role_name": role_name_by_id.get(int(d.get("role_id") or 0), ""),
+                        "enabled": bool(d.get("enabled") or 0),
+                        "expires_at": d.get("expires_at"),
+                        "policy": policy,
+                        "last_login_at": d.get("last_login_at"),
+                        "created_by": str(d.get("created_by") or ""),
+                        "created_at": d.get("created_at"),
+                        "updated_at": d.get("updated_at"),
+                    }
+                )
+
+            token_rows = conn.execute(
+                "SELECT id, user_id, token_sha256, name, scopes_json, expires_at, last_used_at, created_by, created_at, revoked_at "
+                "FROM user_tokens ORDER BY id ASC"
+            ).fetchall()
+            for row in token_rows:
+                d = dict(row)
+                scopes = _safe_json_loads(d.get("scopes_json"), [])
+                if not isinstance(scopes, list):
+                    scopes = []
+                src_user_id = int(d.get("user_id") or 0)
+                panel_state_payload["user_tokens"].append(
+                    {
+                        "source_id": int(d.get("id") or 0),
+                        "source_user_id": src_user_id,
+                        "source_username": user_name_by_id.get(src_user_id, ""),
+                        "token_sha256": str(d.get("token_sha256") or ""),
+                        "name": str(d.get("name") or ""),
+                        "scopes": [str(x).strip() for x in scopes if str(x).strip()],
+                        "expires_at": d.get("expires_at"),
+                        "last_used_at": d.get("last_used_at"),
+                        "created_by": str(d.get("created_by") or ""),
+                        "created_at": d.get("created_at"),
+                        "revoked_at": d.get("revoked_at"),
+                    }
+                )
+
+            owner_rows = conn.execute(
+                "SELECT id, node_id, rule_key, owner_user_id, owner_username, first_seen_at, last_seen_at, active "
+                "FROM rule_owner_map ORDER BY id ASC"
+            ).fetchall()
+            for row in owner_rows:
+                d = dict(row)
+                panel_state_payload["rule_owner_map"].append(
+                    {
+                        "source_id": int(d.get("id") or 0),
+                        "source_node_id": int(d.get("node_id") or 0),
+                        "rule_key": str(d.get("rule_key") or ""),
+                        "owner_source_user_id": int(d.get("owner_user_id") or 0),
+                        "owner_username": str(d.get("owner_username") or ""),
+                        "first_seen_at": d.get("first_seen_at"),
+                        "last_seen_at": d.get("last_seen_at"),
+                        "active": bool(d.get("active") or 0),
+                    }
+                )
+
+            fav_rows = conn.execute(
+                "SELECT id, site_id, owner, path, is_dir, created_at, updated_at "
+                "FROM site_file_favorites ORDER BY id ASC"
+            ).fetchall()
+            for row in fav_rows:
+                d = dict(row)
+                panel_state_payload["site_file_favorites"].append(
+                    {
+                        "source_id": int(d.get("id") or 0),
+                        "source_site_id": int(d.get("site_id") or 0),
+                        "owner": str(d.get("owner") or ""),
+                        "path": str(d.get("path") or ""),
+                        "is_dir": bool(d.get("is_dir") or 0),
+                        "created_at": d.get("created_at"),
+                        "updated_at": d.get("updated_at"),
+                    }
+                )
+
+            share_rows = conn.execute(
+                "SELECT code, site_id, token, token_sha256, created_by, created_at "
+                "FROM site_file_share_short_links ORDER BY created_at ASC"
+            ).fetchall()
+            for row in share_rows:
+                d = dict(row)
+                panel_state_payload["site_file_share_short_links"].append(
+                    {
+                        "code": str(d.get("code") or ""),
+                        "source_site_id": int(d.get("site_id") or 0),
+                        "token": str(d.get("token") or ""),
+                        "token_sha256": str(d.get("token_sha256") or ""),
+                        "created_by": str(d.get("created_by") or ""),
+                        "created_at": d.get("created_at"),
+                    }
+                )
+
+            rev_rows = conn.execute(
+                "SELECT id, site_id, token_sha256, revoked_by, reason, revoked_at "
+                "FROM site_file_share_revocations ORDER BY id ASC"
+            ).fetchall()
+            for row in rev_rows:
+                d = dict(row)
+                panel_state_payload["site_file_share_revocations"].append(
+                    {
+                        "source_id": int(d.get("id") or 0),
+                        "source_site_id": int(d.get("site_id") or 0),
+                        "token_sha256": str(d.get("token_sha256") or ""),
+                        "revoked_by": str(d.get("revoked_by") or ""),
+                        "reason": str(d.get("reason") or ""),
+                        "revoked_at": d.get("revoked_at"),
+                    }
+                )
+
+            evt_rows = conn.execute(
+                "SELECT id, site_id, action, status, actor, payload_json, result_json, error, created_at "
+                "FROM site_events ORDER BY id ASC"
+            ).fetchall()
+            for row in evt_rows:
+                d = dict(row)
+                payload_obj = _safe_json_loads(d.get("payload_json"), {})
+                result_obj = _safe_json_loads(d.get("result_json"), {})
+                if not isinstance(payload_obj, dict):
+                    payload_obj = {}
+                if not isinstance(result_obj, dict):
+                    result_obj = {}
+                panel_state_payload["site_events"].append(
+                    {
+                        "source_id": int(d.get("id") or 0),
+                        "source_site_id": int(d.get("site_id") or 0),
+                        "action": str(d.get("action") or ""),
+                        "status": str(d.get("status") or "success"),
+                        "actor": str(d.get("actor") or ""),
+                        "payload": payload_obj,
+                        "result": result_obj,
+                        "error": str(d.get("error") or ""),
+                        "created_at": d.get("created_at"),
+                    }
+                )
+
+            chk_rows = conn.execute(
+                "SELECT id, site_id, ok, status_code, latency_ms, error, checked_at "
+                "FROM site_checks ORDER BY id ASC"
+            ).fetchall()
+            for row in chk_rows:
+                d = dict(row)
+                panel_state_payload["site_checks"].append(
+                    {
+                        "source_id": int(d.get("id") or 0),
+                        "source_site_id": int(d.get("site_id") or 0),
+                        "ok": bool(d.get("ok") or 0),
+                        "status_code": int(d.get("status_code") or 0),
+                        "latency_ms": int(d.get("latency_ms") or 0),
+                        "error": str(d.get("error") or ""),
+                        "checked_at": d.get("checked_at"),
+                    }
+                )
+    except Exception as exc:
+        panel_state_payload["errors"].append(f"panel_state_collect_failed: {exc}")
+
+    panel_state_payload["summary"] = {
+        "panel_settings": len(panel_state_payload["panel_settings"]),
+        "roles": len(panel_state_payload["roles"]),
+        "users": len(panel_state_payload["users"]),
+        "user_tokens": len(panel_state_payload["user_tokens"]),
+        "rule_owner_map": len(panel_state_payload["rule_owner_map"]),
+        "site_file_favorites": len(panel_state_payload["site_file_favorites"]),
+        "site_file_share_short_links": len(panel_state_payload["site_file_share_short_links"]),
+        "site_file_share_revocations": len(panel_state_payload["site_file_share_revocations"]),
+        "site_events": len(panel_state_payload["site_events"]),
+        "site_checks": len(panel_state_payload["site_checks"]),
+        "errors": len(panel_state_payload.get("errors") or []),
+        "total_items": (
+            len(panel_state_payload["panel_settings"])
+            + len(panel_state_payload["roles"])
+            + len(panel_state_payload["users"])
+            + len(panel_state_payload["user_tokens"])
+            + len(panel_state_payload["rule_owner_map"])
+            + len(panel_state_payload["site_file_favorites"])
+            + len(panel_state_payload["site_file_share_short_links"])
+            + len(panel_state_payload["site_file_share_revocations"])
+            + len(panel_state_payload["site_events"])
+            + len(panel_state_payload["site_checks"])
+        ),
+    }
+    panel_items_total = int((panel_state_payload.get("summary") or {}).get("total_items") or 0)
+    await _emit_backup_progress(
+        progress_callback,
+        {
+            "progress": 93,
+            "stage": "面板状态数据完成",
+            "step_key": "panel_state",
+            "step_status": "done",
+            "step_detail": f"{panel_items_total} 条",
+            "counts": {
+                "nodes": len(nodes),
+                "rules": len(rules_entries),
+                "sites": len(sites_payload["sites"]),
+                "site_files": site_file_total,
+                "certificates": len(certs),
+                "netmon_monitors": len(monitors),
+                "netmon_samples": len(netmon_samples),
+                "panel_items": panel_items_total,
+                "files": fixed_zip_files + len(rules_entries) + site_file_total,
+            },
+        },
     )
 
     meta_payload = {
@@ -1198,13 +1865,16 @@ async def _build_full_backup_bundle(
         "site_file_bytes": int(site_file_bytes),
         "certificates": len(certs_payload["certificates"]),
         "netmon_monitors": len(monitors_payload["monitors"]),
+        "netmon_samples": len(netmon_samples_payload["samples"]),
+        "panel_items": panel_items_total,
+        "panel_state_errors": int((panel_state_payload.get("summary") or {}).get("errors") or 0),
         "rules": len(rules_entries),
         "files": fixed_zip_files + len(rules_entries) + int(site_file_total),
     }
 
     await _emit_backup_progress(
         progress_callback,
-        {"progress": 92, "stage": "打包压缩", "step_key": "package", "step_status": "running", "step_detail": f"{meta_payload['files']} 个文件"},
+        {"progress": 94, "stage": "打包压缩", "step_key": "package", "step_status": "running", "step_detail": f"{meta_payload['files']} 个文件"},
     )
     buf = io.BytesIO()
     site_files_ok = 0
@@ -1215,6 +1885,8 @@ async def _build_full_backup_bundle(
         z.writestr("websites/sites.json", json.dumps(sites_payload, ensure_ascii=False, indent=2))
         z.writestr("websites/certificates.json", json.dumps(certs_payload, ensure_ascii=False, indent=2))
         z.writestr("netmon/monitors.json", json.dumps(monitors_payload, ensure_ascii=False, indent=2))
+        z.writestr("netmon/samples.json", json.dumps(netmon_samples_payload, ensure_ascii=False, indent=2))
+        z.writestr("panel/state.json", json.dumps(panel_state_payload, ensure_ascii=False, indent=2))
         for path, data in rules_entries:
             z.writestr(path, json.dumps(data, ensure_ascii=False, indent=2))
 
@@ -1246,7 +1918,7 @@ async def _build_full_backup_bundle(
                                 "path": rel_path,
                                 "root_base": str(node.get("website_root_base") or ""),
                             },
-                            timeout=45,
+                            timeout=_site_file_fetch_timeout(int(file_item.get("size") or 0)),
                         )
                         if r.status_code != 200:
                             raise RuntimeError(f"HTTP {r.status_code}")
@@ -1265,7 +1937,7 @@ async def _build_full_backup_bundle(
                             site_item["errors"] = []
                         site_item["errors"].append(f"文件拉取失败：{rel_path} · {exc}")
 
-                p = 92 + int((i / max(1, total_jobs)) * 7)
+                p = 94 + int((i / max(1, total_jobs)) * 5)
                 await _emit_backup_progress(
                     progress_callback,
                     {
@@ -1290,15 +1962,18 @@ async def _build_full_backup_bundle(
         meta_payload["site_files"] = int(site_files_ok)
         meta_payload["site_files_failed"] = int(site_files_failed_transfer + site_file_failed)
         meta_payload["site_file_bytes"] = int(site_files_bytes_ok)
+        meta_payload["panel_items"] = panel_items_total
+        meta_payload["panel_state_errors"] = int((panel_state_payload.get("summary") or {}).get("errors") or 0)
         meta_payload["files"] = fixed_zip_files + len(rules_entries) + int(site_files_ok)
         z.writestr("backup_meta.json", json.dumps(meta_payload, ensure_ascii=False, indent=2))
         z.writestr(
             "README.txt",
             "Nexus 全量备份说明\n\n"
             "1) 恢复节点列表：登录面板 → 控制台 → 点击『恢复节点列表』，上传本压缩包（或解压后的 nodes.json）。\n"
-            "2) 全量恢复：控制台 → 全量恢复，自动恢复 nodes/rules/websites/certificates/netmon。\n"
+            "2) 全量恢复：控制台 → 全量恢复，自动恢复 nodes/rules/websites/certificates/netmon/panel_state。\n"
             "3) 网站文件已打包在 websites/files/ 目录，恢复时会按站点映射自动回传到节点。\n"
-            "4) 恢复单节点规则：进入节点页面 → 更多 → 恢复规则，把 rules/ 目录下对应节点的规则文件上传/粘贴即可。\n",
+            "4) 网络波动历史样本位于 netmon/samples.json，会在全量恢复时同步写回。\n"
+            "5) 恢复单节点规则：进入节点页面 → 更多 → 恢复规则，把 rules/ 目录下对应节点的规则文件上传/粘贴即可。\n",
         )
 
     filename = f"nexus-backup-{ts}.zip"
@@ -1318,6 +1993,8 @@ async def _build_full_backup_bundle(
                 "site_files": int(meta_payload.get("site_files") or 0),
                 "certificates": meta_payload["certificates"],
                 "netmon_monitors": meta_payload["netmon_monitors"],
+                "netmon_samples": int(meta_payload.get("netmon_samples") or 0),
+                "panel_items": int(meta_payload.get("panel_items") or 0),
                 "files": meta_payload["files"],
             },
         },
@@ -1337,6 +2014,7 @@ def _restore_steps_template() -> List[Dict[str, Any]]:
         {"key": "rules", "label": "恢复节点与规则", "status": "pending", "detail": ""},
         {"key": "sites_files", "label": "恢复网站与文件", "status": "pending", "detail": ""},
         {"key": "certs_netmon", "label": "恢复证书与网络波动", "status": "pending", "detail": ""},
+        {"key": "panel_state", "label": "恢复用户与面板状态", "status": "pending", "detail": ""},
         {"key": "finalize", "label": "收尾与校验", "status": "pending", "detail": ""},
     ]
 
@@ -1415,21 +2093,24 @@ def _restore_stage_by_progress(progress: int) -> Dict[str, str]:
     p = int(progress)
     if p < 15:
         return {"key": "upload", "stage": "上传备份包中…"}
-    if p < 30:
+    if p < 28:
         return {"key": "parse", "stage": "解析备份包…"}
-    if p < 50:
+    if p < 48:
         return {"key": "rules", "stage": "恢复节点与规则…"}
-    if p < 72:
+    if p < 66:
         return {"key": "sites_files", "stage": "恢复网站配置与文件…"}
-    if p < 88:
+    if p < 80:
         return {"key": "certs_netmon", "stage": "恢复证书与网络波动…"}
+    if p < 94:
+        return {"key": "panel_state", "stage": "恢复用户权限与面板状态…"}
     return {"key": "finalize", "stage": "收尾与校验…"}
 
 
 async def _restore_progress_ticker(job_id: str) -> None:
-    order = ["upload", "parse", "rules", "sites_files", "certs_netmon", "finalize"]
+    order = ["upload", "parse", "rules", "sites_files", "certs_netmon", "panel_state", "finalize"]
     while True:
         await asyncio.sleep(0.6)
+        now_ts = time.time()
         with _FULL_RESTORE_LOCK:
             job = _FULL_RESTORE_JOBS.get(job_id)
             if not isinstance(job, dict):
@@ -1437,7 +2118,17 @@ async def _restore_progress_ticker(job_id: str) -> None:
             if str(job.get("status") or "") != "running":
                 return
             cur = int(job.get("progress") or 6)
+            created_at = float(job.get("created_at") or now_ts)
         if cur >= 95:
+            elapsed = max(0, int(now_ts - created_at))
+            _touch_restore_job(
+                job_id,
+                progress=95,
+                stage="收尾与校验…",
+                step_key="finalize",
+                step_status="running",
+                step_detail=f"执行中 {elapsed}s",
+            )
             continue
         bump = random.randint(1, 3) if cur < 60 else random.randint(1, 2)
         nxt = min(95, cur + bump)
@@ -1496,6 +2187,51 @@ async def api_ping(request: Request, node_id: int, user: str = Depends(require_l
     if not info.get("ok"):
         return {"ok": False, "error": info.get("error", "offline")}
     return info
+
+
+@router.post("/api/nodes/{node_id}/trace")
+async def api_trace_route(request: Request, node_id: int, payload: Dict[str, Any], user: str = Depends(require_login)):
+    node = get_node(node_id)
+    if not node:
+        return JSONResponse({"ok": False, "error": "节点不存在"}, status_code=404)
+
+    target = _trace_route_target(payload.get("target") if isinstance(payload, dict) else "")
+    if not target:
+        return JSONResponse({"ok": False, "error": "目标不能为空"}, status_code=400)
+
+    max_hops = _trace_route_max_hops(payload.get("max_hops") if isinstance(payload, dict) else None)
+    timeout_f = _trace_route_timeout(payload.get("timeout") if isinstance(payload, dict) else None)
+    probes = _trace_route_probes(payload.get("probes") if isinstance(payload, dict) else None)
+
+    body = {
+        "target": target,
+        "max_hops": int(max_hops),
+        "timeout": float(timeout_f),
+        "probes": int(probes),
+    }
+
+    try:
+        data = await agent_post(
+            node.get("base_url", ""),
+            node.get("api_key", ""),
+            "/api/v1/netprobe/trace",
+            body,
+            node_verify_tls(node),
+            timeout=_TRACE_ROUTE_HTTP_TIMEOUT,
+        )
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"路由追踪请求失败：{exc}"}, status_code=502)
+
+    if not isinstance(data, dict):
+        return JSONResponse({"ok": False, "error": "Agent 返回异常"}, status_code=502)
+
+    if data.get("ok") is not True:
+        err = str(data.get("error") or "trace_failed").strip() or "trace_failed"
+        detail = str(data.get("detail") or "").strip()
+        if detail and detail not in err:
+            err = f"{err}：{detail}"
+        data["error"] = err
+    return data
 
 
 @router.get("/api/nodes/{node_id}/pool")
@@ -1755,6 +2491,7 @@ async def api_restore_nodes(
         role = str(item.get("role") or "normal").strip().lower() or "normal"
         if role not in ("normal", "website"):
             role = "normal"
+        capabilities = item.get("capabilities") if isinstance(item.get("capabilities"), dict) else {}
         website_root_base = str(item.get("website_root_base") or "").strip()
         group_name = (
             (item.get("group_name") or "默认分组").strip()
@@ -1775,6 +2512,10 @@ async def api_restore_nodes(
             continue
 
         existing = get_node_by_api_key(api_key) or get_node_by_base_url(base_url)
+        if source_id_i is not None and source_id_i > 0:
+            by_source = get_node(source_id_i)
+            if by_source:
+                existing = by_source
         if existing:
             update_node_basic(
                 existing["id"],
@@ -1785,25 +2526,60 @@ async def api_restore_nodes(
                 is_private=is_private,
                 group_name=group_name,
                 role=role,
+                capabilities=capabilities,
                 website_root_base=website_root_base,
             )
             updated += 1
-            if source_id_i is not None:
-                mapping[str(source_id_i)] = int(existing["id"])
+            node_id = int(existing["id"])
+            if source_id_i is not None and source_id_i > 0:
+                mapping[str(source_id_i)] = node_id
         else:
-            new_id = add_node(
-                name or extract_ip_for_display(base_url),
-                base_url,
-                api_key,
-                verify_tls=verify_tls,
-                is_private=is_private,
-                group_name=group_name,
-                role=role,
-                website_root_base=website_root_base,
-            )
-            added += 1
-            if source_id_i is not None:
-                mapping[str(source_id_i)] = int(new_id)
+            node_name = name or extract_ip_for_display(base_url)
+            preferred_id = source_id_i if source_id_i is not None and source_id_i > 0 else None
+            node_id: Optional[int] = None
+            try:
+                node_id = int(
+                    add_node(
+                        node_name,
+                        base_url,
+                        api_key,
+                        verify_tls=verify_tls,
+                        is_private=is_private,
+                        group_name=group_name,
+                        role=role,
+                        capabilities=capabilities,
+                        website_root_base=website_root_base,
+                        preferred_id=preferred_id,
+                    )
+                )
+                added += 1
+            except Exception:
+                fallback = None
+                if preferred_id:
+                    fallback = get_node(preferred_id)
+                if not fallback:
+                    fallback = get_node_by_api_key(api_key) or get_node_by_base_url(base_url)
+                if fallback:
+                    update_node_basic(
+                        fallback["id"],
+                        node_name,
+                        base_url,
+                        api_key,
+                        verify_tls=verify_tls,
+                        is_private=is_private,
+                        group_name=group_name,
+                        role=role,
+                        capabilities=capabilities,
+                        website_root_base=website_root_base,
+                    )
+                    updated += 1
+                    node_id = int(fallback["id"])
+                else:
+                    skipped += 1
+                    continue
+
+            if source_id_i is not None and source_id_i > 0 and node_id is not None:
+                mapping[str(source_id_i)] = int(node_id)
 
     return {
         "ok": True,
@@ -1851,7 +2627,10 @@ async def api_restore_full_start(
         try:
             ticker = asyncio.create_task(_restore_progress_ticker(job_id))
             upf = UploadFile(filename=str(file.filename or "restore.zip"), file=io.BytesIO(raw))
-            restore_resp = await api_restore_full(file=upf, user=user)
+            restore_resp = await asyncio.wait_for(
+                api_restore_full(file=upf, user=user),
+                timeout=float(_FULL_RESTORE_EXEC_TIMEOUT_SEC),
+            )
             if isinstance(restore_resp, JSONResponse):
                 payload = _parse_json_response_obj(restore_resp)
             elif isinstance(restore_resp, dict):
@@ -1875,7 +2654,7 @@ async def api_restore_full_start(
                 )
                 return
 
-            for k in ("upload", "parse", "rules", "sites_files", "certs_netmon", "finalize"):
+            for k in ("upload", "parse", "rules", "sites_files", "certs_netmon", "panel_state", "finalize"):
                 _touch_restore_job(job_id, step_key=k, step_status="done")
             _touch_restore_job(
                 job_id,
@@ -1886,6 +2665,23 @@ async def api_restore_full_start(
                 step_key="finalize",
                 step_status="done",
                 step_detail="恢复完成",
+            )
+        except asyncio.TimeoutError:
+            pos = _restore_stage_by_progress(int((_restore_job_snapshot(job_id) or {}).get("progress") or 95))
+            timeout_sec = int(max(120, round(float(_FULL_RESTORE_EXEC_TIMEOUT_SEC))))
+            msg = (
+                f"恢复执行超时（>{timeout_sec} 秒），已终止。"
+                "请检查目标节点连通性与站点文件接口后重试。"
+            )
+            _touch_restore_job(
+                job_id,
+                status="failed",
+                progress=99,
+                stage="恢复超时",
+                error=msg,
+                step_key=pos.get("key"),
+                step_status="failed",
+                step_detail="执行超时",
             )
         except asyncio.CancelledError as exc:
             pos = _restore_stage_by_progress(int((_restore_job_snapshot(job_id) or {}).get("progress") or 0))
@@ -2030,6 +2826,7 @@ async def api_restore_full(
         role = str(item.get("role") or "normal").strip().lower() or "normal"
         if role not in ("normal", "website"):
             role = "normal"
+        capabilities = item.get("capabilities") if isinstance(item.get("capabilities"), dict) else {}
         website_root_base = str(item.get("website_root_base") or "").strip()
         group_name = item.get("group_name") or "默认分组"
         group_name = str(group_name).strip() or "默认分组"
@@ -2039,14 +2836,18 @@ async def api_restore_full(
         except Exception:
             source_id_i = None
 
-        if base_url and source_id_i is not None:
+        if base_url and source_id_i is not None and source_id_i > 0:
             srcid_to_baseurl[str(source_id_i)] = base_url
 
         if not base_url or not api_key:
             skipped += 1
             continue
 
-        existing = get_node_by_api_key(api_key) or get_node_by_base_url(base_url)
+        existing = None
+        if source_id_i is not None and source_id_i > 0:
+            existing = get_node(source_id_i)
+        if not existing:
+            existing = get_node_by_api_key(api_key) or get_node_by_base_url(base_url)
         if existing:
             update_node_basic(
                 existing["id"],
@@ -2057,27 +2858,57 @@ async def api_restore_full(
                 is_private=is_private,
                 group_name=group_name,
                 role=role,
+                capabilities=capabilities,
                 website_root_base=website_root_base,
             )
             updated += 1
             node_id = int(existing["id"])
         else:
-            node_id = int(
-                add_node(
-                    name or extract_ip_for_display(base_url),
-                    base_url,
-                    api_key,
-                    verify_tls=verify_tls,
-                    is_private=is_private,
-                    group_name=group_name,
-                    role=role,
-                    website_root_base=website_root_base,
+            node_name = name or extract_ip_for_display(base_url)
+            preferred_id = source_id_i if source_id_i is not None and source_id_i > 0 else None
+            try:
+                node_id = int(
+                    add_node(
+                        node_name,
+                        base_url,
+                        api_key,
+                        verify_tls=verify_tls,
+                        is_private=is_private,
+                        group_name=group_name,
+                        role=role,
+                        capabilities=capabilities,
+                        website_root_base=website_root_base,
+                        preferred_id=preferred_id,
+                    )
                 )
-            )
-            added += 1
+                added += 1
+            except Exception:
+                fallback = None
+                if preferred_id:
+                    fallback = get_node(preferred_id)
+                if not fallback:
+                    fallback = get_node_by_api_key(api_key) or get_node_by_base_url(base_url)
+                if fallback:
+                    update_node_basic(
+                        fallback["id"],
+                        node_name,
+                        base_url,
+                        api_key,
+                        verify_tls=verify_tls,
+                        is_private=is_private,
+                        group_name=group_name,
+                        role=role,
+                        capabilities=capabilities,
+                        website_root_base=website_root_base,
+                    )
+                    updated += 1
+                    node_id = int(fallback["id"])
+                else:
+                    skipped += 1
+                    continue
 
         baseurl_to_nodeid[base_url] = node_id
-        if source_id_i is not None:
+        if source_id_i is not None and source_id_i > 0:
             mapping[str(source_id_i)] = node_id
 
     # ---- restore rules (batch) ----
@@ -2383,6 +3214,10 @@ async def api_restore_full(
     site_file_failed = 0
     site_file_skipped = 0
     site_file_unmatched = 0
+    site_dir_restored = 0
+    site_dir_failed = 0
+    site_dir_skipped = 0
+    site_dir_unmatched = 0
     site_file_bytes = 0
     site_file_failed_items: List[Dict[str, Any]] = []
 
@@ -2478,6 +3313,72 @@ async def api_restore_full(
                     raise RuntimeError(str(resp_chunk.get("error") or "文件上传失败"))
                 offset += len(chunk)
 
+        async def _ensure_site_dir(
+            node: Dict[str, Any],
+            root_path: str,
+            rel_dir: str,
+        ) -> None:
+            clean_rel = _clean_site_rel_path(rel_dir)
+            if not clean_rel:
+                raise RuntimeError("非法目录路径")
+            if "/" in clean_rel:
+                parent_path, dirname = clean_rel.rsplit("/", 1)
+            else:
+                parent_path, dirname = "", clean_rel
+            dirname = dirname.strip()
+            if not dirname:
+                raise RuntimeError("目录名为空")
+            payload_dir = {
+                "root": root_path,
+                "path": parent_path,
+                "name": dirname,
+                "root_base": str(node.get("website_root_base") or "").strip(),
+            }
+            resp_dir = await agent_post(
+                node["base_url"],
+                node["api_key"],
+                "/api/v1/website/files/mkdir",
+                payload_dir,
+                node_verify_tls(node),
+                timeout=20,
+            )
+            if not resp_dir.get("ok", True):
+                raise RuntimeError(str(resp_dir.get("error") or "创建目录失败"))
+
+        file_restore_probe_cache: Dict[Tuple[int, str], Tuple[bool, str]] = {}
+
+        async def _probe_site_file_restore(node: Dict[str, Any], root_path: str) -> Tuple[bool, str]:
+            node_id = _as_int(node.get("id"), 0)
+            key = (node_id, str(root_path or ""))
+            cached = file_restore_probe_cache.get(key)
+            if cached is not None:
+                return cached
+
+            payload_probe = {
+                "root": root_path,
+                "path": "",
+                "filename": ".nexus-restore-probe",
+                "upload_id": f"probe-{uuid.uuid4().hex}",
+                "root_base": str(node.get("website_root_base") or "").strip(),
+            }
+            try:
+                resp_probe = await agent_post(
+                    node["base_url"],
+                    node["api_key"],
+                    "/api/v1/website/files/upload_status",
+                    payload_probe,
+                    node_verify_tls(node),
+                    timeout=8,
+                )
+                if not bool(resp_probe.get("ok", False)):
+                    msg = str(resp_probe.get("error") or "站点文件接口不可用")
+                    file_restore_probe_cache[key] = (False, msg)
+                else:
+                    file_restore_probe_cache[key] = (True, "")
+            except Exception as exc:
+                file_restore_probe_cache[key] = (False, str(exc))
+            return file_restore_probe_cache[key]
+
         for sitem in site_file_items:
             if not isinstance(sitem, dict):
                 continue
@@ -2491,10 +3392,13 @@ async def api_restore_full(
                 if source_site_id is not None and source_site_id in current_sites:
                     target_site_id = int(source_site_id)
 
+            dirs_arr = sitem.get("dirs")
+            dir_items = dirs_arr if isinstance(dirs_arr, list) else []
             files_arr = sitem.get("files")
             file_items = files_arr if isinstance(files_arr, list) else []
             if not target_site_id:
                 site_file_unmatched += len(file_items)
+                site_dir_unmatched += len(dir_items)
                 continue
 
             site_obj = current_sites.get(int(target_site_id))
@@ -2504,13 +3408,45 @@ async def api_restore_full(
                     current_sites[int(target_site_id)] = site_obj
             if not isinstance(site_obj, dict):
                 site_file_unmatched += len(file_items)
+                site_dir_unmatched += len(dir_items)
                 continue
 
             target_node = get_node(_as_int(site_obj.get("node_id"), 0))
             root_path = str(site_obj.get("root_path") or "").strip()
             if not target_node or not root_path:
                 site_file_skipped += len(file_items)
+                site_dir_skipped += len(dir_items)
                 continue
+            probe_ok, probe_err = await _probe_site_file_restore(target_node, root_path)
+            if not probe_ok:
+                site_file_failed += len(file_items)
+                site_dir_failed += len(dir_items)
+                site_file_failed_items.append(
+                    {
+                        "site_id": target_site_id,
+                        "path": "/",
+                        "error": f"站点文件接口不可达，已跳过该站点文件恢复：{probe_err}",
+                    }
+                )
+                continue
+
+            for ditem in dir_items:
+                rel_dir = ""
+                if isinstance(ditem, dict):
+                    rel_dir = _clean_site_rel_path(ditem.get("path"))
+                else:
+                    rel_dir = _clean_site_rel_path(ditem)
+                if not rel_dir:
+                    site_dir_skipped += 1
+                    continue
+                try:
+                    await _ensure_site_dir(target_node, root_path, rel_dir)
+                    site_dir_restored += 1
+                except Exception as exc:
+                    site_dir_failed += 1
+                    site_file_failed_items.append(
+                        {"site_id": target_site_id, "path": f"{rel_dir}/", "error": f"目录恢复失败：{exc}"}
+                    )
 
             pkg_dir = str(sitem.get("package_dir") or "")
             for fitem in file_items:
@@ -2657,12 +3593,17 @@ async def api_restore_full(
     mon_added = 0
     mon_updated = 0
     mon_skipped = 0
+    mon_samples_restored = 0
+    mon_samples_skipped = 0
+    mon_samples_failed = 0
+    mon_samples_cleared = 0
 
     def _monitor_key(target: str, mode: str, tcp_port: int, node_ids: List[int]) -> tuple[str, str, int, tuple[int, ...]]:
         cleaned = sorted(set([int(x) for x in (node_ids or []) if int(x) > 0]))
         return ((target or "").strip().lower(), (mode or "ping").strip().lower(), int(tcp_port or 443), tuple(cleaned))
 
     monitor_index: Dict[tuple[str, str, int, tuple[int, ...]], int] = {}
+    source_monitor_mapping: Dict[str, int] = {}
     try:
         for m in list_netmon_monitors():
             mid = _as_int(m.get("id"), 0)
@@ -2727,6 +3668,7 @@ async def api_restore_full(
                 mon_skipped += 1
                 continue
 
+            src_mid = _as_int(item.get("source_id"), 0)
             mk = _monitor_key(target, mode, tcp_port, resolved_ids)
             mid = monitor_index.get(mk)
             if mid:
@@ -2744,8 +3686,9 @@ async def api_restore_full(
                     last_run_msg=str(item.get("last_run_msg") or ""),
                 )
                 mon_updated += 1
+                target_mid = int(mid)
             else:
-                new_mid = int(
+                target_mid = int(
                     add_netmon_monitor(
                         target=target,
                         mode=mode,
@@ -2757,8 +3700,627 @@ async def api_restore_full(
                         enabled=enabled,
                     )
                 )
-                monitor_index[mk] = new_mid
+                monitor_index[mk] = target_mid
                 mon_added += 1
+            if src_mid > 0:
+                source_monitor_mapping[str(src_mid)] = int(target_mid)
+
+    samples_path = _find_zip_path("netmon/samples.json")
+    if samples_path:
+        sample_items: List[Any] = []
+        try:
+            samples_payload = json.loads(z.read(samples_path).decode("utf-8"))
+            sample_items = (
+                samples_payload.get("samples")
+                if isinstance(samples_payload, dict) and isinstance(samples_payload.get("samples"), list)
+                else (samples_payload if isinstance(samples_payload, list) else [])
+            )
+        except Exception:
+            sample_items = []
+
+        rows_to_insert: List[Tuple[int, int, int, int, Optional[float], Optional[str]]] = []
+        clear_monitor_ids: set[int] = set()
+        for item in sample_items:
+            if not isinstance(item, dict):
+                mon_samples_skipped += 1
+                continue
+
+            src_mid = _as_int(
+                item.get("source_monitor_id", item.get("monitor_source_id", item.get("monitor_id"))),
+                0,
+            )
+            target_mid = source_monitor_mapping.get(str(src_mid)) if src_mid > 0 else None
+            if not target_mid:
+                mon_samples_skipped += 1
+                continue
+
+            src_node_id = _as_int(
+                item.get("source_node_id", item.get("node_source_id", item.get("node_id"))),
+                0,
+            )
+            node_base_url = str(item.get("node_base_url") or "").strip().rstrip("/") or None
+            target_node_id = _resolve_node_id(src_node_id if src_node_id > 0 else None, node_base_url)
+            if not target_node_id:
+                mon_samples_skipped += 1
+                continue
+
+            ts_ms = _as_int(item.get("ts_ms"), 0)
+            if ts_ms <= 0:
+                mon_samples_skipped += 1
+                continue
+
+            latency_raw = item.get("latency_ms")
+            latency_val: Optional[float] = None
+            if latency_raw is not None and str(latency_raw).strip() != "":
+                try:
+                    latency_val = float(latency_raw)
+                except Exception:
+                    latency_val = None
+
+            err_s = str(item.get("error") or "").strip()
+            rows_to_insert.append(
+                (
+                    int(target_mid),
+                    int(target_node_id),
+                    int(ts_ms),
+                    1 if _as_bool(item.get("ok"), False) else 0,
+                    latency_val,
+                    err_s or None,
+                )
+            )
+            clear_monitor_ids.add(int(target_mid))
+
+        if clear_monitor_ids:
+            mids = sorted(clear_monitor_ids)
+            placeholders = ",".join(["?"] * len(mids))
+            with connect() as conn:
+                conn.execute(f"DELETE FROM netmon_samples WHERE monitor_id IN ({placeholders})", tuple(mids))
+                conn.commit()
+            mon_samples_cleared = len(mids)
+
+        if rows_to_insert:
+            chunk_size = 2000
+            for i in range(0, len(rows_to_insert), chunk_size):
+                chunk = rows_to_insert[i : i + chunk_size]
+                try:
+                    mon_samples_restored += int(insert_netmon_samples(chunk))
+                except Exception:
+                    mon_samples_failed += len(chunk)
+
+    # ---- restore panel state (users/roles/share/favorites/events) ----
+    panel_state_result: Dict[str, Any] = {
+        "panel_settings": {"added": 0, "updated": 0, "skipped": 0},
+        "roles": {"added": 0, "updated": 0, "skipped": 0},
+        "users": {"added": 0, "updated": 0, "skipped": 0},
+        "user_tokens": {"added": 0, "updated": 0, "skipped": 0},
+        "rule_owner_map": {"added": 0, "updated": 0, "skipped": 0},
+        "site_file_favorites": {"added": 0, "updated": 0, "skipped": 0},
+        "site_file_share_short_links": {"added": 0, "updated": 0, "skipped": 0},
+        "site_file_share_revocations": {"added": 0, "updated": 0, "skipped": 0},
+        "site_events": {"restored": 0, "skipped": 0},
+        "site_checks": {"restored": 0, "skipped": 0},
+        "errors": [],
+    }
+
+    def _norm_str_list(val: Any) -> List[str]:
+        if not isinstance(val, list):
+            return []
+        out: List[str] = []
+        seen: set[str] = set()
+        for item in val:
+            s = str(item or "").strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
+
+    panel_state_path = _find_zip_path("panel/state.json")
+    if panel_state_path:
+        try:
+            panel_state_payload = json.loads(z.read(panel_state_path).decode("utf-8"))
+            if not isinstance(panel_state_payload, dict):
+                panel_state_payload = {}
+        except Exception as exc:
+            panel_state_payload = {}
+            panel_state_result["errors"].append(f"panel/state.json 解析失败：{exc}")
+
+        settings_items = panel_state_payload.get("panel_settings")
+        if not isinstance(settings_items, list):
+            settings_items = []
+        existing_settings = list_panel_settings()
+        for item in settings_items:
+            if not isinstance(item, dict):
+                panel_state_result["panel_settings"]["skipped"] += 1
+                continue
+            key_s = str(item.get("key") or "").strip()
+            if not key_s:
+                panel_state_result["panel_settings"]["skipped"] += 1
+                continue
+            existed = key_s in existing_settings
+            try:
+                set_panel_setting(key_s, str(item.get("value") or ""))
+                if existed:
+                    panel_state_result["panel_settings"]["updated"] += 1
+                else:
+                    panel_state_result["panel_settings"]["added"] += 1
+                existing_settings[key_s] = str(item.get("value") or "")
+            except Exception as exc:
+                panel_state_result["panel_settings"]["skipped"] += 1
+                panel_state_result["errors"].append(f"面板设置恢复失败[{key_s}]：{exc}")
+
+        role_source_to_target: Dict[str, int] = {}
+        role_name_to_target: Dict[str, int] = {}
+        user_source_to_target: Dict[str, int] = {}
+        username_to_target: Dict[str, int] = {}
+
+        for role in list_roles():
+            rid = _as_int(role.get("id"), 0)
+            rname = str(role.get("name") or "").strip()
+            if rid > 0 and rname:
+                role_name_to_target[rname] = rid
+
+        role_items = panel_state_payload.get("roles")
+        if not isinstance(role_items, list):
+            role_items = []
+        for item in role_items:
+            if not isinstance(item, dict):
+                panel_state_result["roles"]["skipped"] += 1
+                continue
+            role_name = str(item.get("name") or "").strip()
+            if not role_name:
+                panel_state_result["roles"]["skipped"] += 1
+                continue
+            existed = role_name in role_name_to_target
+            try:
+                rid = int(
+                    upsert_role(
+                        role_name,
+                        permissions=_norm_str_list(item.get("permissions")),
+                        description=str(item.get("description") or ""),
+                        builtin=bool(item.get("builtin") or False),
+                    )
+                )
+            except Exception as exc:
+                panel_state_result["roles"]["skipped"] += 1
+                panel_state_result["errors"].append(f"角色恢复失败[{role_name}]：{exc}")
+                continue
+            role_name_to_target[role_name] = rid
+            src_rid = item.get("source_id")
+            if src_rid is not None:
+                role_source_to_target[str(_as_int(src_rid, 0))] = rid
+            if existed:
+                panel_state_result["roles"]["updated"] += 1
+            else:
+                panel_state_result["roles"]["added"] += 1
+
+        with connect() as conn:
+            existing_users = conn.execute(
+                "SELECT id, username FROM users ORDER BY id ASC"
+            ).fetchall()
+            for row in existing_users:
+                d = dict(row)
+                uid = _as_int(d.get("id"), 0)
+                uname = str(d.get("username") or "").strip()
+                if uid > 0 and uname:
+                    username_to_target[uname] = uid
+
+        user_items = panel_state_payload.get("users")
+        if not isinstance(user_items, list):
+            user_items = []
+        for item in user_items:
+            if not isinstance(item, dict):
+                panel_state_result["users"]["skipped"] += 1
+                continue
+            username = str(item.get("username") or "").strip()
+            if not username:
+                panel_state_result["users"]["skipped"] += 1
+                continue
+
+            target_role_id = 0
+            src_role_id = item.get("source_role_id")
+            if src_role_id is not None:
+                target_role_id = _as_int(role_source_to_target.get(str(_as_int(src_role_id, 0))), 0)
+            if target_role_id <= 0:
+                role_name = str(item.get("role_name") or "").strip()
+                if role_name:
+                    target_role_id = _as_int(role_name_to_target.get(role_name), 0)
+            if target_role_id <= 0:
+                fallback_role = get_role_by_name("viewer") or get_role_by_name("owner")
+                target_role_id = _as_int((fallback_role or {}).get("id"), 0)
+            if target_role_id <= 0:
+                panel_state_result["users"]["skipped"] += 1
+                panel_state_result["errors"].append(f"用户恢复失败[{username}]：缺少可用角色")
+                continue
+
+            policy = item.get("policy") if isinstance(item.get("policy"), dict) else {}
+            salt_b64 = str(item.get("salt_b64") or "").strip()
+            hash_b64 = str(item.get("hash_b64") or "").strip()
+            iterations = max(1, _as_int(item.get("iterations"), 120000))
+            enabled = _as_bool(item.get("enabled"), True)
+            expires_at = str(item.get("expires_at") or "").strip() or None
+
+            existing_uid = _as_int(username_to_target.get(username), 0)
+            try:
+                if existing_uid > 0:
+                    update_user_record(
+                        existing_uid,
+                        username=username,
+                        salt_b64=salt_b64 if salt_b64 else None,
+                        hash_b64=hash_b64 if hash_b64 else None,
+                        iterations=iterations if (salt_b64 and hash_b64) else None,
+                        role_id=target_role_id,
+                        enabled=enabled,
+                        expires_at=expires_at,
+                        policy=policy,
+                    )
+                    target_uid = existing_uid
+                    panel_state_result["users"]["updated"] += 1
+                else:
+                    if not salt_b64 or not hash_b64:
+                        panel_state_result["users"]["skipped"] += 1
+                        panel_state_result["errors"].append(f"用户恢复失败[{username}]：缺少密码哈希")
+                        continue
+                    target_uid = int(
+                        create_user_record(
+                            username=username,
+                            salt_b64=salt_b64,
+                            hash_b64=hash_b64,
+                            iterations=iterations,
+                            role_id=target_role_id,
+                            enabled=enabled,
+                            expires_at=expires_at,
+                            policy=policy,
+                            created_by=str(item.get("created_by") or ""),
+                        )
+                    )
+                    panel_state_result["users"]["added"] += 1
+                username_to_target[username] = target_uid
+            except Exception as exc:
+                panel_state_result["users"]["skipped"] += 1
+                panel_state_result["errors"].append(f"用户恢复失败[{username}]：{exc}")
+                continue
+
+            src_uid = item.get("source_id")
+            if src_uid is not None:
+                user_source_to_target[str(_as_int(src_uid, 0))] = int(target_uid)
+
+        token_items = panel_state_payload.get("user_tokens")
+        if not isinstance(token_items, list):
+            token_items = []
+        with connect() as conn:
+            for item in token_items:
+                if not isinstance(item, dict):
+                    panel_state_result["user_tokens"]["skipped"] += 1
+                    continue
+                token_sha256 = str(item.get("token_sha256") or "").strip().lower()
+                if not token_sha256:
+                    panel_state_result["user_tokens"]["skipped"] += 1
+                    continue
+                target_uid = 0
+                src_user_id = item.get("source_user_id")
+                if src_user_id is not None:
+                    target_uid = _as_int(user_source_to_target.get(str(_as_int(src_user_id, 0))), 0)
+                if target_uid <= 0:
+                    target_uid = _as_int(username_to_target.get(str(item.get("source_username") or "").strip()), 0)
+                if target_uid <= 0:
+                    panel_state_result["user_tokens"]["skipped"] += 1
+                    continue
+                scopes = _norm_str_list(item.get("scopes"))
+                scopes_json = json.dumps(scopes, ensure_ascii=False)
+                exists = conn.execute(
+                    "SELECT id FROM user_tokens WHERE token_sha256=? LIMIT 1",
+                    (token_sha256,),
+                ).fetchone()
+                if exists:
+                    conn.execute(
+                        "UPDATE user_tokens SET user_id=?, name=?, scopes_json=?, expires_at=?, last_used_at=?, created_by=?, created_at=COALESCE(?, created_at), revoked_at=? "
+                        "WHERE id=?",
+                        (
+                            int(target_uid),
+                            str(item.get("name") or ""),
+                            scopes_json,
+                            str(item.get("expires_at") or "").strip() or None,
+                            str(item.get("last_used_at") or "").strip() or None,
+                            str(item.get("created_by") or ""),
+                            str(item.get("created_at") or "").strip() or None,
+                            str(item.get("revoked_at") or "").strip() or None,
+                            int(exists["id"]),
+                        ),
+                    )
+                    panel_state_result["user_tokens"]["updated"] += 1
+                else:
+                    conn.execute(
+                        "INSERT INTO user_tokens("
+                        "user_id, token_sha256, name, scopes_json, expires_at, last_used_at, created_by, created_at, revoked_at"
+                        ") VALUES(?,?,?,?,?,?,?,?,?)",
+                        (
+                            int(target_uid),
+                            token_sha256,
+                            str(item.get("name") or ""),
+                            scopes_json,
+                            str(item.get("expires_at") or "").strip() or None,
+                            str(item.get("last_used_at") or "").strip() or None,
+                            str(item.get("created_by") or ""),
+                            str(item.get("created_at") or "").strip() or None,
+                            str(item.get("revoked_at") or "").strip() or None,
+                        ),
+                    )
+                    panel_state_result["user_tokens"]["added"] += 1
+            conn.commit()
+
+        owner_items = panel_state_payload.get("rule_owner_map")
+        if not isinstance(owner_items, list):
+            owner_items = []
+        with connect() as conn:
+            for item in owner_items:
+                if not isinstance(item, dict):
+                    panel_state_result["rule_owner_map"]["skipped"] += 1
+                    continue
+                source_node_id = _as_int(item.get("source_node_id"), 0)
+                target_node_id = _resolve_node_id(source_node_id if source_node_id > 0 else None, None)
+                rule_key = str(item.get("rule_key") or "").strip()
+                if not target_node_id or not rule_key:
+                    panel_state_result["rule_owner_map"]["skipped"] += 1
+                    continue
+                owner_uid = 0
+                src_owner_uid = item.get("owner_source_user_id")
+                if src_owner_uid is not None:
+                    owner_uid = _as_int(user_source_to_target.get(str(_as_int(src_owner_uid, 0))), 0)
+                owner_username = str(item.get("owner_username") or "").strip()
+                if owner_uid <= 0 and owner_username:
+                    owner_uid = _as_int(username_to_target.get(owner_username), 0)
+                active = 1 if _as_bool(item.get("active"), True) else 0
+                first_seen_at = str(item.get("first_seen_at") or "").strip() or None
+                last_seen_at = str(item.get("last_seen_at") or "").strip() or None
+                exists = conn.execute(
+                    "SELECT id FROM rule_owner_map WHERE node_id=? AND rule_key=? LIMIT 1",
+                    (int(target_node_id), rule_key),
+                ).fetchone()
+                if exists:
+                    conn.execute(
+                        "UPDATE rule_owner_map SET owner_user_id=?, owner_username=?, first_seen_at=COALESCE(?, first_seen_at), "
+                        "last_seen_at=COALESCE(?, last_seen_at), active=? WHERE id=?",
+                        (
+                            int(owner_uid),
+                            owner_username,
+                            first_seen_at,
+                            last_seen_at,
+                            int(active),
+                            int(exists["id"]),
+                        ),
+                    )
+                    panel_state_result["rule_owner_map"]["updated"] += 1
+                else:
+                    conn.execute(
+                        "INSERT INTO rule_owner_map("
+                        "node_id, rule_key, owner_user_id, owner_username, first_seen_at, last_seen_at, active"
+                        ") VALUES(?,?,?,?,COALESCE(?, datetime('now')),COALESCE(?, datetime('now')),?)",
+                        (
+                            int(target_node_id),
+                            rule_key,
+                            int(owner_uid),
+                            owner_username,
+                            first_seen_at,
+                            last_seen_at,
+                            int(active),
+                        ),
+                    )
+                    panel_state_result["rule_owner_map"]["added"] += 1
+            conn.commit()
+
+        current_site_ids: Dict[int, int] = {}
+        try:
+            for s in list_sites():
+                sid = _as_int(s.get("id"), 0)
+                if sid > 0:
+                    current_site_ids[sid] = sid
+        except Exception:
+            current_site_ids = {}
+
+        def _resolve_site_id(source_site_id: Any) -> Optional[int]:
+            sid = _as_int(source_site_id, 0)
+            if sid <= 0:
+                return None
+            if str(sid) in site_mapping:
+                return _as_int(site_mapping.get(str(sid)), 0) or None
+            if sid in current_site_ids:
+                return sid
+            return None
+
+        fav_items = panel_state_payload.get("site_file_favorites")
+        if not isinstance(fav_items, list):
+            fav_items = []
+        favorite_existing: set[tuple[int, str, str]] = set()
+        with connect() as conn:
+            fav_rows = conn.execute(
+                "SELECT site_id, owner, path FROM site_file_favorites"
+            ).fetchall()
+            for row in fav_rows:
+                d = dict(row)
+                sid = _as_int(d.get("site_id"), 0)
+                owner = str(d.get("owner") or "").strip()
+                path = str(d.get("path") or "").strip()
+                if sid > 0 and owner and path:
+                    favorite_existing.add((sid, owner, path))
+        for item in fav_items:
+            if not isinstance(item, dict):
+                panel_state_result["site_file_favorites"]["skipped"] += 1
+                continue
+            target_site_id = _resolve_site_id(item.get("source_site_id"))
+            owner = str(item.get("owner") or "").strip()
+            path = str(item.get("path") or "").strip()
+            if not target_site_id or not owner or not path:
+                panel_state_result["site_file_favorites"]["skipped"] += 1
+                continue
+            existed = (int(target_site_id), owner, path) in favorite_existing
+            try:
+                upsert_site_file_favorite(
+                    int(target_site_id),
+                    owner=owner,
+                    path=path,
+                    is_dir=_as_bool(item.get("is_dir"), False),
+                )
+                favorite_existing.add((int(target_site_id), owner, path))
+                if existed:
+                    panel_state_result["site_file_favorites"]["updated"] += 1
+                else:
+                    panel_state_result["site_file_favorites"]["added"] += 1
+            except Exception as exc:
+                panel_state_result["site_file_favorites"]["skipped"] += 1
+                panel_state_result["errors"].append(f"文件收藏恢复失败[{target_site_id}:{path}]：{exc}")
+
+        rev_items = panel_state_payload.get("site_file_share_revocations")
+        if not isinstance(rev_items, list):
+            rev_items = []
+        with connect() as conn:
+            for item in rev_items:
+                if not isinstance(item, dict):
+                    panel_state_result["site_file_share_revocations"]["skipped"] += 1
+                    continue
+                target_site_id = _resolve_site_id(item.get("source_site_id"))
+                digest = str(item.get("token_sha256") or "").strip().lower()
+                if not target_site_id or not digest:
+                    panel_state_result["site_file_share_revocations"]["skipped"] += 1
+                    continue
+                exists = conn.execute(
+                    "SELECT id FROM site_file_share_revocations WHERE site_id=? AND token_sha256=? LIMIT 1",
+                    (int(target_site_id), digest),
+                ).fetchone()
+                if exists:
+                    conn.execute(
+                        "UPDATE site_file_share_revocations SET revoked_by=?, reason=?, revoked_at=COALESCE(?, revoked_at) WHERE id=?",
+                        (
+                            str(item.get("revoked_by") or ""),
+                            str(item.get("reason") or ""),
+                            str(item.get("revoked_at") or "").strip() or None,
+                            int(exists["id"]),
+                        ),
+                    )
+                    panel_state_result["site_file_share_revocations"]["updated"] += 1
+                else:
+                    conn.execute(
+                        "INSERT INTO site_file_share_revocations(site_id, token_sha256, revoked_by, reason, revoked_at) "
+                        "VALUES(?,?,?,?,COALESCE(?, datetime('now')))",
+                        (
+                            int(target_site_id),
+                            digest,
+                            str(item.get("revoked_by") or ""),
+                            str(item.get("reason") or ""),
+                            str(item.get("revoked_at") or "").strip() or None,
+                        ),
+                    )
+                    panel_state_result["site_file_share_revocations"]["added"] += 1
+            conn.commit()
+
+        share_items = panel_state_payload.get("site_file_share_short_links")
+        if not isinstance(share_items, list):
+            share_items = []
+        with connect() as conn:
+            for item in share_items:
+                if not isinstance(item, dict):
+                    panel_state_result["site_file_share_short_links"]["skipped"] += 1
+                    continue
+                code = str(item.get("code") or "").strip()
+                token = str(item.get("token") or "").strip()
+                digest = str(item.get("token_sha256") or "").strip().lower()
+                if token and (not digest):
+                    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+                target_site_id = _resolve_site_id(item.get("source_site_id"))
+                if not code or not target_site_id or not token or not digest:
+                    panel_state_result["site_file_share_short_links"]["skipped"] += 1
+                    continue
+                exists = conn.execute(
+                    "SELECT code FROM site_file_share_short_links WHERE code=? LIMIT 1",
+                    (code,),
+                ).fetchone()
+                if exists:
+                    conn.execute(
+                        "UPDATE site_file_share_short_links SET site_id=?, token=?, token_sha256=?, created_by=?, created_at=COALESCE(?, created_at) "
+                        "WHERE code=?",
+                        (
+                            int(target_site_id),
+                            token,
+                            digest,
+                            str(item.get("created_by") or ""),
+                            str(item.get("created_at") or "").strip() or None,
+                            code,
+                        ),
+                    )
+                    panel_state_result["site_file_share_short_links"]["updated"] += 1
+                else:
+                    conn.execute(
+                        "INSERT INTO site_file_share_short_links(code, site_id, token, token_sha256, created_by, created_at) "
+                        "VALUES(?,?,?,?,?,COALESCE(?, datetime('now')))",
+                        (
+                            code,
+                            int(target_site_id),
+                            token,
+                            digest,
+                            str(item.get("created_by") or ""),
+                            str(item.get("created_at") or "").strip() or None,
+                        ),
+                    )
+                    panel_state_result["site_file_share_short_links"]["added"] += 1
+            conn.commit()
+
+        event_items = panel_state_payload.get("site_events")
+        if not isinstance(event_items, list):
+            event_items = []
+        with connect() as conn:
+            for item in event_items:
+                if not isinstance(item, dict):
+                    panel_state_result["site_events"]["skipped"] += 1
+                    continue
+                target_site_id = _resolve_site_id(item.get("source_site_id"))
+                if not target_site_id:
+                    panel_state_result["site_events"]["skipped"] += 1
+                    continue
+                payload_obj = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+                result_obj = item.get("result") if isinstance(item.get("result"), dict) else {}
+                conn.execute(
+                    "INSERT INTO site_events(site_id, action, status, actor, payload_json, result_json, error, created_at) "
+                    "VALUES(?,?,?,?,?,?,?,COALESCE(?, datetime('now')))",
+                    (
+                        int(target_site_id),
+                        str(item.get("action") or ""),
+                        str(item.get("status") or "success"),
+                        str(item.get("actor") or ""),
+                        json.dumps(payload_obj, ensure_ascii=False),
+                        json.dumps(result_obj, ensure_ascii=False),
+                        str(item.get("error") or ""),
+                        str(item.get("created_at") or "").strip() or None,
+                    ),
+                )
+                panel_state_result["site_events"]["restored"] += 1
+            conn.commit()
+
+        check_items = panel_state_payload.get("site_checks")
+        if not isinstance(check_items, list):
+            check_items = []
+        with connect() as conn:
+            for item in check_items:
+                if not isinstance(item, dict):
+                    panel_state_result["site_checks"]["skipped"] += 1
+                    continue
+                target_site_id = _resolve_site_id(item.get("source_site_id"))
+                if not target_site_id:
+                    panel_state_result["site_checks"]["skipped"] += 1
+                    continue
+                conn.execute(
+                    "INSERT INTO site_checks(site_id, ok, status_code, latency_ms, error, checked_at) "
+                    "VALUES(?,?,?,?,?,COALESCE(?, datetime('now')))",
+                    (
+                        int(target_site_id),
+                        1 if _as_bool(item.get("ok"), False) else 0,
+                        _as_int(item.get("status_code"), 0),
+                        _as_int(item.get("latency_ms"), 0),
+                        str(item.get("error") or ""),
+                        str(item.get("checked_at") or "").strip() or None,
+                    ),
+                )
+                panel_state_result["site_checks"]["restored"] += 1
+            conn.commit()
 
     return {
         "ok": True,
@@ -2780,6 +4342,10 @@ async def api_restore_full(
             "failed": site_file_failed,
             "skipped": site_file_skipped,
             "unmatched": site_file_unmatched,
+            "dirs_restored": site_dir_restored,
+            "dirs_failed": site_dir_failed,
+            "dirs_skipped": site_dir_skipped,
+            "dirs_unmatched": site_dir_unmatched,
             "bytes": site_file_bytes,
         },
         "certificates": {
@@ -2791,12 +4357,29 @@ async def api_restore_full(
             "added": mon_added,
             "updated": mon_updated,
             "skipped": mon_skipped,
+            "samples_restored": mon_samples_restored,
+            "samples_skipped": mon_samples_skipped,
+            "samples_failed": mon_samples_failed,
+            "sample_monitors_cleared": mon_samples_cleared,
+        },
+        "panel_state": {
+            "panel_settings": panel_state_result["panel_settings"],
+            "roles": panel_state_result["roles"],
+            "users": panel_state_result["users"],
+            "user_tokens": panel_state_result["user_tokens"],
+            "rule_owner_map": panel_state_result["rule_owner_map"],
+            "site_file_favorites": panel_state_result["site_file_favorites"],
+            "site_file_share_short_links": panel_state_result["site_file_share_short_links"],
+            "site_file_share_revocations": panel_state_result["site_file_share_revocations"],
+            "site_events": panel_state_result["site_events"],
+            "site_checks": panel_state_result["site_checks"],
         },
         "site_unmatched": site_unmatched[:50],
         "site_file_failed": site_file_failed_items[:50],
         "cert_unmatched": cert_unmatched[:50],
         "rule_unmatched": rule_unmatched[:50],
         "rule_failed": rule_failed[:50],
+        "panel_state_errors": (panel_state_result.get("errors") or [])[:50],
     }
 
 
@@ -2853,20 +4436,67 @@ def _safe_error_text(data: Any, default: str = "unknown") -> str:
     return msg or default
 
 
+def _trace_route_target(raw_target: Any) -> str:
+    s = str(raw_target or "").strip()
+    if len(s) > 256:
+        s = s[:256].strip()
+    return s
+
+
+def _trace_route_max_hops(raw_hops: Any) -> int:
+    try:
+        v = int(raw_hops) if raw_hops is not None else 20
+    except Exception:
+        v = 20
+    if v < 3:
+        v = 3
+    if v > 64:
+        v = 64
+    return v
+
+
+def _trace_route_timeout(raw_timeout: Any) -> float:
+    try:
+        v = float(raw_timeout) if raw_timeout is not None else 1.0
+    except Exception:
+        v = 1.0
+    if v < 0.3:
+        v = 0.3
+    if v > 5.0:
+        v = 5.0
+    return float(v)
+
+
+def _trace_route_probes(raw_probes: Any) -> int:
+    try:
+        v = int(raw_probes) if raw_probes is not None else 3
+    except Exception:
+        v = 3
+    if v < 1:
+        v = 1
+    if v > 5:
+        v = 5
+    return int(v)
+
+
 async def _run_pool_save_precheck(node: Dict[str, Any], pool: Dict[str, Any]) -> Dict[str, Any]:
     """Save-time runtime precheck via agent /api/v1/netprobe (mode=rules)."""
     out_issues: List[PoolValidationIssue] = []
     seen: set[str] = set()
+    precheck_enabled = _save_precheck_enabled()
+    probe_timeout = _save_precheck_probe_timeout()
+    http_timeout = _save_precheck_http_timeout()
+    issues_limit = _save_precheck_max_issues()
 
     eps = pool.get("endpoints") if isinstance(pool.get("endpoints"), list) else []
     if not isinstance(eps, list) or not eps:
         return {
             "ok": True,
             "issues": out_issues,
-            "summary": {"enabled": _SAVE_PRECHECK_ENABLED, "rules_total": 0, "issues": 0, "source": "save_precheck"},
+            "summary": {"enabled": precheck_enabled, "rules_total": 0, "issues": 0, "source": "save_precheck"},
         }
 
-    if not _SAVE_PRECHECK_ENABLED:
+    if not precheck_enabled:
         return {
             "ok": True,
             "issues": out_issues,
@@ -2895,7 +4525,7 @@ async def _run_pool_save_precheck(node: Dict[str, Any], pool: Dict[str, Any]) ->
             item["extra_config"] = ex
         rules_payload.append(item)
 
-    body = {"mode": "rules", "rules": rules_payload, "timeout": _SAVE_PRECHECK_PROBE_TIMEOUT}
+    body = {"mode": "rules", "rules": rules_payload, "timeout": probe_timeout}
     try:
         data = await agent_post(
             node.get("base_url", ""),
@@ -2903,7 +4533,7 @@ async def _run_pool_save_precheck(node: Dict[str, Any], pool: Dict[str, Any]) ->
             "/api/v1/netprobe",
             body,
             node_verify_tls(node),
-            timeout=_SAVE_PRECHECK_HTTP_TIMEOUT,
+            timeout=http_timeout,
         )
     except Exception as exc:
         _append_precheck_issue(
@@ -2915,7 +4545,7 @@ async def _run_pool_save_precheck(node: Dict[str, Any], pool: Dict[str, Any]) ->
                 severity="warning",
                 code="precheck_unreachable",
             ),
-            _SAVE_PRECHECK_MAX_ISSUES,
+            issues_limit,
         )
         return {
             "ok": False,
@@ -2939,7 +4569,7 @@ async def _run_pool_save_precheck(node: Dict[str, Any], pool: Dict[str, Any]) ->
                 severity="warning",
                 code="precheck_failed",
             ),
-            _SAVE_PRECHECK_MAX_ISSUES,
+            issues_limit,
         )
         return {
             "ok": False,
@@ -2966,7 +4596,7 @@ async def _run_pool_save_precheck(node: Dict[str, Any], pool: Dict[str, Any]) ->
                     severity="warning",
                     code="dependency_missing",
                 ),
-                _SAVE_PRECHECK_MAX_ISSUES,
+                issues_limit,
             )
         if deps.get("ss") is False:
             _append_precheck_issue(
@@ -2978,7 +4608,7 @@ async def _run_pool_save_precheck(node: Dict[str, Any], pool: Dict[str, Any]) ->
                     severity="warning",
                     code="dependency_missing",
                 ),
-                _SAVE_PRECHECK_MAX_ISSUES,
+                issues_limit,
             )
 
     # perf hints
@@ -2991,7 +4621,7 @@ async def _run_pool_save_precheck(node: Dict[str, Any], pool: Dict[str, Any]) ->
             out_issues,
             seen,
             PoolValidationIssue(path="endpoints", message=f"性能风险提示：{msg}", severity="warning", code="sysctl_tuning_recommended"),
-            _SAVE_PRECHECK_MAX_ISSUES,
+            issues_limit,
         )
 
     # per-rule warnings / unreachable
@@ -3023,7 +4653,7 @@ async def _run_pool_save_precheck(node: Dict[str, Any], pool: Dict[str, Any]) ->
                         severity="warning",
                         code="target_unreachable",
                     ),
-                    _SAVE_PRECHECK_MAX_ISSUES,
+                    issues_limit,
                 )
 
         warns = r.get("warnings") if isinstance(r.get("warnings"), list) else []
@@ -3036,7 +4666,7 @@ async def _run_pool_save_precheck(node: Dict[str, Any], pool: Dict[str, Any]) ->
                 out_issues,
                 seen,
                 PoolValidationIssue(path=path, message=f"{prefix}{msg}", severity="warning", code="runtime_warning"),
-                _SAVE_PRECHECK_MAX_ISSUES,
+                issues_limit,
             )
 
     summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
@@ -3162,7 +4792,9 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     runtime_precheck: Dict[str, Any]
     # Async jobs should return quickly; runtime netprobe is kept for sync path only.
     skip_runtime_precheck = bool(is_async_job)
-    if _SAVE_PRECHECK_ENABLED and (not skip_runtime_precheck):
+    save_precheck_enabled = _save_precheck_enabled()
+    save_precheck_issues_limit = _save_precheck_max_issues()
+    if save_precheck_enabled and (not skip_runtime_precheck):
         try:
             runtime_precheck = await _run_pool_save_precheck(node, pool)
         except Exception as exc:
@@ -3190,10 +4822,10 @@ async def api_pool_set(request: Request, node_id: int, payload: Dict[str, Any], 
     precheck_issues: List[PoolValidationIssue] = []
     precheck_seen: set[str] = set()
     for i in static_warnings:
-        _append_precheck_issue(precheck_issues, precheck_seen, i, _SAVE_PRECHECK_MAX_ISSUES)
+        _append_precheck_issue(precheck_issues, precheck_seen, i, save_precheck_issues_limit)
     for i in (runtime_precheck.get("issues") or []):
         if isinstance(i, PoolValidationIssue):
-            _append_precheck_issue(precheck_issues, precheck_seen, i, _SAVE_PRECHECK_MAX_ISSUES)
+            _append_precheck_issue(precheck_issues, precheck_seen, i, save_precheck_issues_limit)
 
     try:
         upsert_rule_owner_map(node_id=node_id, pool=pool)
@@ -3642,6 +5274,15 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
     else:
         group_name = str(group_in or "").strip() or "默认分组"
 
+    policy_has_any, policy_in = _normalize_auto_restart_policy_from_payload(data, node)
+    policy_apply = False
+    if policy_has_any:
+        policy_base = node_auto_restart_policy_from_row(node if isinstance(node, dict) else {})
+        policy_apply = any(
+            policy_in.get(k) != policy_base.get(k)
+            for k in ("enabled", "schedule_type", "interval", "hour", "minute", "weekdays", "monthdays")
+        )
+
     # parse existing base_url
     raw_old = str(node.get("base_url") or "").strip()
     if not raw_old:
@@ -3722,9 +5363,25 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
         website_root_base=website_root_base,
     )
 
+    policy_ver = int(node.get("desired_auto_restart_policy_version") or 0)
+    if policy_apply:
+        policy_ver, _ = set_node_auto_restart_policy(
+            int(node_id),
+            enabled=bool(policy_in.get("enabled")),
+            schedule_type=str(policy_in.get("schedule_type") or "daily"),
+            interval=int(policy_in.get("interval") or 1),
+            hour=int(policy_in.get("hour")) if policy_in.get("hour") is not None else 4,
+            minute=int(policy_in.get("minute")) if policy_in.get("minute") is not None else 8,
+            weekdays=list(policy_in.get("weekdays") or [1, 2, 3, 4, 5, 6, 7]),
+            monthdays=list(policy_in.get("monthdays") or [1]),
+        )
+
     # Return updated fields for client-side UI refresh
     updated = get_node(int(node_id)) or {}
     display_ip = extract_ip_for_display(str(updated.get("base_url") or base_url))
+    policy_out = node_auto_restart_policy_from_row(updated if isinstance(updated, dict) else node)
+    if policy_apply:
+        policy_out["desired_version"] = int(policy_ver)
 
     return JSONResponse(
         {
@@ -3739,6 +5396,7 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
                 "is_private": bool(updated.get("is_private") or is_private),
                 "role": str(updated.get("role") or role),
                 "website_root_base": str(updated.get("website_root_base") or website_root_base),
+                "auto_restart_policy": policy_out,
             },
         }
     )
@@ -3748,6 +5406,7 @@ async def api_nodes_update(node_id: int, request: Request, user: str = Depends(r
 async def api_nodes_list(user: str = Depends(require_login)):
     out = []
     for n in filter_nodes_for_user(user, list_nodes()):
+        pol = node_auto_restart_policy_from_row(n if isinstance(n, dict) else {})
         out.append(
             {
                 "id": int(n["id"]),
@@ -3757,6 +5416,7 @@ async def api_nodes_list(user: str = Depends(require_login)):
                 "is_private": bool(n.get("is_private") or 0),
                 "role": n.get("role") or "normal",
                 "website_root_base": n.get("website_root_base") or "",
+                "auto_restart_policy": pol,
             }
         )
     return {"ok": True, "nodes": out}
@@ -4074,24 +5734,37 @@ async def api_sys(request: Request, node_id: int, cached: int = 0, user: str = D
 
     sys_data = None
     source = None
+    rep_cache: Optional[Dict[str, Any]] = None
+    auto_restart_data: Optional[Dict[str, Any]] = None
 
     # 1) Push-report cache（更快、更稳定）
     if cached:
-        rep = get_last_report(node_id)
-        if isinstance(rep, dict) and isinstance(rep.get("sys"), dict):
-            sys_data = dict(rep["sys"])  # copy
+        rep_cache = get_last_report(node_id)
+        if isinstance(rep_cache, dict) and isinstance(rep_cache.get("sys"), dict):
+            sys_data = dict(rep_cache["sys"])  # copy
             sys_data["stale"] = not is_report_fresh(node)
             source = "report"
+        if isinstance(rep_cache, dict) and isinstance(rep_cache.get("auto_restart"), dict):
+            auto_restart_data = dict(rep_cache["auto_restart"])  # copy
+            auto_restart_data["stale"] = not is_report_fresh(node)
+            auto_restart_data["source"] = "report"
     else:
         if is_report_fresh(node):
-            rep = get_last_report(node_id)
-            if isinstance(rep, dict) and isinstance(rep.get("sys"), dict):
-                sys_data = dict(rep["sys"])  # copy
+            rep_cache = get_last_report(node_id)
+            if isinstance(rep_cache, dict) and isinstance(rep_cache.get("sys"), dict):
+                sys_data = dict(rep_cache["sys"])  # copy
                 source = "report"
+            if isinstance(rep_cache, dict) and isinstance(rep_cache.get("auto_restart"), dict):
+                auto_restart_data = dict(rep_cache["auto_restart"])  # copy
+                auto_restart_data["source"] = "report"
 
     # 2) Fallback：直连 Agent
     if sys_data is None:
         if cached:
+            if auto_restart_data is None:
+                auto_restart_data = node_auto_restart_policy_from_row(node if isinstance(node, dict) else {})
+                auto_restart_data["source"] = "panel"
+                auto_restart_data["stale"] = not is_report_fresh(node)
             return {
                 "ok": True,
                 "sys": {
@@ -4099,6 +5772,7 @@ async def api_sys(request: Request, node_id: int, cached: int = 0, user: str = D
                     "error": "Agent 尚未上报系统信息（请升级 Agent 或稍后重试）",
                     "source": "report",
                 },
+                "auto_restart": auto_restart_data,
             }
 
         try:
@@ -4107,12 +5781,37 @@ async def api_sys(request: Request, node_id: int, cached: int = 0, user: str = D
                 sys_data = dict(data)  # copy
                 source = "agent"
             else:
-                return {"ok": False, "error": (data.get("error") if isinstance(data, dict) else "响应格式异常")}
+                if auto_restart_data is None:
+                    auto_restart_data = node_auto_restart_policy_from_row(node if isinstance(node, dict) else {})
+                    auto_restart_data["source"] = "panel"
+                    auto_restart_data["stale"] = not is_report_fresh(node)
+                return {
+                    "ok": False,
+                    "error": (data.get("error") if isinstance(data, dict) else "响应格式异常"),
+                    "auto_restart": auto_restart_data,
+                }
         except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+            if auto_restart_data is None:
+                auto_restart_data = node_auto_restart_policy_from_row(node if isinstance(node, dict) else {})
+                auto_restart_data["source"] = "panel"
+                auto_restart_data["stale"] = not is_report_fresh(node)
+            return {"ok": False, "error": str(exc), "auto_restart": auto_restart_data}
+
+    if auto_restart_data is None:
+        if not isinstance(rep_cache, dict):
+            rep_cache = get_last_report(node_id)
+        if isinstance(rep_cache, dict) and isinstance(rep_cache.get("auto_restart"), dict):
+            auto_restart_data = dict(rep_cache["auto_restart"])  # copy
+            auto_restart_data["source"] = "report"
+            if source == "agent":
+                auto_restart_data["stale"] = not is_report_fresh(node)
+    if auto_restart_data is None:
+        auto_restart_data = node_auto_restart_policy_from_row(node if isinstance(node, dict) else {})
+        auto_restart_data["source"] = "panel"
+        auto_restart_data["stale"] = not is_report_fresh(node)
 
     sys_data["source"] = source or "unknown"
-    return {"ok": True, "sys": sys_data}
+    return {"ok": True, "sys": sys_data, "auto_restart": auto_restart_data}
 
 
 @router.get("/api/nodes/{node_id}/graph")

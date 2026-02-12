@@ -30,7 +30,16 @@ CRED_PATH = "/etc/realm-panel/credentials.json"
 SECRET_PATH = "/etc/realm-panel/secret.key"
 DEFAULT_PBKDF2_ITERATIONS = 120_000
 _LOGIN_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,48}$")
-_ALLOWED_TUNNEL_TYPES = {"wss", "intranet"}
+_ALLOWED_TUNNEL_TYPES = {"direct", "wss", "intranet"}
+
+
+def _normalize_tunnel_type_name(value: Any) -> str:
+    name = str(value or "").strip().lower()
+    # Backward compatibility:
+    # tcp/normal are historical names in some UI logic; canonicalize to "direct".
+    if name in ("tcp", "normal"):
+        return "direct"
+    return name
 
 
 @dataclass
@@ -173,7 +182,7 @@ def normalize_user_policy(raw_policy: Any) -> Dict[str, Any]:
     if isinstance(raw_tunnels, list):
         seen_tunnels: set[str] = set()
         for item in raw_tunnels:
-            name = str(item or "").strip().lower()
+            name = _normalize_tunnel_type_name(item)
             if name not in _ALLOWED_TUNNEL_TYPES or name in seen_tunnels:
                 continue
             seen_tunnels.add(name)
@@ -191,6 +200,32 @@ def normalize_user_policy(raw_policy: Any) -> Dict[str, Any]:
     return out
 
 
+def _secret_path_candidates() -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+
+    def _add(path: Any) -> None:
+        p = str(path or "").strip()
+        if not p or p in seen:
+            return
+        seen.add(p)
+        out.append(p)
+
+    _add(os.getenv("REALM_PANEL_SECRET_PATH"))
+    _add(SECRET_PATH)
+
+    db_path = str(os.getenv("REALM_PANEL_DB") or "").strip()
+    if db_path:
+        _add(os.path.join(os.path.dirname(db_path), "secret.key"))
+
+    runtime_dir = str(os.getenv("XDG_RUNTIME_DIR") or "").strip()
+    if runtime_dir:
+        _add(os.path.join(runtime_dir, "realm-panel-secret.key"))
+
+    _add("/tmp/realm-panel-secret.key")
+    return out
+
+
 def ensure_secret_key() -> str:
     # Allow overriding the session/share secret via env so multiple panel instances
     # behind a load balancer can validate the same cookies & share tokens.
@@ -198,17 +233,32 @@ def ensure_secret_key() -> str:
     if len(env_key) > 10:
         return env_key
 
-    os.makedirs(os.path.dirname(SECRET_PATH), exist_ok=True)
-    if os.path.exists(SECRET_PATH) and os.path.getsize(SECRET_PATH) > 10:
-        with open(SECRET_PATH, "r", encoding="utf-8") as f:
-            return f.read().strip()
+    candidates = _secret_path_candidates()
+    for path in candidates:
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > 10:
+                with open(path, "r", encoding="utf-8") as f:
+                    key = f.read().strip()
+                if len(key) > 10:
+                    return key
+        except Exception:
+            continue
+
     key = base64.urlsafe_b64encode(os.urandom(32)).decode("utf-8")
-    with open(SECRET_PATH, "w", encoding="utf-8") as f:
-        f.write(key)
-    try:
-        os.chmod(SECRET_PATH, 0o600)
-    except PermissionError:
-        pass
+    for path in candidates:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(key)
+            try:
+                os.chmod(path, 0o600)
+            except PermissionError:
+                pass
+            return key
+        except Exception:
+            continue
+
+    # Last resort: keep process alive even if filesystem is read-only.
     return key
 
 
@@ -604,12 +654,14 @@ def check_tunnel_access(
     user = get_user_by_username(username)
     if user is None:
         return False, "用户会话无效", {"code": "invalid_user"}
-    kind = str(tunnel_type or "").strip().lower()
+    kind = _normalize_tunnel_type_name(tunnel_type)
     op = str(action or "").strip().lower()
     if kind not in _ALLOWED_TUNNEL_TYPES:
         return False, "不支持的转发方式", {"code": "invalid_tunnel_type"}
-    req_perms = [f"sync.{kind}", "publish.apply"]
-    if op == "delete":
+    req_perms = ["publish.apply"]
+    if kind != "direct":
+        req_perms.append(f"sync.{kind}")
+    if kind != "direct" and op == "delete":
         req_perms.append("sync.delete")
     missing = [p for p in req_perms if not has_permission(user, p)]
     if missing:

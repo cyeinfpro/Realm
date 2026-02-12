@@ -91,6 +91,7 @@ apt_install(){
   command_exists curl || deps_ok="0"
   command_exists unzip || deps_ok="0"
   command_exists jq || deps_ok="0"
+  command_exists openssl || deps_ok="0"
   command_exists python3 || deps_ok="0"
   command_exists rsync || deps_ok="0"
   dpkg-query -W -f='${Status}' python3-venv 2>/dev/null | grep -q "install ok installed" || deps_ok="0"
@@ -123,11 +124,11 @@ apt_install(){
   fi
   # rsync 用于更稳的覆盖更新（避免部分文件未更新）
   if ! apt-get install -y --no-install-recommends \
-    curl ca-certificates unzip jq python3 python3-venv python3-pip rsync; then
+    curl ca-certificates unzip jq openssl python3 python3-venv python3-pip rsync; then
     err "依赖安装失败，尝试自动修复后重试..."
     apt-get -f install -y || true
     apt-get install -y --no-install-recommends \
-      curl ca-certificates unzip jq python3 python3-venv python3-pip rsync
+      curl ca-certificates unzip jq openssl python3 python3-venv python3-pip rsync
   fi
 
   if ! probe_python_runtime "python3"; then
@@ -158,6 +159,230 @@ apt_install(){
 
 command_exists(){
   command -v "$1" >/dev/null 2>&1
+}
+
+detect_pkg_manager(){
+  if command_exists apt-get; then
+    echo "apt"
+    return
+  fi
+  if command_exists dnf; then
+    echo "dnf"
+    return
+  fi
+  if command_exists yum; then
+    echo "yum"
+    return
+  fi
+  if command_exists zypper; then
+    echo "zypper"
+    return
+  fi
+  if command_exists pacman; then
+    echo "pacman"
+    return
+  fi
+  if command_exists apk; then
+    echo "apk"
+    return
+  fi
+  echo ""
+}
+
+detect_iptables_cmd(){
+  local override="${REALM_IPTABLES_BIN:-}"
+  local c
+  if [[ -n "${override}" ]]; then
+    if [[ "${override}" == */* ]]; then
+      if [[ -x "${override}" ]]; then
+        echo "${override}"
+        return 0
+      fi
+    elif command_exists "${override}"; then
+      command -v "${override}"
+      return 0
+    fi
+  fi
+
+  for c in iptables iptables-nft iptables-legacy; do
+    if command_exists "${c}"; then
+      command -v "${c}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_iptables_save_cmd(){
+  local c
+  for c in iptables-save iptables-nft-save iptables-legacy-save; do
+    if command_exists "${c}"; then
+      command -v "${c}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_iptables_restore_cmd(){
+  local c
+  for c in iptables-restore iptables-nft-restore iptables-legacy-restore; do
+    if command_exists "${c}"; then
+      command -v "${c}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+install_iptables_with_pkg_manager(){
+  local pm="$1"
+  case "${pm}" in
+    apt)
+      apt_update_with_repair || return 1
+      if ! apt-get install -y --no-install-recommends iptables iproute2 >/dev/null 2>&1; then
+        return 1
+      fi
+      ;;
+    dnf)
+      if ! dnf -y install iptables iptables-services iproute >/dev/null 2>&1; then
+        if ! dnf -y install iptables iproute >/dev/null 2>&1; then
+          return 1
+        fi
+      fi
+      ;;
+    yum)
+      if ! yum -y install iptables iptables-services iproute >/dev/null 2>&1; then
+        if ! yum -y install iptables iproute >/dev/null 2>&1; then
+          return 1
+        fi
+      fi
+      ;;
+    zypper)
+      if ! zypper --non-interactive install --no-recommends iptables iproute2 >/dev/null 2>&1; then
+        return 1
+      fi
+      ;;
+    pacman)
+      if ! pacman --noconfirm -Sy iptables iproute2 >/dev/null 2>&1; then
+        return 1
+      fi
+      ;;
+    apk)
+      if ! apk add --no-cache iptables >/dev/null 2>&1; then
+        return 1
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+ensure_ipv4_forwarding(){
+  local f="/etc/sysctl.d/99-realm-ipforward.conf"
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  if [[ -f "${f}" ]]; then
+    if grep -Eq '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=' "${f}"; then
+      sed -i 's/^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=.*/net.ipv4.ip_forward=1/' "${f}" || true
+    else
+      echo "net.ipv4.ip_forward=1" >> "${f}"
+    fi
+  else
+    echo "net.ipv4.ip_forward=1" > "${f}"
+  fi
+  sysctl -p "${f}" >/dev/null 2>&1 || true
+}
+
+ensure_iptables_baseline_rules(){
+  local ipt_bin="$1"
+  "${ipt_bin}" -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || \
+    "${ipt_bin}" -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
+  "${ipt_bin}" -t nat -C POSTROUTING -j MASQUERADE >/dev/null 2>&1 || \
+    "${ipt_bin}" -t nat -A POSTROUTING -j MASQUERADE >/dev/null 2>&1 || true
+}
+
+persist_iptables_rules(){
+  local save_cmd restore_cmd
+
+  if command_exists netfilter-persistent; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+    if command_exists systemctl; then
+      systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+    fi
+    ok "iptables 规则持久化：netfilter-persistent"
+    return
+  fi
+
+  if command_exists service; then
+    if service iptables save >/dev/null 2>&1; then
+      if command_exists systemctl; then
+        systemctl enable iptables >/dev/null 2>&1 || true
+      fi
+      ok "iptables 规则持久化：iptables service"
+      return
+    fi
+  fi
+
+  save_cmd="$(detect_iptables_save_cmd || true)"
+  restore_cmd="$(detect_iptables_restore_cmd || true)"
+  if [[ -z "${save_cmd}" ]]; then
+    info "未检测到 iptables-save，跳过规则持久化（Agent 启动后会自动下发）"
+    return
+  fi
+
+  mkdir -p /etc/iptables
+  "${save_cmd}" > /etc/iptables/rules.v4 2>/dev/null || true
+
+  if [[ -n "${restore_cmd}" ]] && command_exists systemctl; then
+    cat > /etc/systemd/system/realm-iptables-restore.service <<EOF
+[Unit]
+Description=Restore iptables rules for Realm Agent
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=${restore_cmd} /etc/iptables/rules.v4
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable realm-iptables-restore.service >/dev/null 2>&1 || true
+    ok "iptables 规则持久化：/etc/iptables/rules.v4 + realm-iptables-restore.service"
+    return
+  fi
+
+  ok "iptables 规则已保存到 /etc/iptables/rules.v4"
+}
+
+install_iptables_stack(){
+  local ipt_bin pm
+  ipt_bin="$(detect_iptables_cmd || true)"
+  if [[ -z "${ipt_bin}" ]]; then
+    pm="$(detect_pkg_manager)"
+    if [[ -n "${pm}" ]]; then
+      info "未检测到 iptables，尝试使用 ${pm} 安装系统防火墙组件..."
+      install_iptables_with_pkg_manager "${pm}" || true
+      ipt_bin="$(detect_iptables_cmd || true)"
+    fi
+  fi
+
+  if [[ -z "${ipt_bin}" ]]; then
+    err "未检测到可用 iptables 命令（iptables/iptables-nft/iptables-legacy）"
+    err "Agent 仍会继续安装，但使用 iptables 转发规则时会失败。"
+    return
+  fi
+
+  export REALM_IPTABLES_BIN="${ipt_bin}"
+  ok "iptables 命令：${REALM_IPTABLES_BIN}"
+  ensure_ipv4_forwarding
+  ensure_iptables_baseline_rules "${REALM_IPTABLES_BIN}"
+  persist_iptables_rules
 }
 
 download_file(){
@@ -858,6 +1083,11 @@ REALM_AGENT_ID=${REALM_AGENT_ID}
 REALM_AGENT_HEARTBEAT_INTERVAL=${REALM_AGENT_HEARTBEAT_INTERVAL:-3}
 EOF
   fi
+  if [[ -n "${REALM_IPTABLES_BIN:-}" ]]; then
+    cat > /etc/realm-agent/agent.env <<EOF
+REALM_IPTABLES_BIN=${REALM_IPTABLES_BIN}
+EOF
+  fi
 
   info "写入/更新 systemd 服务..."
   cat > /etc/systemd/system/realm-agent.service <<EOF
@@ -869,6 +1099,7 @@ After=network.target
 Type=simple
 WorkingDirectory=${base}/agent
 EnvironmentFile=-/etc/realm-agent/panel.env
+EnvironmentFile=-/etc/realm-agent/agent.env
 # ⚠️ 不要直接 ExecStart=.../uvicorn：因为本脚本使用 staging venv 再切换，
 #    uvicorn 入口脚本的 shebang 可能指向 staging 路径，导致 systemd 报 203/EXEC。
 # ✅ 使用 python -m uvicorn 永远可用（只要 venv 的 python 存在）
@@ -1020,6 +1251,11 @@ main(){
 
   info "安装依赖..."
   apt_install
+  if [[ "${REALM_AGENT_SETUP_IPTABLES:-1}" == "1" ]]; then
+    install_iptables_stack
+  else
+    info "跳过 iptables 系统初始化（REALM_AGENT_SETUP_IPTABLES=0）"
+  fi
   if [[ "${REALM_AGENT_INSTALL_TCPING:-0}" == "1" ]]; then
     install_tcping
   else

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import secrets
 import threading
@@ -16,8 +17,49 @@ from fastapi.responses import JSONResponse
 from ..auth import can_access_rule_endpoint, check_tunnel_access, get_user_by_username, is_rule_owner_scoped, stamp_endpoint_owner
 from ..clients.agent import agent_get, agent_post
 from ..core.deps import require_login
-from ..db import get_node, set_desired_pool, upsert_rule_owner_map
+from ..db import get_last_report, get_node, set_desired_pool, upsert_rule_owner_map
 from ..services.apply import node_verify_tls, schedule_apply_pool
+try:
+    from ..services.panel_config import setting_bool, setting_float
+except Exception:
+    _TRUE_SET = {"1", "true", "yes", "on", "y"}
+    _FALSE_SET = {"0", "false", "no", "off", "n"}
+
+    def _cfg_env(names: Optional[list[str]]) -> str:
+        for n in (names or []):
+            name = str(n or "").strip()
+            if not name:
+                continue
+            v = str(os.getenv(name) or "").strip()
+            if v:
+                return v
+        return ""
+
+    def setting_bool(key: str, default: bool = False, env_names: Optional[list[str]] = None) -> bool:
+        s = _cfg_env(env_names).lower()
+        if s in _TRUE_SET:
+            return True
+        if s in _FALSE_SET:
+            return False
+        return bool(default)
+
+    def setting_float(
+        key: str,
+        default: float,
+        lo: float,
+        hi: float,
+        env_names: Optional[list[str]] = None,
+    ) -> float:
+        raw = _cfg_env(env_names)
+        try:
+            v = float(raw if raw else default)
+        except Exception:
+            v = float(default)
+        if v < float(lo):
+            v = float(lo)
+        if v > float(hi):
+            v = float(hi)
+        return float(v)
 from ..services.pool_ops import (
     choose_receiver_port,
     find_sync_listen_port,
@@ -28,9 +70,11 @@ from ..services.pool_ops import (
     upsert_endpoint_by_sync_id,
 )
 from ..utils.normalize import format_addr, normalize_host_input, split_host_port
+from ..utils.redact import mask_url, redact_log_text
 from ..utils.validate import PoolValidationError, validate_pool_inplace
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _check_sync_policy(
@@ -150,6 +194,10 @@ _SYNC_PRECHECK_PROBE_TIMEOUT = _env_float("REALM_SYNC_SAVE_PRECHECK_PROBE_TIMEOU
 _SYNC_APPLY_TIMEOUT = _env_float("REALM_SYNC_SAVE_APPLY_TIMEOUT", 3.0, 0.5, 20.0)
 _SYNC_PRECHECK_MAX_ISSUES = 24
 _INTRANET_FORCE_TLS_VERIFY = _env_flag("REALM_INTRANET_FORCE_TLS_VERIFY", True)
+# Fail-open by default for better cross-network availability:
+# when cert cannot be fetched, keep tunnel TLS but skip cert verification
+# unless user explicitly requests strict verify for this save action.
+_INTRANET_TLS_VERIFY_FAIL_OPEN = _env_flag("REALM_INTRANET_TLS_VERIFY_FAIL_OPEN", True)
 _INTRANET_TOKEN_GRACE_SEC = _env_int("REALM_INTRANET_TOKEN_GRACE_SEC", 900, 0, 7 * 24 * 3600)
 _INTRANET_TOKEN_GRACE_MAX = _env_int("REALM_INTRANET_TOKEN_GRACE_MAX", 4, 1, 16)
 _SYNC_JOB_TTL_SEC = _env_int("REALM_SYNC_JOB_TTL_SEC", 1800, 120, 7 * 24 * 3600)
@@ -160,6 +208,43 @@ _SYNC_JOB_RETRY_MAX_SEC = _env_float("REALM_SYNC_JOB_RETRY_MAX_SEC", 8.0, 1.0, 1
 _SYNC_JOBS: Dict[str, Dict[str, Any]] = {}
 _SYNC_JOBS_LOCK = threading.Lock()
 _SYNC_EXEC_LOCK = asyncio.Lock()
+
+
+def _sync_precheck_enabled() -> bool:
+    return bool(setting_bool("sync_precheck_enabled", default=bool(_SYNC_PRECHECK_ENABLED)))
+
+
+def _sync_precheck_http_timeout() -> float:
+    return float(
+        setting_float(
+            "sync_precheck_http_timeout",
+            default=float(_SYNC_PRECHECK_HTTP_TIMEOUT),
+            lo=2.0,
+            hi=20.0,
+        )
+    )
+
+
+def _sync_precheck_probe_timeout() -> float:
+    return float(
+        setting_float(
+            "sync_precheck_probe_timeout",
+            default=float(_SYNC_PRECHECK_PROBE_TIMEOUT),
+            lo=0.2,
+            hi=6.0,
+        )
+    )
+
+
+def _sync_apply_timeout() -> float:
+    return float(
+        setting_float(
+            "sync_apply_timeout",
+            default=float(_SYNC_APPLY_TIMEOUT),
+            lo=0.5,
+            hi=20.0,
+        )
+    )
 
 
 def _sync_job_now() -> float:
@@ -740,6 +825,7 @@ def _issue_key(issue: Dict[str, Any]) -> str:
 
 
 async def _apply_pool_best_effort(node: Dict[str, Any], pool: Dict[str, Any]) -> None:
+    apply_timeout = _sync_apply_timeout()
     try:
         data = await agent_post(
             node.get("base_url", ""),
@@ -747,7 +833,7 @@ async def _apply_pool_best_effort(node: Dict[str, Any], pool: Dict[str, Any]) ->
             "/api/v1/pool",
             {"pool": pool},
             node_verify_tls(node),
-            timeout=_SYNC_APPLY_TIMEOUT,
+            timeout=apply_timeout,
         )
         if isinstance(data, dict) and data.get("ok", True):
             await agent_post(
@@ -756,7 +842,7 @@ async def _apply_pool_best_effort(node: Dict[str, Any], pool: Dict[str, Any]) ->
                 "/api/v1/apply",
                 {},
                 node_verify_tls(node),
-                timeout=_SYNC_APPLY_TIMEOUT,
+                timeout=apply_timeout,
             )
     except Exception:
         pass
@@ -795,6 +881,82 @@ def _safe_error_text(data: Any, default: str = "unknown") -> str:
     return msg or default
 
 
+def _intranet_cert_fetch_hint(detail: str) -> str:
+    d = str(detail or "").strip()
+    if not d:
+        return "cert_empty"
+    low = d.lower()
+    if d == "cert_fetch_failed":
+        return "面板请求 A 节点证书接口失败（请检查 panel 日志）"
+    if d == "report_cache_missing":
+        return "A 节点近期未上报，证书缓存不存在"
+    if d == "report_cache_intranet_missing":
+        return "A 节点上报中缺少内网证书信息（可能 Agent 版本过旧）"
+    if d == "report_cache_cert_missing":
+        return "A 节点上报中未包含可用证书（请稍后重试）"
+    if d == "tls_cert_missing":
+        return "A 节点未生成内网穿透 TLS 证书（通常是 openssl 缺失）"
+    if d == "tls_context_unavailable":
+        return "A 节点 TLS 证书或私钥不可用（可重启 Agent 后重试）"
+    if ("certificate verify failed" in low) or ("certificat" in low and "verify" in low):
+        return "A 节点启用了 HTTPS 且开启证书校验，但证书不受信任（可改用有效证书或关闭该节点 TLS 校验）"
+    if ("invalid api key" in low) or ("api key 无效" in low) or ("401" in low) or ("403" in low):
+        return "A 节点 API Key 校验失败，请重新接入节点或更新 API Key"
+    if "命中了站点 nginx 页面而不是 agent api" in low:
+        return "A 节点 base_url 命中了站点端口，请改为 Agent 地址/端口（默认 :18700）"
+    if ("connection refused" in low) or ("timed out" in low) or ("timeout" in low) or ("connect" in low):
+        return "面板无法访问 A 节点 Agent API，请检查 base_url、端口和防火墙"
+    if len(d) > 200:
+        return d[:200] + "…"
+    return d
+
+
+def _sender_cert_from_report_cache(node_id: int) -> Tuple[str, str]:
+    try:
+        report = get_last_report(int(node_id))
+    except Exception:
+        report = None
+    if not isinstance(report, dict):
+        return "", "report_cache_missing"
+    intr = report.get("intranet")
+    if not isinstance(intr, dict):
+        return "", "report_cache_intranet_missing"
+    pem = str(intr.get("cert_pem") or "").strip()
+    ready = bool(intr.get("tls_ready", False))
+    if pem and ready:
+        return pem, ""
+    err = str(intr.get("cert_error") or "").strip()
+    if err:
+        return "", err
+    if pem and (not ready):
+        return "", "tls_context_unavailable"
+    return "", "report_cache_cert_missing"
+
+
+def _intranet_cert_from_existing_receiver_pool(pool: Dict[str, Any], sync_id: str) -> str:
+    sid = str(sync_id or "").strip()
+    if not sid:
+        return ""
+    try:
+        for ep in (pool or {}).get("endpoints") or []:
+            if not isinstance(ep, dict):
+                continue
+            ex = ep.get("extra_config") or {}
+            if not isinstance(ex, dict):
+                continue
+            if str(ex.get("sync_id") or "").strip() != sid:
+                continue
+            role = str(ex.get("intranet_role") or "").strip().lower()
+            if role != "client":
+                continue
+            pem = str(ex.get("intranet_server_cert_pem") or "").strip()
+            if pem:
+                return pem
+    except Exception:
+        return ""
+    return ""
+
+
 def _pool_rules_for_probe(pool: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     eps = pool.get("endpoints") if isinstance(pool.get("endpoints"), list) else []
@@ -824,7 +986,8 @@ def _pool_rules_for_probe(pool: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 async def _probe_node_rules_precheck(node: Dict[str, Any], pool: Dict[str, Any], node_label: str) -> List[Dict[str, Any]]:
-    if not _SYNC_PRECHECK_ENABLED:
+    precheck_enabled = _sync_precheck_enabled()
+    if not precheck_enabled:
         return []
 
     rules_payload = _pool_rules_for_probe(pool)
@@ -833,7 +996,7 @@ async def _probe_node_rules_precheck(node: Dict[str, Any], pool: Dict[str, Any],
 
     issues: List[Dict[str, Any]] = []
     seen: set[str] = set()
-    body = {"mode": "rules", "rules": rules_payload, "timeout": _SYNC_PRECHECK_PROBE_TIMEOUT}
+    body = {"mode": "rules", "rules": rules_payload, "timeout": _sync_precheck_probe_timeout()}
 
     try:
         data = await agent_post(
@@ -842,7 +1005,7 @@ async def _probe_node_rules_precheck(node: Dict[str, Any], pool: Dict[str, Any],
             "/api/v1/netprobe",
             body,
             node_verify_tls(node),
-            timeout=_SYNC_PRECHECK_HTTP_TIMEOUT,
+            timeout=_sync_precheck_http_timeout(),
         )
     except Exception as exc:
         _append_issue(
@@ -1376,7 +1539,8 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
     runtime_issues: List[Dict[str, Any]] = []
     # Async jobs should return quickly; runtime netprobe is kept for sync path only.
     skip_runtime_precheck = bool(is_async_job)
-    if _SYNC_PRECHECK_ENABLED and (not skip_runtime_precheck):
+    sync_precheck_enabled = _sync_precheck_enabled()
+    if sync_precheck_enabled and (not skip_runtime_precheck):
         i1, i2 = await asyncio.gather(
             _probe_node_rules_precheck(sender, sender_pool, "发送机"),
             _probe_node_rules_precheck(receiver, receiver_pool, "接收机"),
@@ -1391,10 +1555,10 @@ async def api_wss_tunnel_save(payload: Dict[str, Any], user: str = Depends(requi
             _append_issue(precheck_issues, precheck_seen, it)
 
     precheck_summary = {
-        "enabled": bool(_SYNC_PRECHECK_ENABLED and (not skip_runtime_precheck)),
+        "enabled": bool(sync_precheck_enabled and (not skip_runtime_precheck)),
         "source": (
             "static_validate+agent_netprobe_rules"
-            if (_SYNC_PRECHECK_ENABLED and (not skip_runtime_precheck))
+            if (sync_precheck_enabled and (not skip_runtime_precheck))
             else ("static_validate+runtime_skipped_async" if skip_runtime_precheck else "static_validate")
         ),
         "runtime_skipped_async": bool(skip_runtime_precheck),
@@ -1604,25 +1768,43 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     # Fetch A-side tunnel cert and embed into B config for TLS verification (strict by default).
     server_cert_pem = ""
     cert_fetch_err = ""
-    try:
-        cert = await agent_get(
-            sender.get("base_url", ""),
-            sender.get("api_key", ""),
-            "/api/v1/intranet/cert",
-            node_verify_tls(sender),
-        )
-        if isinstance(cert, dict) and cert.get("ok") is True:
-            server_cert_pem = str(cert.get("cert_pem") or "").strip()
-        else:
-            cert_fetch_err = _safe_error_text(cert, "cert_unavailable")
-    except Exception:
-        server_cert_pem = ""
-        cert_fetch_err = "cert_fetch_failed"
-
     receiver_pool = await load_pool_for_node(receiver)
     denied_owner = _deny_if_sync_not_owned(user, sync_id, receiver_pool)
     if isinstance(denied_owner, JSONResponse):
         return denied_owner
+
+    # Prefer existing cert already stored on receiver-side synced rule when editing.
+    server_cert_pem = _intranet_cert_from_existing_receiver_pool(receiver_pool, sync_id)
+    if not server_cert_pem:
+        cached_cert, cached_err = _sender_cert_from_report_cache(sender_id)
+        if cached_cert:
+            server_cert_pem = cached_cert
+        else:
+            cert_fetch_err = cached_err or ""
+            try:
+                cert = await agent_get(
+                    sender.get("base_url", ""),
+                    sender.get("api_key", ""),
+                    "/api/v1/intranet/cert",
+                    node_verify_tls(sender),
+                    timeout=_sync_precheck_http_timeout(),
+                )
+                if isinstance(cert, dict) and cert.get("ok") is True:
+                    server_cert_pem = str(cert.get("cert_pem") or "").strip()
+                    cert_fetch_err = ""
+                else:
+                    cert_fetch_err = _safe_error_text(cert, cert_fetch_err or "cert_unavailable")
+            except Exception as exc:
+                server_cert_pem = ""
+                msg = str(exc or "").strip()
+                cert_fetch_err = msg or exc.__class__.__name__ or cert_fetch_err or "cert_fetch_failed"
+                logger.warning(
+                    "intranet cert fetch failed: sender_id=%s sender_base=%s err=%s",
+                    sender_id,
+                    mask_url(str(sender.get("base_url") or "")),
+                    redact_log_text(cert_fetch_err),
+                    exc_info=True,
+                )
 
     now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -1640,15 +1822,28 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     if "intranet_tls_verify" in payload:
         payload_tls_verify = _coerce_bool(payload.get("intranet_tls_verify"))
     tls_verify_required = bool(_INTRANET_FORCE_TLS_VERIFY or (payload_tls_verify is True))
+    tls_verify_degraded_reason = ""
     if tls_verify_required and (not server_cert_pem):
-        return JSONResponse(
-            {
-                "ok": False,
-                "error": "已启用强制 TLS 证书校验，但无法获取公网入口证书，请检查 A 节点在线状态后重试。",
-                "detail": cert_fetch_err or "cert_empty",
-            },
-            status_code=400,
-        )
+        can_fail_open = bool(_INTRANET_TLS_VERIFY_FAIL_OPEN and (payload_tls_verify is not True))
+        if can_fail_open:
+            tls_verify_required = False
+            tls_verify_degraded_reason = _intranet_cert_fetch_hint(cert_fetch_err or "cert_empty")
+            logger.warning(
+                "intranet tls verify degraded to fail-open: sender_id=%s receiver_id=%s reason=%s",
+                sender_id,
+                receiver_id,
+                redact_log_text(cert_fetch_err or "cert_empty"),
+            )
+        else:
+            hint = _intranet_cert_fetch_hint(cert_fetch_err or "cert_empty")
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": f"已启用强制 TLS 证书校验，但无法获取公网入口证书：{hint}。",
+                    "detail": cert_fetch_err or "cert_empty",
+                },
+                status_code=400,
+            )
     tls_verify_enabled = bool(server_cert_pem) or tls_verify_required
 
     token_candidates, token_grace = _build_intranet_tokens(
@@ -1761,6 +1956,7 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         "intranet_tokens": token_candidates,
         "intranet_server_cert_pem": server_cert_pem,
         "intranet_tls_verify": bool(tls_verify_enabled),
+        "intranet_tls_verify_degraded_reason": tls_verify_degraded_reason,
         "intranet_sender_listen": listen,
         "intranet_original_remotes": remotes,
         "sync_id": sync_id,
@@ -1807,7 +2003,8 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
     runtime_issues: List[Dict[str, Any]] = []
     # Async jobs should return quickly; runtime netprobe is kept for sync path only.
     skip_runtime_precheck = bool(is_async_job)
-    if _SYNC_PRECHECK_ENABLED and (not skip_runtime_precheck):
+    sync_precheck_enabled = _sync_precheck_enabled()
+    if sync_precheck_enabled and (not skip_runtime_precheck):
         i1, i2 = await asyncio.gather(
             _probe_node_rules_precheck(sender, sender_pool, "公网入口"),
             _probe_node_rules_precheck(receiver, receiver_pool, "内网出口"),
@@ -1822,10 +2019,10 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
             _append_issue(precheck_issues, precheck_seen, it)
 
     precheck_summary = {
-        "enabled": bool(_SYNC_PRECHECK_ENABLED and (not skip_runtime_precheck)),
+        "enabled": bool(sync_precheck_enabled and (not skip_runtime_precheck)),
         "source": (
             "static_validate+agent_netprobe_rules"
-            if (_SYNC_PRECHECK_ENABLED and (not skip_runtime_precheck))
+            if (sync_precheck_enabled and (not skip_runtime_precheck))
             else ("static_validate+runtime_skipped_async" if skip_runtime_precheck else "static_validate")
         ),
         "runtime_skipped_async": bool(skip_runtime_precheck),
@@ -1860,6 +2057,8 @@ async def api_intranet_tunnel_save(payload: Dict[str, Any], user: str = Depends(
         "receiver_pool": _filter_pool_for_user(user, receiver_pool),
         "sender_desired_version": s_ver,
         "receiver_desired_version": r_ver,
+        "tls_verify_degraded": bool(tls_verify_degraded_reason),
+        "tls_verify_degraded_reason": tls_verify_degraded_reason,
         "precheck": {
             "issues": precheck_issues,
             "summary": precheck_summary,

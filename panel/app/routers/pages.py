@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -12,13 +13,128 @@ from ..core.flash import flash, set_flash
 from ..core.settings import DEFAULT_AGENT_PORT
 from ..core.share import require_login_or_share_view_page, require_login_or_share_wall_page
 from ..core.templates import templates
-from ..db import add_node, delete_node, get_group_orders, get_node, list_nodes
-from ..services.assets import panel_public_base_url
+from ..db import add_node, delete_node, get_group_orders, get_node, get_panel_setting, list_nodes, set_panel_setting
+from ..services.assets import (
+    panel_asset_source,
+    panel_bootstrap_base_url,
+    panel_bootstrap_insecure_tls,
+    panel_public_base_url,
+)
+try:
+    from ..services.panel_config import parse_bool_loose, setting_float, setting_int
+except Exception:
+    _TRUE_SET = {"1", "true", "yes", "on", "y"}
+    _FALSE_SET = {"0", "false", "no", "off", "n"}
+
+    def _cfg_env(names: Optional[list[str]]) -> str:
+        for n in (names or []):
+            name = str(n or "").strip()
+            if not name:
+                continue
+            v = str(os.getenv(name) or "").strip()
+            if v:
+                return v
+        return ""
+
+    def parse_bool_loose(raw: Any, default: bool = False) -> bool:
+        if raw is None:
+            return bool(default)
+        s = str(raw).strip().lower()
+        if not s:
+            return bool(default)
+        if s in _TRUE_SET:
+            return True
+        if s in _FALSE_SET:
+            return False
+        return bool(default)
+
+    def setting_int(
+        key: str,
+        default: int,
+        lo: int,
+        hi: int,
+        env_names: Optional[list[str]] = None,
+    ) -> int:
+        raw = get_panel_setting(str(key or "").strip())
+        v_raw: Any = raw
+        if raw is None or str(raw).strip() == "":
+            env_v = _cfg_env(env_names)
+            v_raw = env_v if env_v else default
+        try:
+            v = int(float(str(v_raw).strip() or default))
+        except Exception:
+            v = int(default)
+        if v < int(lo):
+            v = int(lo)
+        if v > int(hi):
+            v = int(hi)
+        return int(v)
+
+    def setting_float(
+        key: str,
+        default: float,
+        lo: float,
+        hi: float,
+        env_names: Optional[list[str]] = None,
+    ) -> float:
+        raw = get_panel_setting(str(key or "").strip())
+        v_raw: Any = raw
+        if raw is None or str(raw).strip() == "":
+            env_v = _cfg_env(env_names)
+            v_raw = env_v if env_v else default
+        try:
+            v = float(str(v_raw).strip() or default)
+        except Exception:
+            v = float(default)
+        if v < float(lo):
+            v = float(lo)
+        if v > float(hi):
+            v = float(hi)
+        return float(v)
 from ..services.node_status import is_report_fresh
 from ..utils.crypto import generate_api_key
 from ..utils.normalize import extract_ip_for_display, format_host_for_url, split_host_and_port
 
 router = APIRouter()
+
+
+def _as_bool(raw: Optional[str], default: bool = False) -> bool:
+    if raw is None:
+        return bool(default)
+    s = str(raw).strip().lower()
+    if not s:
+        return bool(default)
+    return s in ("1", "true", "yes", "on", "y")
+
+
+def _clamp_int_text(raw: Any, lo: int, hi: int) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    try:
+        v = int(float(s))
+    except Exception:
+        return ""
+    if v < int(lo):
+        v = int(lo)
+    if v > int(hi):
+        v = int(hi)
+    return str(int(v))
+
+
+def _clamp_float_text(raw: Any, lo: float, hi: float) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    try:
+        v = float(s)
+    except Exception:
+        return ""
+    if v < float(lo):
+        v = float(lo)
+    if v > float(hi):
+        v = float(hi)
+    return f"{float(v):g}"
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -103,6 +219,175 @@ async def index(request: Request, user: str = Depends(require_login_page)):
             "title": "控制台",
         },
     )
+
+
+@router.get("/settings", response_class=HTMLResponse)
+async def settings_page(request: Request, user: str = Depends(require_role_page("users.manage"))):
+    configured_url = str(get_panel_setting("agent_bootstrap_url", "") or "").strip()
+    configured_insecure_raw = get_panel_setting("agent_bootstrap_insecure_tls")
+    insecure_tls = (
+        _as_bool(configured_insecure_raw, default=True)
+        if configured_insecure_raw is not None and str(configured_insecure_raw).strip() != ""
+        else panel_bootstrap_insecure_tls(default=True)
+    )
+    configured_public_url = str(get_panel_setting("panel_public_url", "") or "").strip()
+    configured_asset_source = str(get_panel_setting("panel_asset_source", "") or "").strip().lower()
+    if configured_asset_source not in ("panel", "github"):
+        configured_asset_source = ""
+    configured_agent_sh_url = str(get_panel_setting("panel_agent_sh_url", "") or "").strip()
+    configured_agent_zip_url = str(get_panel_setting("panel_agent_zip_url", "") or "").strip()
+    configured_bootstrap_scheme = str(get_panel_setting("agent_bootstrap_default_scheme", "") or "").strip().lower()
+    if configured_bootstrap_scheme not in ("http", "https"):
+        configured_bootstrap_scheme = ""
+    configured_panel_ip_fallback_port = str(get_panel_setting("agent_panel_ip_fallback_port", "") or "").strip()
+
+    configured_ssl_direct_first = parse_bool_loose(get_panel_setting("ssl_direct_first"), default=True)
+    configured_ssl_direct_timeout = _clamp_float_text(get_panel_setting("ssl_direct_timeout_sec", ""), 30.0, 1200.0)
+    configured_ssl_direct_max_attempts = _clamp_int_text(get_panel_setting("ssl_direct_max_attempts", ""), 1, 30)
+    configured_ssl_fallback_to_queue = parse_bool_loose(get_panel_setting("ssl_fallback_to_queue"), default=True)
+
+    configured_save_precheck_enabled = parse_bool_loose(get_panel_setting("save_precheck_enabled"), default=True)
+    configured_save_precheck_http_timeout = _clamp_float_text(
+        get_panel_setting("save_precheck_http_timeout", ""),
+        2.0,
+        20.0,
+    )
+    configured_save_precheck_probe_timeout = _clamp_float_text(
+        get_panel_setting("save_precheck_probe_timeout", ""),
+        0.2,
+        6.0,
+    )
+    configured_save_precheck_max_issues = _clamp_int_text(
+        get_panel_setting("save_precheck_max_issues", ""),
+        5,
+        120,
+    )
+
+    configured_sync_precheck_enabled = parse_bool_loose(get_panel_setting("sync_precheck_enabled"), default=True)
+    configured_sync_precheck_http_timeout = _clamp_float_text(
+        get_panel_setting("sync_precheck_http_timeout", ""),
+        2.0,
+        20.0,
+    )
+    configured_sync_precheck_probe_timeout = _clamp_float_text(
+        get_panel_setting("sync_precheck_probe_timeout", ""),
+        0.2,
+        6.0,
+    )
+    configured_sync_apply_timeout = _clamp_float_text(
+        get_panel_setting("sync_apply_timeout", ""),
+        0.5,
+        20.0,
+    )
+
+    effective_bootstrap_url = panel_bootstrap_base_url(request)
+    effective_public_url = panel_public_base_url(request)
+    effective_asset_source = panel_asset_source()
+    effective_ssl_direct_timeout = setting_float("ssl_direct_timeout_sec", default=240.0, lo=30.0, hi=1200.0)
+    effective_ssl_direct_max_attempts = setting_int("ssl_direct_max_attempts", default=1, lo=1, hi=30)
+    effective_panel_ip_fallback_port = setting_int(
+        "agent_panel_ip_fallback_port",
+        default=6080,
+        lo=1,
+        hi=65535,
+        env_names=["REALM_PANEL_IP_FALLBACK_PORT"],
+    )
+    return templates.TemplateResponse(
+        "settings.html",
+        {
+            "request": request,
+            "user": user,
+            "flash": flash(request),
+            "title": "面板设置",
+            "agent_bootstrap_url": configured_url,
+            "agent_bootstrap_insecure_tls": bool(insecure_tls),
+            "effective_bootstrap_url": effective_bootstrap_url,
+            "panel_public_url": configured_public_url,
+            "panel_asset_source": configured_asset_source,
+            "panel_agent_sh_url": configured_agent_sh_url,
+            "panel_agent_zip_url": configured_agent_zip_url,
+            "agent_bootstrap_default_scheme": configured_bootstrap_scheme,
+            "agent_panel_ip_fallback_port": configured_panel_ip_fallback_port,
+            "ssl_direct_first": bool(configured_ssl_direct_first),
+            "ssl_direct_timeout_sec": configured_ssl_direct_timeout,
+            "ssl_direct_max_attempts": configured_ssl_direct_max_attempts,
+            "ssl_fallback_to_queue": bool(configured_ssl_fallback_to_queue),
+            "save_precheck_enabled": bool(configured_save_precheck_enabled),
+            "save_precheck_http_timeout": configured_save_precheck_http_timeout,
+            "save_precheck_probe_timeout": configured_save_precheck_probe_timeout,
+            "save_precheck_max_issues": configured_save_precheck_max_issues,
+            "sync_precheck_enabled": bool(configured_sync_precheck_enabled),
+            "sync_precheck_http_timeout": configured_sync_precheck_http_timeout,
+            "sync_precheck_probe_timeout": configured_sync_precheck_probe_timeout,
+            "sync_apply_timeout": configured_sync_apply_timeout,
+            "effective_public_url": effective_public_url,
+            "effective_asset_source": effective_asset_source,
+            "effective_ssl_direct_timeout": f"{float(effective_ssl_direct_timeout):g}",
+            "effective_ssl_direct_max_attempts": int(effective_ssl_direct_max_attempts),
+            "effective_panel_ip_fallback_port": int(effective_panel_ip_fallback_port),
+        },
+    )
+
+
+@router.post("/settings")
+async def settings_save(
+    request: Request,
+    user: str = Depends(require_role_page("users.manage")),
+    agent_bootstrap_url: str = Form(""),
+    agent_bootstrap_insecure_tls: Optional[str] = Form(None),
+    panel_public_url: str = Form(""),
+    panel_asset_source: str = Form("panel"),
+    panel_agent_sh_url: str = Form(""),
+    panel_agent_zip_url: str = Form(""),
+    agent_bootstrap_default_scheme: str = Form(""),
+    agent_panel_ip_fallback_port: str = Form(""),
+    ssl_direct_first: Optional[str] = Form(None),
+    ssl_direct_timeout_sec: str = Form(""),
+    ssl_direct_max_attempts: str = Form(""),
+    ssl_fallback_to_queue: Optional[str] = Form(None),
+    save_precheck_enabled: Optional[str] = Form(None),
+    save_precheck_http_timeout: str = Form(""),
+    save_precheck_probe_timeout: str = Form(""),
+    save_precheck_max_issues: str = Form(""),
+    sync_precheck_enabled: Optional[str] = Form(None),
+    sync_precheck_http_timeout: str = Form(""),
+    sync_precheck_probe_timeout: str = Form(""),
+    sync_apply_timeout: str = Form(""),
+):
+    _ = user
+    set_panel_setting("agent_bootstrap_url", str(agent_bootstrap_url or "").strip())
+    set_panel_setting("agent_bootstrap_insecure_tls", "1" if _as_bool(agent_bootstrap_insecure_tls, default=False) else "0")
+    set_panel_setting("panel_public_url", str(panel_public_url or "").strip())
+
+    asset_src = str(panel_asset_source or "").strip().lower()
+    if asset_src not in ("panel", "github"):
+        asset_src = "panel"
+    set_panel_setting("panel_asset_source", asset_src)
+    set_panel_setting("panel_agent_sh_url", str(panel_agent_sh_url or "").strip())
+    set_panel_setting("panel_agent_zip_url", str(panel_agent_zip_url or "").strip())
+
+    bootstrap_scheme = str(agent_bootstrap_default_scheme or "").strip().lower()
+    if bootstrap_scheme not in ("http", "https"):
+        bootstrap_scheme = ""
+    set_panel_setting("agent_bootstrap_default_scheme", bootstrap_scheme)
+    set_panel_setting("agent_panel_ip_fallback_port", _clamp_int_text(agent_panel_ip_fallback_port, 1, 65535))
+
+    set_panel_setting("ssl_direct_first", "1" if _as_bool(ssl_direct_first, default=False) else "0")
+    set_panel_setting("ssl_direct_timeout_sec", _clamp_float_text(ssl_direct_timeout_sec, 30.0, 1200.0))
+    set_panel_setting("ssl_direct_max_attempts", _clamp_int_text(ssl_direct_max_attempts, 1, 30))
+    set_panel_setting("ssl_fallback_to_queue", "1" if _as_bool(ssl_fallback_to_queue, default=False) else "0")
+
+    set_panel_setting("save_precheck_enabled", "1" if _as_bool(save_precheck_enabled, default=False) else "0")
+    set_panel_setting("save_precheck_http_timeout", _clamp_float_text(save_precheck_http_timeout, 2.0, 20.0))
+    set_panel_setting("save_precheck_probe_timeout", _clamp_float_text(save_precheck_probe_timeout, 0.2, 6.0))
+    set_panel_setting("save_precheck_max_issues", _clamp_int_text(save_precheck_max_issues, 5, 120))
+
+    set_panel_setting("sync_precheck_enabled", "1" if _as_bool(sync_precheck_enabled, default=False) else "0")
+    set_panel_setting("sync_precheck_http_timeout", _clamp_float_text(sync_precheck_http_timeout, 2.0, 20.0))
+    set_panel_setting("sync_precheck_probe_timeout", _clamp_float_text(sync_precheck_probe_timeout, 0.2, 6.0))
+    set_panel_setting("sync_apply_timeout", _clamp_float_text(sync_apply_timeout, 0.5, 20.0))
+    set_flash(request, "面板设置已保存")
+    return RedirectResponse(url="/settings", status_code=303)
 
 
 @router.get("/netmon", response_class=HTMLResponse)
@@ -423,8 +708,9 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
     show_install_cmd = bool(request.session.pop("show_install_cmd", False))
     show_edit_node = str(request.query_params.get("edit") or "").strip() in ("1", "true", "yes")
 
-    base_url = panel_public_base_url(request)
+    base_url = panel_bootstrap_base_url(request)
     node["display_ip"] = extract_ip_for_display(node.get("base_url", ""))
+    curl_tls_opt = "-k " if (panel_bootstrap_insecure_tls(default=True) and str(base_url).lower().startswith("https://")) else ""
 
     # 在线判定：默认心跳 30s，取 3 倍窗口避免误判
     node["online"] = is_report_fresh(node, max_age_sec=90)
@@ -432,13 +718,20 @@ async def node_detail(request: Request, node_id: int, user: str = Depends(requir
     # ✅ 一键接入 / 卸载命令（短命令，避免超长）
     # 说明：使用 node.api_key 作为 join token，脚本由面板返回并带参数执行。
     token = node["api_key"]
+    curl_retry_opt_probe = (
+        "CURL_RETRY_ALL_ERRORS=''; "
+        "curl --help all 2>/dev/null | grep -q -- '--retry-all-errors' "
+        "&& CURL_RETRY_ALL_ERRORS='--retry-all-errors'; "
+    )
     install_cmd = (
-        f"curl -fL --retry 5 --retry-all-errors --connect-timeout 10 "
+        f"{curl_retry_opt_probe}"
+        f"curl {curl_tls_opt}-fL --retry 5 $CURL_RETRY_ALL_ERRORS --connect-timeout 10 "
         f"-H \"X-Join-Token: {token}\" -o /tmp/realm-join.sh {base_url}/join "
         f"&& bash /tmp/realm-join.sh && rm -f /tmp/realm-join.sh"
     )
     uninstall_cmd = (
-        f"curl -fL --retry 5 --retry-all-errors --connect-timeout 10 "
+        f"{curl_retry_opt_probe}"
+        f"curl {curl_tls_opt}-fL --retry 5 $CURL_RETRY_ALL_ERRORS --connect-timeout 10 "
         f"-H \"X-Join-Token: {token}\" -o /tmp/realm-uninstall.sh {base_url}/uninstall "
         f"&& bash /tmp/realm-uninstall.sh && rm -f /tmp/realm-uninstall.sh"
     )

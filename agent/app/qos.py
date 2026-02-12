@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+from .iptables_cmd import iptables_available, run_iptables
 
 
 IPT_TABLE = os.getenv("REALM_QOS_IPT_TABLE", "filter").strip() or "filter"
@@ -296,19 +297,10 @@ class _IptablesBackend:
 
     @property
     def available(self) -> bool:
-        return bool(shutil.which("iptables"))
+        return iptables_available()
 
     def _run(self, args: List[str]) -> Tuple[int, str, str]:
-        try:
-            proc = subprocess.run(
-                ["iptables", *args],
-                capture_output=True,
-                text=True,
-                timeout=IPT_TIMEOUT,
-            )
-            return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
-        except Exception as exc:
-            return 127, "", str(exc)
+        return run_iptables(args, timeout=IPT_TIMEOUT)
 
     def _ensure_chain(self) -> None:
         self._run(["-t", self.table, "-N", self.chain])

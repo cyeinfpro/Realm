@@ -81,6 +81,9 @@ OPEN_TIMEOUT = float(os.getenv('REALM_INTRANET_OPEN_TIMEOUT', '8.0'))
 TCP_BACKLOG = int(os.getenv('REALM_INTRANET_TCP_BACKLOG', '256'))
 UDP_SESSION_TTL = float(os.getenv('REALM_INTRANET_UDP_TTL', '60.0'))
 MAX_FRAME = int(os.getenv('REALM_INTRANET_MAX_UDP_FRAME', '65535'))
+DIAL_CONNECT_TIMEOUT = _env_float('REALM_INTRANET_DIAL_CONNECT_TIMEOUT', 6.0, 1.0, 60.0)
+DIAL_TLS_TIMEOUT = _env_float('REALM_INTRANET_DIAL_TLS_TIMEOUT', 8.0, 1.0, 60.0)
+SERVER_TLS_HANDSHAKE_TIMEOUT = _env_float('REALM_INTRANET_SERVER_TLS_HANDSHAKE_TIMEOUT', 8.0, 1.0, 60.0)
 FIRST_PACKET_TIMEOUT = _env_float('REALM_INTRANET_FIRST_PACKET_TIMEOUT', 5.0, 1.0, 30.0)
 FIRST_PACKET_MAX = _env_int('REALM_INTRANET_FIRST_PACKET_MAX', 65536, 256, 1024 * 1024)
 MAX_ACCEPT_WORKERS = _env_int('REALM_INTRANET_MAX_ACCEPT_WORKERS', 512, 8, 8192)
@@ -244,6 +247,25 @@ def shutil_which(cmd: str) -> Optional[str]:
         return None
 
 
+def _server_cert_pair_usable() -> bool:
+    try:
+        if (not SERVER_CERT.exists()) or (not SERVER_KEY.exists()):
+            return False
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=str(SERVER_CERT), keyfile=str(SERVER_KEY))
+        return True
+    except Exception:
+        return False
+
+
+def _write_server_pem() -> None:
+    try:
+        pem = (SERVER_KEY.read_text(encoding='utf-8') + '\n' + SERVER_CERT.read_text(encoding='utf-8')).strip() + '\n'
+        SERVER_PEM.write_text(pem, encoding='utf-8')
+    except Exception:
+        pass
+
+
 def ensure_server_cert() -> None:
     """Ensure we have a self-signed cert for intranet tunnel server.
 
@@ -255,8 +277,20 @@ def ensure_server_cert() -> None:
     except Exception:
         return
 
-    if SERVER_CERT.exists() and SERVER_KEY.exists():
+    pair_exists = SERVER_CERT.exists() and SERVER_KEY.exists()
+    if pair_exists and _server_cert_pair_usable():
+        # Keep bundled PEM in sync (used by some tooling / debug flows).
+        if (not SERVER_PEM.exists()) or (SERVER_PEM.stat().st_size <= 0):
+            _write_server_pem()
         return
+    if pair_exists:
+        # Self-heal corrupted / mismatched cert-key pair.
+        for p in (SERVER_CERT, SERVER_KEY, SERVER_PEM):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
 
     openssl = shutil_which('openssl')
     if not openssl:
@@ -280,9 +314,16 @@ def ensure_server_cert() -> None:
             '/CN=realm-intranet',
         ]
         subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if SERVER_KEY.exists() and SERVER_CERT.exists():
-            pem = (SERVER_KEY.read_text(encoding='utf-8') + '\n' + SERVER_CERT.read_text(encoding='utf-8')).strip() + '\n'
-            SERVER_PEM.write_text(pem, encoding='utf-8')
+        if _server_cert_pair_usable():
+            _write_server_pem()
+            return
+        # Avoid leaving a broken cert pair behind; next round can retry generation.
+        for p in (SERVER_CERT, SERVER_KEY, SERVER_PEM):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
     except Exception:
         return
 
@@ -904,11 +945,15 @@ class _TunnelServer:
                 pass
             return conn, 'plain'
         try:
-            conn.settimeout(None)
+            conn.settimeout(SERVER_TLS_HANDSHAKE_TIMEOUT)
             _set_keepalive(conn)
             ss = self._ssl_ctx.wrap_socket(conn, server_side=True)
             ss.settimeout(None)
             return ss, 'tls'
+        except socket.timeout as exc:
+            _log('accept_wrap_timeout', port=self.port, error=str(exc))
+            _safe_close(conn)
+            return None, 'tls'
         except Exception as exc:
             _log('accept_wrap_failed', port=self.port, error=str(exc))
             _safe_close(conn)
@@ -1813,8 +1858,8 @@ class _TunnelClient:
         Returns: (socket_like, dial_mode, error)
         """
         try:
-            raw = socket.create_connection((self.peer_host, self.peer_port), timeout=6)
-            raw.settimeout(None)
+            raw = socket.create_connection((self.peer_host, self.peer_port), timeout=DIAL_CONNECT_TIMEOUT)
+            raw.settimeout(DIAL_TLS_TIMEOUT)
             _set_keepalive(raw)
         except Exception as exc:
             return None, '', f'dial_failed: {exc}'
@@ -1829,6 +1874,9 @@ class _TunnelClient:
             ss = ctx.wrap_socket(raw, server_hostname=None)
             ss.settimeout(None)
             return ss, 'tls', ''
+        except socket.timeout as exc:
+            _safe_close(raw)
+            return None, '', f'dial_tls_timeout: {exc}'
         except ssl.SSLCertVerificationError as exc:
             _safe_close(raw)
             return None, '', f'tls_verify_failed: {exc}'
@@ -1840,7 +1888,7 @@ class _TunnelClient:
             ):
                 # Re-dial plaintext
                 try:
-                    raw2 = socket.create_connection((self.peer_host, self.peer_port), timeout=6)
+                    raw2 = socket.create_connection((self.peer_host, self.peer_port), timeout=DIAL_CONNECT_TIMEOUT)
                     raw2.settimeout(None)
                     _set_keepalive(raw2)
                     return raw2, 'plain', ''
@@ -1856,7 +1904,7 @@ class _TunnelClient:
             if (not self.server_cert_pem) and (not self.tls_verify) and ALLOW_PLAINTEXT_FALLBACK and isinstance(exc, ConnectionResetError):
                 _safe_close(raw)
                 try:
-                    raw2 = socket.create_connection((self.peer_host, self.peer_port), timeout=6)
+                    raw2 = socket.create_connection((self.peer_host, self.peer_port), timeout=DIAL_CONNECT_TIMEOUT)
                     raw2.settimeout(None)
                     _set_keepalive(raw2)
                     return raw2, 'plain', ''
@@ -2485,8 +2533,26 @@ class IntranetManager:
                 key = str(self._rule_client_key.get(sid) or '')
             if (not key) and token:
                 key = str(self._client_token_index.get(token) or '')
-            if (not key) and peer_host and token:
-                key = f"{peer_host}:{port}:{token}"
+            if not key:
+                # Backward-compatible fallback:
+                # find a client by token/peer/port even when key schema changes.
+                for ck, cv in self._clients.items():
+                    try:
+                        st0 = cv.get_state()
+                    except Exception:
+                        continue
+                    if token and (not cv.owns_token(token)):
+                        continue
+                    if peer_host and str(st0.get('peer_host') or '').strip() != peer_host:
+                        continue
+                    try:
+                        p0 = int(st0.get('peer_port') or 0)
+                    except Exception:
+                        p0 = 0
+                    if port > 0 and p0 != int(port):
+                        continue
+                    key = ck
+                    break
             c = self._clients.get(key) if key else None
             if not c:
                 return {'ok': False, 'error': 'client_not_running'}
@@ -2501,13 +2567,17 @@ class IntranetManager:
                     'token_count': int(st.get('token_count') or 1),
                     'ping_sent': int(st.get('ping_sent') or 0),
                     'pong_recv': int(st.get('pong_recv') or 0),
+                    'last_attempt_at': int(st.get('last_attempt_at') or 0),
+                    'last_connected_at': int(st.get('last_connected_at') or 0),
                 }
                 if st.get('rtt_ms') is not None:
                     payload2['latency_ms'] = int(st.get('rtt_ms') or 0)
                 elif st.get('handshake_ms') is not None:
                     payload2['latency_ms'] = int(st.get('handshake_ms') or 0)
                 return payload2
-            err = str(st.get('last_error') or 'not_connected')
+            err = str(st.get('last_error') or '').strip()
+            if not err:
+                err = 'dialing' if int(st.get('last_attempt_at') or 0) > 0 else 'not_connected'
             return {
                 'ok': False,
                 'error': err,
@@ -2518,6 +2588,8 @@ class IntranetManager:
                 'token_count': int(st.get('token_count') or 1),
                 'ping_sent': int(st.get('ping_sent') or 0),
                 'pong_recv': int(st.get('pong_recv') or 0),
+                'last_attempt_at': int(st.get('last_attempt_at') or 0),
+                'last_connected_at': int(st.get('last_connected_at') or 0),
             }
 
         return {'ok': None, 'message': 'unknown_role'}
@@ -2597,8 +2669,8 @@ class IntranetManager:
             net = e.get('network') if isinstance(e.get('network'), dict) else {}
             net_qos = net.get('qos') if isinstance(net.get('qos'), dict) else {}
 
-            def _pick_qos(keys: Tuple[str, ...]) -> Any:
-                for src in (qos, net_qos, ex, net, e):
+            def _pick_qos(keys: Tuple[str, ...], sources: Tuple[Any, ...] = (qos, net_qos, ex, net, e)) -> Any:
+                for src in sources:
                     if not isinstance(src, dict):
                         continue
                     for k in keys:

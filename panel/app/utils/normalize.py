@@ -220,6 +220,25 @@ def sanitize_pool_fields(pool: Dict[str, Any]) -> None:
                     if e.get(k) is not None and isinstance(e.get(k), str):
                         e[k] = e[k].strip()
 
+                if e.get("forward_tool") is not None:
+                    ft = str(e.get("forward_tool") or "").strip().lower()
+                    if ft in ("ipt", "iptables"):
+                        e["forward_tool"] = "iptables"
+                    elif ft == "realm":
+                        e["forward_tool"] = "realm"
+                    elif not ft:
+                        e.pop("forward_tool", None)
+
+                ex = e.get("extra_config")
+                if isinstance(ex, dict) and ex.get("forward_tool") is not None:
+                    ft = str(ex.get("forward_tool") or "").strip().lower()
+                    if ft in ("ipt", "iptables"):
+                        ex["forward_tool"] = "iptables"
+                    elif ft == "realm":
+                        ex["forward_tool"] = "realm"
+                    elif not ft:
+                        ex.pop("forward_tool", None)
+
                 # Panel-only meta fields
                 if e.get("remark") is not None:
                     v = str(e.get("remark") or "").strip()
@@ -247,4 +266,3 @@ def sanitize_pool_fields(pool: Dict[str, Any]) -> None:
 
 # Backward-compatible alias
 sanitize_pool = sanitize_pool_fields
-

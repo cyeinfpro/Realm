@@ -35,6 +35,50 @@
   </div>
 </div>
 
+<section class="card wm-fav-card" id="wmFavCard">
+  <div class="wm-card-head">
+    <div>
+      <div class="wm-card-title">文件收藏</div>
+      <div class="wm-card-sub">将常用文件/目录固定在这里，点击后以弹窗方式直接管理。</div>
+    </div>
+    <div class="wm-card-tools">
+      <span class="pill xs ghost" id="wmFavCount">{{ file_favorites|length }} 项</span>
+    </div>
+  </div>
+  <div class="wm-fav-grid" id="wmFavGrid">
+    {% if file_favorites %}
+      {% for f in file_favorites %}
+        <div
+          class="wm-fav-item"
+          data-site-id="{{ f.site_id }}"
+          data-path="{{ f.path }}"
+          data-type="{{ 'dir' if f.is_dir else 'file' }}"
+          data-name="{{ f.name }}"
+        >
+          <button class="wm-fav-main" type="button" data-action="open-favorite">
+            <div class="wm-fav-main-top">
+              <span class="wm-fav-star">★</span>
+              <span class="wm-fav-name" title="{{ f.name }}">{{ f.name }}</span>
+              <span class="pill xs ghost">{{ '目录' if f.is_dir else '文件' }}</span>
+            </div>
+            <div class="wm-fav-path mono" title="{{ f.path }}">{{ f.path }}</div>
+            <div class="wm-fav-meta">
+              <span>{{ f.site_name }}</span>
+              {% if f.site_domain %}<span class="mono">{{ f.site_domain }}</span>{% endif %}
+            </div>
+          </button>
+          <div class="wm-fav-actions">
+            <button class="btn xs ghost" type="button" data-action="open-favorite">打开</button>
+            <button class="btn xs ghost wm-fav-unstar" type="button" data-action="unstar-favorite">取消收藏</button>
+          </div>
+        </div>
+      {% endfor %}
+    {% else %}
+      <div class="wm-fav-empty" id="wmFavEmpty">暂未收藏文件或目录。可在文件管理里点击“☆/★”收藏常用项。</div>
+    {% endif %}
+  </div>
+</section>
+
 {# ---- Main layout ---- #}
 <div class="wm-layout">
 
@@ -83,6 +127,9 @@
           {% set extra = (domains|length - 1) %}
 
           <div class="wm-site-row"
+               data-site-id="{{ s.id }}"
+               data-site-name="{{ s.name }}"
+               data-site-domain="{{ primary_domain if primary_domain != '-' else '' }}"
                data-name="{{ (s.name or '')|lower }}"
                data-domains="{{ (s.domains_text or '')|lower }}"
                data-node="{{ (s.node.name if s.node else '-')|lower }}"
@@ -230,7 +277,7 @@
           <div class="wm-node-row">
             <div style="min-width:0;">
               <div class="wm-node-name">{{ n.name }}</div>
-              <div class="wm-node-url mono" title="{{ n.base_url }}">{{ n.base_url }}</div>
+              <div class="wm-node-url mono" title="{{ (n.base_url|mask_url) if n.base_url else '-' }}">{{ (n.base_url|mask_url) if n.base_url else '-' }}</div>
               <div class="wm-node-meta">根目录基准：<span class="mono">{{ n.website_root_base or '/www' }}</span></div>
 
               {% if caps.list %}
@@ -285,6 +332,24 @@
 
 </div>
 
+<div id="wmFavoriteModal" class="modal" style="display:none;">
+  <div class="modal-inner modal-pro wm-favorite-modal-inner">
+    <div class="modal-head">
+      <div class="title-wrap">
+        <div class="h2" id="wmFavoriteTitle">收藏项</div>
+        <div class="muted sm" id="wmFavoriteSub">弹窗内直接管理文件或目录</div>
+      </div>
+      <div class="row" style="gap:8px;">
+        <a class="btn xs ghost" id="wmFavoriteOpenPage" href="#" target="_blank" rel="noopener">新窗口</a>
+        <button class="btn xs ghost" type="button" id="wmFavoriteCloseTop">关闭</button>
+      </div>
+    </div>
+    <div class="modal-body wm-favorite-modal-body">
+      <iframe id="wmFavoriteFrame" class="wm-favorite-frame" src="about:blank" loading="lazy"></iframe>
+    </div>
+  </div>
+</div>
+
 <div id="wmCreateModal" class="modal wm-create-modal" style="display:none;" data-auto-open="{{ 1 if open_create else 0 }}">
   <div class="modal-inner modal-pro wm-create-inner">
     <div class="modal-head wm-create-head">
@@ -310,7 +375,7 @@
               <label class="label">网站机节点</label>
               <select class="select" name="node_id" required>
                 {% for n in nodes %}
-                  <option value="{{ n.id }}">{{ n.name }} · {{ n.base_url }}</option>
+                  <option value="{{ n.id }}">{{ n.name }} · {{ (n.base_url|mask_url) if n.base_url else '-' }}</option>
                 {% endfor %}
               </select>
               {% if not nodes %}
@@ -412,6 +477,324 @@
 
 <script>
 (function(){
+  var grid = document.getElementById('wmFavGrid');
+  var countEl = document.getElementById('wmFavCount');
+  var favModal = document.getElementById('wmFavoriteModal');
+  var favFrame = document.getElementById('wmFavoriteFrame');
+  var favTitle = document.getElementById('wmFavoriteTitle');
+  var favSub = document.getElementById('wmFavoriteSub');
+  var favOpenPage = document.getElementById('wmFavoriteOpenPage');
+  var favCloseTop = document.getElementById('wmFavoriteCloseTop');
+
+  function favItems(){
+    if(!grid) return [];
+    return Array.from(grid.querySelectorAll('.wm-fav-item'));
+  }
+
+  function syncFavCount(){
+    var n = favItems().length;
+    if(countEl){
+      countEl.textContent = String(n) + ' 项';
+    }
+    var empty = document.getElementById('wmFavEmpty');
+    if(n <= 0){
+      if(!empty && grid){
+        empty = document.createElement('div');
+        empty.className = 'wm-fav-empty';
+        empty.id = 'wmFavEmpty';
+        empty.textContent = '暂未收藏文件或目录。可在文件管理里点击“☆/★”收藏常用项。';
+        grid.appendChild(empty);
+      }
+    }else if(empty && empty.parentNode){
+      empty.parentNode.removeChild(empty);
+    }
+  }
+
+  function favUrl(siteId, path, type, modal){
+    var sid = parseInt(siteId || 0, 10) || 0;
+    var p = String(path || '');
+    var t = String(type || 'file');
+    var base = t === 'dir'
+      ? '/websites/' + sid + '/files?path=' + encodeURIComponent(p)
+      : '/websites/' + sid + '/files/edit?path=' + encodeURIComponent(p);
+    if(!modal){
+      return base;
+    }
+    return base + '&modal=1';
+  }
+
+  function findFavCard(siteId, path){
+    var sid = parseInt(siteId || 0, 10) || 0;
+    var p = String(path || '').replace(/^\/+/, '').trim();
+    if(!sid || !p){
+      return null;
+    }
+    var list = favItems();
+    for(var i=0; i<list.length; i++){
+      var it = list[i];
+      var csid = parseInt(it.getAttribute('data-site-id') || '0', 10) || 0;
+      var cp = String(it.getAttribute('data-path') || '').replace(/^\/+/, '').trim();
+      if(csid === sid && cp === p){
+        return it;
+      }
+    }
+    return null;
+  }
+
+  function removeFavCard(siteId, path){
+    var card = findFavCard(siteId, path);
+    if(card && card.parentNode){
+      card.parentNode.removeChild(card);
+      syncFavCount();
+    }
+  }
+
+  function siteMetaById(siteId){
+    var sid = parseInt(siteId || 0, 10) || 0;
+    if(!sid){
+      return {siteName:'', siteDomain:''};
+    }
+    var row = document.querySelector('.wm-site-row[data-site-id="' + sid + '"]');
+    if(!row){
+      return {siteName:'', siteDomain:''};
+    }
+    return {
+      siteName: String(row.getAttribute('data-site-name') || '').trim(),
+      siteDomain: String(row.getAttribute('data-site-domain') || '').trim()
+    };
+  }
+
+  function makeFavCard(data){
+    var sid = parseInt(data && data.siteId || 0, 10) || 0;
+    var path = String(data && data.path || '').replace(/^\/+/, '').trim();
+    var isDir = !!(data && data.isDir);
+    var type = isDir ? 'dir' : 'file';
+    var name = String(data && data.name || path.split('/').pop() || path);
+    var siteName = String(data && data.siteName || ('站点#' + sid));
+    var siteDomain = String(data && data.siteDomain || '');
+
+    var card = document.createElement('div');
+    card.className = 'wm-fav-item';
+    card.setAttribute('data-site-id', String(sid));
+    card.setAttribute('data-path', path);
+    card.setAttribute('data-type', type);
+    card.setAttribute('data-name', name);
+
+    var main = document.createElement('button');
+    main.className = 'wm-fav-main';
+    main.type = 'button';
+    main.setAttribute('data-action', 'open-favorite');
+
+    var top = document.createElement('div');
+    top.className = 'wm-fav-main-top';
+
+    var star = document.createElement('span');
+    star.className = 'wm-fav-star';
+    star.textContent = '★';
+    top.appendChild(star);
+
+    var nameEl = document.createElement('span');
+    nameEl.className = 'wm-fav-name';
+    nameEl.title = name;
+    nameEl.textContent = name;
+    top.appendChild(nameEl);
+
+    var badge = document.createElement('span');
+    badge.className = 'pill xs ghost';
+    badge.textContent = isDir ? '目录' : '文件';
+    top.appendChild(badge);
+
+    var pathEl = document.createElement('div');
+    pathEl.className = 'wm-fav-path mono';
+    pathEl.title = path;
+    pathEl.textContent = path;
+
+    var meta = document.createElement('div');
+    meta.className = 'wm-fav-meta';
+    var siteNameEl = document.createElement('span');
+    siteNameEl.textContent = siteName;
+    meta.appendChild(siteNameEl);
+    if(siteDomain){
+      var siteDomainEl = document.createElement('span');
+      siteDomainEl.className = 'mono';
+      siteDomainEl.textContent = siteDomain;
+      meta.appendChild(siteDomainEl);
+    }
+
+    main.appendChild(top);
+    main.appendChild(pathEl);
+    main.appendChild(meta);
+
+    var actions = document.createElement('div');
+    actions.className = 'wm-fav-actions';
+    var openBtn = document.createElement('button');
+    openBtn.className = 'btn xs ghost';
+    openBtn.type = 'button';
+    openBtn.setAttribute('data-action', 'open-favorite');
+    openBtn.textContent = '打开';
+    actions.appendChild(openBtn);
+    var unstarBtn = document.createElement('button');
+    unstarBtn.className = 'btn xs ghost wm-fav-unstar';
+    unstarBtn.type = 'button';
+    unstarBtn.setAttribute('data-action', 'unstar-favorite');
+    unstarBtn.textContent = '取消收藏';
+    actions.appendChild(unstarBtn);
+
+    card.appendChild(main);
+    card.appendChild(actions);
+    return card;
+  }
+
+  function upsertFavCard(data){
+    if(!grid) return;
+    var sid = parseInt(data && data.siteId || 0, 10) || 0;
+    var path = String(data && data.path || '').replace(/^\/+/, '').trim();
+    if(!sid || !path){
+      return;
+    }
+    var old = findFavCard(sid, path);
+    if(old && old.parentNode){
+      old.parentNode.removeChild(old);
+    }
+    var card = makeFavCard(data || {});
+    var first = grid.querySelector('.wm-fav-item');
+    if(first){
+      grid.insertBefore(card, first);
+    }else{
+      grid.appendChild(card);
+    }
+    syncFavCount();
+  }
+
+  function openFavorite(card){
+    if(!card || !favModal || !favFrame) return;
+    var siteId = parseInt(card.getAttribute('data-site-id') || '0', 10) || 0;
+    var path = String(card.getAttribute('data-path') || '').replace(/^\/+/, '').trim();
+    var type = String(card.getAttribute('data-type') || 'file').trim().toLowerCase();
+    var name = String(card.getAttribute('data-name') || path.split('/').pop() || path);
+    if(siteId <= 0 || !path){
+      return;
+    }
+    var modalUrl = favUrl(siteId, path, type, true);
+    var fullUrl = favUrl(siteId, path, type, false);
+    favFrame.src = modalUrl;
+    if(favOpenPage){
+      favOpenPage.href = fullUrl;
+    }
+    if(favTitle){
+      favTitle.textContent = (type === 'dir' ? '目录管理' : '文件编辑') + ' · ' + name;
+    }
+    if(favSub){
+      favSub.textContent = path;
+    }
+    favModal.style.display = 'flex';
+    document.body.classList.add('modal-open');
+  }
+
+  function closeFavorite(){
+    if(!favModal) return;
+    favModal.style.display = 'none';
+    if(favFrame){
+      favFrame.src = 'about:blank';
+    }
+    var createModal = document.getElementById('wmCreateModal');
+    if(!(createModal && createModal.style.display !== 'none')){
+      document.body.classList.remove('modal-open');
+    }
+  }
+
+  async function unstarFavorite(card){
+    if(!card) return;
+    var siteId = parseInt(card.getAttribute('data-site-id') || '0', 10) || 0;
+    var path = String(card.getAttribute('data-path') || '').replace(/^\/+/, '').trim();
+    var type = String(card.getAttribute('data-type') || 'file').trim().toLowerCase();
+    if(siteId <= 0 || !path){
+      return;
+    }
+    var btn = card.querySelector('[data-action="unstar-favorite"]');
+    if(btn) btn.disabled = true;
+    try{
+      var resp = await fetch('/websites/' + siteId + '/files/favorite', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        credentials: 'same-origin',
+        body: JSON.stringify({path: path, type: type, favorite: false})
+      });
+      var data = await resp.json().catch(function(){ return {ok:false,error:'取消收藏失败'}; });
+      if(!data.ok){
+        throw new Error(data.error || '取消收藏失败');
+      }
+      removeFavCard(siteId, path);
+    }catch(err){
+      alert(String(err));
+      if(btn) btn.disabled = false;
+    }
+  }
+
+  grid?.addEventListener('click', function(e){
+    var trigger = e.target && e.target.closest ? e.target.closest('[data-action]') : null;
+    if(!trigger) return;
+    var action = String(trigger.getAttribute('data-action') || '');
+    var card = trigger.closest('.wm-fav-item');
+    if(!card) return;
+    if(action === 'open-favorite'){
+      e.preventDefault();
+      openFavorite(card);
+      return;
+    }
+    if(action === 'unstar-favorite'){
+      e.preventDefault();
+      unstarFavorite(card);
+    }
+  });
+
+  favCloseTop?.addEventListener('click', closeFavorite);
+  favModal?.addEventListener('click', function(e){
+    if(e.target === favModal){
+      closeFavorite();
+    }
+  });
+
+  window.addEventListener('message', function(e){
+    if(e.origin !== window.location.origin){
+      return;
+    }
+    var data = e.data || {};
+    if(data.type !== 'nexus-file-favorite-updated'){
+      return;
+    }
+    var sid = parseInt(data.siteId || 0, 10) || 0;
+    var p = String(data.path || '').replace(/^\/+/, '').trim();
+    if(!sid || !p) return;
+    if(data.favorite === false){
+      removeFavCard(sid, p);
+      return;
+    }
+    if(data.favorite === true){
+      var meta = siteMetaById(sid);
+      upsertFavCard({
+        siteId: sid,
+        siteName: String(data.siteName || meta.siteName || ('站点#' + sid)),
+        siteDomain: String(data.siteDomain || meta.siteDomain || ''),
+        path: p,
+        name: String(data.name || p.split('/').pop() || p),
+        isDir: !!data.isDir
+      });
+    }
+  });
+
+  document.addEventListener('keydown', function(e){
+    if(e.key === 'Escape' && favModal && favModal.style.display !== 'none'){
+      closeFavorite();
+    }
+  });
+
+  syncFavCount();
+})();
+</script>
+
+<script>
+(function(){
   var modal = document.getElementById('wmCreateModal');
   if(!modal) return;
 
@@ -447,7 +830,10 @@
 
   function closeModal(){
     modal.style.display = 'none';
-    document.body.classList.remove('modal-open');
+    var favModal = document.getElementById('wmFavoriteModal');
+    if(!(favModal && favModal.style.display !== 'none')){
+      document.body.classList.remove('modal-open');
+    }
   }
 
   openBtns.forEach(function(btn){

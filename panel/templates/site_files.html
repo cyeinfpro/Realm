@@ -1,5 +1,12 @@
 {% extends "base.html" %}
 {% block content %}
+{% if embed_mode %}
+<style>
+.topbar,.footer{display:none !important;}
+main.container{max-width:none;padding:10px 12px 12px;}
+</style>
+{% endif %}
+{% if not embed_mode %}
 <div class="page-head">
   <div class="page-title">
     <h1 class="h1">文件管理 · {{ site.name }}</h1>
@@ -14,6 +21,7 @@
 </div>
 
 {% include "site_nav.html" %}
+{% endif %}
 
 {% if error %}
   <div class="flash" style="background:rgba(239,68,68,0.15);border-color:rgba(239,68,68,0.4);">
@@ -23,15 +31,15 @@
 
 <div class="card fm-card compact" style="margin-top:12px;">
   <div class="fm-pathbar">
-    <div class="fm-crumbs">
-      <button class="btn xs ghost" type="button" id="fmUpBtn">上一级</button>
-      <div class="file-path fm-crumb-trail">
-        {% for name, p in breadcrumbs %}
-          <a href="/websites/{{ site.id }}/files?path={{ p }}">{{ name }}</a>
+      <div class="fm-crumbs">
+        <button class="btn xs ghost" type="button" id="fmUpBtn">上一级</button>
+        <div class="file-path fm-crumb-trail">
+          {% for name, p in breadcrumbs %}
+          <a href="/websites/{{ site.id }}/files?path={{ p }}{% if embed_mode %}&modal=1{% endif %}">{{ name }}</a>
           {% if not loop.last %}<span class="sep">/</span>{% endif %}
-        {% endfor %}
+          {% endfor %}
+        </div>
       </div>
-    </div>
     <div class="fm-path-actions">
       <button class="btn xs ghost" type="button" id="fmRefreshBtn">刷新</button>
     </div>
@@ -44,6 +52,7 @@
       <div class="fm-divider"></div>
       <form method="post" action="/websites/{{ site.id }}/files/mkdir" class="fm-mkdir">
         <input type="hidden" name="path" value="{{ path }}">
+        {% if embed_mode %}<input type="hidden" name="modal" value="1">{% endif %}
         <input class="input sm" name="name" placeholder="新建目录">
         <button class="btn xs ghost" type="submit">创建</button>
       </form>
@@ -87,12 +96,13 @@
           {% set ext = it.name.rsplit(".", 1)[-1] | lower %}
         {% endif %}
         <tr
-          class="fm-row"
+          class="fm-row{% if it.favorite %} is-favorite{% endif %}"
           data-name="{{ it.name|lower }}"
           data-display-name="{{ it.name }}"
           data-path="{{ it.path }}"
           data-type="{{ 'dir' if it.is_dir else 'file' }}"
           data-size="{{ it.size or 0 }}"
+          data-favorite="{{ 1 if it.favorite else 0 }}"
         >
           <td class="fm-sel">
             <input type="checkbox" class="fm-check fm-item-check">
@@ -101,7 +111,7 @@
             <div class="fm-name-wrap">
               <span class="fm-badge {{ 'dir' if it.is_dir else 'file' }}">{{ '目录' if it.is_dir else (ext or '文件') }}</span>
               {% if it.is_dir %}
-                <a href="/websites/{{ site.id }}/files?path={{ it.path }}" class="fm-link">{{ it.name }}</a>
+                <a href="/websites/{{ site.id }}/files?path={{ it.path }}{% if embed_mode %}&modal=1{% endif %}" class="fm-link">{{ it.name }}</a>
               {% else %}
                 <span>{{ it.name }}</span>
               {% endif %}
@@ -112,18 +122,28 @@
           <td class="fm-actions-cell">
             <div class="fm-inline-actions">
               {% if it.is_dir %}
-                <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/download?path={{ it.path }}">下载</a>
+                <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/download?path={{ it.path }}{% if embed_mode %}&modal=1{% endif %}">下载</a>
               {% else %}
-                <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/edit?path={{ it.path }}">编辑</a>
-                <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/download?path={{ it.path }}">下载</a>
+                <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/edit?path={{ it.path }}{% if embed_mode %}&modal=1{% endif %}">编辑</a>
+                <a class="btn xs ghost fm-act-btn" href="/websites/{{ site.id }}/files/download?path={{ it.path }}{% if embed_mode %}&modal=1{% endif %}">下载</a>
                 {% if it.name.endswith('.zip') %}
                   <form method="post" action="/websites/{{ site.id }}/files/unzip" class="fm-inline-form">
                     <input type="hidden" name="path" value="{{ it.path }}">
                     <input type="hidden" name="dest" value="{{ path }}">
+                    {% if embed_mode %}<input type="hidden" name="modal" value="1">{% endif %}
                     <button class="btn xs ghost fm-act-btn" type="submit">解压</button>
                   </form>
                 {% endif %}
               {% endif %}
+              <button
+                class="btn xs ghost fm-act-btn fm-fav-toggle{% if it.favorite %} active{% endif %}"
+                type="button"
+                data-path="{{ it.path }}"
+                data-name="{{ it.name }}"
+                data-type="{{ 'dir' if it.is_dir else 'file' }}"
+                data-favorite="{{ 1 if it.favorite else 0 }}"
+                title="{{ '取消收藏' if it.favorite else '收藏' }}"
+              >{{ '★' if it.favorite else '☆' }}</button>
               <button
                 class="btn xs ghost fm-act-btn fm-share-one"
                 type="button"
@@ -133,6 +153,7 @@
               >分享</button>
               <form method="post" action="/websites/{{ site.id }}/files/delete" class="fm-inline-form" onsubmit="return confirm('确定删除吗？');">
                 <input type="hidden" name="path" value="{{ it.path }}">
+                {% if embed_mode %}<input type="hidden" name="modal" value="1">{% endif %}
                 <button class="btn xs ghost fm-act-btn fm-act-danger" type="submit">删除</button>
               </form>
             </div>
@@ -164,16 +185,12 @@
       <button class="btn xs ghost" type="button" id="fmModalCloseTop">关闭</button>
     </div>
     <div class="modal-body fm-upload-body">
-      <div class="fm-upload-mode">
-        <button class="btn xs ghost fm-mode-btn" type="button" id="fmModeFiles">文件</button>
-        <button class="btn xs ghost fm-mode-btn" type="button" id="fmModeFolder">文件夹</button>
-      </div>
       <div class="fm-upload-row">
-        <button class="btn xs" type="button" id="fmModalPick">选择文件</button>
-        <input type="file" id="fmModalFilesInput" class="fm-file-input" multiple>
-        <input type="file" id="fmModalFolderInput" class="fm-file-input" webkitdirectory directory mozdirectory multiple>
+        <button class="btn xs ghost" type="button" id="fmModalRepick">重新选择文件/文件夹</button>
+        <input type="file" id="fmUploadPickerInput" class="fm-file-input" multiple webkitdirectory directory mozdirectory>
         <div class="muted sm" id="fmModalHint">未选择</div>
       </div>
+      <div class="muted sm" id="fmModalFolderMeta"></div>
       <div class="fm-upload-row">
         <span class="muted sm">并发上传</span>
         <select class="select sm" id="fmModalConcurrency"></select>
@@ -237,7 +254,6 @@
 
 <script>
 const pickFilesBtn = document.getElementById('fmPickFiles');
-const pickFolderBtn = document.getElementById('fmPickFolder');
 const fmSearch = document.getElementById('fmSearch');
 const fmSearchClear = document.getElementById('fmSearchClear');
 const fmRefreshBtn = document.getElementById('fmRefreshBtn');
@@ -247,13 +263,11 @@ const fmSelectInfo = document.getElementById('fmSelectInfo');
 const fmSelectAll = document.getElementById('fmSelectAll');
 const fmShareBtn = document.getElementById('fmShareBtn');
 const fmUploadModal = document.getElementById('fmUploadModal');
-const fmModeFiles = document.getElementById('fmModeFiles');
-const fmModeFolder = document.getElementById('fmModeFolder');
 const fmModalSub = document.getElementById('fmModalSub');
-const fmModalPick = document.getElementById('fmModalPick');
-const fmModalFilesInput = document.getElementById('fmModalFilesInput');
-const fmModalFolderInput = document.getElementById('fmModalFolderInput');
+const fmModalRepick = document.getElementById('fmModalRepick');
+const fmUploadPickerInput = document.getElementById('fmUploadPickerInput');
 const fmModalHint = document.getElementById('fmModalHint');
+const fmModalFolderMeta = document.getElementById('fmModalFolderMeta');
 const fmModalConcurrency = document.getElementById('fmModalConcurrency');
 const fmModalFileList = document.getElementById('fmModalFileList');
 const fmModalStats = document.getElementById('fmModalStats');
@@ -283,12 +297,15 @@ const fmShareRevoke = document.getElementById('fmShareRevoke');
 const CHUNK_SIZE = 1024 * 512;
 const UPLOAD_MAX_BYTES = {{ upload_max_bytes }};
 const SITE_ID = {{ site.id }};
+const SITE_NAME = {{ (site.name or '')|tojson }};
+const SITE_DOMAIN = {{ ((site.domains[0]) if site.domains and (site.domains|length > 0) else '')|tojson }};
 const CUR_PATH = {{ path|tojson }};
+const IS_EMBED_MODAL = {{ 1 if embed_mode else 0 }};
 const FILE_SHARE_DEFAULT_TTL_SEC = {{ file_share_default_ttl_sec }};
 const FILE_SHARE_MIN_TTL_SEC = {{ file_share_min_ttl_sec }};
 const FILE_SHARE_MAX_TTL_SEC = {{ file_share_max_ttl_sec }};
 const FILE_SHARE_MAX_ITEMS = {{ file_share_max_items }};
-const folderPickerEl = fmModalFolderInput;
+const folderPickerEl = fmUploadPickerInput;
 const SUPPORTS_FOLDER_PICK = !!(folderPickerEl && (('webkitdirectory' in folderPickerEl) || ('mozdirectory' in folderPickerEl)));
 const modalUI = {
   panel: fmModalProgress,
@@ -312,6 +329,14 @@ let shareItems = [];
 let shareHistoryRows = [];
 let currentShareUrl = '';
 let shareHistoryLoading = false;
+
+function withModal(url){
+  const base = String(url || '');
+  if(!IS_EMBED_MODAL || !base){
+    return base;
+  }
+  return base.includes('?') ? `${base}&modal=1` : `${base}?modal=1`;
+}
 
 function bytesToHuman(n){
   if(!n) return '0 B';
@@ -951,12 +976,117 @@ function collectCheckedShareItems(){
   return normalizeShareItems(out);
 }
 
+function notifyFavoriteChanged(path, isDir, favorite, name){
+  const p = String(path || '');
+  const leaf = String(name || p.split('/').pop() || p);
+  if(window.parent && window.parent !== window){
+    try{
+      window.parent.postMessage(
+        {
+          type: 'nexus-file-favorite-updated',
+          siteId: SITE_ID,
+          siteName: String(SITE_NAME || ''),
+          siteDomain: String(SITE_DOMAIN || ''),
+          path: p,
+          name: leaf,
+          isDir: !!isDir,
+          favorite: !!favorite
+        },
+        window.location.origin
+      );
+    }catch(_e){}
+  }
+}
+
+function applyFavoriteBtnState(btn, favorite){
+  if(!btn) return;
+  const on = !!favorite;
+  btn.dataset.favorite = on ? '1' : '0';
+  btn.classList.toggle('active', on);
+  btn.title = on ? '取消收藏' : '收藏';
+  btn.textContent = on ? '★' : '☆';
+  const row = btn.closest('.fm-row');
+  if(row){
+    row.dataset.favorite = on ? '1' : '0';
+    row.classList.toggle('is-favorite', on);
+  }
+}
+
+async function toggleFavoriteByBtn(btn){
+  if(!btn) return;
+  const path = String(btn.dataset.path || '').trim();
+  if(!path){
+    return;
+  }
+  const type = String(btn.dataset.type || '').trim().toLowerCase();
+  const name = String(btn.dataset.name || path.split('/').pop() || path);
+  const oldVal = String(btn.dataset.favorite || '') === '1';
+  const nextVal = !oldVal;
+  btn.disabled = true;
+  try{
+    const resp = await fetch(`/websites/${SITE_ID}/files/favorite`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        path,
+        type,
+        is_dir: type === 'dir',
+        favorite: nextVal
+      })
+    });
+    const data = await resp.json().catch(()=>({ok:false,error:'收藏操作失败'}));
+    if(!data.ok){
+      throw new Error(data.error || '收藏操作失败');
+    }
+    applyFavoriteBtnState(btn, !!data.favorite);
+    notifyFavoriteChanged(path, type === 'dir', !!data.favorite, name);
+  }catch(err){
+    alert(String(err));
+    applyFavoriteBtnState(btn, oldVal);
+  }finally{
+    btn.disabled = false;
+  }
+}
+
+function summarizeFolderSelection(files){
+  const roots = new Set();
+  const dirs = new Set();
+  let maxDepth = 0;
+  (Array.isArray(files) ? files : []).forEach((f)=>{
+    const rel = String(f?.webkitRelativePath || '').replace(/\\/g, '/').trim();
+    if(!rel){
+      return;
+    }
+    const parts = rel.split('/').filter(Boolean);
+    if(!parts.length){
+      return;
+    }
+    roots.add(parts[0]);
+    const depth = Math.max(0, parts.length - 1);
+    if(depth > maxDepth){
+      maxDepth = depth;
+    }
+    let acc = '';
+    for(let i=0; i<parts.length - 1; i++){
+      const seg = parts[i];
+      acc = acc ? (acc + '/' + seg) : seg;
+      dirs.add(acc);
+    }
+  });
+  return {
+    roots: Array.from(roots),
+    dirCount: dirs.size,
+    maxDepth
+  };
+}
+
 function renderModalList(files){
   if(!fmModalFileList || !fmModalStats) return;
   fmModalFileList.innerHTML = '';
   if(!files.length){
     fmModalFileList.textContent = '未选择';
     fmModalStats.textContent = '';
+    if(fmModalFolderMeta) fmModalFolderMeta.textContent = '';
     return;
   }
   const limit = 200;
@@ -982,38 +1112,77 @@ function renderModalList(files){
     fmModalFileList.appendChild(more);
   }
   fmModalStats.textContent = `共 ${files.length} 个文件 · ${bytesToHuman(totalBytes)}`;
-}
-
-let modalMode = 'file';
-
-function setModalMode(mode){
-  modalMode = mode === 'folder' ? 'folder' : 'file';
-  if(fmModeFiles) fmModeFiles.classList.toggle('active', modalMode === 'file');
-  if(fmModeFolder) fmModeFolder.classList.toggle('active', modalMode === 'folder');
-  if(fmModalPick) fmModalPick.textContent = modalMode === 'folder' ? '选择文件夹' : '选择文件';
-  if(fmModalPick){
-    if(modalMode === 'folder' && !SUPPORTS_FOLDER_PICK){
-      fmModalPick.title = '当前浏览器不支持文件夹选择';
+  if(fmModalFolderMeta){
+    const folderFiles = files.filter((f)=> String(f?.webkitRelativePath || '').replace(/\\/g, '/').includes('/'));
+    if(folderFiles.length){
+      const summary = summarizeFolderSelection(folderFiles);
+      const roots = summary.roots;
+      const rootTxt = roots.length <= 1
+        ? (roots[0] || '文件夹')
+        : `${roots[0]} 等 ${roots.length} 个目录`;
+      fmModalFolderMeta.textContent = `目录结构：${rootTxt} · 子目录 ${summary.dirCount} · 最大层级 ${summary.maxDepth}`;
     }else{
-      fmModalPick.title = modalMode === 'folder' ? '选择文件夹' : '选择文件';
+      fmModalFolderMeta.textContent = '';
     }
   }
-  if(fmModalSub){
-    fmModalSub.textContent = modalMode === 'folder'
-      ? '选择文件夹后确认上传'
+}
+
+function countFolderStructuredFiles(files){
+  let count = 0;
+  (Array.isArray(files) ? files : []).forEach((f)=>{
+    const rel = String(f?.webkitRelativePath || '').replace(/\\/g, '/').trim();
+    if(rel.includes('/')){
+      count += 1;
+    }
+  });
+  return count;
+}
+
+function updateModalSubtitle(files){
+  if(!fmModalSub) return;
+  if(!files.length){
+    fmModalSub.textContent = SUPPORTS_FOLDER_PICK
+      ? '选择文件或文件夹后确认上传（保留目录结构）'
       : '选择文件后确认上传';
+    return;
   }
-  modalFiles = [];
-  if(fmModalFilesInput) fmModalFilesInput.value = '';
-  if(fmModalFolderInput) fmModalFolderInput.value = '';
-  if(fmModalHint) fmModalHint.textContent = '未选择';
-  renderModalList([]);
+  const folderFileCount = countFolderStructuredFiles(files);
+  if(folderFileCount > 0){
+    fmModalSub.textContent = `已选择 ${files.length} 个文件（含目录结构）`;
+  }else{
+    fmModalSub.textContent = `已选择 ${files.length} 个文件`;
+  }
+}
+
+function resetModalUploadProgress(){
   if(fmModalStart) fmModalStart.disabled = true;
   if(fmModalCompat) fmModalCompat.disabled = true;
   if(fmModalProgress) fmModalProgress.style.display = 'none';
   if(fmModalProgressFill) fmModalProgressFill.style.width = '0%';
   if(fmModalStatus) fmModalStatus.textContent = '';
   if(fmModalRetry) fmModalRetry.style.display = 'none';
+}
+
+function applyModalSelection(files){
+  modalFiles = Array.isArray(files) ? files : [];
+  const folderFileCount = countFolderStructuredFiles(modalFiles);
+  if(fmModalHint){
+    if(!modalFiles.length){
+      fmModalHint.textContent = '未选择';
+    }else if(folderFileCount > 0 && folderFileCount < modalFiles.length){
+      const plainCount = modalFiles.length - folderFileCount;
+      fmModalHint.textContent = `已选择 ${modalFiles.length} 个文件（普通 ${plainCount}，目录 ${folderFileCount}）`;
+    }else if(folderFileCount > 0){
+      fmModalHint.textContent = `已选择 ${modalFiles.length} 个目录文件`;
+    }else{
+      fmModalHint.textContent = `已选择 ${modalFiles.length} 个文件`;
+    }
+  }
+  renderModalList(modalFiles);
+  updateModalSubtitle(modalFiles);
+  resetModalUploadProgress();
+  if(fmModalStart) fmModalStart.disabled = !modalFiles.length;
+  if(fmModalCompat) fmModalCompat.disabled = !modalFiles.length;
 }
 
 function bufToHex(buffer){
@@ -1381,12 +1550,16 @@ async function startChunkedUpload(files, ui, resumeOnly){
   }
 }
 
-async function compatUploadOnce(files, mode, ui){
+async function compatUploadOnce(files, ui){
   const form = new FormData();
   form.append('path', CUR_PATH || '');
-  const field = mode === 'folder' ? 'folder' : 'files';
+  if(IS_EMBED_MODAL){
+    form.append('modal', '1');
+  }
   files.forEach((f)=>{
+    const rel = String(f?.webkitRelativePath || '').replace(/\\/g, '/').trim();
     const name = f.webkitRelativePath || f.name;
+    const field = rel.includes('/') ? 'folder' : 'files';
     form.append(field, f, name);
   });
   return await new Promise((resolve, reject)=>{
@@ -1414,7 +1587,7 @@ async function compatUploadOnce(files, mode, ui){
   });
 }
 
-async function startCompatUpload(files, mode, ui){
+async function startCompatUpload(files, ui){
   lastUploadMethod = 'compat';
   if(!files.length){
     alert('请选择文件或文件夹');
@@ -1436,7 +1609,7 @@ async function startCompatUpload(files, mode, ui){
     const totalAttempts = Math.max(1, COMPAT_UPLOAD_MAX_RETRIES + 1);
     for(let attempt=1; attempt<=totalAttempts; attempt++){
       try{
-        await compatUploadOnce(files, mode, ui);
+        await compatUploadOnce(files, ui);
         break;
       }catch(err){
         const canRetry = attempt < totalAttempts && isRetriableError(err);
@@ -1458,70 +1631,42 @@ async function startCompatUpload(files, mode, ui){
   }
 }
 
+let openModalAfterPicker = false;
+
+function triggerUploadPicker(openAfterSelect){
+  if(!fmUploadPickerInput){
+    alert('当前环境不支持文件选择');
+    return;
+  }
+  openModalAfterPicker = !!openAfterSelect;
+  fmUploadPickerInput.value = '';
+  fmUploadPickerInput.click();
+}
+
 pickFilesBtn?.addEventListener('click', ()=>{
-  setModalMode('file');
-  openModal();
+  triggerUploadPicker(true);
 });
 
-pickFolderBtn?.addEventListener('click', ()=>{
-  if(!SUPPORTS_FOLDER_PICK){
-    alert('当前浏览器不支持文件夹选择，请使用 Chrome / Edge 或尝试兼容上传。');
+fmModalRepick?.addEventListener('click', ()=>{
+  triggerUploadPicker(false);
+});
+
+fmUploadPickerInput?.addEventListener('change', ()=>{
+  const files = fmUploadPickerInput?.files ? Array.from(fmUploadPickerInput.files) : [];
+  if(!files.length){
+    openModalAfterPicker = false;
     return;
   }
-  setModalMode('folder');
-  openModal();
-});
-
-fmModeFiles?.addEventListener('click', ()=> setModalMode('file'));
-fmModeFolder?.addEventListener('click', ()=>{
-  if(!SUPPORTS_FOLDER_PICK){
-    alert('当前浏览器不支持文件夹选择，请使用 Chrome / Edge。');
-    return;
+  applyModalSelection(files);
+  if(openModalAfterPicker){
+    openModal();
   }
-  setModalMode('folder');
-});
-
-fmModalPick?.addEventListener('click', ()=>{
-  if(modalMode === 'folder'){
-    if(!SUPPORTS_FOLDER_PICK){
-      alert('当前浏览器不支持文件夹选择，请使用 Chrome / Edge。');
-      return;
-    }
-    fmModalFolderInput?.click();
-  }else{
-    fmModalFilesInput?.click();
-  }
-});
-
-fmModalFilesInput?.addEventListener('change', ()=>{
-  modalFiles = fmModalFilesInput?.files ? Array.from(fmModalFilesInput.files) : [];
-  if(fmModalHint){
-    fmModalHint.textContent = modalFiles.length ? `已选择 ${modalFiles.length} 个文件` : '未选择';
-  }
-  renderModalList(modalFiles);
-  if(fmModalStart) fmModalStart.disabled = !modalFiles.length;
-  if(fmModalCompat) fmModalCompat.disabled = !modalFiles.length;
-});
-
-fmModalFolderInput?.addEventListener('change', ()=>{
-  modalFiles = fmModalFolderInput?.files ? Array.from(fmModalFolderInput.files) : [];
-  if(fmModalHint){
-    if(modalFiles.length){
-      const rel = modalFiles[0].webkitRelativePath || '';
-      const folderName = rel ? rel.split('/')[0] : '文件夹';
-      fmModalHint.textContent = `已选择：${folderName}`;
-    }else{
-      fmModalHint.textContent = '未选择';
-    }
-  }
-  renderModalList(modalFiles);
-  if(fmModalStart) fmModalStart.disabled = !modalFiles.length;
-  if(fmModalCompat) fmModalCompat.disabled = !modalFiles.length;
+  openModalAfterPicker = false;
 });
 
 fmModalStart?.addEventListener('click', async ()=>{
   if(!modalFiles.length){
-    alert(modalMode === 'folder' ? '请选择文件夹' : '请选择文件');
+    alert('请选择文件或文件夹');
     return;
   }
   await startChunkedUpload(modalFiles, modalUI, false);
@@ -1529,16 +1674,16 @@ fmModalStart?.addEventListener('click', async ()=>{
 
 fmModalCompat?.addEventListener('click', async ()=>{
   if(!modalFiles.length){
-    alert(modalMode === 'folder' ? '请选择文件夹' : '请选择文件');
+    alert('请选择文件或文件夹');
     return;
   }
-  await startCompatUpload(modalFiles, modalMode, modalUI);
+  await startCompatUpload(modalFiles, modalUI);
 });
 
 fmModalRetry?.addEventListener('click', async ()=>{
   if(!modalFiles.length) return;
   if(lastUploadMethod === 'compat'){
-    await startCompatUpload(modalFiles, modalMode, modalUI);
+    await startCompatUpload(modalFiles, modalUI);
   }else{
     await startChunkedUpload(modalFiles, modalUI, true);
   }
@@ -1699,7 +1844,12 @@ fmUpBtn?.addEventListener('click', ()=>{
   if(!segs.length) return;
   segs.pop();
   const up = segs.join('/');
-  window.location.href = `/websites/${SITE_ID}/files?path=${encodeURIComponent(up)}`;
+  window.location.href = withModal(`/websites/${SITE_ID}/files?path=${encodeURIComponent(up)}`);
+});
+
+document.querySelectorAll('.fm-fav-toggle').forEach((btn)=>{
+  applyFavoriteBtnState(btn, String(btn.dataset.favorite || '') === '1');
+  btn.addEventListener('click', ()=> toggleFavoriteByBtn(btn));
 });
 
 fmSelectAll?.addEventListener('change', ()=>{
@@ -1717,16 +1867,6 @@ document.querySelectorAll('.fm-item-check').forEach((c)=>{
   c.addEventListener('change', updateSelectionInfo);
 });
 
-if(!SUPPORTS_FOLDER_PICK && pickFolderBtn){
-  pickFolderBtn.setAttribute('disabled', 'disabled');
-  pickFolderBtn.classList.add('disabled');
-  pickFolderBtn.title = '当前浏览器不支持文件夹选择';
-}
-if(!SUPPORTS_FOLDER_PICK && fmModeFolder){
-  fmModeFolder.setAttribute('disabled', 'disabled');
-  fmModeFolder.classList.add('disabled');
-  fmModeFolder.title = '当前浏览器不支持文件夹选择';
-}
 if(fmShareTtlHint){
   fmShareTtlHint.textContent = `范围：${formatDurationLabel(FILE_SHARE_MIN_TTL_SEC)} - ${formatDurationLabel(FILE_SHARE_MAX_TTL_SEC)}`;
 }
@@ -1737,7 +1877,7 @@ setShareStatus('', false);
 computeTableStats();
 applySearchFilter();
 initUploadConcurrency();
-setModalMode('file');
+applyModalSelection([]);
 loadShareHistory();
 </script>
 {% endblock %}

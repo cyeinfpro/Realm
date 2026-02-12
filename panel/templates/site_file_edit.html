@@ -1,5 +1,17 @@
 {% extends "base.html" %}
 {% block content %}
+{% if embed_mode %}
+<style>
+.topbar,.footer{display:none !important;}
+main.container{max-width:none;padding:10px 12px 12px;}
+</style>
+{% endif %}
+{% set parent_path = '/'.join(path.split('/')[:-1]) %}
+{% set back_href = '/websites/' ~ site.id ~ '/files?path=' ~ parent_path %}
+{% if embed_mode %}
+  {% set back_href = back_href ~ '&modal=1' %}
+{% endif %}
+{% if not embed_mode %}
 <div class="page-head">
   <div class="page-title">
     <h1 class="h1">编辑文件 · {{ site.name }}</h1>
@@ -8,11 +20,12 @@
     </div>
   </div>
   <div class="right">
-    <a class="btn sm ghost" href="/websites/{{ site.id }}/files?path={{ '/'.join(path.split('/')[:-1]) }}">返回目录</a>
+    <a class="btn sm ghost" href="{{ back_href }}">返回目录</a>
   </div>
 </div>
 
 {% include "site_nav.html" %}
+{% endif %}
 
 {% if error %}
   <div class="flash" style="background:rgba(239,68,68,0.15);border-color:rgba(239,68,68,0.4);">
@@ -23,11 +36,12 @@
 <div class="card" style="margin-top:12px;">
   <form method="post" action="/websites/{{ site.id }}/files/save" class="form">
     <input type="hidden" name="path" value="{{ path }}">
+    {% if embed_mode %}<input type="hidden" name="modal" value="1">{% endif %}
     <label class="label">文件内容</label>
     <textarea class="textarea mono" name="content" rows="22" style="min-height:60vh;">{{ content }}</textarea>
     <div class="row" style="margin-top:12px;">
       <div class="col">
-        <a class="btn ghost" href="/websites/{{ site.id }}/files?path={{ '/'.join(path.split('/')[:-1]) }}">取消</a>
+        <a class="btn ghost" href="{{ back_href }}">取消</a>
       </div>
       <div class="col right">
         <button class="btn" type="submit">保存</button>
